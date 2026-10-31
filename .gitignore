@@ -87,6 +87,7 @@
 !/Installer/Wallbox/decision.py
 !/Installer/Wallbox/demand_contract.py
 !/Installer/Wallbox/diagnostics.py
+!/Installer/Wallbox/distribution.py
 !/Installer/Wallbox/drivers.py
 !/Installer/Wallbox/e3dc_session.py
 !/Installer/Wallbox/fixed_phase_session.py
@@ -107,6 +108,7 @@
 !/Installer/Wallbox/policy.py
 !/Installer/Wallbox/ramps.py
 !/Installer/Wallbox/runtime_state.py
+!/Installer/Wallbox/simple_core.py
 !/Installer/Wallbox/scheduler.py
 !/Installer/Wallbox/soc_tracker.py
 !/Installer/Wallbox/source_watt_cap.py
@@ -158,11 +160,11 @@
 !/Installer/docker-logrotate.conf
 !/Installer/e3dc_history_slots.py
 !/Installer/e3dc_live.py
+!/Installer/retired_websocket.py
 !/Installer/forecast_evidence_sidecar.py
 !/Installer/external_pv_topology.py
 !/Installer/ext_inverter_modbus.py
 !/Installer/e3dc_mqtt_hub.py
-!/Installer/e3dc_websocket.py
 !/Installer/emergency_mode.py
 !/Installer/emergency_release.py
 !/Installer/ems_decision_diagnostics.py

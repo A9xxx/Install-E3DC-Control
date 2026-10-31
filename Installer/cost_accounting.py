@@ -52,7 +52,10 @@ HISTORY_FIELDS = frozenset(('ts', 'soc', 'pv', 'pv_total_w', 'pv_external_w',
     'grid', 'bat', 'home', 'home_raw', 'wb', 'wb2', 'wp', 'hs', 'climate',
     'price_ct', 'cost_prices', 'rscp_sample_valid', 'is_external_wb', 'is_external_wb2',
     'wb_home_relation', 'wb2_home_relation', 'wb_native_type', 'wb2_native_type',
-    'wb_source', 'wb2_source', 'wb_daily_source', 'wb2_daily_source'))
+    'wb_source', 'wb2_source', 'wb_daily_source', 'wb2_daily_source',
+    'wb_measure_only', 'wb_measure_only_w', 'wb2_measure_only', 'wb2_measure_only_w',
+    'wb_measure_only_configured', 'wb2_measure_only_configured',
+    'wb_measure_only_reason', 'wb2_measure_only_reason'))
 
 
 def read_history(paths, after=None, before=None, deadline=None):

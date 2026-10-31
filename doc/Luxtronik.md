@@ -509,11 +509,16 @@ freigegeben. Ungültige Messungen erzeugen keine kostenlose Energie.
 
 Das Energiekonto und möglicherweise noch wirksame PV-Kanalaufträge werden
 getrennt und privat gespeichert. Neue Zusagen werden vor ihrer Freigabe
-gesichert. Fehlt ein vertrauenswürdiges Konto, etwa bei erster Einrichtung
-oder Docker-Neuerstellung, warten neue optionale PV-Starts zunächst
-24 Stunden nachweisbar verstrichene Laufzeit. Ein weiterer Neustart behält
-die Restwartezeit bei. Danach werden frische Daten, bestätigter Stillstand
-und geklärte alte Aufträge benötigt. Normale Heizung und berechtigte
+gesichert. Nach einem Neustart wird das letzte gültige Energiekonto fortgeführt.
+Unbekannte Ausfallzeiten werden mit getrennten konservativen Obergrenzen für
+Akku- und Netzenergie gebucht. Fehlt ein vertrauenswürdiges Konto, gelten die
+Wh-Kontingente zunächst als verbraucht. Es gibt kein zusätzliches Sperrfenster:
+Mit der ersten gültigen Zeit- und Messprobe ist PV-Betrieb ohne Überbrückung
+wieder möglich. Mit Zeitnachweis des Systems wird die belegte Ausfallzeit gebucht. Ohne
+Zeitnachweis, etwa im Docker-Container, gilt die Ausfallzeit als verbraucht.
+Widersprüchliche Uhrdaten verhindern neue PV-Aufträge nur so lange, wie sie
+widersprüchlich sind. Mindestlaufzeit und
+Mindeststillstand bleiben erhalten. Normale Heizung und berechtigte
 Warmwasser-Zeitfenster bleiben unabhängig. Private Kontodateien nicht als
 vermeintliche Reparatur löschen.
 

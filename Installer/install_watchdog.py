@@ -352,6 +352,7 @@ sm_quiesce_attempted=false
 sm_incident_id=""
 warned_sm=false
 warned_quiesce_latch=false
+quiesce_latch_warn_ts=0
 # Zu überwachende IPs (leerzeichengetrennt)
 ROUTER_IPS={router_ips_quoted}
 MONITOR_FILE={monitor_file_quoted}
@@ -376,6 +377,24 @@ restart_core_service() {{
 
 emergency_latch_active() {{
     [ -e "$EMERGENCY_LATCH" ] || [ -L "$EMERGENCY_LATCH" ]
+}}
+
+# Akkugrenzen aus dem e3dc-live-Readback als Kurztext; unbekannt, wenn der Helfer fehlt oder nichts liefert.
+quiesce_limits_text() {{
+    local text=""
+    if [ -x "$VENV_PY" ] && [ -f "$INSTALL_DIR/Installer/live_snapshot.py" ]; then
+        text=$("$VENV_PY" "$INSTALL_DIR/Installer/live_snapshot.py" --watchdog-limits --live-path /var/www/html/ramdisk/live_data_py.json 2>/dev/null | head -n 1 | tr -d '"%')
+    fi
+    [ -n "$text" ] || text="Akkugrenzen: unbekannt"
+    printf '%s' "$text"
+}}
+
+# Hinweis im Latch-Zustand mit aktiven Akkugrenzen und Rückweg; der Watchdog frischt ihn auf, damit er nicht nach 24 h verschwindet.
+write_quiesce_latch_warning() {{
+    local now_ts="$1" limits
+    limits=$(quiesce_limits_text)
+    printf '{{"warning": "Emergency-Quiesce aktiv - manueller Reset nach Prüfung erforderlich. %s. Rückweg: Ursache beheben und das Emergency-Latch zurücksetzen oder den E3DC neu starten (setzt die Akkugrenzen auf die Grundeinstellung).", "level": "critical", "ts": %s, "battery_limits": "%s"}}\n' "$limits" "$now_ts" "$limits" > /var/www/html/ramdisk/watchdog_warning.json
+    chmod 664 /var/www/html/ramdisk/watchdog_warning.json 2>/dev/null
 }}
 
 new_storage_incident_id() {{
@@ -693,10 +712,14 @@ while true; do
           if emergency_latch_active; then
               if [ "$warned_quiesce_latch" = false ]; then
                   log_msg "WATCHDOG: Emergency-Quiesce-Latch aktiv; kein Restart und kein erneuter Aktorpfad. Manuelle Prüfung erforderlich."
-                  printf '{{"warning": "Emergency-Quiesce aktiv - manueller Reset nach Prüfung erforderlich", "level": "critical", "ts": %s}}\n' "$sm_current_time" > /var/www/html/ramdisk/watchdog_warning.json
-                  chmod 664 /var/www/html/ramdisk/watchdog_warning.json 2>/dev/null
-                  /usr/local/bin/boot_notify.sh "Watchdog: Emergency-Quiesce aktiv - kein automatischer Wiederholungsversuch."
+                  write_quiesce_latch_warning "$sm_current_time"
+                  /usr/local/bin/boot_notify.sh "Watchdog: Emergency-Quiesce aktiv - kein automatischer Wiederholungsversuch. $(quiesce_limits_text)."
                   warned_quiesce_latch=true
+                  quiesce_latch_warn_ts=$sm_current_time
+              elif [ $((sm_current_time - quiesce_latch_warn_ts)) -ge 21600 ]; then
+                  # Nur auffrischen (Zeitstempel, aktuelle Grenzen), keine neue Benachrichtigung.
+                  write_quiesce_latch_warning "$sm_current_time"
+                  quiesce_latch_warn_ts=$sm_current_time
               fi
               warned_sm=true
           elif [ $sm_diff -gt 300 ] || [ "$sm_service_down_too_long" = true ]; then
@@ -737,7 +760,8 @@ while true; do
                           /usr/local/bin/boot_notify.sh "Watchdog: Storage-Writer geordnet beendet; Emergency-Quiesce bestätigt."
                       else
                           log_msg "WATCHDOG: Emergency-Quiesce unvollstaendig (Exit $quiesce_rc); kein Retry und kein Hardware-Fallback."
-                          printf '{{"warning": "Emergency-Quiesce unvollstaendig - manueller Eingriff erforderlich", "level": "critical", "ts": %s, "exit_code": %s}}\n' "$sm_current_time" "$quiesce_rc" > /var/www/html/ramdisk/watchdog_warning.json
+                          quiesce_limits=$(quiesce_limits_text)
+                          printf '{{"warning": "Emergency-Quiesce unvollstaendig - manueller Eingriff erforderlich. %s.", "level": "critical", "ts": %s, "exit_code": %s, "battery_limits": "%s"}}\n' "$quiesce_limits" "$sm_current_time" "$quiesce_rc" "$quiesce_limits" > /var/www/html/ramdisk/watchdog_warning.json
                           chmod 664 /var/www/html/ramdisk/watchdog_warning.json 2>/dev/null
                           /usr/local/bin/boot_notify.sh "Watchdog: Emergency-Quiesce unvollstaendig - manueller Eingriff erforderlich."
                       fi

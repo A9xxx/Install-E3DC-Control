@@ -192,9 +192,46 @@ Gerätedaten. Alte manuelle Ladebefehle und Speicherlimits aus der Pause werden
 nicht wieder aufgenommen. Technisch wird der Schalter als
 `storage_regulation_enabled` (`1`/`0`, Standard `1`) gespeichert; der Web-Schalter
 bindet die Übernahme mit `storage_regulation_changed_ts` an die aktuelle
-Bedienaktion. Ein Dienststopp allein ersetzt diese geordnete Abschaltung nicht.
+Bedienaktion.
 
-> **Stand:** v5.5.5c
+Auch beim geordneten Dienstende versucht der Storage Manager genau einmal,
+seine flüchtigen Akkugrenzen freizugeben, bevor er den Prozessbesitz abgibt.
+Voraussetzungen sind eine zuletzt aktive Speicherregelung, bestätigter
+Geräte-Readback, gültige frische Live-Daten
+und weiterhin gültiges HA-Schreibrecht. Bei aktiver oder unbekannter Notstromsperre sowie angewandtem
+oder unbestätigtem Vorhaltungsdeckel bleiben die Grenzen erhalten. Auch bei
+Inselversorgung, unlesbarem Notstromstatus oder unbekannter Ausgangsfreigabe
+des letzten Zyklus wird nicht geschrieben. Nach einem Wechsel der Zugangsdaten
+im laufenden Dienst bleibt der Rahmen beim Dienstende stehen.
+Bei einem zuletzt aktiven SET_POWER-Modus (Netzladen,
+Laden oder Entladen) bleiben die Grenzen beim Dienstende erhalten, damit
+der Ladedeckel nicht vor dem geräteseitigen Rückfall entfällt. Eine bereits
+ausgeschaltete oder unlesbare Speicherregelung erhält keinen weiteren Versuch.
+Der Endzustand nennt die Freigabe als bestätigt, unbestätigt oder mit Grund
+ausgelassen. Vor dem Versuch wird ein ausstehender Zustand gespeichert; ein
+abgeschnittener Versuch bleibt diagnostisch ausstehend. Der nächste Start
+prüft den Gerätestand wie bisher per Rücklesen. Der Freigabestatus dient
+nur der Diagnose und ersetzt diese Prüfung nicht.
+
+Bei einem Neustart oder geplanten HA-Wechsel mit gültigem Schreibrecht läuft
+das E3DC nach bestätigter Freigabe kurz in freier Automatik. Der Nachfolger
+bestätigt zuerst den aktuellen Geräte-Readback und setzt dann seine Grenzen
+neu. Bei entzogener HA-Schreiberberechtigung erfolgt keine Freigabe. Ein
+Absturz, hartes Prozessende oder Rechnerausfall kann die letzten Grenzen
+zurücklassen. Das Notfall-Stillsetzen selbst sendet keine Hardwarebefehle.
+
+Bleibt der Speicher-Manager nach einem Notfall-Stillsetzen gesperrt, nennt der
+Watchdog-Hinweis in der Oberfläche und in der Benachrichtigung die zuletzt vom
+E3DC gelesenen Akkugrenzen: „Akkugrenzen aktiv: Laden höchstens … W,
+Entladen höchstens … W“, „keine aktiv“ oder „unbekannt“, wenn der Readback
+fehlt, veraltet oder ungültig ist. Der Hinweis bleibt sichtbar, solange die
+Sperre besteht. Rückweg: Ursache beheben und die Sperre als Root zurücksetzen
+(`emergency_release.py --reset-latch --incident-id <ID>`; die ID steht in
+`/var/lib/e3dc-control/emergency-quiesce/active-incident.json`) oder den E3DC
+neu starten. Ein Neustart des E3DC setzt die Akkugrenzen auf die
+Grundeinstellung.
+
+> **Stand:** v5.5.6
 >
 > **Dateien:** `Installer/storage_simulator.py`,
 > `Installer/storage_manager.py`, `Installer/storage_parallel_regulator.py`

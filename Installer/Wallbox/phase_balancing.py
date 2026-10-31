@@ -938,6 +938,7 @@ def openwb_pro_one_phase_current_cap(
     voltage_source=None,
     meter_mismatch=False,
     legal_cap_epsilon_a=1e-6,
+    phase_frame_cap_a=None,
 ):
     """Bestimme den sicheren 1p-Stromdeckel für eine openWB Pro.
 
@@ -1264,6 +1265,10 @@ def openwb_pro_one_phase_current_cap(
     pcc_effective = wallbox_share + foreign_margin
     headroom = operating_limit - pcc_effective
     cap_safety = accepted + headroom
+    if phase_frame_cap_a is not None:
+        # Gemeinsamer Rahmen: Marge liegt bereits vor dem Eigenabzug.
+        cap_safety = max(0.0, _finite(phase_frame_cap_a, 0.0))
+        headroom = cap_safety - accepted
     other_min = min(
         value for index, value in enumerate(measured) if index != phase_index
     )
@@ -1693,6 +1698,7 @@ def clamp_targets_to_phase_limit(
         "limited": any(best.get(charger_id, 0) < max(0, int(_finite(proposed_amp_by_id.get(charger_id), 0))) for charger_id in ids),
         "reason": "phase_limit" if any(best.get(charger_id, 0) < max(0, int(_finite(proposed_amp_by_id.get(charger_id), 0))) for charger_id in ids) else "within_limit",
     }
+
 
 
 def aggregate_target_display(charger_specs, target_amp_by_id):

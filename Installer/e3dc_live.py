@@ -12,8 +12,8 @@ Verzeichnisstruktur:
 
 Betrieb:
   Test (Einzel):    python3 e3dc_live.py
-  Daemon (nonstop): python3 e3dc_live.py --write --loops 0 --interval 3
-  N-mal wiederholen: python3 e3dc_live.py --loops 5 --interval 3
+  Daemon (nonstop): python3 e3dc_live.py --write --loops 0 --interval 2
+  N-mal wiederholen: python3 e3dc_live.py --loops 5 --interval 2
 """
 
 import os
@@ -60,20 +60,20 @@ LIVE_PLAUSIBILITY_DIAG_LOG_MAX_BYTES = 2 * 1024 * 1024
 LIVE_PLAUSIBILITY_DIAG_LOG_TARGET_BYTES = 1024 * 1024
 # Die Zusatzdiagnose läuft synchron und best-effort im Live-Zyklus. Sie startet
 # nur, wenn unmittelbar nach dem Glitch-I/O bis zur nächsten Akquise noch
-# mindestens 1 s bleibt. Braucht sie länger als 0,25 s (weniger als ein Zehntel
-# des 3-s-Takts, ein Vielfaches des üblichen Aufwands), pausiert sie 5 Minuten.
+# mindestens 1 s bleibt. Braucht sie länger als 0,25 s (ein Achtel
+# des 2-s-Takts, ein Vielfaches des üblichen Aufwands), pausiert sie 5 Minuten.
 # Ein blockierender Dateizugriff kann den Takt wie beim bestehenden Glitch-Log
 # verzögern; die Pause greift erst nach Rückkehr. Keine harte Laufzeitgarantie.
 # Ausgelassene Diagnosen werden gezählt.
 LIVE_PLAUSIBILITY_DIAG_MIN_SLACK_S = 1.0
 LIVE_PLAUSIBILITY_DIAG_BUDGET_S = 0.25
 LIVE_PLAUSIBILITY_DIAG_SUSPEND_S = 300.0
-# Je Episode höchstens 20 Frames (60 s im 3-s-Takt) mit Diagnose, einschließlich
+# Je Episode höchstens 30 Frames (60 s im 2-s-Takt) mit Diagnose, einschließlich
 # des Erholungsframes. Das deckt das Persistfenster der Netz/PM-Abweichung (20 s)
 # und das Budget-Timeout der Wallbox (45 s) mit Reserve ab. Weitere Frames werden
 # nur gezählt und nicht mehr ausgewertet, damit ein Dauerfehler weder Laufzeit
 # noch Logdatei belastet.
-LIVE_PLAUSIBILITY_EPISODE_FRAME_LIMIT = 20
+LIVE_PLAUSIBILITY_EPISODE_FRAME_LIMIT = 30
 # Gültige Einzelframe-Spitze: Netzleistung (EMS) weicht um mehr als 500 W vom
 # Mittel aus Vor- und Nachframe ab; alle drei Frames sind gültig und ohne
 # Diagnosegrund, der Detektor sieht sie also nicht.
@@ -85,7 +85,8 @@ LIVE_PLAUSIBILITY_SPIKE_MIN_HEIGHT_W = 500.0
 # nicht vom Mittel ab. Übliches Rauschen der Netzleistung zwischen zwei Frames
 # bleibt darunter.
 LIVE_PLAUSIBILITY_SPIKE_NEIGHBOR_TOLERANCE_W = 300.0
-# Die drei Frames müssen zeitlich anschließen (3-s-Takt, ein verspäteter Zyklus erlaubt).
+# Die drei Frames müssen zeitlich anschließen; die absolute 10-s-Grenze
+# toleriert beim 2-s-Takt auch verzögerte Akquisen.
 LIVE_PLAUSIBILITY_SPIKE_MAX_FRAME_GAP_S = 10.0
 # Höchstens 4 Detailsätze je Stunde (höchstens 96 am Tag, etwa 0,2 MB). So bleibt
 # das Größenbudget der Diagnosedatei für Episodenframes verfügbar. Gezählt wird
@@ -2160,15 +2161,14 @@ def apply_power_plausibility(
                 "observed_count": 0,
             }
         grid_diagnostic_valid = (not pm_available) or not grid_pm_status["diagnostic_high"]
-        grid_valid = (not pm_available) or not grid_pm_status["rule_effective"]
+        # Der Zählervergleich ist Diagnose; echte Datenfehler verwerfen die Probe.
+        grid_valid = True
         clean["Grid_Power_Diagnostic_Valid"] = bool(grid_diagnostic_valid)
         clean["Grid_Power_Valid"] = bool(grid_valid)
         clean["Grid_PM_Delta_Rule_Effective"] = bool(pm_available and grid_pm_status["rule_effective"])
         clean["Grid_PM_Delta_Status"] = grid_pm_status
         if pm_available and grid_pm_status["diagnostic_high"]:
             diagnostic_reasons.append("grid_pm_delta_high")
-        if pm_available and grid_pm_status["rule_effective"]:
-            reasons.append("grid_pm_delta_high")
     else:
         clean.setdefault("Grid_Power_Valid", True)
         clean.setdefault("Grid_Power_Diagnostic_Valid", clean["Grid_Power_Valid"])
@@ -3936,7 +3936,7 @@ def _plausibility_episode_for_state(last_valid_path, frame, state, *, now_s, dia
 
 
 def _track_plausibility_episode(context, *, last_valid_path, diag_path):
-    """Detailframes einer Glitch-Episode: höchstens 20 je Episode, danach nur Zählung."""
+    """Detailframes einer Glitch-Episode: höchstens 30 je Episode, danach nur Zählung."""
     frame = context.frame
     now_s = float(context.now_s)
     if frame.get("valid") and not (frame.get("reasons") or []):
@@ -4212,7 +4212,7 @@ def ext_inverter_reload_if_changed(settings, poller, last_mtime_ns, *, config_pa
     return new_settings, new_poller, mtime_ns, True
 
 
-def run_test(host, port, user, pw, aes_pw, cfg, loops=1, interval=3, write=False):
+def run_test(host, port, user, pw, aes_pw, cfg, loops=1, interval=2, write=False):
     """
     Haupt-Schleife.
     loops=0  -> Endlosschleife (Daemon-Modus)
@@ -4498,8 +4498,8 @@ if __name__ == "__main__":
     parser.add_argument("--aes",      default=None)
     parser.add_argument("--loops",    type=int, default=1,
                         help="Anzahl Wiederholungen. 0 = Endlosschleife (Daemon)")
-    parser.add_argument("--interval", type=int, default=3,
-                        help="Sekunden zwischen Abfragen (Standard: 3)")
+    parser.add_argument("--interval", type=int, default=2,
+                        help="Sekunden zwischen Abfragen (Standard: 2)")
     parser.add_argument(
         "--write", action="store_true",
         help="Schreibt Ergebnis als live_data_py.json in RAM-Disk (Daemon-Modus)"

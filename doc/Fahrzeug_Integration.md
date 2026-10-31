@@ -133,7 +133,7 @@ Alternativ stehen dieselben Felder auf der Seite **Wallbox** in der Karte **Fahr
 
 **Weitere Einstellungen:**
 * `bluelink_vin` (Fahrgestellnummer): eintragen, wenn mehrere Fahrzeuge im Konto sind, damit das richtige Fahrzeug verwendet wird.
-* `bluelink_interval` (Abfrage-Intervall in Minuten, Standard 15, kleinster Wert 5): Empfohlen sind **15 bis 30 Minuten**, um die Abfragelimits des Herstellers einzuhalten und das Fahrzeug nicht unnötig zu belasten. Das reguläre Intervall ruft nur den zwischengespeicherten Fahrzeugstatus der Hersteller-Cloud ab und weckt das Auto nicht auf. Ein Aufwecken erfolgt nur auf Anforderung (Schaltfläche „Fahrzeug aufwecken“) oder automatisch beim Anstecken an einer openWB Pro.
+* `bluelink_interval` (Abfrage-Intervall in Minuten, Standard 15, kleinster Wert 5): Empfohlen sind **15 bis 30 Minuten**, um die Abfragelimits des Herstellers einzuhalten und das Fahrzeug nicht unnötig zu belasten. Das reguläre Intervall ruft nur den zwischengespeicherten Fahrzeugstatus der Hersteller-Cloud ab und weckt das Auto nicht auf. Ein Aufwecken erfolgt nur auf Anforderung (Schaltfläche „Fahrzeug aufwecken“) oder automatisch beim Anstecken an einer openWB Pro. Ein Cloud-SoC gilt bis zum eingestellten Intervall plus 5 Minuten als aktuell (mindestens 15 Minuten); danach zeigt die Fahrzeuganzeige ein Warnzeichen, bis die Hersteller-Cloud einen neueren Fahrzeugstand liefert.
 * `bluelink_car_name`: Anzeigename im Dashboard.
 
 **Wenn die Anmeldung fehlschlägt:**

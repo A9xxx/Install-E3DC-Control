@@ -124,7 +124,7 @@ HA_MANAGED_SERVICES = (
     "e3dc", "e3dc-live", "e3dc-storage-manager", "e3dc-storage-simulator",
     "e3dc-epex-manager", "e3dc-weather-manager", "e3dc-forecast-evidence", "e3dc-wallbox-manager",
     "energy_manager", "e3dc-idm-live", "e3dc-lux-live", "e3dc-stiebel-live", "e3dc-dimplex-live", "e3dc-heizstab", "e3dc-climate-live", "e3dc-climate-control",
-    "e3dc-mqtt-hub", "e3dc-bluelink", "e3dc-matter-bridge", "e3dc-notifier", "e3dc-websocket", "e3dc-shadow-sync",
+    "e3dc-mqtt-hub", "e3dc-bluelink", "e3dc-matter-bridge", "e3dc-notifier", "e3dc-shadow-sync",
 )
 FORECAST_EVIDENCE_BASE = "/var/lib/e3dc-control"
 FORECAST_EVIDENCE_ROOT = f"{FORECAST_EVIDENCE_BASE}/forecast-evidence"
@@ -2014,7 +2014,6 @@ FILE_DEFINITIONS = [
     {"path": f"{INSTALLER_DIR}/epex_manager.py", "mode": "755", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": True},
     {"path": f"{INSTALLER_DIR}/Forecast/pv_forecast_service.py", "mode": "755", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": True},
     {"path": f"{INSTALLER_DIR}/forecast_evidence_sidecar.py", "mode": "755", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": True},
-    {"path": f"{INSTALLER_DIR}/e3dc_websocket.py", "mode": "755", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": True},
     {"path": f"{INSTALLER_DIR}/sqlite_archiver.py", "mode": "755", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": True},
     {"path": f"{INSTALLER_DIR}/vital_stats.py", "mode": "755", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": True},
     {"path": f"{INSTALLER_DIR}/shadow_sync.py", "mode": "755", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": True},
@@ -4995,7 +4994,6 @@ RELEASE_CORE_SERVICES = (
     "e3dc-weather-manager",
     "e3dc-storage-simulator",
     "e3dc-storage-manager",
-    "e3dc-websocket",
     "e3dc-notifier",
 )
 LEGACY_532B_BOUND_FUNCTIONS = (

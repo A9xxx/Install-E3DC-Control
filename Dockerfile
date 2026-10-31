@@ -30,17 +30,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN apt-get update && apt-get install -y --no-install-recommends nodejs npm avahi-daemon avahi-utils dbus && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
-# 2. Apache PHP + Reverse Proxy für WebSockets
+# 2. Apache PHP und Laufzeitpfadschutz
 COPY --chown=root:root --chmod=0644 Installer/apache/e3dc-control-security.conf /etc/apache2/conf-available/e3dc-control-security.conf
 COPY --chown=root:root --chmod=0644 Installer/apache/e3dc-control-access-log.conf /etc/apache2/conf-available/e3dc-control-access-log.conf
 RUN PHP_APACHE_MOD="$(php -r 'echo "php".PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;')" && \
     (a2dismod mpm_event >/dev/null 2>&1 || true) && \
     (a2dismod mpm_worker >/dev/null 2>&1 || true) && \
-    a2enmod mpm_prefork "$PHP_APACHE_MOD" proxy proxy_wstunnel && \
+    a2enmod mpm_prefork "$PHP_APACHE_MOD" && \
     a2enconf e3dc-control-security && \
     echo "ServerName localhost" >> /etc/apache2/apache2.conf && \
     sed -i 's|^[[:space:]]*CustomLog ${APACHE_LOG_DIR}/access.log combined$|    # E3DC-Control: erfolgreiche Live-POSTs nicht persistent protokollieren\n    IncludeOptional /etc/apache2/conf-available/e3dc-control-access-log.conf|' /etc/apache2/sites-available/000-default.conf && \
-    sed -i 's|</VirtualHost>|    ProxyPass "/ws" "ws://127.0.0.1:8765/"\n</VirtualHost>|' /etc/apache2/sites-available/000-default.conf && \
     test "$(grep -Fc 'IncludeOptional /etc/apache2/conf-available/e3dc-control-access-log.conf' /etc/apache2/sites-available/000-default.conf)" = "1" && \
     test "$(grep -Fc 'CustomLog ${APACHE_LOG_DIR}/access.log combined' /etc/apache2/sites-available/000-default.conf)" = "0" && \
     apache2ctl configtest
@@ -52,7 +51,7 @@ ENV E3DC_CONTAINER_MODE=1
 ENV E3DC_CONTAINER_INSTALL_USER=root
 # Python-Bibliotheken mit festen Versionen (Stand 5.5.5b); ein Neubau übernimmt nur Sicherheitsupdates des Systems.
 RUN pip3 install --upgrade pip wheel setuptools && \
-    pip3 install --prefer-binary paho-mqtt==2.1.0 requests==2.34.2 websocket-client==1.9.2 websockets==17.2 luxtronik==0.3.14 hyundai_kia_connect_api==4.23.0 pywebpush==2.5.0 pycryptodome==4.0.1 pymodbus==3.16.1 pyserial==3.5
+    pip3 install --prefer-binary paho-mqtt==2.1.0 requests==2.34.2 websocket-client==1.9.2 luxtronik==0.3.14 hyundai_kia_connect_api==4.23.0 pywebpush==2.5.0 pycryptodome==4.0.1 pymodbus==3.16.1 pyserial==3.5
 
 # Feste Laufzeitidentität; Installation und unveränderlicher Produktcode bleiben Root.
 # Rechtemodell im Container: Produktcode root:root ohne Gruppen-/Weltschreibbit,
@@ -121,6 +120,7 @@ RUN find -P /app/pi/Install -xdev -type d -exec chmod 0755 -- {} + && \
     test -f /app/pi/Install/Installer/Wallbox/fixed_phase_runtime.py && \
     test -f /app/pi/Install/Installer/Wallbox/fixed_start_energy.py && \
     test -f /app/pi/Install/Installer/Wallbox/openwb_transport.py && \
+    test -f /app/pi/Install/Installer/Wallbox/simple_core.py && \
     test -f /app/pi/Install/Installer/control_time.py && \
     test -f /app/pi/Install/Installer/location_defaults.py && \
     test -f /app/pi/Install/Installer/heatpump_channel_owner.py && \
@@ -128,6 +128,7 @@ RUN find -P /app/pi/Install -xdev -type d -exec chmod 0755 -- {} + && \
     test -f /app/pi/Install/Installer/heatpump_pv_contract.py && \
     test -f /app/pi/Install/Installer/heatpump_pv_state.py && \
     test -f /app/pi/Install/Installer/direct_marketing_actions.py && \
+    test -f /app/pi/Install/Installer/retired_websocket.py && \
     test -f /app/pi/Install/Installer/docker_healthcheck.py && \
     test -f /app/pi/Install/Installer/ha_writer_admission.py && \
     test -f /app/pi/Install/Installer/Heat/tariff_shift.py && \

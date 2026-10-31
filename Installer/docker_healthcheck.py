@@ -32,7 +32,6 @@ MAX_LOGROTATE_HEALTH_AGE_S = 3900.0
 REQUIRED_PROCESSES = {
     "apache2": "Apache",
     "e3dc_live.py": "Live",
-    "e3dc_websocket.py": "WebSocket",
     "epex_manager.py": "EPEX",
     "Forecast/pv_forecast_service.py": "Weather/PV-Forecast",
     "storage_simulator.py": "Storage Simulator",

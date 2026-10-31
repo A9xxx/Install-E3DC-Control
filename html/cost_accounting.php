@@ -78,6 +78,8 @@ function e3dcCostHistoricalPrice($row, $config, $timestamp) {
 
 /** Zwei Minutenproben auf das überlappende Intervall begrenzen. */
 function e3dcCostIntervalEnergy($a, $b, $from, $to, $aTs, $bTs) {
+    $a = e3dcWallboxMeasureHistoryDisplay($a);
+    $b = e3dcWallboxMeasureHistoryDisplay($b);
     $rows = [];
     foreach ([$from, $to] as $at) {
         $row = $a;

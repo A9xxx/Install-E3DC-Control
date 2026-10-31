@@ -330,6 +330,7 @@ V4_BLOCK_INTELLIGENCE = {
 
 # --- Block 6: Wallbox ---
 V4_BLOCK_WALLBOX = {
+    'wb1_locked', 'wb2_locked', 'wb1_manual_pause', 'wb2_manual_pause',
     'wb_native_enable', 'wb_native_type', 'wb_native_ip',
     'wb_native_type2', 'wb_native_ip2',
     'wb1_e3dc_wbchar6_compat_enable', 'wb2_e3dc_wbchar6_compat_enable',
@@ -629,6 +630,7 @@ V4_LOCAL_PATH_KEYS = {'install_user', 'home_dir', 'install_path', 'venv_name', '
 # Inline-Kommentare noch Wertebereiche; ein ungültiger Wert bliebe dauerhaft in
 # e3dc_v4.json, und die Wallbox-Transaktionsprüfung lehnte danach jede Änderung ab.
 V4_TXT_IMPORT_SKIP_KEYS = frozenset({
+    'wb1_locked', 'wb2_locked', 'wb1_manual_pause', 'wb2_manual_pause',
     'car_capacity', 'car_target_unit', 'car_target_kwh', 'car_target_soc',
     'car_max_soc_si', 'car_charge_power',
 })
@@ -636,7 +638,7 @@ V4_TXT_IMPORT_SKIP_KEYS = frozenset({
 # Schlüssel, die NIEMALS in e3dc_v4.json gespeichert werden dürfen
 V4_BLACKLIST = {
     # Laufzeitzustände (gehören in die Ramdisk)
-    'wbhour', 'wb_sofort', 'wb_locked', 'wb2_locked', 'wbbis', 'wbvon', 'wbmode',
+    'wbhour', 'wb_sofort', 'wb_locked', 'wbbis', 'wbvon', 'wbmode',
     # Lokale Installationspfade sind gültige Metadaten. Import/Rollback schützt sie
     # separat gegen Fremdwerte; Cleanup darf sie nicht zyklisch entfernen.
     # Dopplung
@@ -1319,7 +1321,8 @@ def _migrate_luxtronik_config():
         v4 = _load_v4()
         for k, v in lux_conf.items():
             key_lower = k.lower()
-            if key_lower in V4_ALL_KEYS:
+            if (key_lower in V4_ALL_KEYS
+                    and key_lower not in {'wb1_locked', 'wb2_locked', 'wb1_manual_pause', 'wb2_manual_pause'}):
                 v4[key_lower] = str(v)
                 if _is_secret_config_key(key_lower) or key_lower.endswith(('_user', '_username', '_login', '_vin')):
                     value_state = 'gesetzt' if str(v).strip() else 'fehlt'

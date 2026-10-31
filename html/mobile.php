@@ -1022,6 +1022,7 @@ if ($wpvAjaxRequest && $seite === 'waermepumpe_vorschau') {
             </button>
         </div>
 
+        <div data-wallbox-emergency-notice class="small text-body bg-body-tertiary border rounded p-2 my-2" hidden><?= htmlspecialchars(e3dcWallboxEmergencyHint(), ENT_QUOTES, 'UTF-8') ?></div>
         <div id="m-wallbox-outage-1" class="mb-3 rounded-3" hidden><span id="m-wallbox-outage-badge-1" class="badge text-bg-warning m-2">Wallbox 1 ohne Daten</span></div>
         <div id="m-wallbox-outage-2" class="mb-3 rounded-3" hidden><span id="m-wallbox-outage-badge-2" class="badge text-bg-warning m-2">Wallbox 2 ohne Daten</span></div>
         <div id="m-flow-wrapper" class="position-relative mb-2">
@@ -1737,11 +1738,6 @@ function invalidateMobileLiveFetch() {
 
 function updateDashboard() {
     if (typeof e3dcLiveAuthBlocked === 'function' && e3dcLiveAuthBlocked()) return Promise.resolve(null);
-    const wsFresh = window.liveWs
-        && window.liveWs.readyState === WebSocket.OPEN
-        && window.liveWsLastMessageTs
-        && (Date.now() - window.liveWsLastMessageTs) < 5000;
-    if (wsFresh) return Promise.resolve(null);
     if (mobileLiveFetchPromise) return mobileLiveFetchPromise;
 
     const requestGeneration = ++mobileLiveRequestGeneration;
@@ -1791,7 +1787,6 @@ let mobileLivePollTimer = null;
 let mobileLivePollGeneration = 0;
 let mobileLiveTransportStarted = false;
 let mobileLiveLastResumeMs = 0;
-const mobileWebSocketEnabled = false;
 function mobileLivePollDelayMs() {
     return document.hidden ? 10000 : 2000;
 }
@@ -1829,22 +1824,6 @@ window.addEventListener('pageshow', resumeMobileLiveTransport);
 window.addEventListener('focus', resumeMobileLiveTransport);
 window.addEventListener('online', resumeMobileLiveTransport);
 
-function initWebSocket() {
-    const protocol = window.location.protocol === 'https:' ? 'wss://' : 'ws://';
-    window.liveWs = new WebSocket(protocol + window.location.host + '/ws');
-    window.liveWs.onmessage = function(e) {
-        try {
-            const data = JSON.parse(e.data);
-            window.liveWsLastMessageTs = Date.now();
-            if (data) processMobileData(data);
-        } catch (err) {
-            console.error("WebSocket Message Error:", err);
-        }
-    };
-    window.liveWs.onclose = function() { window.liveWsLastMessageTs = 0; setTimeout(initWebSocket, 3000); };
-    window.liveWs.onerror = function() { window.liveWsLastMessageTs = 0; window.liveWs.close(); };
-}
-
 // startSystemUpdate, pollUpdate, finalize entfernt -> jetzt in solar.js
 
 function placeMobileStatsPanel() {
@@ -1872,10 +1851,6 @@ function startMobileLiveTransportOnce() {
     if (typeof window.processMobileData !== 'function') return false;
     mobileLiveTransportStarted = true;
     mobileLiveLastResumeMs = Date.now();
-    // Der native WebSocket-Producer bleibt bis zu einem vollständigen
-    // Web-Auth-Vertrag für Handshake und Reconnect deaktiviert. Bis dahin
-    // läuft genau ein gebündelter, authentifizierter Pollingpfad.
-    if (mobileWebSocketEnabled) initWebSocket();
     scheduleMobileLivePoll(true);
     return true;
 }

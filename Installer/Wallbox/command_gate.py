@@ -774,6 +774,9 @@ def _storage_hard_block_allows_unplug_offer(charger, action, payload):
         return False
     if getattr(charger, _STORAGE_HARD_BLOCK_REASON_ATTR, "") not in (
         "authorized_wallbox_budget_below_minimum", "wallbox_budget_unknown",
+        # Der Manager lässt diesen Grund nur bei freigegebener Netzquelle,
+        # offenem Reservetor und tatsächlich ruhendem Akku passieren.
+        "emergency_reserve",
     ):
         return False
     if not scope[1]():
@@ -789,6 +792,24 @@ def _storage_hard_block_allows_unplug_offer(charger, action, payload):
         return False
     target = _group_deficit_downward_target_from_action(charger, name, data)
     return target is not None and target > 0.0 and target == scope[0]
+
+
+def native_pause_release_allowed(charger):
+    """Die einmalige Übergabe einer eigenen Pause braucht kein Regelbudget."""
+    binding = getattr(charger, '_command_gate_release_binding', None) or {}
+    context = getattr(charger, '_command_gate_context', None) or {}
+    reader = getattr(charger, 'native_abort_status', None)
+    sample = reader() if callable(reader) else {}
+    return bool(is_default_release_allowed(charger)
+        and getattr(charger, '_command_gate_release_reason', '') == 'mode0_user_switch'
+        and context.get('mode') == 0
+        and not context.get('locked')
+        and binding.get('schema') == 'native_owned_pause_release_v1'
+        and bool(binding.get('session_id'))
+        and binding.get('owned_session') == binding.get('session_id')
+        and binding.get('user_off') is False
+        and binding.get('consumed') is False
+        and sample.get('abort_fresh') is True and sample.get('abort_active') is True)
 
 
 def _storage_hard_block_allows_output(
@@ -863,8 +884,10 @@ def _storage_hard_block_allows_output(
         if data.get("heartbeat") is True:
             return False
         return bool(
-            force_state == 1.0
-            and getattr(charger, "real_charging", None) is True
+            (force_state == 1.0
+             and callable(getattr(charger, "_native_stop_bit_allowed", None))
+             and charger._native_stop_bit_allowed())
+            or (force_state == 2.0 and native_pause_release_allowed(charger))
         )
 
     absolute_current_actions = {
@@ -945,6 +968,11 @@ def _rotate_audit_if_needed(path: str) -> None:
 
 
 def audit_event(charger: Any, *, action: str, decision: str, reason: str = "", payload: Any = None, owner: str = "") -> None:
+    if decision == "blocked":
+        try:
+            charger._command_gate_last_rejection = {"action": str(action), "reason": str(reason), "ts": time.time()}
+        except (AttributeError, TypeError):
+            pass
     ctx = getattr(charger, "_command_gate_context", {}) or {}
     if not isinstance(ctx, dict):
         ctx = {}
@@ -1292,7 +1320,9 @@ def default_release_scope(
     prev_release_type = getattr(charger, "_command_gate_release_type", "")
     prev_binding = getattr(charger, "_command_gate_release_binding", None)
     release_reason = str(reason or "mode0_user_switch")
-    normalized_binding = _normalized_openwb_pro_mode0_binding(binding)
+    normalized_binding = (binding if isinstance(binding, dict)
+        and binding.get('schema') == 'native_owned_pause_release_v1'
+        else _normalized_openwb_pro_mode0_binding(binding))
     if (
         charger.__class__.__name__ == "OpenWBProCharger"
         and release_reason == "mode0_user_switch"

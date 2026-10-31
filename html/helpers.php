@@ -1,4 +1,16 @@
 <?php
+
+// Ein gemeinsamer Leser erhält auch defekte Marker-Symlinks als Not-Aus.
+function e3dcWallboxEmergencyFlagActive() {
+    foreach (['/var/www/html/data/wallbox_emergency_stop.flag', '/var/www/html/ramdisk/wallbox_emergency_stop.flag'] as $marker) {
+        if (file_exists($marker) || is_link($marker)) return true;
+    }
+    return false;
+}
+
+function e3dcWallboxEmergencyHint() {
+    return 'Not-Aus aktiv – Freigabe über den Ein/Aus-Schalter (Power-Symbol) der Ladepunktkarte in der erweiterten Ansicht auf der Seite „Wallbox“.';
+}
 /**
  * helpers.php - Zentrale Utility-Funktionen für E3DC-Control Web-Interface
  */
@@ -1078,7 +1090,6 @@ function handleDiagnoseAck() {
             'notifier'       => '/var/www/html/logs/notification_manager.log',
             'bluelink'       => '/var/www/html/logs/bluelink_client.log',
             'mqtt_hub'       => '/var/www/html/logs/e3dc_mqtt_hub.log',
-            'websocket'      => '/var/www/html/logs/e3dc_websocket.log',
             'update'         => '/var/www/html/logs/update.log',
             'self_update'    => '/var/log/e3dc-control/web-update.log'
         ];
@@ -1957,16 +1968,20 @@ function e3dcRenderEnergyDecisionDailyKpis() {
 }
 
 function e3dcRenderWallboxDecisionDailyKpis() {
-    $stale = 0; $timeout = 0; $changes = 0; $setAmp = 0;
-    $total = e3dcWalkLatestDecisionHistoryRows('wallbox_decision_history_', function($row) use (&$stale, &$timeout, &$changes, &$setAmp) {
+    $stale = 0; $timeout = 0; $changes = 0; $setAmp = 0; $coreRows = 0; $contextRows = 0;
+    $total = e3dcWalkLatestDecisionHistoryRows('wallbox_decision_history_', function($row) use (&$stale, &$timeout, &$changes, &$setAmp, &$coreRows, &$contextRows) {
+        if (($row['_history']['record_type'] ?? '') === 'context') { $contextRows++; return; }
         $decision = is_array($row['decision'] ?? null) ? $row['decision'] : [];
+        if (!empty($decision['core_wallboxes'])) { $coreRows++; return; }
         $inputs = is_array($row['inputs'] ?? null) ? $row['inputs'] : [];
         if (!empty($inputs['budget_stale'])) $stale++;
         if (!empty($inputs['budget_timeout'])) $timeout++;
         if (!empty($decision['made_changes'])) $changes++;
         if ((float)($inputs['set_amp'] ?? 0) > 0) $setAmp++;
     });
+    $total -= $contextRows;
     if ($total <= 0) return '';
+    if ($coreRows > 0) return "Tageshistorie: " . $total . " Einträge, davon " . $coreRows . " mit Regelkern\n";
     return "R5 Tages-KPIs: Budget stale " . $stale
         . " | Timeout " . $timeout
         . " | Schreibaktionen " . $changes
@@ -2277,16 +2292,49 @@ function e3dcRenderEnergyDecisionHistoryText($limit = 20) {
 }
 
 function e3dcReadWallboxDecisionHistoryEvents($limit = 20) {
-    return e3dcReadDecisionHistoryEventsByPrefix(
+    $events = e3dcReadDecisionHistoryEventsByPrefix(
         'wallbox_decision_history_',
         '/var/www/html/ramdisk/wallbox_decision_latest.json',
         $limit
     );
+    return array_values(array_filter($events, function($event) {
+        return ($event['_history']['record_type'] ?? '') !== 'context';
+    }));
+}
+
+function e3dcWallboxCoreDecisionText($event) {
+    $cores = $event['decision']['core_wallboxes'] ?? [];
+    if (!is_array($cores) || empty($cores)) return '';
+    $states = ['idle' => 'Warten', 'hold' => 'Ladeangebot halten',
+        'start_wait' => 'Ladebeginn abwarten', 'stop_wait' => 'Ladeende abwarten',
+        'protection' => 'Schutzstopp', 'charging' => 'Laden', 'stopped' => 'Ladung beenden',
+        'phase_wait' => 'Phasenwechsel abwarten'];
+    $lines = [];
+    foreach ($cores as $id => $core) {
+        if (!is_array($core)) continue;
+        $budget = isset($core['budget_w']) && is_numeric($core['budget_w'])
+            ? (string)(int)round((float)$core['budget_w']) . ' W' : 'unbekannt';
+        $phases = in_array($core['phases'] ?? null, [1, 2, 3], true) ? ' | ' . (int)$core['phases'] . 'p' : '';
+        $change = is_array($core['phase_change'] ?? null) && in_array($core['phase_change']['target_phases'] ?? null, [1, 3], true)
+            ? ' | Wechsel auf ' . (int)$core['phase_change']['target_phases'] . 'p vorbereitet' : '';
+        $lines[] = 'WB' . (int)$id . ': ' . trim((string)($core['sentence'] ?? ''))
+            . ' | Zustand: ' . ($states[$core['state'] ?? ''] ?? 'Zustand unbekannt')
+            . ' | Kernbudget: ' . $budget . $phases . $change;
+    }
+    foreach (($event['wallboxes'] ?? []) as $wb) {
+        if (!is_array($wb) || isset($cores[(string)($wb['id'] ?? '')])) continue;
+        $lines[] = 'WB' . (int)($wb['id'] ?? 0) . ': ' . ($wb['state'] ?? '--')
+            . ' | ' . (int)($wb['amp'] ?? 0) . 'A | ' . (int)($wb['power_w'] ?? 0) . 'W'
+            . (!empty($wb['state_reason']) ? ' | ' . $wb['state_reason'] : '');
+    }
+    return implode(' | ', $lines);
 }
 
 function e3dcFormatWallboxDecisionLine($event) {
     if (!is_array($event)) return '';
     $ts = isset($event['ts']) ? date('d.m. H:i:s', (int)$event['ts']) : '--';
+    $coreText = e3dcWallboxCoreDecisionText($event);
+    if ($coreText !== '') return $ts . ' | ' . $coreText;
     $decision = is_array($event['decision'] ?? null) ? $event['decision'] : [];
     $inputs = is_array($event['inputs'] ?? null) ? $event['inputs'] : [];
     $state = trim((string)($decision['state'] ?? '--'));
@@ -2310,25 +2358,30 @@ function e3dcRenderWallboxDecisionHistoryText($limit = 20) {
     $out = "--- Wallbox-Entscheidungen ---\n\n";
     $dailyKpis = e3dcRenderWallboxDecisionDailyKpis();
     if ($dailyKpis !== '') $out .= $dailyKpis . "\n";
-    $out .= "Letzte Entscheidung: " . ($decision['state'] ?? '--') . "\n";
-    $out .= "Grund: " . ($decision['reason'] ?? '--') . "\n";
-    $out .= "Budget: " . (int)($inputs['effective_budget_w'] ?? 0) . " W\n";
-    $out .= "Sollstrom: " . (int)($inputs['set_amp'] ?? 0) . " A\n";
-    $out .= "Akku-Anforderung: " . ($decision['battery_request'] ?? '--') . "\n\n";
-    if (!empty($wallboxes)) {
-        $out .= "--- Wallboxen ---\n";
-        foreach ($wallboxes as $wb) {
-            if (!is_array($wb)) continue;
-            $out .= 'WB' . (int)($wb['id'] ?? 0) . ': ' . ($wb['state'] ?? '--')
-                . ' | ' . (int)($wb['amp'] ?? 0) . 'A'
-                . ' | ' . (int)($wb['power_w'] ?? 0) . "W";
-            if (!empty($wb['state_reason'])) $out .= ' | ' . $wb['state_reason'];
-            if (!empty($wb['rscp_error_active']) && !empty($wb['rscp_last_error'])) {
-                $out .= ' | RSCP-Fehler: ' . $wb['rscp_last_error'];
+    $coreText = e3dcWallboxCoreDecisionText($last);
+    if ($coreText !== '') {
+        $out .= "Letzte Entscheidung: " . $coreText . "\n\n";
+    } else {
+        $out .= "Letzte Entscheidung: " . ($decision['state'] ?? '--') . "\n";
+        $out .= "Grund: " . ($decision['reason'] ?? '--') . "\n";
+        $out .= "Budget: " . (int)($inputs['effective_budget_w'] ?? 0) . " W\n";
+        $out .= "Sollstrom: " . (int)($inputs['set_amp'] ?? 0) . " A\n";
+        $out .= "Akku-Anforderung: " . ($decision['battery_request'] ?? '--') . "\n\n";
+        if (!empty($wallboxes)) {
+            $out .= "--- Wallboxen ---\n";
+            foreach ($wallboxes as $wb) {
+                if (!is_array($wb)) continue;
+                $out .= 'WB' . (int)($wb['id'] ?? 0) . ': ' . ($wb['state'] ?? '--')
+                    . ' | ' . (int)($wb['amp'] ?? 0) . 'A'
+                    . ' | ' . (int)($wb['power_w'] ?? 0) . "W";
+                if (!empty($wb['state_reason'])) $out .= ' | ' . $wb['state_reason'];
+                if (!empty($wb['rscp_error_active']) && !empty($wb['rscp_last_error'])) {
+                    $out .= ' | RSCP-Fehler: ' . $wb['rscp_last_error'];
+                }
+                $out .= "\n";
             }
             $out .= "\n";
         }
-        $out .= "\n";
     }
     $out .= "--- Letzte Entscheidungen ---\n";
     foreach ($events as $event) {
@@ -2374,7 +2427,6 @@ function handleSystemLog() {
             'notifier'       => '/var/www/html/logs/notification_manager.log',
             'bluelink'       => '/var/www/html/logs/bluelink_client.log',
             'mqtt_hub'       => '/var/www/html/logs/e3dc_mqtt_hub.log',
-            'websocket'      => '/var/www/html/logs/e3dc_websocket.log',
             'update'         => '/var/www/html/logs/update.log',
             'self_update'    => '/var/log/e3dc-control/web-update.log'
         ];
@@ -2558,7 +2610,6 @@ function handleSystemLog() {
             'watchdog' => ['type' => 'tag', 'name' => 'PIGUARD'],
             'notifier' => ['type' => 'unit', 'name' => 'e3dc-notifier'],
             'bluelink' => ['type' => 'unit', 'name' => 'e3dc-bluelink'],
-            'websocket' => ['type' => 'unit', 'name' => 'e3dc-websocket']
         ];
 
         if (!$isDocker && array_key_exists($logType, $journalServices)) {
@@ -5057,6 +5108,62 @@ function hasWallbox1Config($cfg) {
 
     // Ohne positiven Capability-/Konfigurationsbeleg gibt es keine Wallbox-Kachel.
     return false;
+}
+
+/** Anzeigenplatzhalter, keine Steuerkonfiguration. */
+function e3dcWallboxMqttMeasureConfigured($cfg, $slot) {
+    $second = (int)$slot === 2;
+    $prefix = $second ? 'wb2' : 'wb';
+    $key = $second ? 'wb_native_type2' : 'wb_native_type';
+    return is_array($cfg) && array_key_exists($key, $cfg)
+        && normalizeWallboxTypeConfig($cfg[$key]) === 'none'
+        && cfgHasAddress($cfg[$prefix . '_ip'] ?? '')
+        && trim((string)($cfg[$prefix . '_topic'] ?? '')) !== '';
+}
+
+/** Direkte MQTT-Messung ohne Wallbox-Steuerung; dieselbe Frischegrenze wie der Messpfad. */
+function e3dcWallboxMqttMeasureOnly($cfg, $extData, $slot, $now) {
+    $second = (int)$slot === 2;
+    if (!e3dcWallboxMqttMeasureConfigured($cfg, $slot)) return false;
+    if (!is_array($extData) || !e3dcPayloadContextValid($extData)) return false;
+    $sample = $extData[$second ? 'wb2' : 'wb1'] ?? ($second ? null : $extData);
+    if (!is_array($sample) || !e3dcPayloadContextValid($sample)
+        || !isset($sample['ts']) || !is_numeric($sample['ts'])
+        || !is_finite((float)$sample['ts'])
+        || !($now - $sample['ts'] >= 0 && $now - $sample['ts'] < 120)) return false;
+    $power = $sample['measure_power_raw'] ?? ($sample['power'] ?? null);
+    return is_numeric($power) && is_finite((float)$power) && (float)$power >= 0;
+}
+
+/** Nur die Darstellung liest die eigenen Messfelder; Lernzeilen bleiben unverändert. */
+function e3dcWallboxMeasureHistoryDisplay($row) {
+    foreach (['wb', 'wb2'] as $prefix) {
+        $configured = ($row[$prefix . '_measure_only_configured'] ?? false) === true;
+        $valid = ($row[$prefix . '_measure_only'] ?? false) === true;
+        if (!$configured && !$valid) continue;
+        $power = $row[$prefix . '_measure_only_w'] ?? null;
+        unset($row[$prefix . '_measure_only'], $row[$prefix . '_measure_only_w'],
+            $row[$prefix . '_measure_only_configured']);
+        if (!$valid || !is_numeric($power) || !is_finite((float)$power) || (float)$power < 0) {
+            $row[$prefix] = null;
+            // Unbekannte Messanteile verbleiben vollständig im Hausverbrauch.
+            continue;
+        }
+        $row[$prefix] = (float)$power;
+        $row[$prefix === 'wb' ? 'is_external_wb' : 'is_external_wb2'] = true;
+        $row[$prefix . '_source'] = 'external_mqtt_measure_only';
+        $row['home'] = max(0, (float)($row['home'] ?? $row['home_raw'] ?? 0) - (float)$power);
+        unset($row[$prefix . '_measure_only'], $row[$prefix . '_measure_only_w']);
+    }
+    return $row;
+}
+
+function e3dcWallboxMeasureStatsDisplay($result) {
+    if (is_array($result['measure_only_display'] ?? null)) {
+        $result = array_replace($result, $result['measure_only_display']);
+        unset($result['measure_only_display']);
+    }
+    return $result;
 }
 
 function hasWallbox2ExplicitConfig($cfg) {
@@ -8950,6 +9057,7 @@ function handleServiceRestart() {
 
         $serviceWrapper = null;
         if (!file_exists('/.dockerenv')) {
+            $journalServices = ['watchdog' => ['type' => 'tag', 'name' => 'PIGUARD'], 'notifier' => ['type' => 'unit', 'name' => 'e3dc-notifier'], 'bluelink' => ['type' => 'unit', 'name' => 'e3dc-bluelink']];
             // Vor jeder Zustandsänderung an Release-Root, Owner, Mode, Inode
             // und den root-eigenen Modul-Vertrag binden.
             $serviceWrapper = e3dcFindServiceWrapper($wrapperStatus);
@@ -9289,7 +9397,6 @@ function handleWatchdogStatus() {
 
         $logFiles = [
             'notifier'       => '/var/www/html/logs/notification_manager.log',
-            'websocket'      => '/var/www/html/logs/e3dc_websocket.log',
         ];
         if ($isEM) $logFiles['energy_manager'] = '/var/www/html/logs/energy_manager.log';
         if ($isHa) $logFiles['ha_manager'] = '/var/www/html/logs/ha_manager.log';
@@ -9328,7 +9435,7 @@ function handleWatchdogStatus() {
         }
 
         if (!file_exists('/.dockerenv')) {
-            $journalServices = ['watchdog' => ['type' => 'tag', 'name' => 'PIGUARD'], 'notifier' => ['type' => 'unit', 'name' => 'e3dc-notifier'], 'bluelink' => ['type' => 'unit', 'name' => 'e3dc-bluelink'], 'websocket' => ['type' => 'unit', 'name' => 'e3dc-websocket']];
+            $journalServices = ['watchdog' => ['type' => 'tag', 'name' => 'PIGUARD'], 'notifier' => ['type' => 'unit', 'name' => 'e3dc-notifier'], 'bluelink' => ['type' => 'unit', 'name' => 'e3dc-bluelink']];
             $since = !empty($ackState['time']) ? '@' . $ackState['time'] : '1 day ago';
             foreach ($journalServices as $key => $j) {
                 if (in_array($key, $errorLogs)) continue;
@@ -9588,7 +9695,6 @@ function renderDiagnoseModal($dialogClass = 'modal-lg modal-dialog-scrollable') 
     $html .= '<option value="wallbox_command_gate">Wallbox Command-Gate</option>';
     if ($isBlue) $html .= '<option value="bluelink">Bluelink (Fahrzeug)</option>';
     if ($isMqtt) $html .= '<option value="mqtt_hub">Smart Home MQTT Hub</option>';
-    $html .= '<option value="websocket">WebSocket Server</option>';
     if (!$isDocker) $html .= '<option value="watchdog">Watchdog (PiGuard)</option>';
     if ($isHa) $html .= '<option value="ha_manager">High Availability (Cluster)</option>';
     $html .= '<option value="config_validation">Config-Validator</option>';
@@ -9781,6 +9887,7 @@ function getHistoryBackupFiles($backupDir = '/var/www/html/data/history_backups/
             foreach ($files as $file) {
                 $basename = basename($file);
                 if (preg_match('/history_(\d{4}-\d{2}-\d{2})\.txt/', $basename, $m)) {
+                    if ($m[1] === date('Y-m-d')) continue;
                     $label = date('d.m.Y', strtotime($m[1]));
                     $historyFiles[] = ['file' => $basename, 'label' => $label];
                 }
@@ -10066,6 +10173,7 @@ function handleDailyStats() {
                 $statsData = @json_decode((string)@file_get_contents($statsFile), true);
                 if (is_array($statsData)) {
                     $confData = loadE3dcConfig();
+                    $statsData = e3dcWallboxMeasureStatsDisplay($statsData);
                     e3dcApplyEegRevenueToDailyStats($statsData, $confData['config'] ?? []);
                     echo json_encode($statsData);
                 } else {
@@ -10078,8 +10186,9 @@ function handleDailyStats() {
             $path = '/var/www/html/data/history_backups/' . $file;
             if (file_exists($path)) {
                 $lines = file($path, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
-                $statsData = calculateDailyEnergyStats($lines);
+                $statsData = calculateDailyEnergyStats($lines, ['require_day_start' => true]);
                 $confData = loadE3dcConfig();
+                $statsData = e3dcWallboxMeasureStatsDisplay($statsData);
                 e3dcApplyEegRevenueToDailyStats($statsData, $confData['config'] ?? []);
                 echo json_encode($statsData);
             } else {
@@ -10421,11 +10530,11 @@ function renderEnergyFlow($layout = 'mobile', $extraClass = '', $extraAttributes
 
     $showWpConfigured = isset($wpEnabled) ? $wpEnabled : isHeatpumpEnabledConfig($cfg);
     $showWp = $showWpConfigured || hasFreshMqttHeatpumpInbound($cfg);
-    $showWb = hasWallbox1Config($cfg);
-    $showWb2 = hasWallbox2Config($cfg);
+    $showWb = hasWallbox1Config($cfg) || e3dcWallboxMqttMeasureConfigured($cfg, 1);
+    $showWb2 = hasWallbox2Config($cfg) || e3dcWallboxMqttMeasureConfigured($cfg, 2);
     if (isset($wbEnabled) && !$wbEnabled) {
-        $showWb = false;
-        $showWb2 = false;
+        $showWb = e3dcWallboxMqttMeasureConfigured($cfg, 1);
+        $showWb2 = e3dcWallboxMqttMeasureConfigured($cfg, 2);
     }
     $showHs = isset($hsEnabled) ? $hsEnabled : isHeaterEnabledConfig($cfg);
     $showClimate = cfgBool($cfg['climate_enable'] ?? '0', false);
@@ -10673,8 +10782,8 @@ function renderEnergyFlow($layout = 'mobile', $extraClass = '', $extraAttributes
         <div class="flow-node node-bat" id="f-node-bat" data-flow-node="battery" data-flow-color-key="battery" ' . $nodeAttrs('battery') . ' style="' . $nodeStyle('battery', 'battery') . '"><i class="fas fa-battery-half fa-icon"></i><div class="val" id="f-val-bat">0W</div><div class="label" data-flow-label-key="battery">' . $labelFor('battery', 'Speicher') . '</div><div class="label flow-secondary-label" id="f-lbl-soc">0%</div></div>
         <div class="flow-node node-home" id="f-node-home" data-flow-node="home" data-flow-color-key="home" ' . $nodeAttrs('home') . ' style="' . $nodeStyle('home', 'home') . '"><i class="fas fa-home fa-icon"></i><div class="val" id="f-val-home">0W</div><div class="label" data-flow-label-key="home">' . $labelFor('home', 'Haus') . '</div></div>
         ' . ($showWp ? '<div class="flow-node node-wp" id="f-node-wp" data-flow-node="heatpump" data-flow-color-key="heatpump" ' . $nodeAttrs('heatpump') . ' style="' . $nodeStyle('heatpump', 'heatpump') . '"><i class="fas fa-fire fa-icon"></i><div class="val" id="f-val-wp">0W</div><div class="label" data-flow-label-key="heatpump">' . $labelFor('heatpump', 'Wärmepumpe') . '</div></div>' : '') . '
-        ' . ($showWb ? '<div class="flow-node node-wb node-wb-1" id="f-node-wb" data-flow-node="wallbox" data-flow-color-key="wallbox" ' . $nodeAttrs('wallbox') . ' style="' . $nodeStyle('wallbox', 'wallbox') . '" title="'.$wb1_title.'"><i class="fas fa-charging-station fa-icon"></i><div class="val" id="f-val-wb">–</div><div class="label" data-flow-label-key="wallbox">'.$wb1_name.'</div><i class="fas fa-lock" id="f-wb-lock" style="display:none; position:absolute; top:12%; right:22%; font-size:0.7rem; color:#ffc107;"></i><div class="price-tag" id="f-val-wb-session" style="display:none;"></div><div class="price-tag text-success border-success" id="f-val-car-soc" style="display:none; bottom: -42px; background: rgba(16, 185, 129, 0.1); cursor:pointer;" onclick="forceSocUpdate()" title="SoC vom Auto abrufen (Aufwecken)"></div></div>' : '') . '
-        ' . ($showWb2 ? '<div class="flow-node node-wb node-wb-2" id="f-node-wb2" data-flow-node="wallbox2" data-flow-color-key="wallbox2" ' . $nodeAttrs('wallbox2') . ' style="' . $nodeStyle('wallbox2', 'wallbox2') . '" title="'.$wb2_title.'"><i class="fas fa-charging-station fa-icon"></i><div class="val" id="f-val-wb2">–</div><div class="label" data-flow-label-key="wallbox2">'.$wb2_name.'</div><i class="fas fa-lock" id="f-wb2-lock" style="display:none; position:absolute; top:12%; right:22%; font-size:0.7rem; color:#ffc107;"></i><div class="price-tag" id="f-val-wb2-session" style="display:none;"></div><div class="price-tag text-success border-success" id="f-val-car-soc2" style="display:none; bottom: -42px; background: rgba(16, 185, 129, 0.1); cursor:pointer;" onclick="forceSocUpdate()" title="SoC vom Auto abrufen (Aufwecken)"></div></div>' : '') . '
+        ' . ($showWb ? '<div class="flow-node node-wb node-wb-1" id="f-node-wb" data-flow-node="wallbox" data-flow-color-key="wallbox" ' . $nodeAttrs('wallbox') . ' style="' . $nodeStyle('wallbox', 'wallbox') . (hasWallbox1Config($cfg) ? '' : ';display:none;') . '" title="'.$wb1_title.'"><i class="fas fa-charging-station fa-icon"></i><div class="val" id="f-val-wb">–</div><div class="label" data-flow-label-key="wallbox">'.$wb1_name.'</div><i class="fas fa-lock" id="f-wb-lock" style="display:none; position:absolute; top:12%; right:22%; font-size:0.7rem; color:#ffc107;"></i><div class="price-tag" id="f-val-wb-session" style="display:none;"></div><div class="price-tag text-success border-success" id="f-val-car-soc" style="display:none; bottom: -42px; background: rgba(16, 185, 129, 0.1); cursor:pointer;" onclick="forceSocUpdate()" title="SoC vom Auto abrufen (Aufwecken)"></div></div>' : '') . '
+        ' . ($showWb2 ? '<div class="flow-node node-wb node-wb-2" id="f-node-wb2" data-flow-node="wallbox2" data-flow-color-key="wallbox2" ' . $nodeAttrs('wallbox2') . ' style="' . $nodeStyle('wallbox2', 'wallbox2') . (hasWallbox2Config($cfg) ? '' : ';display:none;') . '" title="'.$wb2_title.'"><i class="fas fa-charging-station fa-icon"></i><div class="val" id="f-val-wb2">–</div><div class="label" data-flow-label-key="wallbox2">'.$wb2_name.'</div><i class="fas fa-lock" id="f-wb2-lock" style="display:none; position:absolute; top:12%; right:22%; font-size:0.7rem; color:#ffc107;"></i><div class="price-tag" id="f-val-wb2-session" style="display:none;"></div><div class="price-tag text-success border-success" id="f-val-car-soc2" style="display:none; bottom: -42px; background: rgba(16, 185, 129, 0.1); cursor:pointer;" onclick="forceSocUpdate()" title="SoC vom Auto abrufen (Aufwecken)"></div></div>' : '') . '
         ' . ($showHs ? '<div class="flow-node node-hs" id="f-node-hs" data-flow-node="heater" data-flow-color-key="heater" ' . $nodeAttrs('heater') . ' style="' . $nodeStyle('heater', 'heater', $hsSize) . '"><i class="fas fa-fire-burner fa-icon" style="'.$hsIconSize.'"></i><div class="val" id="f-val-hs" style="'.$hsValSize.'">0W</div><div class="label" data-flow-label-key="heater" style="'.($showWp ? 'font-size: 0.5rem;' : '').'">' . $labelFor('heater', 'Heizstab') . '</div><div class="price-tag text-warning border-warning" id="f-val-hs-temp" style="display:none; bottom:-26px; background:rgba(253,126,20,0.12);"></div></div>' : '') . '
         ' . ($showClimate ? '<div class="flow-node node-climate" id="f-node-climate" data-flow-node="climate" data-flow-color-key="climate" ' . $nodeAttrs('climate') . ' style="' . $nodeStyle('climate', 'climate') . '"><i class="fas fa-snowflake fa-icon"></i><div class="val" id="f-val-climate">0W</div><div class="label" data-flow-label-key="climate">' . $labelFor('climate', 'Klima') . '</div></div>' : '') . '
 
@@ -11326,6 +11435,11 @@ function e3dcDailyBalanceInputs($historyLines, $activeDate, $options = []) {
         if (!is_array($row) || !isset($row['ts']) || substr($row['ts'], 0, 10) !== $activeDate) continue;
         $ts = strtotime($row['ts']);
         if ($ts === false) continue;
+        if ($previous === null && !empty($options['require_day_start'])
+            && $ts - (new DateTimeImmutable($activeDate, new DateTimeZone('Europe/Berlin')))->getTimestamp() >= 3600) {
+            $complete = array_fill_keys($keys, false);
+            $heaterComplete = false;
+        }
         $lastTs = $ts;
         $externalPv = $externalPv || !empty($row['pv_external_topology_present'])
             || e3dcHistoryNumber($row, 'pv_external_w', 0.0) > 0.0;
@@ -11382,6 +11496,7 @@ function e3dcDailyBalanceInputs($historyLines, $activeDate, $options = []) {
     }
     $values = [];
     $sources = [];
+    $wallboxExactAccepted = [];
     foreach ($keys as $key) {
         $measured = $intervals > 0 && $complete[$key];
         $counter = $exact[$key];
@@ -11396,6 +11511,7 @@ function e3dcDailyBalanceInputs($historyLines, $activeDate, $options = []) {
         if (in_array($key, ['wb', 'wb2'], true) && $counter !== null) {
             $sanity = null;
             $counter = e3dcSanitizeWallboxExactCounter($counter, $integral[$key], $exactSource[$key], $sanity);
+            $wallboxExactAccepted[$key] = $sanity === null;
             if (($sanity['action'] ?? '') === 'reject_without_integral') $counter = null;
         }
         // Ältere Verläufe führen nicht verfügbare Zähler als konstante Null.
@@ -11412,7 +11528,8 @@ function e3dcDailyBalanceInputs($historyLines, $activeDate, $options = []) {
             $sources[$key] = 'measurement_missing_or_incomplete';
         }
     }
-    return ['values' => $values, 'sources' => $sources, 'integral_complete' => $complete];
+    return ['values' => $values, 'sources' => $sources, 'integral_complete' => $complete,
+        'wallbox_exact_sources' => $exactSource, 'wallbox_exact_accepted' => $wallboxExactAccepted];
 }
 
 function e3dcApplyDailyConsumerEnergy(&$stats, $key, $energy) {
@@ -11658,10 +11775,36 @@ function e3dcClimateStatsBreakdown($db, $period, $length) {
 }
 
 function calculateDailyEnergyStats($historyLines, $options = []) {
+    $displayLines = [];
+    $hasMeasureOnly = false;
+    foreach ($historyLines as $line) {
+        $row = @json_decode($line, true);
+        $display = is_array($row) ? e3dcWallboxMeasureHistoryDisplay($row) : $row;
+        if ($display !== $row) $hasMeasureOnly = true;
+        $displayLines[] = $display !== $row ? json_encode($display) : $line;
+    }
+    if ($hasMeasureOnly) {
+        // Zusätzliche Felder entfernen: identische Eingabe für die unveränderte Lernberechnung.
+        $learningLines = [];
+        foreach ($historyLines as $line) {
+            $row = @json_decode($line, true);
+            if (is_array($row)) {
+                foreach (['wb', 'wb2'] as $prefix) unset($row[$prefix . '_measure_only'], $row[$prefix . '_measure_only_w'],
+                    $row[$prefix . '_measure_only_configured'], $row[$prefix . '_measure_only_reason']);
+                $line = json_encode($row);
+            }
+            $learningLines[] = $line;
+        }
+        $result = calculateDailyEnergyStats($learningLines, $options);
+        $result['measure_only_display'] = calculateDailyEnergyStats($displayLines, $options);
+        return $result;
+    }
     $lastTs = null;
     $lastRow = null;
     $activeDate = null;
     $unknownWallbox = false;
+    $unknownWallboxMinutes = 0;
+    $externalWallboxes = [];
     $unknownWallboxReasons = [];
 
     // Wir lesen das Datum aus dem aktuellsten Eintrag (ganz unten),
@@ -11699,7 +11842,14 @@ function calculateDailyEnergyStats($historyLines, $options = []) {
         $d = json_decode($ln, true);
         if (!$d || !isset($d['ts']) || strpos($d['ts'], $activeDate) !== 0) continue;
 
+        foreach (['wb' => 'wb_native_type', 'wb2' => 'wb2_native_type'] as $box => $typeKey) {
+            $kind = str_replace(['-', ' '], '_', strtolower(trim((string)($d[$typeKey] ?? ''))));
+            if ($kind !== '' && !in_array($kind, ['native', 'e3dc', 'e3dc_easy', 'e3dc_easy_connect', 'e3dc_legacy', 'e3dc_efy', 'e3dc_auto', 'e3dc_multi', 'e3dc_multi_connect', 'e3dc_multi_connect_ii'], true)) {
+                $externalWallboxes[$box] = true;
+            }
+        }
         if (!empty($d['house_includes_unknown_wallbox'])) {
+            $unknownWallboxMinutes++;
             $unknownWallbox = true;
             foreach (($d['house_unknown_wallbox_reasons'] ?? []) as $reason) {
                 if (is_string($reason)) $unknownWallboxReasons[$reason] = true;
@@ -12209,9 +12359,22 @@ function calculateDailyEnergyStats($historyLines, $options = []) {
             $res['sources']["{$k}_midnight_baseline_kwh"] = round((float)$baseline, 3);
         }
     }
+    // Nur eine akzeptierte Tageszählung löst den Minutenhinweis für diese Box auf.
+    if ($unknownWallbox && $externalWallboxes) {
+        $unknownWallbox = false;
+        foreach ($externalWallboxes as $box => $_) {
+            if (($balance['sources'][$box] ?? '') !== 'daily_counter'
+                || empty($balance['wallbox_exact_accepted'][$box])
+                || ($balance['wallbox_exact_sources'][$box] ?? '') === ''
+                || e3dcWallboxExactCounterNeedsIntegralGuard($balance['wallbox_exact_sources'][$box])) {
+                $unknownWallbox = true;
+            }
+        }
+    }
+    $res['house_unknown_wallbox_minutes'] = $unknownWallboxMinutes;
     $res['house_includes_unknown_wallbox'] = $unknownWallbox;
     $res['house_unknown_wallbox_reasons'] = array_keys($unknownWallboxReasons);
-    $res['house_consumption_label'] = $unknownWallbox ? 'Haus inkl. Wallbox (unbekannt)' : 'Hausverbrauch';
+    $res['house_consumption_label'] = $unknownWallbox ? 'Haus inkl. Wallbox (unbekannt, ' . $unknownWallboxMinutes . ' Min. ohne Messwert)' : 'Hausverbrauch';
     $res['sources']['home_energy_source'] = $homeReason;
     $res['sources']['home_includes_unmeasured_consumers'] = [];
     foreach (['home' => $cleanExactHome] + array_intersect_key($balance['values'], array_flip(['wb', 'wb2', 'wp', 'climate'])) as $key => $energy) {
@@ -12232,7 +12395,14 @@ function calculateDailyEnergyStats($historyLines, $options = []) {
         $res['sources'][$key . '_energy_source'] = $balance['sources'][$key];
         if ($balance['values'][$key] === null) $res['stats']['total_' . $key . '_kwh'] = null;
     }
-    if ($balance['values']['pv'] === null) $res['pv_today_kwh'] = null;
+    if ($balance['values']['pv'] === null) {
+        $res['pv_today_kwh'] = null;
+        $res['selfcon_day'] = null;
+        foreach (['pv_e3dc', 'pv_external', 'pv_source_rest'] as $source) {
+            $res['stats'][$source . '_kwh'] = null;
+            $res['stats'][$source . '_pct'] = null;
+        }
+    }
     if ($cleanExactHome === null) $res['autarky_day'] = null;
     if ($stats['count_price'] === 0) {
         $res['sources']['price_energy_source'] = 'interval_price_missing';
@@ -12645,6 +12815,13 @@ function getGitCommitInfo() {
 function renderFooterVersion() {
     $info = getGitCommitInfo();
     $release = getInstalledReleaseInfo();
+    // Der reguläre Updater führt ein vorhandenes Nutzer-Git nicht nach. Ist dessen Commit älter als das
+    // installierte Release, gehört der Hash nicht zu diesem Stand und entfällt in der Anzeige.
+    $gitDay = ($info && !empty($info['date'])) ? DateTime::createFromFormat('!d.m.Y', (string)$info['date']) : false;
+    $releaseDay = !empty($release['date_raw']) ? DateTime::createFromFormat('!Y-m-d', (string)$release['date_raw']) : false;
+    if ($gitDay && $releaseDay && $gitDay < $releaseDay) {
+        $info = null;
+    }
     $version = $release['version'] ?? '';
     $date = $release['date'] ?: ($info['date'] ?? null);
     $time = ($release['date'] ? null : ($info['time'] ?? null));
@@ -12736,79 +12913,185 @@ function e3dcMarketSocTrajectoryForDisplay($plan, $live, $nowMs = null) {
     // 20 s nur für den Plan; das end_ts des aktiven Vertrags bleibt strikt.
     if (!$finite($market['valid_until_ts'] ?? null) || $market['valid_until_ts'] <= 0
         || $market['valid_until_ts'] + 20000 < $nowMs) return $fail('plan_expired');
-    $contract = $market['active_contract'] ?? null;
-    if (!is_array($contract) || !is_array($contract['released_consumers'] ?? null)) return $fail('market_contract_invalid');
-    if ($contract['released_consumers'] && array_keys($contract['released_consumers'])
-        !== range(0, count($contract['released_consumers']) - 1)) return $fail('market_contract_invalid');
-    foreach ($contract['released_consumers'] as $consumer)
-        if (!is_string($consumer)) return $fail('market_contract_invalid');
-    foreach ([[$market, ['consumer_policy', 'economics']], [$contract, ['forecast']]] as $entry)
-        foreach ($entry[1] as $key)
-            if (array_key_exists($key, $entry[0]) && !is_array($entry[0][$key])) return $fail('market_contract_invalid');
-    $forecast = $contract['forecast'] ?? [];
-    foreach (['price_action_contracts', 'grid_charge_job', 'late_fill'] as $key)
-        if (array_key_exists($key, $forecast) && !is_array($forecast[$key])) return $fail('market_contract_invalid');
-    foreach ($forecast['price_action_contracts'] ?? [] as $value)
-        if (!is_array($value)) return $fail('market_contract_invalid');
-    $late = $forecast['late_fill'] ?? [];
-    foreach (['active', 'wait_active'] as $key)
-        if (array_key_exists($key, $late) && !is_bool($late[$key])) return $fail('market_contract_invalid');
-    foreach ([$market['created_ts'] ?? null, $contract['start_ts'] ?? null, $contract['end_ts'] ?? null] as $v)
-        if (!$finite($v)) return $fail('market_contract_invalid');
-    if ($nowMs < $contract['start_ts'] || $nowMs >= $contract['end_ts']) return $fail('market_contract_inactive');
-    $sourceAction = $contract['action'] ?? null;
-    if (($market['active'] ?? null) !== true
-        || !in_array('storage', $contract['released_consumers'], true)
-        || !in_array($sourceAction, ['hold_discharge', 'grid_charge'], true)
-        || ($contract['forecast']['price_action_contracts'][$sourceAction]['complete'] ?? null) !== true) return $fail('market_contract_invalid');
-    $policyKey = $sourceAction === 'hold_discharge' ? 'storage_hold' : 'storage_grid_charge';
-    if (($market['consumer_policy'][$policyKey] ?? null) !== true) return $fail('market_action_disabled');
-    if (!empty($plan['cheap_grid_charge']['active']) || !empty($plan['storm_grid_charge']['active'])) return $fail('storage_override_active');
-    foreach ([$market['created_ts'] ?? null, $contract['start_ts'] ?? null, $contract['end_ts'] ?? null] as $v)
-        if (!$finite($v)) return $fail('market_contract_invalid');
-    $identity = [$t['plan_id'], $sourceAction, sprintf('%.6F', $market['created_ts']),
-        sprintf('%.6F', $contract['start_ts']), sprintf('%.6F', $contract['end_ts'])];
-    $contractId = 'sha256:' . hash('sha256', implode('|', $identity));
-    $selected = $t['selected_actions'] ?? null;
-    if (!is_array($selected) || !$selected || count($selected) > 2) return $fail('market_selection_invalid');
-    $job = $forecast['grid_charge_job'] ?? [];
-    if ($sourceAction === 'grid_charge') {
-        foreach ([$job['window_end_ts'] ?? null, $market['economics']['roundtrip_efficiency_pct'] ?? null,
-                $forecast['grid_charge_target_soc_pct'] ?? null] as $v)
-            if (!$finite($v)) return $fail('market_contract_invalid');
-        if ($forecast['grid_charge_target_soc_pct'] < $t['anchor_soc_pct']
-            || $forecast['grid_charge_target_soc_pct'] > 100) return $fail('market_contract_invalid');
+    $horizon = $market['forecast']['hold_horizon'] ?? [];
+    // Reine Anzeige: dieselben Planer-Slots ohne Puffer, keine eigene Verteilung.
+    $replacementProjection = static function () use ($plan, $market, $horizon, $finite) {
+        if (($horizon['valid'] ?? null) !== true
+            || ($horizon['replacement_reason'] ?? null) !== 'executable_cheaper_replacement'
+            || ($market['consumer_policy']['storage_grid_charge'] ?? null) !== true) return [[], 1.0];
+        $efficiency = $market['economics']['roundtrip_efficiency_pct'] ?? null;
+        if (!$finite($efficiency) || $efficiency <= 0 || $efficiency > 100) return [[], 1.0];
+        $eta = $efficiency / 100;
+        $windows = $horizon['replacement_windows'] ?? null;
+        $proofs = $market['forecast']['future_grid_window_evidence'] ?? null;
+        if (!is_array($windows) || !$windows || !is_array($proofs)) return [[], 1.0];
+        $actions = []; $total = 0.0;
+        foreach ($windows as $window) {
+            foreach (['window_end_ts', 'replacement_wh', 'buffer_wh'] as $key)
+                if (!$finite($window[$key] ?? null)) return [[], 1.0];
+            $end = $window['window_end_ts']; $amount = $window['replacement_wh']; $buffer = $window['buffer_wh'];
+            $matches = array_values(array_filter($proofs, static function ($proof) use ($end, $finite) {
+                return is_array($proof) && $finite($proof['window_end_ts'] ?? null) && $proof['window_end_ts'] == $end;
+            }));
+            if (count($matches) !== 1) return [[], 1.0];
+            $proof = $matches[0];
+            if (($proof['active'] ?? null) !== true
+                || ($proof['basis'] ?? null) !== 'projected_executable_without_own_credit') return [[], 1.0];
+            foreach (['window_start_ts', 'delivery_end_ts', 'job_grid_wh', 'max_charge_power_w'] as $key)
+                if (!$finite($proof[$key] ?? null)) return [[], 1.0];
+            $start = $proof['window_start_ts']; $delivery = $proof['delivery_end_ts'];
+            $job = $proof['job_grid_wh']; $cap = min($proof['max_charge_power_w'], $plan['max_charge_w']);
+            $hours = ($delivery - $start) / 3600000;
+            if (!($plan['simulation_start_ts_ms'] < $start && $start < $delivery && $delivery <= $end
+                    && $end <= $plan['horizon_end_ts_ms'])
+                || $start != floor($start) || $delivery != floor($delivery) || $end != floor($end)
+                || $amount <= 0 || $buffer < 0 || $job <= 0 || $cap < 300
+                || $amount + $buffer > $job * $eta + 0.002
+                || $amount > $cap * $hours * $eta + 0.002) return [[], 1.0];
+            $slots = $window['slots'] ?? null;
+            if (!is_array($slots) || !$slots || array_keys($slots) !== range(0, count($slots) - 1)) return [[], 1.0];
+            $slotTotal = 0.0;
+            foreach ($slots as $slot) {
+                foreach (['start_ts', 'end_ts', 'amount_wh'] as $key)
+                    if (!$finite($slot[$key] ?? null)) return [[], 1.0];
+                $left = $slot['start_ts']; $right = $slot['end_ts']; $energy = $slot['amount_wh'];
+                $slotHours = ($right - $left) / 3600000;
+                if (!($start <= $left && $left < $delivery && $left < $right && $right <= $end)
+                    || $left != floor($left) || $right != floor($right) || $energy <= 0
+                    || $energy > $cap * $slotHours * $eta + 0.002) return [[], 1.0];
+                $actions[] = ['action' => 'grid_charge', 'origin' => 'hold_replacement',
+                    'start_ts_ms' => (int)$left, 'end_ts_ms' => (int)$right,
+                    'power_w' => $energy / $slotHours / $eta];
+                $slotTotal += $energy;
+            }
+            if (abs($slotTotal - $amount) > 0.002) return [[], 1.0];
+            $total += $amount;
+        }
+        usort($actions, static function ($a, $b) { return $a['start_ts_ms'] <=> $b['start_ts_ms']; });
+        if (!$finite($horizon['replacement_total_wh'] ?? null)
+            || abs($total - $horizon['replacement_total_wh']) > 0.002) return [[], 1.0];
+        for ($i = 1; $i < count($actions); $i++)
+            if ($actions[$i - 1]['end_ts_ms'] > $actions[$i]['start_ts_ms']) return [[], 1.0];
+        return [$actions, $eta];
+    };
+    $schedule = []; $holdEnd = $t['integration_start_ts_ms'];
+    if (($horizon['valid'] ?? null) === true && ($market['consumer_policy']['storage_hold'] ?? null) === true) {
+        if (!is_array($horizon['schedule'] ?? null)) return $fail('market_hold_horizon_invalid');
+        foreach ($horizon['schedule'] as $item) {
+            foreach (['start_ts', 'end_ts', 'load_wh', 'battery_pv_supply_wh', 'grid_wh', 'billing_ct'] as $key)
+                if (!$finite($item[$key] ?? null)) return $fail('market_hold_horizon_invalid');
+            if ($item['end_ts'] <= $item['start_ts'] || min($item['load_wh'], $item['battery_pv_supply_wh'], $item['grid_wh']) < 0
+                || $item['battery_pv_supply_wh'] > $item['load_wh'] + 0.002
+                || abs($item['load_wh'] - $item['battery_pv_supply_wh'] - $item['grid_wh']) > 0.002) return $fail('market_hold_horizon_invalid');
+            if ($item['battery_pv_supply_wh'] > 0) $holdEnd = $item['end_ts'];
+        }
+        $expected = $t['integration_start_ts_ms'];
+        foreach ($horizon['schedule'] as $item) {
+            $left = max($t['integration_start_ts_ms'], $item['start_ts']); $right = min($item['end_ts'], $holdEnd);
+            if ($right <= $t['integration_start_ts_ms'] || $left >= $holdEnd) continue;
+            if ($left != $expected || $right <= $left) return $fail('market_hold_horizon_invalid');
+            $item['start_ts'] = $left; $item['end_ts'] = $right;
+            $schedule[] = $item; $expected = $right;
+        }
+        if ($schedule && $expected != $holdEnd) return $fail('market_hold_horizon_invalid');
     }
-    if (!empty($late['active']) && !empty($late['wait_active'])
-        && !$finite($late['latest_start_ts'] ?? null)) return $fail('market_contract_invalid');
-    $late = $contract['forecast']['late_fill'] ?? [];
-    $expectedOrigins = $sourceAction === 'hold_discharge' ? ['hold_discharge']
-        : (!empty($late['active']) && !empty($late['wait_active']) ? ['selected_grid_wait', 'grid_charge'] : ['grid_charge']);
-    if (array_column($selected, 'origin') !== $expectedOrigins) return $fail('market_selection_invalid');
-    if ($sourceAction === 'grid_charge' && (($job['active'] ?? null) !== true
-        || ($contract['forecast']['grid_charge_job_basis'] ?? null) !== 'executable'
-        || !$finite($job['planned_charge_w'] ?? null) || $job['planned_charge_w'] < 300
-        || !$finite($job['job_grid_wh'] ?? null) || $job['job_grid_wh'] <= 0
-        || abs($eta * 100 - ($market['economics']['roundtrip_efficiency_pct'] ?? -100)) > 0.001)) return $fail('grid_charge_not_selected');
-    foreach ($selected as $a) {
-        foreach (['start_ts_ms', 'end_ts_ms', 'power_w'] as $key) if (!$finite($a[$key] ?? null)) return $fail('market_selection_invalid');
-        if (($a['contract_id'] ?? null) !== $contractId
-            || $a['start_ts_ms'] < max($t['integration_start_ts_ms'], $contract['start_ts'] ?? PHP_INT_MAX)
-            || $a['end_ts_ms'] > ($contract['end_ts'] ?? 0) || $a['start_ts_ms'] >= $a['end_ts_ms']) return $fail('market_selection_invalid');
-        if (($a['action'] ?? null) === 'grid_charge') {
-            $expectedStart = max($t['integration_start_ts_ms'], $contract['start_ts'],
-                !empty($late['active']) && !empty($late['wait_active']) ? ($late['latest_start_ts'] ?? PHP_INT_MAX) : 0);
-            if ($sourceAction !== 'grid_charge' || ($a['origin'] ?? null) !== 'grid_charge'
-                || $a['start_ts_ms'] != $expectedStart || $a['power_w'] != $job['planned_charge_w']
-                || $a['end_ts_ms'] != min($contract['end_ts'], $job['window_end_ts'] ?? 0)) return $fail('market_selection_invalid');
-        } elseif (($a['action'] ?? null) === 'hold_economic') {
-            if (($market['consumer_policy']['storage_hold'] ?? null) !== true || $a['power_w'] != 0) return $fail('market_selection_invalid');
-            $holdEnd = $sourceAction === 'hold_discharge' ? $contract['end_ts'] : ($late['latest_start_ts'] ?? 0);
-            if (($a['origin'] ?? null) !== ($sourceAction === 'hold_discharge' ? 'hold_discharge' : 'selected_grid_wait')
-                || ($sourceAction === 'grid_charge' && (empty($late['active']) || empty($late['wait_active'])))
-                || $a['start_ts_ms'] != max($t['integration_start_ts_ms'], $contract['start_ts'])
-                || $a['end_ts_ms'] != $holdEnd) return $fail('market_selection_invalid');
-        } else return $fail('market_selection_invalid');
+    $contract = $market['active_contract'] ?? null;
+    if ($contract !== null && (!is_array($contract) || !is_string($contract['action'] ?? null))) return $fail('market_contract_invalid');
+    if (!is_array($t['selected_actions'] ?? null)) return $fail('market_selection_invalid');
+    $horizonOnly = (bool)$schedule && $finite($horizon['hold_wh'] ?? null)
+        && ($contract === null || ($contract['action'] ?? null) === 'hold_discharge')
+        && ($horizon['hold_wh'] <= 0.001 || ($contract['action'] ?? null) === 'hold_discharge')
+        && (in_array('hold_horizon', array_column($t['selected_actions'], 'origin'), true)
+            || in_array('hold_replacement', array_column($t['selected_actions'], 'origin'), true));
+    if (!$horizonOnly) $schedule = [];
+    if ($horizonOnly) {
+        $sourceAction = 'hold_horizon'; $job = [];
+        if (!$finite($market['created_ts'] ?? null)) return $fail('market_contract_invalid');
+        $identity = [$t['plan_id'], $sourceAction, sprintf('%.6F', $market['created_ts']),
+            sprintf('%.6F', $t['integration_start_ts_ms']), sprintf('%.6F', $holdEnd)];
+        $contractId = 'sha256:' . hash('sha256', implode('|', $identity));
+        $selected = $t['selected_actions'] ?? [];
+        [$replacements, $replacementEta] = $replacementProjection();
+        if (abs($eta - $replacementEta) > 0.001) return $fail('market_projection_energy_invalid');
+        foreach ($replacements as &$replacement) $replacement['contract_id'] = $contractId;
+        unset($replacement);
+        $expectedSelected = $replacements;
+        if (!empty($plan['cheap_grid_charge']['active']) || !empty($plan['storm_grid_charge']['active'])) return $fail('storage_override_active');
+    } else {
+        $contract = $market['active_contract'] ?? null;
+        if (!is_array($contract) || !is_array($contract['released_consumers'] ?? null)) return $fail('market_contract_invalid');
+        if ($contract['released_consumers'] && array_keys($contract['released_consumers'])
+            !== range(0, count($contract['released_consumers']) - 1)) return $fail('market_contract_invalid');
+        foreach ($contract['released_consumers'] as $consumer)
+            if (!is_string($consumer)) return $fail('market_contract_invalid');
+        foreach ([[$market, ['consumer_policy', 'economics']], [$contract, ['forecast']]] as $entry)
+            foreach ($entry[1] as $key)
+                if (array_key_exists($key, $entry[0]) && !is_array($entry[0][$key])) return $fail('market_contract_invalid');
+        $forecast = $contract['forecast'] ?? [];
+        foreach (['price_action_contracts', 'grid_charge_job', 'late_fill'] as $key)
+            if (array_key_exists($key, $forecast) && !is_array($forecast[$key])) return $fail('market_contract_invalid');
+        foreach ($forecast['price_action_contracts'] ?? [] as $value)
+            if (!is_array($value)) return $fail('market_contract_invalid');
+        $late = $forecast['late_fill'] ?? [];
+        foreach (['active', 'wait_active'] as $key)
+            if (array_key_exists($key, $late) && !is_bool($late[$key])) return $fail('market_contract_invalid');
+        foreach ([$market['created_ts'] ?? null, $contract['start_ts'] ?? null, $contract['end_ts'] ?? null] as $v)
+            if (!$finite($v)) return $fail('market_contract_invalid');
+        if ($nowMs < $contract['start_ts'] || $nowMs >= $contract['end_ts']) return $fail('market_contract_inactive');
+        $sourceAction = $contract['action'] ?? null;
+        if (($market['active'] ?? null) !== true
+            || !in_array('storage', $contract['released_consumers'], true)
+            || !in_array($sourceAction, ['hold_discharge', 'grid_charge'], true)
+            || ($contract['forecast']['price_action_contracts'][$sourceAction]['complete'] ?? null) !== true) return $fail('market_contract_invalid');
+        $policyKey = $sourceAction === 'hold_discharge' ? 'storage_hold' : 'storage_grid_charge';
+        if (($market['consumer_policy'][$policyKey] ?? null) !== true) return $fail('market_action_disabled');
+        if (!empty($plan['cheap_grid_charge']['active']) || !empty($plan['storm_grid_charge']['active'])) return $fail('storage_override_active');
+        foreach ([$market['created_ts'] ?? null, $contract['start_ts'] ?? null, $contract['end_ts'] ?? null] as $v)
+            if (!$finite($v)) return $fail('market_contract_invalid');
+        $identity = [$t['plan_id'], $sourceAction, sprintf('%.6F', $market['created_ts']),
+            sprintf('%.6F', $contract['start_ts']), sprintf('%.6F', $contract['end_ts'])];
+        $contractId = 'sha256:' . hash('sha256', implode('|', $identity));
+        $selected = $t['selected_actions'] ?? null;
+        if (!is_array($selected) || !$selected || count($selected) > 2) return $fail('market_selection_invalid');
+        $job = $forecast['grid_charge_job'] ?? [];
+        if ($sourceAction === 'grid_charge') {
+            foreach ([$job['window_end_ts'] ?? null, $market['economics']['roundtrip_efficiency_pct'] ?? null,
+                    $forecast['grid_charge_target_soc_pct'] ?? null] as $v)
+                if (!$finite($v)) return $fail('market_contract_invalid');
+            if ($forecast['grid_charge_target_soc_pct'] < $t['anchor_soc_pct']
+                || $forecast['grid_charge_target_soc_pct'] > 100) return $fail('market_contract_invalid');
+        }
+        if (!empty($late['active']) && !empty($late['wait_active'])
+            && !$finite($late['latest_start_ts'] ?? null)) return $fail('market_contract_invalid');
+        $late = $contract['forecast']['late_fill'] ?? [];
+        $expectedOrigins = $sourceAction === 'hold_discharge' ? ['hold_discharge']
+            : (!empty($late['active']) && !empty($late['wait_active']) ? ['selected_grid_wait', 'grid_charge'] : ['grid_charge']);
+        if (array_column($selected, 'origin') !== $expectedOrigins) return $fail('market_selection_invalid');
+        if ($sourceAction === 'grid_charge' && (($job['active'] ?? null) !== true
+            || ($contract['forecast']['grid_charge_job_basis'] ?? null) !== 'executable'
+            || !$finite($job['planned_charge_w'] ?? null) || $job['planned_charge_w'] < 300
+            || !$finite($job['job_grid_wh'] ?? null) || $job['job_grid_wh'] <= 0
+            || abs($eta * 100 - ($market['economics']['roundtrip_efficiency_pct'] ?? -100)) > 0.001)) return $fail('grid_charge_not_selected');
+        foreach ($selected as $a) {
+            foreach (['start_ts_ms', 'end_ts_ms', 'power_w'] as $key) if (!$finite($a[$key] ?? null)) return $fail('market_selection_invalid');
+            if (($a['contract_id'] ?? null) !== $contractId
+                || $a['start_ts_ms'] < max($t['integration_start_ts_ms'], $contract['start_ts'] ?? PHP_INT_MAX)
+                || $a['end_ts_ms'] > ($contract['end_ts'] ?? 0) || $a['start_ts_ms'] >= $a['end_ts_ms']) return $fail('market_selection_invalid');
+            if (($a['action'] ?? null) === 'grid_charge') {
+                $expectedStart = max($t['integration_start_ts_ms'], $contract['start_ts'],
+                    !empty($late['active']) && !empty($late['wait_active']) ? ($late['latest_start_ts'] ?? PHP_INT_MAX) : 0);
+                if ($sourceAction !== 'grid_charge' || ($a['origin'] ?? null) !== 'grid_charge'
+                    || $a['start_ts_ms'] != $expectedStart || $a['power_w'] != $job['planned_charge_w']
+                    || $a['end_ts_ms'] != min($contract['end_ts'], $job['window_end_ts'] ?? 0)) return $fail('market_selection_invalid');
+            } elseif (($a['action'] ?? null) === 'hold_economic') {
+                if (($market['consumer_policy']['storage_hold'] ?? null) !== true || $a['power_w'] != 0) return $fail('market_selection_invalid');
+                $holdEnd = $sourceAction === 'hold_discharge' ? $contract['end_ts'] : ($late['latest_start_ts'] ?? 0);
+                if (($a['origin'] ?? null) !== ($sourceAction === 'hold_discharge' ? 'hold_discharge' : 'selected_grid_wait')
+                    || ($sourceAction === 'grid_charge' && (empty($late['active']) || empty($late['wait_active'])))
+                    || $a['start_ts_ms'] != max($t['integration_start_ts_ms'], $contract['start_ts'])
+                    || $a['end_ts_ms'] != $holdEnd) return $fail('market_selection_invalid');
+            } else return $fail('market_selection_invalid');
+        }
     }
     $baseSlots = [];
     if (!is_array($plan['slots'] ?? null)) return $fail('market_projection_slot_id_invalid');
@@ -12846,13 +13129,44 @@ function e3dcMarketSocTrajectoryForDisplay($plan, $live, $nowMs = null) {
             || ($s['action'] === 'hold_economic' && ($s['power_w'] < -0.01 || $s['grid_charge_w'] != 0))
             || ($s['action'] !== 'grid_charge' && $s['grid_charge_w'] != 0)
             || ($s['action'] === 'grid_charge' && ($s['grid_charge_w'] > $chosen['power_w'] + 0.01
-                || $s['power_w'] + 0.01 < $s['grid_charge_w'] * $eta))) return $fail('market_projection_action_invalid');
+                || (($chosen['origin'] ?? null) !== 'hold_replacement' && $s['power_w'] + 0.01 < $s['grid_charge_w'] * $eta)))) return $fail('market_projection_action_invalid');
+        $allocation = null;
+        foreach ($schedule as $item) if ($item['start_ts'] <= $s['start_ts_ms'] && $s['start_ts_ms'] < $item['end_ts']) $allocation = $item;
+        if ($horizonOnly) {
+            $replacement = null;
+            foreach ($replacements as $a) if ($a['start_ts_ms'] <= $s['start_ts_ms'] && $s['start_ts_ms'] < $a['end_ts_ms']) $replacement = $a;
+            $shouldHold = !$replacement && $allocation && $allocation['load_wh'] > 0 && $allocation['battery_pv_supply_wh'] == 0
+                && $s['soc_start_pct'] > $reserve + 0.001;
+            if ($shouldHold) $expectedSelected[] = ['action' => 'hold_economic', 'origin' => 'hold_horizon',
+                'start_ts_ms' => $s['start_ts_ms'], 'end_ts_ms' => $s['end_ts_ms'],
+                'contract_id' => $contractId, 'power_w' => 0.0];
+            if (($shouldHold || $replacement !== null) !== ($chosen !== null)) return $fail('market_selection_invalid');
+        }
+        $checkScheduled = $allocation && (!$chosen || in_array($chosen['origin'] ?? null, ['hold_horizon', 'hold_replacement'], true));
+        if ($checkScheduled || ($chosen['origin'] ?? null) === 'hold_replacement') {
+            $scheduledPower = max(0, $s['base_power_w']);
+            if ($checkScheduled) {
+                if ($s['end_ts_ms'] > $allocation['end_ts']) return $fail('market_projection_action_invalid');
+                $scheduledPower = $chosen && ($chosen['origin'] ?? null) === 'hold_horizon' ? 0.0 : ($s['base_power_w'] < 0
+                    ? max(-$t['max_discharge_w'], -$allocation['battery_pv_supply_wh'] / (($allocation['end_ts'] - $allocation['start_ts']) / 3600000))
+                    : max(0, $s['base_power_w']));
+            }
+            if (($chosen['origin'] ?? null) === 'hold_replacement') {
+                $gridPower = min($chosen['power_w'], max(0, $t['max_charge_w'] - max(0, $scheduledPower)) / $eta,
+                    max(0, (100 - $s['soc_start_pct']) * $capacity / 100 / $hours - $scheduledPower) / $eta);
+                $scheduledPower += $gridPower * $eta;
+                if (abs($gridPower - $s['grid_charge_w']) > 0.01) return $fail('market_projection_energy_invalid');
+            }
+            $scheduledSoc = max($reserve, min(100, $s['soc_start_pct'] + $scheduledPower * $hours / $capacity * 100));
+            if (abs($scheduledSoc - $s['soc_end_pct']) > 0.001) return $fail('market_projection_energy_invalid');
+        }
         $gridWh += $s['grid_charge_w'] * $hours;
         foreach (['slot_id', 'action', 'origin', 'contract_id'] as $key) $material[] = (string)($s[$key] ?? '');
         foreach (['start_ts_ms', 'end_ts_ms', 'soc_start_pct', 'soc_end_pct', 'power_w', 'grid_charge_w', 'base_power_w', 'reserve_soc_pct'] as $key)
             $material[] = sprintf('%.6F', $s[$key]);
         $expected = $s['end_ts_ms']; $previousSoc = $s['soc_end_pct'];
     }
+    if ($horizonOnly && (!$expectedSelected || $selected != $expectedSelected)) return $fail('market_selection_invalid');
     if ($expected != $t['horizon_end_ts_ms']) return $fail('market_projection_endpoint_missing');
     if ($sourceAction === 'grid_charge' && $gridWh > $job['job_grid_wh'] + 0.01) return $fail('market_projection_energy_invalid');
     if (($t['trajectory_revision'] ?? null) !== 'sha256:' . hash('sha256', implode('|', $material))) return $fail('market_projection_revision_invalid');

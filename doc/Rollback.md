@@ -16,6 +16,63 @@ export E3DC_INSTALL_PATH="/absoluter/pfad/zur/installation"
 test -f "$E3DC_INSTALL_PATH/e3dc-setup"
 ```
 
+## Rückfall von 5.5.6 auf 5.5.5c
+
+**Docker:** Auf dem Host in `.env` `E3DC_IMAGE_TAG=v5.5.5c` setzen und
+`sudo docker compose up -d` ausführen; die vorhandenen Daten-Volumes bleiben
+erhalten. Das Image von 5.5.5c startet seinen E3DC-WebSocket-Dienst wieder
+selbst; dafür ist nichts einzurichten. Beim Start bereinigt 5.5.5c die
+Konfiguration und entfernt dabei gespeicherte Pausen und Ladepunktsperren.
+Eine unter 5.5.6 gesetzte Pause oder Sperre gilt danach nicht mehr.
+
+**Bare Metal:** Der Rückweg ist das beim Update angelegte verifizierte Backup
+(siehe „Betriebsdaten wiederherstellen“). Es stellt Programmstand,
+Konfiguration und die darin gesicherten Betriebsdaten von vor dem Update
+wieder her, einschließlich der Dienst-Unit des E3DC-WebSocket-Dienstes und der
+Apache-Site mit der Weiterleitung `/ws`. Nach dem Update geänderte
+Einstellungen und hinzugekommene Statistik- und Diagnosedaten sind darin nicht
+enthalten und vorher gesondert zu sichern. Pause und Ladepunktsperre stehen
+danach wieder auf dem Stand vor dem Update.
+
+**Pause, Not-Aus und Ladepunktsperre:** Nach dem Rückfall den Zustand jedes
+Ladepunkts auf der Seite „Wallbox“ prüfen und Pause, Sperre oder Not-Aus bei
+Bedarf neu setzen. Unter 5.5.5c bleiben sie nicht in jedem Fall über einen
+Neustart oder Containerstart erhalten, und es gelten die bisherigen
+Stopp- und Freigaberegeln.
+
+**Konfiguration:** 5.5.6 führt keine neuen Einstellfelder ein. Die in 5.5.6
+entfallenen Felder „Beharrung 3p→1p (s)“, „Vorlauf 1p→3p (s)“,
+„Export-Wh 1p→3p (Wh)“, „Symmetrie-Klausel 1p→3p“ und „Phasen-Halt (s)“
+bleiben mit ihren gespeicherten Werten in der Konfiguration und gelten unter
+5.5.5c wieder; ohne eigenen Wert gelten die Standardwerte von 5.5.5c. Ein
+leeres oder auf 0 gesetztes Reservefeld („Hausreserve (%)“ bzw.
+„Fallback-Reserve (%)“) bleibt erhalten; unter 5.5.5c sperrt E3DC-Control an
+der Notstromreserve die Entladung wieder selbst.
+
+**Daten:** Statistikdatenbank, Minutenhistorie und Tagesarchive bleiben
+erhalten. 5.5.5c ignoriert die neuen Spalten für Minuten ohne Wallbox-Messwert
+und für die nur per MQTT gemessene Wallbox; diese Wallbox erscheint dann
+wieder im Hausverbrauch, und fehlende Tageswerte können wieder als 0
+erscheinen. Die stündliche Sicherung der Minutenhistorie entfällt; es gilt
+wieder die tägliche Sicherung. Zusätzliche Felder in Status- und
+Zustandsdateien, etwa die gelernte Ladeleistung je Ladezustand oder Angaben
+des Wallbox-Regelkerns, wertet 5.5.5c nicht aus und kann sie beim nächsten
+Speichern entfernen.
+
+**Verhalten unter 5.5.5c:** Die Wallboxen regeln wieder mit der bisherigen
+Regelung einschließlich Einschwingfrist, Anhebungstreppe, Grid-Wächter und
+der Phasenzeiten aus der Konfiguration; ein gesperrtes Budget
+beendet eine Ladung dann nicht nach der Datenfrist. Die Preisplanung bewertet
+die Livewerte wieder nach ihrer Rechenzeit, sodass auf langsamen Geräten
+Netzladefenster mit „Livewerte nicht nutzbar“ entfallen können. Eine
+Unterbrechung der Planquelle wird wieder bis zu 15 Minuten überbrückt. Fehlt
+der Wärmepumpe ein vertrauenswürdiges Energiekonto, warten neue optionale
+PV-Starts wieder bis zu 24 Stunden.
+
+**Dienste:** 5.5.6 führt keine neuen Dienste oder systemd-Units ein und
+entfernt den E3DC-WebSocket-Dienst. Nach dem Rückfall läuft er wieder; eine
+erneute Aktualisierung auf 5.5.6 entfernt ihn erneut.
+
 ## Rückfall von 5.5.5c auf 5.5.5b
 
 **Docker:** Auf dem Host in `.env` `E3DC_IMAGE_TAG=v5.5.5b` setzen und
@@ -461,7 +518,7 @@ oder einen Prozessabbruch außerhalb des erkannten Fehlerpfads.
 
 ## Programmstand zurücksetzen
 
-Der aktuelle Stable-Stand ist `v5.5.5c`.
+Der aktuelle Stable-Stand ist `v5.5.6`.
 
 Beim Rücklauf wird der tatsächliche Dateisystemzustand einer Unit weiterhin
 streng gegen reguläre Unit-Datei, kanonische `/dev/null`-Maske, unerwarteten

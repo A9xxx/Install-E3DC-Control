@@ -23,6 +23,47 @@ Fehlt eine externe Quelle vorübergehend, verwendet das System nur die lokal
 verfügbaren, als gültig bewerteten Daten. Fehlende Slots werden nicht als
 bestätigte Erzeugung ausgegeben.
 
+## PV-Flächen und Wechselrichtergruppen
+
+Im Config-Editor „Erweiterte Ansicht“ → „Standort & PV-Prognose“ →
+„M3 — Solcast (Satellit, optional)“ den Kasten „PV-Flächen und Wechselrichtergruppen“
+öffnen. Der Kasten ist auch ohne Solcast nutzbar; Solcast-Zuordnungen sind dann
+nicht erforderlich. Die vierte und jede weitere physische PV-Fläche wird nur
+über diesen Kasten angelegt; „Dachflächen & PV-Ausrichtungen“ bietet drei Flächen.
+
+Mit „Wechselrichtergruppe“ eine Gruppe anlegen und unter „Kopplung“ „E3DC-DC“
+oder „Externer AC-WR“ wählen. Die Kopplung gilt für jede Fläche der Gruppe.
+Flächen unterschiedlicher Kopplung benötigen getrennte Gruppen. Mit „Fläche hinzufügen“
+weitere Flächen ergänzen und jeweils „Neigung °“, „Ausrichtung °“ und „kWp“
+eintragen. Für die Ausrichtung gilt: Süd = 0°, Ost = −90°, West = +90°,
+Nord = ±180°. Bestehende Gruppen- und Flächen-IDs bleiben erhalten.
+„Bestehende Flächen übernehmen“ bietet die Übernahme vorhandener Angaben an;
+vor dem Speichern die Zuordnung kontrollieren.
+
+Sobald eine Gruppe „Externer AC-WR“ verwendet, im Feld „Externe AC-WR-Leistung (W)“
+oberhalb des Kastens eine positive AC-Nennleistung bzw. das wirksame Ausgangslimit
+eintragen. Dieser gemeinsame Wert gilt für alle externen AC-Wechselrichter
+und deren Flächen zusammen, nicht je Fläche. W ist die AC-Leistungsgrenze;
+kWp beschreibt die installierte Modulleistung der einzelnen Fläche.
+Bei leerem Pflichtfeld zeigt das Speichern den vorhandenen Prüfgrund und
+springt zum Leistungsfeld. Die Statuszeile wird bei jeder Eingabe neu berechnet.
+
+Beispiel mit zwei Gruppen und vier Flächen (frei gewählte Werte):
+
+| Gruppe | Kopplung | Fläche | Neigung ° | Ausrichtung ° | kWp |
+|---|---|---|---:|---:|---:|
+| Hauptdach | E3DC-DC | Süd | 30 | 0 | 6 |
+| Hauptdach | E3DC-DC | Nord | 30 | 180 | 6 |
+| Nebendach | Externer AC-WR | Ost | 20 | −90 | 2 |
+| Nebendach | Externer AC-WR | West | 20 | +90 | 2 |
+
+Bei einem externen Wechselrichter mit 4 000 W AC-Nennleistung einmal „4000“
+in „Externe AC-WR-Leistung (W)“ eintragen, gemeinsam für Ost und West.
+Die vierte Fläche mit „Fläche hinzufügen“ in der Gruppe „Nebendach“ ergänzen.
+Bei Solcast-Nutzung die Resource IDs unter „Solcast-Zuordnungen“ den passenden
+Gruppen zuordnen; eine Resource darf nur einmal vorkommen. Abschließend
+Statuszeile und „Technische Vertragsvorschau“ prüfen und „Speichern“ wählen.
+
 ## Sichtbares Verhalten
 
 Das Dashboard zeigt die erwartete PV-Leistung und die daraus abgeleitete

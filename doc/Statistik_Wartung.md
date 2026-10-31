@@ -45,7 +45,18 @@ müssen erfolgreich sein. Der ausgegebene Backup-Pfad enthält `e3dc_stats.db` u
 kein erfolgreicher Wartungslauf.
 
 Aktualisiert werden ausschließlich die berechneten Energie-, Verteilungs- und
-Kostenspalten sowie Autarkie und Eigenverbrauch der geeigneten Tage. Haus und
+Kostenspalten sowie Autarkie, Eigenverbrauch und der Wallbox-Tageshinweis der geeigneten Tage.
+
+Der Hinweis „Haus inkl. Wallbox (unbekannt)“ erscheint nur, wenn markierte Minuten
+vorliegen und mindestens eine externe Wallbox keinen akzeptierten Tageszähler hat.
+Die Tageszeile nennt zusätzlich die Zahl der Minuten ohne Messwert; der
+Hausverbrauch selbst bleibt unverändert.
+
+Nach dem Update berücksichtigt die erste Nachberechnung bis zu 30 abgeschlossene
+Tage, um den neuen Wallbox-Tageshinweis nachzutragen; vorher einen regulären
+Stundenlauf abwarten.
+
+Haus und
 Verbraucher erhalten dieselbe Bilanz: Eine nicht mehr belegte Einzelmessung bleibt
 `null`, ihr Verbrauch wird nicht zusätzlich zum bereits enthaltenen Hauswert gezählt.
 Bestehende Peak-Shaving-Einsparwerte (`saved_*`), andere Tage und ML-Daten bleiben erhalten.

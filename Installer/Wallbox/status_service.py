@@ -4,12 +4,44 @@ import math
 import time
 
 
+# Vorhandene Datenfrist des Statusdienstes, auch für den Quellenfortschritt.
+STATUS_STALE_DEFAULT_S = 45.0
+
+
+def status_stale_guard_s(config):
+    try:
+        return max(10.0, min(300.0, float(str((config or {}).get(
+            "wallbox_status_stale_guard_s", STATUS_STALE_DEFAULT_S)).strip().replace(",", "."))))
+    except (TypeError, ValueError):
+        return STATUS_STALE_DEFAULT_S
+
+
+def published_measurement_valid(status, now_s, max_age_s=STATUS_STALE_DEFAULT_S):
+    """Veröffentlichter Ablauf und engere Leserfrist müssen beide gültig sein."""
+    observation = status.get("observation") if isinstance(status, dict) else None
+    if not isinstance(observation, dict) or "valid_until_ts" not in observation:
+        return None  # Bestandsformat ohne veröffentlichten Ablauf.
+    deadline = observation.get("valid_until_ts")
+    sample = observation.get("sample_ts")
+    guard = observation.get("valid_for_s", STATUS_STALE_DEFAULT_S)
+    return bool(observation.get("valid") is True
+                and type(deadline) in (int, float) and math.isfinite(deadline)
+                and type(sample) in (int, float) and math.isfinite(sample) and sample > 0
+                and math.isfinite(now_s) and math.isfinite(max_age_s) and max_age_s > 0
+                and -2 <= now_s - sample <= max_age_s
+                and type(guard) in (int, float) and math.isfinite(guard) and 0 < guard <= 300
+                and now_s <= deadline <= sample + guard + 1
+                and deadline - now_s <= guard + 2)
+
+
 STATUS_DIAGNOSTIC_KEYS = (
     'openwb_mqtt_field_age_s', 'openwb_mqtt_field_received_ts', 'openwb_mqtt_field_reason', 'openwb_mqtt_status_reason', 'openwb_status_fallback_reason', 'openwb_simpleapi_status_ts',
     "driver_status_valid", "driver_status_stale", "driver_status_degraded",
     "driver_status_age_s", "driver_status_reason", "driver_status_last_ok_ts",
     "driver_status_last_sample_ts", "driver_status_source", "driver_status_plausible",
     "driver_status_glitch", "driver_status_glitch_reason", "driver_status_last_good_ts",
+    "driver_status_valid_until_ts", "driver_status_valid_for_s", "source_timestamp", "source_progress_ts",
+    "command_target_amp", "command_target_ts",
 )
 
 NATIVE_STATUS_CONTRACT_KEYS = (
@@ -218,7 +250,7 @@ class StatusService:
         absent = [key for key, value in values.items() if value is None]
         hint = ""
         if not fresh or values["power_w"] is None:
-            hint = "Wallbox ohne Daten – Regelung wie ohne Wallbox. Verbindung bzw. Sicherung der Wallbox prüfen. Externe Last bei Bedarf im Config-Editor unter „Tarif & Strompreise“ → „Geplante Lastfenster“ absichern."
+            hint = "Wallbox ohne Daten – Unterhalb der Hausakku-Untergrenze bleibt die Speicherentladung für die Wallbox begrenzt. Verbindung bzw. Sicherung der Wallbox prüfen. Externe Last bei Bedarf im Config-Editor unter „Tarif & Strompreise“ → „Geplante Lastfenster“ absichern."
             if _native_status_present(sample):
                 hint = "Die Wallbox kann derzeit nicht gelesen werden. Deshalb wird keine Akkustützung für das Fahrzeug freigegeben."
             reason_code = str(sample.get("driver_status_reason") or "").lower()
@@ -238,6 +270,16 @@ class StatusService:
                 hint += " Ursache: MQTT verbunden, aber noch keine bestätigten Lesedaten."
             elif any(code in reason_code for code in ("certificate", "cert_verify", "tls_pin", "tls_untrusted", "tls_required", "ssl")):
                 hint += " Ursache: Zertifikat nicht bestätigt oder ungültig."
+            elif "measurement_implausible" in reason_code:
+                hint += " Ursache: Messwert außerhalb der physikalischen Wallbox-Grenzen."
+            elif "source_timestamp_implausible" in reason_code:
+                hint += " Ursache: Quellenzeitstempel der Wallbox ungültig."
+            elif "source_timestamp_unconfirmed" in reason_code:
+                hint += " Ursache: Fortschritt der Wallbox-Uhr noch nicht bestätigt."
+            elif "source_timestamp_backwards" in reason_code:
+                hint += " Ursache: Wallbox-Uhr zurückgelaufen."
+            elif "source_timestamp_stale" in reason_code:
+                hint += " Ursache: Wallbox-Uhr steht; Messwerte veraltet."
             elif "openwb_mqtt_stale" in reason_code:
                 hint += " Ursache: MQTT-Messwerte fehlen oder sind veraltet."
             elif any(code in reason_code for code in ("timeout", "timed_out")):
@@ -249,10 +291,13 @@ class StatusService:
         return {
             "schema_version": "wallbox_observation_v1", "valid": fresh, "hint": hint,
             "data_outage": {"active": bool(hint) and not _native_status_present(sample), "since_ts": number("wallbox_data_outage_since_ts"),
-                            "regulation": "Regelung wie ohne Wallbox" if hint and not _native_status_present(sample) else None},
+                            "regulation": "Unterhalb der Hausakku-Untergrenze bleibt die Speicherentladung für die Wallbox begrenzt" if hint and not _native_status_present(sample) else None},
             "source": str(sample.get("driver_status_source") or sample.get("wb_status_source") or "driver_readback"),
             "reason": str(sample.get("driver_status_reason") or "status_unavailable") if not fresh else ("partial_measurement" if absent else "fresh"),
             "sample_ts": number("driver_status_last_ok_ts"),
+            **({"valid_until_ts": number("driver_status_valid_until_ts"),
+                "valid_for_s": number("driver_status_valid_for_s")}
+               if "driver_status_valid_until_ts" in sample else {}),
             "age_s": number("driver_status_age_s"), "values": values,
             "missing_fields": absent,
             "phases_source": phases_source if values["phases"] is not None and phases_source in (
@@ -320,6 +365,16 @@ class StatusService:
                 "driver_status_last_sample_ts": int(now_value),
                 "driver_status_last_ok_ts": int(now_value),
             })
+            # Veröffentlichter Ablauf ergänzt die engeren Altersgrenzen der Leser.
+            # Eine Übergabe mit stale_guard_s=0 verbietet Ersatzproben;
+            # sie macht den gerade gelesenen Messwert nicht sofort ungültig.
+            sample_guard_s = float(stale_guard_s) if float(stale_guard_s) > 0 else STATUS_STALE_DEFAULT_S
+            deadline = now_value + sample_guard_s
+            source_deadline = raw_status.get("driver_status_valid_until_ts")
+            if "source_progress_ts" in raw_status and type(source_deadline) in (int, float) and math.isfinite(source_deadline):
+                deadline = min(deadline, source_deadline)
+            raw_status["driver_status_valid_until_ts"] = deadline
+            raw_status["driver_status_valid_for_s"] = sample_guard_s
             values = raw_status.get("observation_values")
             power = values.get("power_w") if isinstance(values, dict) else raw_status.get("real_power_w", raw_status.get("power_w"))
             power_valid = type(power) in (int, float) and math.isfinite(power) and power >= 0

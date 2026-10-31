@@ -2289,10 +2289,11 @@ function loadVehicleSocDisplayCache($file) {
     return is_array($cache) ? $cache : [];
 }
 
-function applyVehicleSocDisplayCache(&$vehicle, $cache, $maxAgeS = 604800) {
+function applyVehicleSocDisplayCache(&$vehicle, $cache, $maxAgeS = 604800, $cloudFreshnessS = 900) {
     if (!is_array($vehicle) || empty($cache) || !mqttVehicleRecordAllowed($vehicle)) return;
+    // Ein Cloudwert bleibt innerhalb der Frist aus dem Abrufintervall der eigene Wert.
     if (vehicleSocPercentValue($vehicle['soc'] ?? null) !== null
-        && wallboxVehicleSocRuleUsable($vehicle)) return;
+        && wallboxVehicleSocRuleUsable($vehicle, $cloudFreshnessS)) return;
     $observedReceivedTs = vehicleSocTimestamp($vehicle['soc_observed_received_ts'] ?? null);
     $observedSourceTs = vehicleSocTimestamp($vehicle['soc_source_ts'] ?? null);
     if (($vehicle['soc_display_only'] ?? null) === true
@@ -2423,7 +2424,7 @@ function liveSessionEstimateDisplayOnly($manual, $source, $sourceTs, $now = null
     return e3dcVehicleSocSessionContractState($manual, $source, $now) === 'valid';
 }
 
-function saveVehicleSocDisplayCache($file, $vehicles, $existingCache = [], $maxAgeS = 604800) {
+function saveVehicleSocDisplayCache($file, $vehicles, $existingCache = [], $maxAgeS = 604800, $cloudFreshnessS = 900) {
     $now = time();
     $cache = is_array($existingCache) ? $existingCache : [];
     foreach ($cache as $key => $entry) {
@@ -2435,7 +2436,7 @@ function saveVehicleSocDisplayCache($file, $vehicles, $existingCache = [], $maxA
         foreach ($vehicles as $vehicle) {
             if (!is_array($vehicle) || !empty($vehicle['soc_stale'])) continue;
             $vehicleSoc = vehicleSocPercentValue($vehicle['soc'] ?? null);
-            if ($vehicleSoc === null || !wallboxVehicleSocRuleUsable($vehicle)) continue;
+            if ($vehicleSoc === null || !wallboxVehicleSocRuleUsable($vehicle, $cloudFreshnessS)) continue;
             $sourceTs = vehicleSocRecordTimestamp($vehicle, $now);
             // Ohne echten Quellanker darf selbst ein bestätigter Anzeigewert
             // nicht unter dem aktuellen Cache-Schreibzeitpunkt gespeichert
@@ -2897,9 +2898,17 @@ function liveApplyWallboxObservationProjection(&$data, $native, $enabled, $confi
         $external = !in_array($kind, ['native', 'e3dc', 'e3dc_easy', 'e3dc_easy_connect', 'e3dc_legacy', 'e3dc_efy', 'e3dc_auto', 'e3dc_multi', 'e3dc_multi_connect', 'e3dc_multi_connect_ii'], true);
         $sampleTs = $number($observation['sample_ts'] ?? null);
         $age = $sampleTs !== null ? $now - $sampleTs : null;
-        $valid = $packetFresh && ($observation['schema_version'] ?? '') === 'wallbox_observation_v1'
-            && ($observation['valid'] ?? null) === true && $sampleTs !== null && $sampleTs > 0
-            && $age >= -5 && ($external ? $age <= $externalSampleMaxAgeS : $age < 60);
+        // Neue Erzeuger veröffentlichen den Ablauf für alle Leser gemeinsam.
+        $hasDeadline = array_key_exists('valid_until_ts', $observation);
+        $deadline = $number($observation['valid_until_ts'] ?? null);
+        $validFor = $number($observation['valid_for_s'] ?? 45);
+        $sampleFresh = $packetFresh && $sampleTs !== null && $sampleTs > 0
+            && $age >= -2 && ($external ? $age <= $externalSampleMaxAgeS : $age < 60);
+        $fresh = $sampleFresh && (!$hasDeadline || ($deadline !== null
+            && $validFor !== null && $validFor > 0 && $validFor <= 300
+            && $now <= $deadline && $deadline - $now <= $validFor + 2 && $deadline <= $sampleTs + $validFor + 1));
+        $valid = $fresh && ($observation['schema_version'] ?? '') === 'wallbox_observation_v1'
+            && ($observation['valid'] ?? null) === true;
         $reason = !$packetFresh ? 'status_packet_stale_or_missing'
             : (!$observation ? 'observation_missing'
                 : (!$valid ? (string)($observation['reason'] ?? 'observation_stale_or_invalid')
@@ -2935,12 +2944,15 @@ function liveApplyWallboxObservationProjection(&$data, $native, $enabled, $confi
         $data[$prefix . '_status_source'] = (string)($observation['source'] ?? 'driver_readback');
         $data[$prefix . '_status_reason'] = $reason;
         $data[$prefix . '_observation'] = ['valid' => $valid, 'reason' => $reason,
-            'hint' => $valid && $data[$prefix] !== null ? '' : (string)($observation['hint'] ?? ($external ? 'Wallbox ohne Daten – Regelung wie ohne Wallbox. Verbindung bzw. Sicherung der Wallbox prüfen. Externe Last bei Bedarf im Config-Editor unter „Tarif & Strompreise“ → „Geplante Lastfenster“ absichern.' : 'Die Wallbox kann derzeit nicht gelesen werden. Deshalb wird keine Akkustützung für das Fahrzeug freigegeben.')),
+            'hint' => $valid && $data[$prefix] !== null ? '' : (string)($observation['hint'] ?? ($external ? 'Wallbox ohne Daten – Unterhalb der Hausakku-Untergrenze bleibt die Speicherentladung für die Wallbox begrenzt. Verbindung bzw. Sicherung der Wallbox prüfen. Externe Last bei Bedarf im Config-Editor unter „Tarif & Strompreise“ → „Geplante Lastfenster“ absichern.' : 'Die Wallbox kann derzeit nicht gelesen werden. Deshalb wird keine Akkustützung für das Fahrzeug freigegeben.')),
             'data_outage' => ['active' => $external && (!$valid || $data[$prefix] === null),
                 'since_ts' => $number($observation['data_outage']['since_ts'] ?? null)
-                    ?? ($sampleTs !== null ? min($now, $sampleTs + $externalSampleMaxAgeS) : $packetTs),
-                'reason' => $reason, 'regulation' => $external ? 'Regelung wie ohne Wallbox' : null],
+                    ?? ($sampleTs !== null
+                        ? min($now, $sampleTs + $externalSampleMaxAgeS, $deadline ?? ($sampleTs + $externalSampleMaxAgeS))
+                        : ($deadline !== null ? min($now, $deadline) : $packetTs)),
+                'reason' => $reason, 'regulation' => $external ? 'Unterhalb der Hausakku-Untergrenze bleibt die Speicherentladung für die Wallbox begrenzt' : null],
             'source' => $data[$prefix . '_status_source'], 'sample_ts' => $sampleTs,
+            'valid_until_ts' => $deadline,
             'age_s' => $age, 'missing_fields' => $missing,
             'phases_source' => $data[$prefix . '_phases_source']];
         if (!$valid) {
@@ -2973,8 +2985,13 @@ function liveApplyWallboxOutageProjection(&$data, $state, $now = null) {
     $ts = is_array($state) ? ($state['ts'] ?? null) : null;
     $valid = (is_int($ts) || is_float($ts)) && is_finite((float)$ts)
         && $now - $ts >= -5 && $now - $ts <= 15;
-    $data['storage_wallbox_data_outage'] = $valid && is_array($state['wallbox_data_outage'] ?? null)
+    $outage = $valid && is_array($state['wallbox_data_outage'] ?? null)
         ? $state['wallbox_data_outage'] : null;
+    // Eine leere Fahrzeugbelegung bleibt ein Objekt ({}), keine Liste ([]).
+    if (is_array($outage) && ($outage['vehicle_present'] ?? null) === []) {
+        $outage['vehicle_present'] = new stdClass();
+    }
+    $data['storage_wallbox_data_outage'] = $outage;
 }
 
 function liveBoolValue($value, $default = false) {
@@ -3568,6 +3585,10 @@ $paths = getInstallPaths();
 $confData = loadE3dcConfig();
 $wallboxConfig = $confData['config'] ?? [];
 $wbConfigured = hasWallbox1Config($wallboxConfig);
+// Nur external_wb.json ist eine Quelle für den reinen Messmodus.
+$measureOnlyExternal = @json_decode((string)@file_get_contents('/var/www/html/ramdisk/external_wb.json'), true);
+$wb1MeasureOnly = e3dcWallboxMqttMeasureOnly($wallboxConfig, $measureOnlyExternal, 1, time());
+$wb2MeasureOnly = e3dcWallboxMqttMeasureOnly($wallboxConfig, $measureOnlyExternal, 2, time());
 $wb2Configured = hasWallbox2Config($wallboxConfig);
 $wb2ExplicitlyDisabled = isWallbox2ExplicitlyDisabledConfig($wallboxConfig);
 $auxInverterCfg = $wallboxConfig;
@@ -7181,6 +7202,7 @@ $data['wp_type'] = (string)$wpTypeCfg;
 
 // --- NEU: Native Wallbox Daten einmischen ---
 $wbNativeEnable = isset($confData['config']['wb_native_enable']) && in_array(strtolower(trim($confData['config']['wb_native_enable'])), ['1', 'true']);
+$data['emergency_stop_active'] = e3dcWallboxEmergencyFlagActive();
 $wbNativeFile = '/var/www/html/ramdisk/wallbox_native.json';
 
 if ($wbNativeEnable && ($wbConfigured || $wb2Configured) && file_exists($wbNativeFile)) {
@@ -8475,6 +8497,14 @@ if ($validData && $historySampleValid && (time() - $lastWrite) >= 60 && !$isStan
             'rscp_glitch_reasons' => $data['rscp_glitch_reasons'] ?? [],
             'grid' => $data['grid'],
             'soc' => $data['soc'],
+            'wb_measure_only_configured' => e3dcWallboxMqttMeasureConfigured($wallboxConfig, 1),
+            'wb_measure_only_reason' => e3dcWallboxMqttMeasureConfigured($wallboxConfig, 1) && !$wb1MeasureOnly ? 'measurement_invalid' : null,
+            'wb_measure_only' => $wb1MeasureOnly,
+            'wb_measure_only_w' => $wb1MeasureOnly ? (float)($measureOnlyExternal['wb1']['power'] ?? $measureOnlyExternal['power']) : null,
+            'wb2_measure_only_configured' => e3dcWallboxMqttMeasureConfigured($wallboxConfig, 2),
+            'wb2_measure_only_reason' => e3dcWallboxMqttMeasureConfigured($wallboxConfig, 2) && !$wb2MeasureOnly ? 'measurement_invalid' : null,
+            'wb2_measure_only' => $wb2MeasureOnly,
+            'wb2_measure_only_w' => $wb2MeasureOnly ? (float)$measureOnlyExternal['wb2']['power'] : null,
             'wb' => $data['wb'],   // Wallbox 1
             'wb2' => $data['wb2'], // Wallbox 2
             'is_external_wb' => !empty($data['is_external_wb']),
@@ -8669,6 +8699,7 @@ $statsFile = '/var/www/html/ramdisk/daily_stats.json';
 if (file_exists($statsFile)) {
     $statsData = json_decode(file_get_contents($statsFile), true);
     if ($statsData) {
+        $statsData = e3dcWallboxMeasureStatsDisplay($statsData);
         e3dcApplyEegRevenueToDailyStats($statsData, $confData['config'] ?? []);
         if ($wpTypeCfg === 4 && isset($statsData['stats']) && is_array($statsData['stats'])) {
             $historyForDisplay = file_exists($liveHistoryFile)
@@ -9356,6 +9387,14 @@ foreach ($sessions as $sIndex => $sConf) {
 if (isset($data['vehicles']) && is_array($data['vehicles'])) {
     $vehicleSocDisplayCacheFile = '/var/www/html/ramdisk/vehicle_soc_display_cache.json';
     $vehicleSocDisplayCache = loadVehicleSocDisplayCache($vehicleSocDisplayCacheFile);
+    $legacyConfigPath = !empty($paths['valid']) && !empty($paths['install_path'])
+        ? rtrim((string)$paths['install_path'], '/') . '/e3dc.config.txt'
+        : null;
+    $vehicleSocCloudFreshnessS = vehicleSocResolvedCloudFreshnessSeconds(
+        $wallboxConfig ?? [],
+        '/var/www/html/data/e3dc_v4.json',
+        $legacyConfigPath
+    );
     foreach ($data['vehicles'] as &$veh) {
         $displayProfile = (string)($veh['profile_id'] ?? ($veh['id'] ?? ''));
         $connectedDisplayTs = $connectedSessionSocByProfile[$displayProfile]['soc_source_ts'] ?? null;
@@ -9385,7 +9424,7 @@ if (isset($data['vehicles']) && is_array($data['vehicles'])) {
                 $displayCacheSourceTs = $cacheSourceTs;
             }
         }
-        applyVehicleSocDisplayCache($veh, $displayCacheCandidate);
+        applyVehicleSocDisplayCache($veh, $displayCacheCandidate, 604800, $vehicleSocCloudFreshnessS);
     }
     unset($veh);
 
@@ -9435,14 +9474,6 @@ if (isset($data['vehicles']) && is_array($data['vehicles'])) {
         // Live-Datensatz. So kann dessen Reihenfolge kein Profil erraten.
         $vehicleIndexByName[$ambiguousNameKey] = null;
     }
-    $legacyConfigPath = !empty($paths['valid']) && !empty($paths['install_path'])
-        ? rtrim((string)$paths['install_path'], '/') . '/e3dc.config.txt'
-        : null;
-    $vehicleSocCloudFreshnessS = vehicleSocResolvedCloudFreshnessSeconds(
-        $wallboxConfig ?? [],
-        '/var/www/html/data/e3dc_v4.json',
-        $legacyConfigPath
-    );
     foreach ($data['vehicles'] as $veh) {
         if (!is_array($veh)) continue;
         $vehicleWbSlot = (int)($veh['wb_slot'] ?? 0);
@@ -9582,7 +9613,7 @@ if (isset($data['vehicles']) && is_array($data['vehicles'])) {
             'rule_usable' => $vehicle['soc_meta']['rule_usable'],
         ];
     }
-    saveVehicleSocDisplayCache($vehicleSocDisplayCacheFile, $data['vehicles'], $vehicleSocDisplayCache);
+    saveVehicleSocDisplayCache($vehicleSocDisplayCacheFile, $data['vehicles'], $vehicleSocDisplayCache, 604800, $vehicleSocCloudFreshnessS);
 }
 
 
@@ -9723,6 +9754,12 @@ if (
     $storState = @json_decode(file_get_contents($storStateFile), true);
     if ($storState) {
         $storageAuthoritativeSnapshotLoaded = !empty($storState['state']);
+        $chargeForecastText = $storState['market_grid_charge_forecast_text'] ?? null;
+        if (is_string($chargeForecastText) && strlen($chargeForecastText) <= 600
+            && !preg_match('/[<>\x00-\x1f\x7f]/', $chargeForecastText)) {
+            $data['storage_grid_charge_forecast_text'] = $chargeForecastText;
+        }
+
         if (!$isShadowMode && is_array($storState['backup_hold_observation'] ?? null)) {
             $backupObservation = $storState['backup_hold_observation'];
             $backupUntil = liveStorageFiniteNumber($backupObservation['valid_until_ts_ms'] ?? null);
@@ -9750,7 +9787,11 @@ if (
         $data['storage_market_plan_quality'] = $storState['market_plan_quality'] ?? null;
         $data['storage_market_control_active'] = $storState['market_control_active'] ?? null;
         $data['storage_market_control_end'] = $storState['market_control_end'] ?? null;
-        $data['storage_market_hold_bridge'] = $storState['market_hold_bridge'] ?? null;
+        $grace = $storState['market_plan_grace'] ?? null;
+        $data['storage_market_plan_grace'] = is_array($grace) ? array_intersect_key($grace, array_flip([
+            'active', 'tariff', 'plan_id', 'last_monotonic_s', 'first_monotonic_s',
+            'first_transition_ts_ms', 'reason'
+        ])) : null;
         $data['storage_market_control_text'] = $storState['market_control_text'] ?? null;
 
         // Korridorlage ausschließlich aus dem Entscheider, ohne Plan-Rückfall.
@@ -11120,6 +11161,23 @@ e3dcApplyWallboxPresenceProjection($data, $wbConfigured, $wb2Configured, $wb2Exp
 
 if ($wpTypeCfg === 4) {
     liveApplyStiebelMeasurementProjection($data, ($wpSourceIsFresh && is_array($wpSourceJson)) ? $wpSourceJson : []);
+}
+
+// Messung erst nach allen Bestands-, Verlaufs- und Lernpfaden für die Anzeige auflegen.
+$data['home_without_measure_only'] = $data['home'];
+$data['wb_measure_only'] = false;
+$data['wb2_measure_only'] = false;
+foreach ([1 => $wb1MeasureOnly, 2 => $wb2MeasureOnly] as $slot => $measureOnly) {
+    if (!$measureOnly) continue;
+    $prefix = $slot === 1 ? 'wb' : 'wb2';
+    $sample = $measureOnlyExternal[$slot === 1 ? 'wb1' : 'wb2'] ?? $measureOnlyExternal;
+    $data[$prefix] = (float)$sample['power'];
+    $data[$prefix . '_configured'] = true;
+    $data[$prefix . '_measure_only'] = true;
+    $data[$prefix . '_measure_only_w'] = (float)$sample['power'];
+    $data[$prefix . '_source'] = 'external_mqtt_measure_only';
+    $data[$prefix === 'wb' ? 'is_external_wb' : 'is_external_wb2'] = true;
+    $data['home'] = max(0, (float)$data['home'] - (float)$sample['power']);
 }
 
 echo json_encode($data);

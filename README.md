@@ -1,12 +1,14 @@
 # E3DC-Control Web-Portal & Installer
 
-Ein hochperformantes, modulares Dashboard und Installations-System für die **native Python-Architektur** [A9xxx/Install-E3DC-Control](https://github.com/A9xxx/Install-E3DC-Control) <kbd>Version 5.5.5c</kbd>. Es verwandelt das System in ein intelligentes Smart-Home-Zentrum mit moderner Web-Oberfläche, eigenem Energy Manager und proaktivem Systemschutz.
+Ein hochperformantes, modulares Dashboard und Installations-System für die **native Python-Architektur** [A9xxx/Install-E3DC-Control](https://github.com/A9xxx/Install-E3DC-Control) <kbd>Version 5.5.6</kbd>. Es verwandelt das System in ein intelligentes Smart-Home-Zentrum mit moderner Web-Oberfläche, eigenem Energy Manager und proaktivem Systemschutz.
 
 ![E3DC-Control Dashboard](html/app-icon-512.png)
 
 ## Aktuelle Version und Update
 
-Die aktuelle stabile Version ist **5.5.5c**. Hinweise zum Web-, Konsolen- und Docker-Update sowie zur Wiederherstellung stehen in [doc/Update.md](doc/Update.md). Die vollständigen Änderungen dokumentieren [RELEASE_NOTES.md](RELEASE_NOTES.md) und [CHANGELOG.md](CHANGELOG.md). Der sanitierte Root **v5.3.2b** bleibt ausschließlich als Docker-Rückfall-Image verfügbar. Ein Bare-Metal-Programm-Rückfall auf diesen Stand wird nicht angeboten; dort bleibt die Wiederherstellung aus einem verifizierten Datei-Backup der sichere Rückweg.
+Die aktuelle stabile Version ist **5.5.6**. Hinweise zum Web-, Konsolen- und Docker-Update sowie zur Wiederherstellung stehen in [doc/Update.md](doc/Update.md). Die vollständigen Änderungen dokumentieren [RELEASE_NOTES.md](RELEASE_NOTES.md) und [CHANGELOG.md](CHANGELOG.md). Der sanitierte Root **v5.3.2b** bleibt ausschließlich als Docker-Rückfall-Image verfügbar. Ein Bare-Metal-Programm-Rückfall auf diesen Stand wird nicht angeboten; dort bleibt die Wiederherstellung aus einem verifizierten Datei-Backup der sichere Rückweg.
+
+5.5.6 ist ein Funktions- und Korrekturupdate: Alle geregelten Wallboxen nutzen einen gemeinsamen, einfacheren Regelkern mit Start nach 60 Sekunden ausreichendem Anteil, Stopp nach drei Minuten Unterdeckung und Abstieg auf eine Phase schon nach 60 Sekunden; der Hausanschluss je Phase folgt den Phasenwerten des E3DC-Leistungsmessers. Pause, Not-Aus und Ladepunktsperre stoppen sofort und bleiben über Neustarts erhalten. Netzladen im Marktfenster behält Vorrang, die Preisplanung bewertet die Frische der Livewerte zum Lesezeitpunkt, und die Wärmepumpe wartet nach einem Neustart nicht mehr pauschal 24 Stunden auf den PV-Boost. Bestehende Installationen aktualisieren wie gewohnt über **System Update** bzw. das Docker-Update; eine Konfigurationsänderung ist nicht nötig. Der E3DC-WebSocket-Dienst ist entfernt; für Smart-Home-Anbindungen steht der MQTT-Hub zur Verfügung.
 
 5.5.5c ist ein Sicherheitsupdate zu 5.5.5b: Das Docker-Image enthält PHP 8.2.35 mit den Korrekturen für die kritischen Lücken CVE-2026-109618 und CVE-2026-109619 („PHP2Shell“); die Python-Bibliotheken im Image sind auf die Versionen von 5.5.5b festgelegt. Die Funktionen sind unverändert. Bei Installationen direkt auf dem Raspberry Pi stammt PHP aus dem Betriebssystem und wird mit `sudo apt update`, `sudo apt upgrade` und `sudo systemctl restart apache2` aktualisiert (behoben ab PHP 8.4.27 unter Debian 13 bzw. 8.2.35 unter Debian 12).
 
@@ -57,6 +59,8 @@ sondern eine eindeutige Auswahl verlangt.
 > **Config-Schutz:** Standardinstallationen speichern `data/e3dc_v4.json` und lokale Config-Backups mit `660` für Install-User und `www-data`, damit WebUI und Dienste weiter automatisch starten, die Datei aber nicht mehr weltlesbar ist. Der normale Config-Download „Einstellungen ohne Zugangsdaten“ enthält keine Zugangsdaten, aber weiterhin IP-Adressen und Gerätekennungen und ist nicht zum Teilen gedacht; der Raw-Download enthält Zugangsdaten und wird nur angeboten, wenn eine Web-PIN gesetzt ist. Der Kompatibilitätsmodus (`664`) ist nur für eigene externe Leser gedacht. Import, Rollback und normales Speichern im Config-Editor prüfen die fertig zusammengeführte JSON-Datei auf höchstens 64 KiB; eine bestandene Rollenprüfung beweist keinen laufenden Regelbetrieb. Für HA-Sicherungen und Ersatzhardware gilt [Rolle und Rollenanker](doc/High_Availability_Dokumentation.md#rolle-und-rollenanker).
 
 > **Bedienansichten:** Config-Editor und Wallbox-Seite unterscheiden zwischen einfacher Ansicht für Einrichtung und täglichen Betrieb sowie erweiterter Ansicht für alle Detailparameter. Die Logik und Abgrenzung sind in [doc/Frontend_Ansichten.md](doc/Frontend_Ansichten.md) dokumentiert.
+
+> **Neu in 5.5.6:** Gemeinsamer Wallbox-Regelkern (Start nach 60 s, Stopp nach drei Minuten Unterdeckung, Abstieg auf eine Phase nach 60 s, Wolken-Kontingent über die ganze Ladeepisode), Hausanschluss je Phase aus den Phasenwerten des E3DC-Leistungsmessers, sofortiger und neustartfester Stopp bei Pause, Not-Aus und Ladepunktsperre, Vorrang für Netzladen im Marktfenster, Tarifvorschau mit Kostenvergleich, Wärmepumpen-PV-Boost ohne pauschale 24-Stunden-Sperre, Messwallbox per MQTT, WebSocket-Dienst entfernt. Einzelheiten stehen in den [Release Notes](RELEASE_NOTES.md).
 
 > **Neu in 5.5.5c:** Sicherheitsupdate: Docker-Image mit PHP 8.2.35 (CVE-2026-109618 und CVE-2026-109619 geschlossen) und auf den Stand von 5.5.5b festgelegten Python-Bibliotheken; bei Installationen ohne Docker schließt ein Systemupdate die Lücken.
 
@@ -115,7 +119,7 @@ sondern eine eindeutige Auswahl verlangt.
 ### 🚀 Maximale Performance & SD-Karten-Schutz
 * **RAM-Disk für hochfrequente Laufzeitdaten:** Live-Werte und häufig wechselnde Energie-, Fahrzeug- und Wallboxzustände werden im Arbeitsspeicher gehalten. Dauerhafte Wiederanlaufstände entstehen nur bei fachlichen Änderungen, sicherheitsrelevanten Übergängen und zusätzlich höchstens alle zwei Minuten; das senkt die Schreibzugriffe auf SD-Karten deutlich. Bare-Metal-Dienste und Docker starten nur mit einem exakt gemounteten `tmpfs`; Diagnose und Reparatur beschreibt der [RAM-Disk-Betriebsvertrag](doc/RAM-Disk_Betrieb.md).
 * **Native Python Live-API:** Der RSCP-Live-Dienst schreibt atomare JSON-Werte direkt in die RAM-Disk. Ungültige Werte wie `NaN` werden abgefangen, damit Dashboard, Historie und MQTT-Hub stabil weiterlaufen.
-* **Ein Live-Snapshot für interne Verbraucher:** WebSocket, MQTT, Matter und Watchdog lesen den validierten RAM-Zustand direkt, statt fortlaufend Apache und PHP mit vollständigen Liveabfragen zu beschäftigen.
+* **Ein Live-Snapshot für interne Verbraucher:** MQTT, Matter und Watchdog lesen den validierten RAM-Zustand direkt, statt fortlaufend Apache und PHP mit vollständigen Liveabfragen zu beschäftigen.
 * **Begrenzte Persistenz:** Maschinenlesbare Formate ersetzen keine Aufbewahrungsgrenze. Produktlogs, Historien und Docker-Engine-Logs werden deshalb getrennt rotiert beziehungsweise begrenzt. Der automatisch verwaltete Zielbestand beträgt maximal drei Update-Backup-Familien und separat maximal drei Web-Installer-Sicherungen. Schutzbindungen dürfen diese Zielgrenzen vorübergehend überschreiten; fremde oder nicht verifizierbare Bestände werden niemals erzwungen gelöscht.
 * **Klassisches und modernes Frontend:** Beide Dashboard-Layouts bleiben produktiv auswählbar und unterstützen die Detailstufen kompakt, normal und detailreich.
 * **Frontend-Optimierung:** Statische Assets (JavaScript) werden automatisch komprimiert (minifiziert) und mit Cache-Busting-Mechanismen ausgeliefert, um die Ladezeiten des Dashboards zu minimieren.
@@ -562,7 +566,7 @@ sudo docker compose logs --tail=80 e3dc-control
 > `ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}`. Ohne Eintrag
 > folgt sie dem geprüften Stable-Tag `latest`. Ein fester Versions-Tag wechselt
 > bei `pull` absichtlich nicht; für einen bewussten Pin oder Rückfall wird
-> `E3DC_IMAGE_TAG=v5.5.5c` in `.env` gesetzt und `sudo docker compose up -d`
+> `E3DC_IMAGE_TAG=v5.5.6` in `.env` gesetzt und `sudo docker compose up -d`
 > ausgeführt. `config --images` zeigt vor dem Pull das tatsächlich gewählte
 > Image.
 

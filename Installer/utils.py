@@ -318,7 +318,6 @@ def apt_install(pkg):
 
 
 APACHE_DEFAULT_SITE_CONF = "/etc/apache2/sites-available/000-default.conf"
-WEBSOCKET_PROXY_LINE = 'ProxyPass "/ws" "ws://127.0.0.1:8765/"'
 
 
 def ensure_apache_php_module():
@@ -358,130 +357,6 @@ def ensure_apache_php_module():
         return False
 
     print("✓ Apache PHP-Modul aktiv und Konfiguration gültig.")
-    return True
-
-
-def _websocket_proxy_config_is_exact(content):
-    proxy_lines = [
-        line.strip()
-        for line in str(content or "").splitlines()
-        if line.strip().startswith('ProxyPass "/ws"')
-    ]
-    return proxy_lines == [WEBSOCKET_PROXY_LINE]
-
-
-def _render_websocket_proxy_config(content):
-    """Erzeugt genau eine kanonische /ws-ProxyPass-Zeile."""
-    lines = str(content or "").splitlines(keepends=True)
-    proxy_indexes = [
-        index
-        for index, line in enumerate(lines)
-        if line.strip().startswith('ProxyPass "/ws"')
-    ]
-    if len(proxy_indexes) > 1:
-        return None
-
-    if proxy_indexes:
-        index = proxy_indexes[0]
-        original = lines[index]
-        indent = original[: len(original) - len(original.lstrip())]
-        ending = "\r\n" if original.endswith("\r\n") else "\n"
-        lines[index] = indent + WEBSOCKET_PROXY_LINE + ending
-    else:
-        closing_index = next(
-            (
-                index
-                for index, line in enumerate(lines)
-                if line.strip() == "</VirtualHost>"
-            ),
-            None,
-        )
-        if closing_index is None:
-            return None
-        closing_line = lines[closing_index]
-        indent = closing_line[: len(closing_line) - len(closing_line.lstrip())]
-        ending = "\r\n" if closing_line.endswith("\r\n") else "\n"
-        lines.insert(closing_index, indent + "    " + WEBSOCKET_PROXY_LINE + ending)
-
-    rendered = "".join(lines)
-    return rendered if _websocket_proxy_config_is_exact(rendered) else None
-
-
-def ensure_websocket_proxy_configuration(conf_path=APACHE_DEFAULT_SITE_CONF):
-    """Schreibt die WebSocket-Proxyregel atomar und prüft den Endzustand."""
-    try:
-        with open(conf_path, "r", encoding="utf-8") as handle:
-            original = handle.read()
-    except OSError as exc:
-        print(f"✗ Apache-Site-Konfiguration ist nicht lesbar: {conf_path}: {exc}")
-        return False
-
-    rendered = _render_websocket_proxy_config(original)
-    if rendered is None:
-        print(
-            "✗ Apache-WebSocket-Proxyvertrag ist mehrdeutig oder besitzt "
-            "keinen VirtualHost-Abschluss."
-        )
-        return False
-
-    if rendered != original:
-        local_tmp = None
-        staged_path = f"{conf_path}.e3dc-control-{os.getpid()}.tmp"
-        staged_created = False
-        try:
-            with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as tmp:
-                tmp.write(rendered)
-                local_tmp = tmp.name
-
-            install_result = run_command(
-                "sudo install -o root -g root -m 0644 -- "
-                + shlex.quote(local_tmp)
-                + " "
-                + shlex.quote(staged_path),
-                timeout=30,
-            )
-            if not install_result.get("success"):
-                print(
-                    "✗ Apache-WebSocket-Konfiguration konnte nicht vorbereitet werden: "
-                    + format_command_failure(install_result)
-                )
-                return False
-            staged_created = True
-
-            move_result = run_command(
-                "sudo mv -f -- "
-                + shlex.quote(staged_path)
-                + " "
-                + shlex.quote(conf_path),
-                timeout=30,
-            )
-            if not move_result.get("success"):
-                print(
-                    "✗ Apache-WebSocket-Konfiguration konnte nicht atomar aktiviert werden: "
-                    + format_command_failure(move_result)
-                )
-                return False
-            staged_created = False
-        finally:
-            if local_tmp and os.path.exists(local_tmp):
-                os.remove(local_tmp)
-            if staged_created:
-                run_command(
-                    "sudo rm -f -- " + shlex.quote(staged_path),
-                    timeout=30,
-                )
-
-    try:
-        with open(conf_path, "r", encoding="utf-8") as handle:
-            installed = handle.read()
-    except OSError as exc:
-        print(f"✗ Apache-WebSocket-Endzustand ist nicht lesbar: {conf_path}: {exc}")
-        return False
-    if not _websocket_proxy_config_is_exact(installed):
-        print("✗ Apache-WebSocket-Endzustand enthält nicht exakt die erwartete ProxyPass-Regel.")
-        return False
-
-    print("  ✓ WebSocket-Proxyregel ist atomar und exakt auf Port 8765 gebunden.")
     return True
 
 
@@ -663,7 +538,6 @@ PYTHON_PACKAGES = [
     "paho-mqtt",            # MQTT (wallbox_manager, mqtt_hub)
     "requests",             # HTTP (bluelink, APIs)
     "websocket-client",     # Luxtronik WebSocket (lux_live.py)
-    "websockets",           # e3dc_websocket.py server
     "pymodbus",             # Modbus-TCP (energy_manager, idm_live)
     "pyserial",             # pymodbus ab 3.16 braucht es schon beim Import
     "hyundai_kia_connect_api", # Bluelink / Fahrzeug SoC
@@ -1098,7 +972,6 @@ V4_SYSTEM_PACKAGES = [
     "apache2", "php", "php-cli", "libapache2-mod-php", "php-curl", "php-sqlite3", "php-mbstring",
     # Python Grundausstattung
     "python3", "python3-pip", "python3-venv",
-    "python3-websockets",
     # Python Bibliotheken (via apt, fuer ML / Datenverarbeitung)
     "python3-sklearn", "python3-numpy", "python3-cryptography",
     "python3-bs4",          # Luxtronik WebSocket-Scraping (lux_live.py)
@@ -1455,31 +1328,9 @@ def install_system_packages(use_venv=True, first_install=False):
 
     cleanup_legacy_python_packages(use_venv)
 
-    # --- Apache PHP + WebSocket Reverse Proxy automatisch einrichten ---
+    # --- Apache PHP und Laufzeitpfadschutz einrichten ---
     if ensure_apache_php_module() is not True:
         return False
-
-    print("\n→ Konfiguriere Apache Reverse Proxy für WebSockets...")
-    for module_name in ("proxy", "proxy_wstunnel"):
-        module_result = run_command(f"sudo a2enmod {module_name}", timeout=30)
-        if not module_result.get("success"):
-            print(
-                f"✗ Apache-Modul {module_name} konnte nicht aktiviert werden: "
-                + format_command_failure(module_result)
-            )
-            return False
-
-    if ensure_websocket_proxy_configuration() is not True:
-        return False
-
-    proxy_configtest = run_command("sudo apache2ctl configtest", timeout=30)
-    if not proxy_configtest.get("success"):
-        print(
-            "✗ Apache-Konfiguration ist nach der WebSocket-Proxybindung ungültig: "
-            + format_command_failure(proxy_configtest)
-        )
-        return False
-    system_logger.info("Apache Proxy-Regel für WebSockets auf Port 8765 geprüft.")
 
     from .apache_security import ensure_apache_runtime_path_protection
     if not ensure_apache_runtime_path_protection(run_command, reload_apache=False):
@@ -1540,30 +1391,6 @@ def setup_service_wrapper(first_install=False):
     print(f"  ✓ Wrapperintegrität und sudoers atomar geprüft{suffix}.")
     return True
 
-
-
-def setup_websocket_service(
-    start_service=True,
-    defer_activation=False,
-    bundle_snapshot=None,
-):
-    """Richtet den E3DC WebSocket Server als Systemd-Dienst ein."""
-    print("→ Richte e3dc-websocket Service ein...")
-    return _create_service_file(
-        "e3dc-websocket",
-        "E3DC WebSocket Server für flüssige Dashboard-Animationen",
-        "e3dc_websocket.py",
-        "python3",
-        restart_sec=5,
-        start_service=start_service,
-        enable_service=True,
-        restart_policy="always",
-        after_services=("apache2.service",),
-        require_venv=True,
-        defer_activation=defer_activation,
-        syslog_identifier="e3dc-websocket",
-        bundle_snapshot=bundle_snapshot,
-    )
 
 
 def _manager_lock_namespace_errors():
@@ -3892,7 +3719,7 @@ def install_e3dc_live_service(
 
     Dieser Dienst ist der native Python-Ersatz fuer den C++ Daten-Export.
     Er liest Echtzeit-Daten direkt per RSCP aus dem E3DC und schreibt sie
-    alle 3 Sekunden in /var/www/html/ramdisk/live_data_py.json.
+    alle 2 Sekunden in /var/www/html/ramdisk/live_data_py.json.
     """
     print("\n=== E3DC Live Data Service (Python RSCP) einrichten ===\n")
     service_logger.info("Richte e3dc-live Service ein.")
@@ -3910,7 +3737,7 @@ def install_e3dc_live_service(
         start_limit_interval_sec=300,
         start_limit_burst=3,
         require_venv=True,
-        script_args=("--write", "--loops", "0", "--interval", "3"),
+        script_args=("--write", "--loops", "0", "--interval", "2"),
         defer_activation=defer_activation,
         wants_services=("network-online.target",),
         documentation="https://github.com/A9xxx/Install-E3DC-Control",

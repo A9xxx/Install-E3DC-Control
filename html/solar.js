@@ -2354,7 +2354,7 @@ function marketSocDisplay(data = {}, nowMs = Date.now()) {
     }
     const windows = (Array.isArray(t.selected_actions) ? t.selected_actions : []).filter(action =>
         action && ['hold_economic', 'grid_charge'].includes(action.action)
-        && ['hold_discharge', 'selected_grid_wait', 'grid_charge'].includes(action.origin)
+        && ['hold_discharge', 'hold_horizon', 'selected_grid_wait', 'grid_charge'].includes(action.origin)
         && finite(action.start_ts_ms) && finite(action.end_ts_ms) && action.end_ts_ms > action.start_ts_ms);
     return {complete: true, reasonCode: null, planId: t.plan_id, points, windows,
         expiresAt: Math.min(t.valid_until_ts_ms, sample + 300001)};
@@ -2402,7 +2402,7 @@ function marketSocTooltip(ctx) {
     const action = marketSocActionText(point.action, point.origin);
     if (ctx.dataset.marketWindow) return action;
     // Zwei kurze Zeilen bleiben auch in schmalen Diagrammen lesbar.
-    return [`SoC-Prognose mit Marktplan: ${Number(point.y).toFixed(1)} %`, ...(action ? [action] : [])];
+    return [`SoC-Prognose mit Marktplan: ${Number(point.y).toFixed(1)} %`, 'Geplant, wird jede Viertelstunde neu bestätigt', ...(action ? [action] : [])];
 }
 
 function marketSocTooltipTitle(items, fallback) {
@@ -2443,7 +2443,7 @@ function appendMarketSocDatasets(datasets, data, timestamps, yAxisID = 'y1', his
         // Messhistorie bleibt in der bisherigen Reihe; der Vergleich beginnt am Plan.
         if (historyLength) datasets.push({...baseline, label: 'SoC-Historie (Messwerte) (%)',
             data: baseline.data.map((value, index) => index < historyLength ? value : null)});
-        baseline.label = 'SoC ohne Marktaktionen (%)';
+        baseline.label = 'Standard-SoC-Prognose ohne Halten und Nachladen, bis zur Reserve (%)';
         baseline.data = baseline.data.map((value, index) => index < historyLength ? null : value);
         baseline.borderDash = [4, 4]; baseline.borderWidth = 1; baseline.segment = undefined;
     }
@@ -2478,7 +2478,7 @@ function appendMarketSocDatasets(datasets, data, timestamps, yAxisID = 'y1', his
 function marketSocXScale(view, timestamps, fallback) {
     if (!view.complete) return fallback;
     const points = view.points.filter(point => point.y !== null);
-    return {type: 'linear', min: timestamps[0],
+    return {type: 'linear', offset: false, min: timestamps[0],
         max: view.chartEnd ?? Math.max(timestamps[timestamps.length - 1], points[points.length - 1].x),
         grid: {color: fallback.grid?.color}, ticks: {color: fallback.ticks?.color,
             maxTicksLimit: 8, callback: value => new Date(value).toLocaleString('de-DE',
@@ -3101,7 +3101,7 @@ function renderStorageCurveSparkline(data = {}) {
         wrap.dataset.runtimeState = 'projection-unavailable';
         wrap.dataset.curveSource = 'target_curve';
         state.textContent = 'Sollkurve · SoC-Prognose fehlt' + (marketHint ? '. ' + marketHint : '');
-        wrap.title = `Geplanter Soll-SoC, gestrichelt. ${unavailable.text}. Die Sollkurve ist keine SoC-Prognose.`
+        wrap.title = `Geplanter Soll-SoC (blau). ${unavailable.text}. Die Sollkurve ist keine SoC-Prognose.`
             + (marketHint ? ' ' + marketHint : '');
         wrap.setAttribute('aria-label', wrap.title);
         return;
@@ -6387,6 +6387,7 @@ function storageStateDisplayLabel(state, providedLabel = '') {
 function storageMarketPlanQualityText(data) {
     const quality = data.storage_market_plan_quality;
     if (!quality || typeof quality !== 'object') return '';
+    if (quality.status === 'awaiting_next_plan') return 'Preisplanung: Folgeplan wird gelesen.';
     if (quality.status === 'unreadable_plan') return 'Preisplanung: Plan nicht lesbar.';
     if (quality.status === 'invalid_contract') return 'Preisplanung: Plan ungültig.';
     if (quality.status === 'other_owner') return 'Preisplanung: Keine Steuerungsfreigabe.';
@@ -6396,7 +6397,7 @@ function storageMarketPlanQualityText(data) {
 }
 
 function storageBackupReasonText(code) {
-    const reasons = {"backup_live_unknown_or_stale":"Speichermessung unbekannt oder zu alt","backup_disabled": "Beobachtung ausgeschaltet", "backup_plan_missing": "Speicherplan fehlt", "backup_binding_config_or_age_invalid": "Planbindung, Konfiguration oder Planalter ungültig", "backup_switch_invalid": "Schalterwert ungültig", "backup_energy_missing_or_invalid": "Speicherinhalt fehlt oder ist ungültig", "backup_reference_times_missing_or_invalid": "Bestätigte Bezugszeiten fehlen oder sind ungültig", "backup_grid_price_missing_or_invalid": "Explizite Reservepreisgrenze fehlt oder ist ungültig", "backup_timezone_invalid": "Ortszeit ungültig", "backup_reference_duration_invalid": "Bezugsdauer nach Sommerzeitauflösung ungültig", "backup_capacity_energy_or_limits_unknown": "Kapazität, Speicherinhalt, Reserve oder Ladegrenze unbekannt", "backup_calculation_invalid": "Zusatzrechnung mit diesen Daten nicht möglich", "pv_forecast_age_unknown_or_stale": "PV-Prognosealter unbekannt oder zu alt", "load_forecast_age_unknown_or_stale": "Lastprognosealter unbekannt oder zu alt", "forecast_missing_or_invalid": "Prognose fehlt oder ist ungültig", "forecast_horizon_gap": "Prognosehorizont lückenhaft", "pv_forecast_value_or_provenance_invalid": "PV-Wert oder Quellenfrische ungültig", "load_forecast_value_invalid": "Lastprognosewert ungültig", "forecast_source_revision_invalid": "Quellenrevision ungültig", "pv_forecast_issue_mismatch": "PV-Prognose und Metadaten passen nicht zusammen", "chargeable_forecast_unbound": "Ladbarer PV-Anteil nicht gebunden", "chargeable_forecast_unknown": "Ladbarer PV-Anteil unbekannt", "chargeable_dc_forecast_unknown": "Ladbarer DC-Anteil unbekannt", "pv_takeover_unknown": "PV-Übernahme unbekannt", "recommendation_only": "Berechnete Empfehlung ohne Gerätewirkung", "target_exceeds_capacity": "Bedarf übersteigt Kapazität", "backup_observation_stale_or_unknown": "Beobachtung fehlt oder ist zu alt"};
+    const reasons = {"backup_live_unknown_or_stale":"Speichermessung unbekannt oder zu alt","backup_disabled": "Beobachtung ausgeschaltet", "backup_plan_missing": "Speicherplan fehlt", "backup_binding_config_or_age_invalid": "Planbindung, Konfiguration oder Planalter ungültig", "backup_switch_invalid": "Schalterwert ungültig", "backup_energy_missing_or_invalid": "Speicherinhalt fehlt oder ist ungültig", "backup_reference_times_missing_or_invalid": "Bestätigte Bezugszeiten fehlen oder sind ungültig", "backup_grid_price_missing_or_invalid": "Explizite Reservepreisgrenze fehlt oder ist ungültig", "backup_timezone_invalid": "Ortszeit ungültig", "backup_reference_duration_invalid": "Bezugsdauer nach Sommerzeitauflösung ungültig", "backup_capacity_energy_or_limits_unknown": "Kapazität, Speicherinhalt, Reserve oder Ladegrenze unbekannt", "backup_calculation_invalid": "Zusatzrechnung mit diesen Daten nicht möglich", "pv_forecast_age_unknown_or_stale": "PV-Prognosealter unbekannt oder zu alt", "load_forecast_age_unknown_or_stale": "Lastprognosealter unbekannt oder zu alt", "forecast_missing_or_invalid": "Prognose fehlt oder ist ungültig", "forecast_horizon_gap": "Prognosehorizont lückenhaft", "pv_forecast_value_or_provenance_invalid": "PV-Wert oder Quellenfrische ungültig", "load_forecast_value_invalid": "Lastprognosewert ungültig", "forecast_source_revision_invalid": "Quellenrevision ungültig", "pv_forecast_issue_mismatch": "PV-Prognose und Metadaten passen nicht zusammen", "pv_topology_coupling_missing": "Kopplung oder Angaben der PV-Flächen unvollständig oder ungültig; Vorhaltung rechnet ohne Prognose", "chargeable_forecast_unbound": "Ladbarer PV-Anteil nicht gebunden", "chargeable_forecast_unknown": "Ladbarer PV-Anteil unbekannt", "chargeable_dc_forecast_unknown": "Ladbarer DC-Anteil unbekannt", "pv_takeover_unknown": "PV-Übernahme unbekannt", "recommendation_only": "Berechnete Empfehlung ohne Gerätewirkung", "target_exceeds_capacity": "Bedarf übersteigt Kapazität", "backup_observation_stale_or_unknown": "Beobachtung fehlt oder ist zu alt"};
     return String(code || '').split(';').map(value => reasons[value] || 'Beobachtungsdaten unbekannt').join('; ');
 }
 
@@ -6557,6 +6558,10 @@ function updateMobileStorageStrip(data) {
         && chargeAcceptanceDiagnostic.display_text === 'Ladeannahme begrenzt – Ursache unklar';
 
     const requestParts = [];
+    const gridChargeForecastText = data.storage_grid_charge_forecast_text;
+    if (typeof gridChargeForecastText === 'string' && gridChargeForecastText.length <= 600
+        && !/[<>\x00-\x1f\x7f]/.test(gridChargeForecastText)) requestParts.push(gridChargeForecastText);
+
     if (chargeAcceptanceActive) requestParts.push(chargeAcceptanceDiagnostic.display_text);
     if (abregelActive && abregelW !== null && Math.abs(abregelW) > 0) requestParts.push('Abregel ' + mobileStoragePower(abregelW));
     if (!(abregelActive && abregelW !== null && Math.abs(abregelW) > 0) && curtailmentPressureWh !== null && curtailmentPressureWh > 0) {
@@ -11183,7 +11188,7 @@ function renderForecastKwhSummary(data = {}) {
     const hasClimateData = (summary.tomorrow && summary.tomorrow.climate_kwh > 0)
         || (summary.day_after && summary.day_after.climate_kwh > 0);
     const summaryValue = (icon, title, value) =>
-        `<span class="forecast-summary-value" title="${title}">${icon} <b>${fmt(value)}</b> kWh</span>`;
+        `<span class="forecast-summary-value" title="${title}">${icon} <b>${fmt(value)}</b> kWh${title.includes('Tagesprognose') ? ' <small>Tagesprognose</small>' : ''}</span>`;
     const dayBlock = (key, label, day, consumptionLabel) => {
         if (!day || typeof day !== 'object') return '';
         const consumption = [summaryValue('🏠', consumptionLabel, day.home_kwh)];
@@ -11197,11 +11202,11 @@ function renderForecastKwhSummary(data = {}) {
             && typeof day.pv_operating_available_kwh === 'number' && Number.isFinite(day.pv_operating_available_kwh)
             && typeof day.pv_weather_potential_kwh === 'number' && Number.isFinite(day.pv_weather_potential_kwh);
         const pvSummary = completeOperatingDay
-            ? summaryValue('☀', `${label}: geplanter nutzbarer PV-Ertrag nach bekannten Abschaltungen`, day.pv_operating_available_kwh)
-                + summaryValue('⛅', `${label}: PV-Wetterpotential ohne geplante Abschaltungen`, day.pv_weather_potential_kwh)
+            ? summaryValue('☀', `${label}: Tagesprognose – geplanter nutzbarer PV-Ertrag nach bekannten Abschaltungen`, day.pv_operating_available_kwh)
+                + summaryValue('⛅', `${label}: Tagesprognose – PV-Wetterpotential ohne geplante Abschaltungen`, day.pv_weather_potential_kwh)
             : summaryValue('☀', data.direct_marketing_enabled === true
-                ? `${label}: PV-Prognose; betrieblicher Tageswert noch nicht vollständig belegt`
-                : `${label}: PV-Ertrag`, day.pv_kwh);
+                ? `${label}: Tagesprognose PV; betrieblicher Tageswert noch nicht vollständig belegt`
+                : `${label}: Tagesprognose PV-Ertrag`, day.pv_kwh);
         return `<span class="forecast-summary-day forecast-summary-${key}">
             <span class="forecast-summary-label text-secondary fw-normal">${label}</span>
             <span class="forecast-summary-lines">
@@ -12563,10 +12568,74 @@ function getShadowBadgeVisual(data) {
 
 function publishE3dcLiveData(data) {
     if (!data || typeof data !== 'object') return;
+    for (const prefix of ['wb', 'wb2']) {
+        const hint = document.getElementById(prefix + '-measure-only-hint');
+        const measured = data[prefix + '_measure_only'] === true;
+        if (hint) hint.hidden = !measured;
+        const node = document.getElementById('f-node-' + prefix);
+        if (node && measured) node.title = 'Messung per MQTT, keine Steuerung';
+    }
     window.E3DC_LAST_LIVE_DATA = data;
     if (typeof window.dispatchEvent === 'function' && typeof CustomEvent === 'function') {
         window.dispatchEvent(new CustomEvent('e3dc:live-data', { detail: data }));
     }
+}
+
+function wallboxEmergencyHint() {
+    return document.querySelector('[data-wallbox-emergency-notice]')?.textContent.trim() || '';
+}
+
+function updateWallboxControlStatus(data) {
+    const active = data?.emergency_stop_active === true;
+    window.E3DC_WALLBOX_EMERGENCY_STOP = active;
+    document.querySelectorAll('[data-dashboard-wb-force-start], [data-dashboard-wb-pause], [data-wallbox-pause-button]').forEach(button => {
+        if (active && button.dataset.wallboxEmergency !== '1') button.dataset.wallboxNormalTitle = button.title;
+        const slot = button.dataset.dashboardWbForceStart || button.dataset.dashboardWbPause || button.dataset.wallboxPauseButton || '1';
+        const prefix = Number(slot) === 2 ? 'wb2' : 'wb';
+        const measureOnly = data?.[prefix + '_measure_only'] === true;
+        if (button.style) {
+            if (measureOnly) button.style.setProperty('display', 'none', 'important');
+            else button.style.removeProperty('display');
+        }
+        button.disabled = measureOnly || active || button.dataset.wallboxPending === '1';
+        if (active) button.title = wallboxEmergencyHint();
+        else if (button.dataset.wallboxEmergency === '1') button.title = button.dataset.wallboxNormalTitle || '';
+        button.dataset.wallboxEmergency = active ? '1' : '0';
+    });
+    document.querySelectorAll('[data-wallbox-lock-notice]').forEach(el => {
+        el.hidden = active || el.dataset.wallboxLocked !== '1';
+    });
+    document.querySelectorAll('[data-wallbox-emergency-notice]').forEach(el => {
+        el.hidden = !active;
+    });
+}
+
+function updateWallboxCoreStatus(data) {
+    const details = Array.isArray(data?.wb_details) ? data.wb_details : [];
+    const labels = {idle: 'Bereit', start_wait: 'Start abwarten', charging: 'Laden', hold: 'Halten', stop_wait: 'Stopp abwarten', stopped: 'Ladung beendet', protection: 'Schutzstopp'};
+    document.querySelectorAll('[data-wallbox-core-status]').forEach(el => {
+        const detail = details.find(row => Number(row.id) === Number(el.dataset.wallboxCoreStatus));
+        const active = detail?.simple_core_active === true;
+        const sentence = active && typeof detail.simple_core_sentence === 'string' ? detail.simple_core_sentence.trim() : '';
+        el.hidden = !sentence;
+        el.querySelector('[data-wallbox-core-sentence]').textContent = sentence;
+        const diagnosis = detail?.simple_core_data_diagnostics;
+        const pvPartsUnknown = active && detail.simple_core_state === 'protection'
+            && detail.simple_core_reason === 'data_timeout'
+            && diagnosis?.budget_pv_source === 'source_parts_unknown'
+            && diagnosis.source === 'pv' && diagnosis.share_w === null
+            && diagnosis.live_valid === true && diagnosis.status_valid === true
+            && diagnosis.budget_valid === true && diagnosis.budget_stale === false
+            && diagnosis.budget_timeout === false
+            && (diagnosis.mode !== 4 || diagnosis.soc_valid === true);
+        el.querySelector('[data-wallbox-core-state]').textContent = sentence ? (pvPartsUnknown ? 'Wartet auf PV-Aufteilung' : (labels[detail.simple_core_state] || '')) : '';
+        el.title = pvPartsUnknown ? 'Nachts oder in der Dämmerung fehlt die Aufteilung der PV-Leistung; es wird nicht geladen.' : '';
+        const mapping = el.parentElement.querySelector('[data-wallbox-phase-mapping="' + el.dataset.wallboxCoreStatus + '"]');
+        if (mapping) {
+            mapping.textContent = detail?.phase_mapping_hint || '';
+            mapping.hidden = !mapping.textContent;
+        }
+    });
 }
 
 function setDashboardWallboxPauseButton(wbIdx, paused, pending = false) {
@@ -12575,8 +12644,9 @@ function setDashboardWallboxPauseButton(wbIdx, paused, pending = false) {
     btn.attr('data-paused', paused ? '1' : '0')
         .toggleClass('btn-warning', paused)
         .toggleClass('btn-outline-secondary', !paused)
-        .prop('disabled', pending)
-        .attr('title', paused ? 'Automatik fortsetzen' : 'Wallbox manuell pausieren')
+        .prop('disabled', pending || window.E3DC_WALLBOX_EMERGENCY_STOP === true)
+        .attr('data-wallbox-pending', pending ? '1' : '0')
+        .attr('title', window.E3DC_WALLBOX_EMERGENCY_STOP === true ? wallboxEmergencyHint() : paused ? 'Automatik fortsetzen' : 'Wallbox manuell pausieren')
         .attr('aria-label', `Wallbox ${wbIdx} ${paused ? 'fortsetzen' : 'pausieren'}`);
     const icon = btn.find('i');
     icon.attr('class', `fas ${pending ? 'fa-spinner fa-spin' : (paused ? 'fa-play' : 'fa-pause')}`);
@@ -12587,6 +12657,7 @@ function bindDashboardWallboxPauseButtons() {
         e.preventDefault();
         e.stopPropagation();
         const btn = $(this);
+        if (btn.prop('disabled') || window.E3DC_WALLBOX_EMERGENCY_STOP === true) return;
         const wbIdx = String(btn.data('dashboard-wb-pause') || '1');
         const paused = btn.attr('data-paused') === '1';
         const nextPaused = !paused;
@@ -12636,7 +12707,7 @@ function clearWallboxForceStartMessage(wbIdx) {
 function triggerWallboxForceStart(wbIdx) {
     wbIdx = String(wbIdx || '1');
     const btn = $(`[data-dashboard-wb-force-start="${wbIdx}"]`);
-    if (btn.prop('disabled')) return;
+    if (btn.prop('disabled') || window.E3DC_WALLBOX_EMERGENCY_STOP === true) return;
     const previous = wallboxForceStartMessages.get(wbIdx);
     if (previous) clearTimeout(previous.timer);
     const messageState = {title: previous ? previous.title : btn.attr('title'), timer: null, cleared: false};
@@ -12658,7 +12729,7 @@ function triggerWallboxForceStart(wbIdx) {
     const timeoutMessage = 'Die Startanforderung wurde innerhalb von 60 Sekunden nicht bestätigt. Sie bleibt höchstens 60 Sekunden erhalten. Bitte erneut starten.';
     const deadline = Date.now() + 60000;
     icon.attr('class', 'fas fa-spinner fa-spin');
-    btn.prop('disabled', true).attr('title', processingMessage);
+    btn.attr('data-wallbox-pending', '1').prop('disabled', true).attr('title', processingMessage);
     status.text(processingMessage);
 
     const post = (action, requestId) => {
@@ -12724,7 +12795,8 @@ function triggerWallboxForceStart(wbIdx) {
         .finally(() => {
             setTimeout(() => {
                 icon.attr('class', 'fas fa-play');
-                btn.prop('disabled', false);
+                btn.attr('data-wallbox-pending', '0').prop('disabled', window.E3DC_WALLBOX_EMERGENCY_STOP === true);
+                if (window.E3DC_WALLBOX_EMERGENCY_STOP === true) btn.attr('title', wallboxEmergencyHint());
             }, 3000);
         });
 }
@@ -12743,7 +12815,7 @@ function updateWallboxDataOutage(data) {
         const failed = external && wallboxConfiguredFlag(data, slot) && (storageGap || (!!observation
             && (observation.valid !== true || data[prefix] === null)));
         anyOutage = anyOutage || failed;
-        const message = observation?.hint || 'Wallbox ohne Daten – Regelung wie ohne Wallbox. Verbindung bzw. Sicherung der Wallbox prüfen. Externe Last bei Bedarf im Config-Editor unter „Tarif & Strompreise“ → „Geplante Lastfenster“ absichern.';
+        const message = observation?.hint || 'Wallbox ohne Daten – Unterhalb der Hausakku-Untergrenze bleibt die Speicherentladung für die Wallbox begrenzt. Verbindung bzw. Sicherung der Wallbox prüfen. Externe Last bei Bedarf im Config-Editor unter „Tarif & Strompreise“ → „Geplante Lastfenster“ absichern.';
         for (const id of [`card-${prefix}-wrapper`, `m-wallbox-outage-${slot}`]) {
             const card = document.getElementById(id);
             if (!card) continue;
@@ -12765,7 +12837,7 @@ function updateWallboxDataOutage(data) {
     const badge = document.getElementById('head-icon-wb');
     if (badge) {
         badge.classList.toggle('wallbox-data-outage', anyOutage);
-        if (anyOutage) badge.setAttribute('title', 'Wallbox ohne Daten – Regelung wie ohne Wallbox');
+        if (anyOutage) badge.setAttribute('title', 'Wallbox ohne Daten – Unterhalb der Hausakku-Untergrenze bleibt die Speicherentladung für die Wallbox begrenzt');
         else badge.removeAttribute('title');
     }
 }
@@ -12777,6 +12849,8 @@ function processLiveData(data) {
     const wb1Configured = wallboxConfiguredFlag(data, 1);
     const wb2Configured = wallboxConfiguredFlag(data, 2);
     const consumptionValidity = energyFlowConsumptionValidity(data);
+    updateWallboxControlStatus(data);
+    updateWallboxCoreStatus(data);
     updateWallboxDataOutage(data);
     updateClimateMeterDisplay(data);
     cacheStorageCurveData(data);
@@ -14465,6 +14539,12 @@ function storageCorridorNow(data = window._storageLiveData || {}) {
         && regulation.label.length <= 80 && !/[<>\x00-\x1f\x7f]/.test(regulation.label);
     // Die Bezeichnung kommt vom Speicher-Manager; hier wird nur angezeigt.
     const regulationLabel = known ? regulation.label : 'Regelart unbekannt';
+    const description = regulation.description;
+    if (known && status.reason !== 'manager_state_stale' && status.remaining_valid_s > elapsed
+        && typeof description === 'string' && description.length > 0
+        && description.length <= 400 && !/[<>\x00-\x1f\x7f]/.test(description)) {
+        return {...unknown, label: description, colorClass: 'text-info'};
+    }
     if (status.valid !== true || status.source !== 'storage_manager.adaptive_curve_context'
         || !finite(status.floor_soc) || !finite(status.ceiling_soc)
         || status.floor_soc < 0 || status.ceiling_soc > 100 || status.floor_soc > status.ceiling_soc) {
@@ -14779,11 +14859,11 @@ function _renderStorageCurveExplanation(meta, reason) {
     }
     const activeTarget = _storageActiveCurveTarget(meta, window._storageControlSoc ?? window._storageLiveSoc);
     const curveStatus = effectiveProjectionHidden
-        ? 'Die klassische Sollkurve ist ausgeblendet. Eine vollständig belegte DV-SoC-Prognose bleibt als geplanter Verlauf sichtbar; der aktuelle Ausführungsstatus wird getrennt bewertet.'
+        ? 'Blaue Linie: Die klassische Sollkurve ist ausgeblendet. Eine vollständig belegte DV-SoC-Prognose bleibt als geplanter Verlauf sichtbar; der aktuelle Ausführungsstatus wird getrennt bewertet.'
         : (window._storageSollCurveSource === 'curve_anchors_fallback'
-        ? 'Die blaue Sollkurve wird aus den gültigen, eingefrorenen Kurvenankern rekonstruiert, weil die slotweise Zielprojektion in diesem Snapshot fehlt. Die Regelung selbst bleibt unverändert.'
+        ? 'Blaue Linie: Die Sollkurve wird aus den gültigen, eingefrorenen Kurvenankern rekonstruiert, weil die slotweise Zielprojektion in diesem Snapshot fehlt. Die Regelung selbst bleibt unverändert.'
         : (meta.has_target_curve === false
-        ? 'Für diesen Tag liegt noch keine eingefrorene Sollkurve vor; angezeigt wird die Vorschau aus der Simulation.'
+        ? 'Blaue Linie: Für diesen Tag liegt noch keine eingefrorene Sollkurve vor; angezeigt wird die Vorschau aus der Simulation.'
         : (targetReachState === 'unreachable_auto'
             ? 'Blaue Linie: geplante Ladekurve bis zum Tagesziel. Sie bleibt sichtbar, auch wenn das Tagesziel laut aktueller Prognose nicht erreichbar ist; die voraussichtliche Speicherladung zeigt separat, ob der SoC dieser Planung folgt.'
             : 'Blaue Linie: geplanter Tagespfad bis zum Freilauf-SoC. Sie ist kein harter Sekunden-Sollwert; die Regelung arbeitet mit Zielkorridor, Hysterese und ruhigem Nachladen. Liegt der Speicher unter der aktuellen Unterkante, wird zuerst in den Zielkorridor zurückgeladen. Ist das Tagesziel mit sicherer Rest-PV erreichbar, darf der gleitende Prognosehorizont die Ladung entspannen.')));
@@ -14813,7 +14893,7 @@ function _renderStorageCurveExplanation(meta, reason) {
             title:'Startanker',
             text:`Startpunkt der heutigen Kurve: ${startAnchorTime || '--:--'} bei ${_fmtStoragePct(startAnchorSoc)}. Adaptive Unterkanten sind Diagnose-/Regelband, kein neuer Startanker; Unter- und Oberkanten verschieben diesen Startpunkt nicht.`
         },
-        {icon:'fa-chart-line', color:'#a78bfa', title:'Prognose-SoC', text:'Violette Linie: erwarteter Speicherverlauf aus der Simulation. Bei künftigen Tagen kann sie eine Vorschau sein; die echte Sollkurve wird erst beim Tagesplan eingefroren.'},
+        {icon:'fa-chart-line', color:'#a78bfa', title:'Prognose-SoC', text:'Lila Linie: erwarteter Speicherverlauf aus der Simulation. Bei künftigen Tagen kann sie eine Vorschau sein; die echte Sollkurve wird erst beim Tagesplan eingefroren.'},
         {icon:'fa-battery-half', color:'#51cf66', title:'Morgen-Puffer', text:`Eingestellte Startreserve: ${morning}. Liegt der Speicher morgens darunter, darf der E3DC autonom aufbauen.`},
         {
             icon:'fa-arrow-down-short-wide',
@@ -14961,6 +15041,32 @@ function _renderStorageCurveExplanation(meta, reason) {
     if (reasonEl) reasonEl.textContent = _formatStorageReason(reason);
 }
 
+function storageCurveReachability(meta, simCurve) {
+    const future = Number(meta.day_offset) > 0 || (meta.display_day_label || 'Heute') !== 'Heute';
+    const start = Number(meta.display_day_start);
+    const endDate = new Date(start);
+    endDate.setDate(endDate.getDate() + 1);
+    const end = endDate.getTime();
+    const points = Array.isArray(simCurve) && Number.isFinite(start) && start > 0
+        ? simCurve.filter(point => point && point.ts >= start && point.ts < end) : [];
+    const valid = points.length > 0 && points.every((point, index) =>
+        Number.isFinite(point.ts) && Number.isFinite(point.soc) && point.soc >= 0 && point.soc <= 100
+        && (!index || (point.ts > points[index - 1].ts && point.ts - points[index - 1].ts <= 900000)));
+    // Die Tagesreihe enthält Slotanfänge; der letzte Viertelstunden-Slot
+    // endet am Folgetag. Teilprognosen ergeben kein Tagesmaximum.
+    const complete = valid && (!future || (points[0].ts === start && points[points.length - 1].ts >= end - 900000));
+    const forecastMax = complete ? Math.max(...points.map(point => point.soc)) : null;
+    const rawMax = future ? forecastMax : (meta.max_reachable_soc ?? meta.max_soc_pct);
+    const max = rawMax !== null && rawMax !== undefined && rawMax !== '' && Number.isFinite(Number(rawMax))
+        ? Number(rawMax) : null;
+    const target = meta.target_soc;
+    const unreachable = forecastMax !== null && max !== null
+        && ((target !== null && target !== undefined && target !== '' && Number.isFinite(Number(target))
+            && Number(target) - max > 2) || (!future && meta.target_reach_state === 'unreachable_auto'));
+    return {future, max, unreachable,
+        label: unreachable ? `Soll-SoC (Tagesziel laut Prognose nicht erreichbar, höchstens ${max.toLocaleString('de-DE', {maximumFractionDigits: 1})} %)` : 'Soll-SoC'};
+}
+
 function showStorageCurveModal() {
     const el = document.getElementById('storageCurveModal');
     if (!el) return;
@@ -15017,9 +15123,11 @@ function showStorageCurveModal() {
     } else {
         $('#sc-noon-wrap').hide();
     }
-    const modalReachableSoc = _fmtStoragePct(meta.max_reachable_soc ?? meta.max_soc_pct);
+    const reachability = storageCurveReachability(meta, window._storageSimCurve || []);
+    const modalReachableSoc = reachability.future && reachability.max === null ? '--' : _fmtStoragePct(reachability.max);
     const modalSimSoc = _fmtStoragePct(meta.sim_max_soc_pct ?? meta.max_soc_pct);
-    $('#sc-max-soc').text(modalReachableSoc === modalSimSoc ? modalReachableSoc : `${modalReachableSoc} / Sim ${modalSimSoc}`);
+    $('#sc-max-soc').text(reachability.future || modalReachableSoc === modalSimSoc ? modalReachableSoc : `${modalReachableSoc} / Sim ${modalSimSoc}`)
+        .toggleClass('text-warning', reachability.unreachable);
     if (meta.q_ratio !== undefined && meta.q_ratio !== null) {
         const q = parseFloat(meta.q_ratio);
         $('#sc-qratio').text(q.toFixed(2));
@@ -15153,6 +15261,7 @@ function _renderStorageCurveChart(socPoints) {
         const pvData   = sortedTs.map(ts => interpPV(ts));
         const sollData = rawSollData;
         const simSocData = sortedTs.map(ts => interpSimSoc(ts));
+        const reachability = storageCurveReachability(meta, simCurve);
         const liveSoc = currentLiveSocForChart();
         // Die Historie bleibt eine eigene IST-Linie. Sie darf keinen alten
         // Punkt als scheinbar aktuellen Messwert oder aktiven Zielanker ausgeben.
@@ -15213,9 +15322,9 @@ function _renderStorageCurveChart(socPoints) {
                 labels: timeContext.labels,
                 datasets: [
                     {
-                        label: 'Soll-SoC',
+                        label: reachability.label,
                         data: sollData,
-                        borderColor: '#4dabf7',
+                        borderColor: reachability.unreachable ? 'rgba(77,171,247,0.4)' : '#4dabf7',
                         backgroundColor: 'rgba(77,171,247,0.1)',
                         borderWidth: 2.5,
                         borderDash: [6, 3],
@@ -15406,7 +15515,7 @@ function _renderStorageCurveChart(socPoints) {
                                 const marketText = marketSocTooltip(ctx);
                                 if (marketText !== null) return marketText;
                                 if (label === 'SoC ohne Marktaktionen (%)') return label + ': ' + Number(ctx.parsed.y).toFixed(1) + '%';
-                                if (label === 'Soll-SoC') return 'Soll: ' + (ctx.parsed.y !== null ? ctx.parsed.y.toFixed(1) + '%' : '--');
+                                if (label.startsWith('Soll-SoC')) return (reachability.unreachable ? label + ': ' : 'Soll: ') + (ctx.parsed.y !== null ? ctx.parsed.y.toFixed(1) + '%' : '--');
                                 if (label === 'Aktives Regelziel') return 'Aktives Regelziel: ' + (ctx.parsed.y !== null ? ctx.parsed.y.toFixed(1) + '%' : '--');
                                 if (label === 'Unterkante') return 'Unterkante: ' + (ctx.parsed.y !== null ? ctx.parsed.y.toFixed(1) + '%' : '--');
                                 if (label === 'Oberkante') return 'Oberkante: ' + (ctx.parsed.y !== null ? ctx.parsed.y.toFixed(1) + '%' : '--');

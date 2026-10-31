@@ -29,7 +29,7 @@ sofern sie vorhanden sind:
 * `e3dc-mqtt-hub`
 * `e3dc-epex-manager`
 * `energy_manager`
-* `e3dc-websocket`
+* `e3dc-websocket` (Altbestand bis 5.5.5; wird weiterhin entfernt)
 * optionale Dienste wie Heizstab, Luxtronik, IDM, Bluelink, Matter oder
   Benachrichtigungen
 

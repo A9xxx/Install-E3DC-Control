@@ -1334,6 +1334,7 @@ def on_wb_message(client, userdata, msg):
             power = finite_float(payload)
 
         if power is None: return
+        measure_power_raw = power
         power = max(0.0, power)
 
         ext_wb_file = EXTERNAL_WB_FILE
@@ -1356,6 +1357,7 @@ def on_wb_message(client, userdata, msg):
         all_wb_data["enabled"] = True
         all_wb_data[wb_id] = {
             "power": power,
+            "measure_power_raw": measure_power_raw,
             "ts": int(time.time()),
             "topic": topic,
             "source": "direct_mqtt",

@@ -139,31 +139,41 @@ if (!$row) {
 }
 
 $showWp = isset($config['wp']) && (strtolower($config['wp']) === 'true' || $config['wp'] == '1') || (isset($config['luxtronik']) && $config['luxtronik'] == '1');
-$climateConsumption = (float)($row['climate_consumption'] ?? 0);
+$climateConsumption = $row['climate_consumption'];
 $showClimate = telegramConfigTruthy($config['climate_enable'] ?? '0') || $climateConsumption > 0.05;
 
-$total_cons = $row['home_consumption'] + $row['wb_consumption'] + $row['wp_consumption'] + $climateConsumption;
+$consumptionParts = [$row['home_consumption'], $row['wb_consumption'], $row['wb2_consumption'] ?? null, $row['wp_consumption'], $climateConsumption];
+$total_cons = in_array(null, $consumptionParts, true) ? null : array_sum($consumptionParts);
+$houseLabel = !empty($row['house_includes_unknown_wallbox'])
+    ? 'Haus inkl. Wallbox (unbekannt' . (isset($row['house_unknown_wallbox_minutes']) ? ', ' . (int)$row['house_unknown_wallbox_minutes'] . ' Min. ohne Messwert' : '') . ')'
+    : 'Hausverbrauch';
+function telegramDailyNumber($value, $digits = 2) {
+    return $value === null ? 'unbekannt' : number_format($value, $digits, ',', '.');
+}
 
 $msg = "📊 *$deviceName Tagesstatistik ($dateFormatted)*\n\n";
-$msg .= "☀️ *PV Ertrag:* " . number_format($row['pv_yield'], 2, ',', '.') . " kWh\n";
-$msg .= "🔌 *Netzbezug:* " . number_format($row['grid_in'], 2, ',', '.') . " kWh\n";
-$msg .= "🔋 *Batterie (Out):* " . number_format($row['bat_out'], 2, ',', '.') . " kWh\n\n";
-$msg .= "🏠 *Hausverbrauch:* " . number_format($row['home_consumption'], 2, ',', '.') . " kWh\n";
+$msg .= "☀️ *PV Ertrag:* " . telegramDailyNumber($row['pv_yield'], 2) . " kWh\n";
+$msg .= "🔌 *Netzbezug:* " . telegramDailyNumber($row['grid_in'], 2) . " kWh\n";
+$msg .= "🔋 *Batterie (Out):* " . telegramDailyNumber($row['bat_out'], 2) . " kWh\n\n";
+$msg .= "🏠 *$houseLabel:* " . telegramDailyNumber($row['home_consumption'], 2) . " kWh\n";
 
 if ($showWp) {
-    $msg .= "🚗 *Wallbox:* " . number_format($row['wb_consumption'], 2, ',', '.') . " kWh\n";
-    $msg .= "♨️ *Wärmepumpe:* " . number_format($row['wp_consumption'], 2, ',', '.') . " kWh\n";
+    $msg .= "🚗 *Wallbox:* " . telegramDailyNumber($row['wb_consumption'], 2) . " kWh\n";
+    $msg .= "♨️ *Wärmepumpe:* " . telegramDailyNumber($row['wp_consumption'], 2) . " kWh\n";
 } else {
-    $msg .= "🚗 *Wallbox:* " . number_format($row['wb_consumption'], 2, ',', '.') . " kWh\n";
+    $msg .= "🚗 *Wallbox:* " . telegramDailyNumber($row['wb_consumption'], 2) . " kWh\n";
+}
+if (isConfiguredWallboxTypeConfig($config['wb_native_type2'] ?? '') || ($row['wb2_consumption'] ?? 0) > 0) {
+    $msg .= "🚗 *Wallbox 2:* " . telegramDailyNumber($row['wb2_consumption'] ?? null) . " kWh\n";
 }
 if ($showClimate) {
-    $msg .= "❄️ *Klima:* " . number_format($climateConsumption, 2, ',', '.') . " kWh\n";
+    $msg .= "❄️ *Klima:* " . telegramDailyNumber($climateConsumption, 2) . " kWh\n";
 }
 $msg .= "\n";
 
-$msg .= "📈 *Tages-Autarkie:* " . number_format($row['autarky'], 1, ',', '.') . "%\n";
-$msg .= "♻️ *Eigenverbrauch:* " . number_format($row['self_con'], 1, ',', '.') . "%\n";
-$msg .= "⚡ *Gesamtverbrauch:* " . number_format($total_cons, 2, ',', '.') . " kWh\n\n";
+$msg .= "📈 *Tages-Autarkie:* " . telegramDailyNumber($row['autarky'], 1) . "%\n";
+$msg .= "♻️ *Eigenverbrauch:* " . telegramDailyNumber($row['self_con'], 1) . "%\n";
+$msg .= "⚡ *Gesamtverbrauch:* " . telegramDailyNumber($total_cons, 2) . " kWh\n\n";
 
 // Holen von Temperatur und Uptime
 $uptime = @exec('uptime -p');

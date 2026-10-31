@@ -25,6 +25,8 @@ try:
     from .aux_inverter_contract import effective_contract as aux_inverter_effective_contract
     from .pv_forecast_topology import (
         build_pv_forecast_topology,
+        external_ac_source_configured,
+        normalize_aux_ac_storage_mode,
         has_explicit_topology_config,
     )
     from .direct_marketing_identity import (
@@ -50,6 +52,8 @@ except ImportError:
     from aux_inverter_contract import effective_contract as aux_inverter_effective_contract
     from pv_forecast_topology import (
         build_pv_forecast_topology,
+        external_ac_source_configured,
+        normalize_aux_ac_storage_mode,
         has_explicit_topology_config,
     )
     from direct_marketing_identity import (
@@ -192,46 +196,7 @@ def _configured_optional_float(config, key):
 
 
 def _normalize_aux_ac_storage_mode(config):
-    """Liest den neuen AC-Modus fail-safe und migriert nur explizite Altfreigaben.
-
-    Der frühere Bool-Schalter war eine Nutzerfreigabe, enthielt aber keine
-    wirtschaftliche Aussage. ``true`` wird deshalb ausschließlich auf den
-    konservativen Modus ``reserve_only`` abgebildet. Fehlende, leere oder
-    unbekannte Werte bleiben ``off``.
-    """
-
-    config = config or {}
-    canonical_keys = (
-        "direct_marketing_aux_inverter_ac_storage_mode",
-        "direct_marketing_pv_store_aux_ac_mode",
-    )
-    for key in canonical_keys:
-        if key not in config:
-            continue
-        raw = str(config.get(key) or "").strip().lower().replace("-", "_").replace(" ", "_")
-        aliases = {
-            "aus": "off",
-            "disabled": "off",
-            "reserve": "reserve_only",
-            "reserve_sichern": "reserve_only",
-            "reserve_only": "reserve_only",
-            "hausversorgung": "house_supply",
-            "hausversorgung_sichern": "house_supply",
-            "house_supply": "house_supply",
-            "wirtschaftlich": "economic",
-            "economical": "economic",
-            "economic": "economic",
-        }
-        mode = aliases.get(raw, raw)
-        return (
-            mode if mode in AUX_AC_STORAGE_MODES else "off",
-            key if mode in AUX_AC_STORAGE_MODES else "%s_invalid" % key,
-        )
-
-    legacy_key = "direct_marketing_aux_inverter_ac_storage_enable"
-    if legacy_key in config and cfg_bool(config.get(legacy_key), False):
-        return "reserve_only", "legacy_bool_explicit_true"
-    return "off", "default_off"
+    return normalize_aux_ac_storage_mode(config)
 
 
 def _pv_store_route_efficiencies(config):
@@ -639,45 +604,7 @@ def _slot_power_present(slot, keys):
 
 
 def _external_ac_source_configured(config):
-    """True, wenn die Konfiguration einen externen AC-PV-Pfad erkennen lässt."""
-
-    config = config or {}
-    if safe_float(config.get("pv_external_ac_inverter_limit_w"), 0.0) > 0.0:
-        return True
-    aux_ac_mode, _mode_source = _normalize_aux_ac_storage_mode(config)
-    if aux_ac_mode != "off":
-        return True
-    try:
-        topology = build_pv_forecast_topology(config)
-    except Exception:
-        topology = {}
-    if any(
-        str(item.get("coupling") or "").strip().upper() == "EXTERNAL_AC"
-        for item in topology.get("resources", [])
-        if isinstance(item, dict)
-    ):
-        return True
-    if cfg_bool(config.get("direct_marketing_aux_inverter_ac_storage_enable"), False):
-        return True
-    if str(config.get("direct_marketing_aux_inverter_shelly_override") or "").strip().lower() == "central":
-        return True
-    if str(config.get("direct_marketing_aux_inverter_shelly_ip") or "").strip():
-        return True
-    nested = config.get("direct_marketing_aux_inverter_shelly")
-    if isinstance(nested, dict):
-        if str(nested.get("override") or "").strip().lower() == "central":
-            return True
-        if str(nested.get("ip") or "").strip():
-            return True
-    return any(
-        str(config.get(key) or "").strip().upper().replace("-", "_") == "EXTERNAL_AC"
-        for key in (
-            "pv_forecast_coupling_fc1",
-            "pv_forecast_coupling_fc2",
-            "pv_forecast_coupling_fc3",
-            "pv_forecast_coupling_fc4",
-        )
-    )
+    return external_ac_source_configured(config)
 
 
 def _pv_operating_rules(config):

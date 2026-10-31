@@ -51,6 +51,7 @@ DAILY_STATS_MIGRATION_COLUMNS = (
     'pv_balance_rest', 'bat_balance_rest', 'balance_unknown_rest',
     'saved_u', 'saved_td', 'saved_wb', 'pv_e3dc', 'pv_external',
     'pv_source_rest', 'pv_grid', 'bat_grid', 'house_includes_unknown_wallbox',
+    'house_unknown_wallbox_minutes',
 )
 
 
@@ -146,7 +147,8 @@ def init_db():
     }
     for col in DAILY_STATS_MIGRATION_COLUMNS:
         if col not in existing_columns:
-            cursor.execute(f"ALTER TABLE daily_stats ADD COLUMN {col} REAL DEFAULT 0")
+            column_type = 'INTEGER' if col == 'house_unknown_wallbox_minutes' else 'REAL DEFAULT 0'
+            cursor.execute(f"ALTER TABLE daily_stats ADD COLUMN {col} {column_type}")
 
     # Tabelle für Machine Learning Trainingsdaten (15-Minuten Raster aus Ertrag.X.txt)
     cursor.execute('''
@@ -174,6 +176,7 @@ MAINTENANCE_COLUMNS = (
     'pv_balance_rest', 'bat_balance_rest', 'balance_unknown_rest',
     'cost_total', 'cost_home', 'cost_bat', 'cost_wb', 'cost_wb2', 'cost_wp',
     'cost_climate', 'autarky', 'self_con',
+    'house_includes_unknown_wallbox', 'house_unknown_wallbox_minutes',
 )
 
 
@@ -194,6 +197,29 @@ def _nullable_number(value):
     if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
         return None
     return float(value)
+
+
+def _store_measure_only_display(conn, day, data):
+    """Separate Anzeigegrößen, niemals Eingänge der Verbrauchsprognose."""
+    if not isinstance(data, dict):
+        return
+    display = data.get('measure_only_display')
+    columns = ('display_home_consumption', 'display_wb_consumption', 'display_wb2_consumption',
+               'display_cost_home', 'display_cost_wb', 'display_cost_wb2')
+    existing = {row[1] for row in conn.execute('PRAGMA table_info(daily_stats)')}
+    if not isinstance(display, dict) and not any(column in existing for column in columns):
+        return
+    for column in columns:
+        if column not in existing:
+            conn.execute('ALTER TABLE daily_stats ADD COLUMN ' + column + ' REAL')
+    values = [None] * len(columns)
+    if isinstance(display, dict):
+        stats = display.get('stats', {})
+        values = [_nullable_number(stats.get(key)) for key in
+                  ('total_home_kwh', 'total_wb_kwh', 'total_wb2_kwh')]
+        values += [_nullable_number(display.get('costs', {}).get(key)) for key in ('home', 'wb', 'wb2')]
+    conn.execute('UPDATE daily_stats SET ' + ', '.join(column + '=?' for column in columns) + ' WHERE date=?',
+                 (*values, day.isoformat()))
 
 
 def _daily_values(data):
@@ -229,6 +255,7 @@ def _daily_values(data):
     values['balance_unknown_rest'] = (round(max(0.0, sum(known[:3]) - sum(known[3:])), 3)
                                       if all(v is not None for v in known) else None)
     values['house_includes_unknown_wallbox'] = int(bool(data.get('house_includes_unknown_wallbox')))
+    values['house_unknown_wallbox_minutes'] = data.get('house_unknown_wallbox_minutes')
     saved = data.get('saved', {})
     for col, key in (('saved_u', 'total_today_kwh'), ('saved_td', 'derating_today_kwh'),
                      ('saved_wb', 'inverter_today_kwh')):
@@ -424,6 +451,7 @@ def archive_today(conn=None, now=None):
             columns = ('date', *values)
             current_changed = _upsert_changed(db_conn.cursor(), 'daily_stats', 'date', columns,
                                               (today.isoformat(), *values.values()))
+        _store_measure_only_display(db_conn, today, data)
         split_changed = _store_climate_breakdown(db_conn, today, entries)
         changed = previous_changed + int(current_changed or split_changed)
         if owns_connection:
@@ -1062,7 +1090,13 @@ def recalculate_statistics(*, apply=False, days=30, today=None):
     try:
         # Vorhandene SQLite-Sperre statt einer unabhängigen Sperrdatei.
         conn.execute('BEGIN IMMEDIATE' if apply else 'BEGIN')
-        columns = ', '.join(MAINTENANCE_COLUMNS)
+        existing = {row[1] for row in conn.execute('PRAGMA table_info(daily_stats)')}
+        # Vor dem ersten regulären Archivzyklus kann die neue Hinweisspalte fehlen.
+        # Der Trockenlauf bleibt lesend; nur vorhandene Spalten werden gewartet.
+        maintenance_columns = tuple(key for key in MAINTENANCE_COLUMNS if key in existing)
+        if maintenance_columns not in (MAINTENANCE_COLUMNS, MAINTENANCE_COLUMNS[:-1], MAINTENANCE_COLUMNS[:-2]):
+            raise ValueError('Statistikdatenbank enthält nicht das unterstützte Wartungsschema')
+        columns = ', '.join(maintenance_columns)
         changes = []
         for offset in range(1, days + 1):
             day = today - datetime.timedelta(days=offset)
@@ -1079,12 +1113,12 @@ def recalculate_statistics(*, apply=False, days=30, today=None):
             if values['home_consumption'] is None:
                 entry.update(status='übersprungen', grund=data['sources']['home_energy_source'])
                 continue
-            before = dict(zip(MAINTENANCE_COLUMNS, old))
-            after = {key: values[key] for key in MAINTENANCE_COLUMNS}
+            before = dict(zip(maintenance_columns, old))
+            after = {key: values[key] for key in maintenance_columns}
             entry.update(vorher=before, nachher=after,
                          differenz={key: round(after[key] - before[key], 6)
                              if before[key] is not None and after[key] is not None else None
-                             for key in MAINTENANCE_COLUMNS},
+                             for key in maintenance_columns},
                          quellen=data['sources'])
             if before == after:
                 entry['status'] = 'unverändert'
@@ -1097,7 +1131,7 @@ def recalculate_statistics(*, apply=False, days=30, today=None):
             report['rückweg'] = shlex.join([sys.executable, '-B', str(Path(__file__).resolve()),
                 '--wiederherstellen', str(backup), '--web-root', str(Path(DB_DIR).parent)])
             for change in changes:
-                assignments = ', '.join(key + '=?' for key in MAINTENANCE_COLUMNS)
+                assignments = ', '.join(key + '=?' for key in maintenance_columns)
                 conn.execute('UPDATE daily_stats SET ' + assignments + ' WHERE date=?',
                     (*change['nachher'].values(), change['tag']))
             conn.commit()
@@ -1129,7 +1163,7 @@ def restore_statistics(backup):
                 raise ValueError('Backup ist nicht konsistent')
             for change in manifest['tage']:
                 columns = tuple(change['vorher'])
-                if columns != MAINTENANCE_COLUMNS:
+                if columns not in (MAINTENANCE_COLUMNS, MAINTENANCE_COLUMNS[:-1], MAINTENANCE_COLUMNS[:-2]):
                     raise ValueError('Backup enthält unerwartete Spalten')
                 query = 'SELECT ' + ', '.join(columns) + ' FROM daily_stats WHERE date=?'
                 before = source.execute(query, (change['tag'],)).fetchone()
@@ -1140,9 +1174,9 @@ def restore_statistics(backup):
                     continue
                 if current != tuple(change['nachher'].values()):
                     raise ValueError('Tageswerte inzwischen verändert: ' + change['tag'])
-                pending.append((change['tag'], before))
-        for day, before in pending:
-            conn.execute('UPDATE daily_stats SET ' + ', '.join(key + '=?' for key in MAINTENANCE_COLUMNS)
+                pending.append((change['tag'], before, columns))
+        for day, before, columns in pending:
+            conn.execute('UPDATE daily_stats SET ' + ', '.join(key + '=?' for key in columns)
                          + ' WHERE date=?', (*before, day))
         conn.commit()
         return {'wiederhergestellt': len(pending), 'backup': str(backup)}

@@ -82,6 +82,86 @@ def _clamp(value, low, high):
     return max(low, min(high, value))
 
 
+# Vorläufige Faktoren: nach Messung Maintainer-Anlage ersetzen.
+# Gemeinsame Definition für Lernen, Dienst und Planung; kein Eingabefeld.
+MARKET_CHARGE_BANDS = ((0.0, 90.0, 0.73), (90.0, 95.0, 0.58),
+                       (95.0, 97.0, 0.33), (97.0, 100.0, 0.33))
+MARKET_CHARGE_MAX_AGE_S = 7 * 86400.0
+MARKET_CHARGE_BUFFER_S = 1800.0
+MARKET_CHARGE_RATE_STEP_W = 100
+MARKET_CHARGE_CHANGE_W = 300
+MARKET_CHARGE_CHANGE_RATIO = 0.10
+MARKET_CHARGE_REDUCE_S = 300.0
+MARKET_CHARGE_MODE_DWELL_S = 120.0
+MARKET_CHARGE_MODE_BAND_W = 300
+
+
+def market_charge_profile(source, now_s):
+    """Frische Bandwerte lesen; einzelne ungültige Bänder auf Startwert setzen."""
+    source = source if isinstance(source, dict) else {}
+    result = {}
+    for index, (_low, _high, initial) in enumerate(MARKET_CHARGE_BANDS):
+        row = source.get(str(index), {})
+        row = row if isinstance(row, dict) else {}
+        factor = safe_float(row.get("factor"), float("nan"))
+        ts = safe_float(row.get("ts"), 0.0)
+        fresh = (math.isfinite(factor) and 0.1 <= factor <= 1.0
+                 and ts > 0 and -5 <= now_s - ts <= MARKET_CHARGE_MAX_AGE_S)
+        samples = safe_float(row.get("samples"), 0.0)
+        samples = max(0, int(samples)) if math.isfinite(samples) else 0
+        result[str(index)] = {"factor": factor if fresh else initial,
+                              "ts": ts if fresh else 0.0,
+                              "samples": samples if fresh else 0}
+    return result
+
+
+def market_charge_duration_s(capacity_wh, soc, target, rate_w, device_w, profile):
+    """Ladezeit als Summe Energie je SoC-Band / prognostizierte Ladeleistung."""
+    if rate_w <= 0 or device_w <= 0:
+        return float("inf")
+    duration = 0.0
+    for index, (low, high, initial) in enumerate(MARKET_CHARGE_BANDS):
+        energy = max(0.0, min(target, high) - max(soc, low)) * capacity_wh / 100.0
+        power = min(rate_w, device_w * profile.get(str(index), {}).get("factor", initial))
+        duration += energy / max(1.0, power) * 3600.0
+    return duration
+
+
+def market_charge_deliverable_wh(capacity_wh, soc, target, seconds, limit_w, device_w, profile):
+    """Tatsächlich lieferbare Energie mit demselben Bandmodell wie die Dauer."""
+    delivered = 0.0
+    for index, (low, high, initial) in enumerate(MARKET_CHARGE_BANDS):
+        energy = max(0.0, min(target, high) - max(soc, low)) * capacity_wh / 100.0
+        power = min(limit_w, device_w * profile.get(str(index), {}).get("factor", initial))
+        take = min(energy, max(0.0, seconds) * max(0.0, power) / 3600.0)
+        delivered += take
+        seconds -= take / max(1.0, power) * 3600.0
+    return delivered
+
+
+def market_charge_rate_w(capacity_wh, soc, target, available_s, limit_w, device_w, profile):
+    """Kleinste gleichmäßige Rate, die das Ziel mit dem Bandprofil erreicht.
+
+    Ist die Zielzeit schon vorbei oder unerreichbar, bleibt die volle Freigabe
+    bis zum Fensterende. Keine zusätzliche Aufholstufe.
+    """
+    if target <= soc:
+        return 0
+    low, high = 0.0, float(limit_w)
+    for _ in range(32):
+        middle = (low + high) / 2.0
+        if market_charge_duration_s(capacity_wh, soc, target, middle, device_w, profile) > available_s:
+            low = middle
+        else:
+            high = middle
+    return int(min(limit_w, max(300, math.ceil(high / MARKET_CHARGE_RATE_STEP_W) * MARKET_CHARGE_RATE_STEP_W)))
+
+
+def market_charge_target_ts(window_start_ms, window_end_ms):
+    span_s = max(0.0, (window_end_ms - window_start_ms) / 1000.0)
+    return int(window_end_ms - min(MARKET_CHARGE_BUFFER_S, span_s / 2.0) * 1000.0)
+
+
 def _format_t(ts):
     try:
         return datetime.fromtimestamp(float(ts) / 1000.0).strftime("%H:%M")
@@ -448,6 +528,7 @@ def _grid_charge_job_state(
     observed_charge_w=None,
     profile=None,
     running_grid_window_end_ts=None,
+    window_reference=None,
 ):
     """Zeitgerichteter Netzladejob bis zum Fensterende.
 
@@ -480,10 +561,13 @@ def _grid_charge_job_state(
     configured_power_w = _configured_charge_power_w(config)
     observed_power_w = max(0.0, safe_float(observed_charge_w, 0.0))
     charge_power_source = "config"
-    max_charge_power_w = configured_power_w
+    device_w = max(configured_power_w, safe_float(config.get("_market_device_charge_w"), safe_float(config.get("maximumladeleistung"), configured_power_w)))
     if configured_power_w >= 300.0 and 300.0 <= observed_power_w < configured_power_w:
-        max_charge_power_w = observed_power_w
         charge_power_source = "observed"
+    profile_state = market_charge_profile(config.get("_market_charge_forecast"), now_ms / 1000.0)
+    if profile_state["0"]["samples"] == 0 and 300 <= observed_power_w <= device_w:
+        profile_state["0"].update(factor=max(0.1, min(1.0, observed_power_w/device_w)))
+    max_charge_power_w = min(configured_power_w, device_w * profile_state["0"]["factor"])
     configured_power_cap = max_charge_power_w >= 300.0
     capacity_wh = max(0.0, safe_float(capacity_wh, 0.0))
     min_job_wh = _grid_charge_min_job_wh(config, capacity_wh)
@@ -628,7 +712,10 @@ def _grid_charge_job_state(
     # Zeit und Leistung begrenzen die tatsächlich lieferbare Netzenergie.
     # Ein kurzer Abschnitt wird weder auf 15 Minuten noch auf das Startminimum aufgefüllt.
     if configured_power_cap:
-        deliverable_grid_wh = max_charge_power_w * remaining_window_ms / 3600000.0
+        start_soc_for_cap = hard_reserve_pct + stock_now_rel_wh / max(1.0, capacity_wh) * 100.0
+        deliverable_grid_wh = market_charge_deliverable_wh(capacity_wh, start_soc_for_cap,
+            target_soc_pct, remaining_window_ms / 1000.0, configured_power_w, device_w,
+            profile_state) / efficiency
         if deliverable_grid_wh + 0.001 < job_grid_wh:
             job_grid_wh = deliverable_grid_wh
             job_cap_source = "time"
@@ -636,22 +723,20 @@ def _grid_charge_job_state(
     min_job_gate_wh = 0.0 if job_running else min_job_wh
     if job_grid_wh <= 0.001 or job_grid_wh + 0.001 < min_job_gate_wh:
         return dict(base, blocked_reason="grid_charge_job_below_minimum")
-    preferred_duration_ms = int(
-        max(
-            15.0,
-            safe_float(
-                (config or {}).get("market_grid_charge_preferred_duration_min"),
-                DEFAULT_GRID_CHARGE_PREFERRED_DURATION_MIN,
-            ),
-        )
-        * 60000.0
-    )
-    planning_duration_ms = min(remaining_window_ms, preferred_duration_ms)
-    raw_planned_w = job_grid_wh / (planning_duration_ms / 3600000.0)
-    planned_charge_w = max(300.0, math.ceil(raw_planned_w / 100.0) * 100.0)
-    if configured_power_cap:
-        planned_charge_w = max(300.0, min(max_charge_power_w, planned_charge_w))
-    charge_duration_ms = int((job_grid_wh / planned_charge_w) * 3600000.0)
+
+    device_w = max(configured_power_w, safe_float(config.get("_market_device_charge_w"), safe_float(config.get("maximumladeleistung"), configured_power_w)))
+    start_soc = hard_reserve_pct + stock_now_rel_wh / max(1.0, capacity_wh) * 100.0
+    end_soc = min(target_soc_pct, start_soc + job_grid_wh * efficiency / max(1.0, capacity_wh) * 100.0)
+    reference = window_reference if isinstance(window_reference, dict) else {}
+    bound_start = int(window["start_ts"])
+    if reference.get("window_end_ts") == window["end_ts"]:
+        bound_start = min(bound_start, int(safe_float(reference.get("bound_ts"), bound_start)))
+    target_ts = market_charge_target_ts(bound_start, window["end_ts"])
+    planning_duration_ms = max(1, target_ts - now_ms)
+    planned_charge_w = market_charge_rate_w(capacity_wh, start_soc, end_soc,
+        planning_duration_ms / 1000.0, configured_power_w, device_w, profile_state)
+    charge_duration_ms = int(market_charge_duration_s(capacity_wh, start_soc, end_soc,
+        planned_charge_w, device_w, profile_state) * 1000.0)
     result = dict(base)
     result.update({
         "active": True,
@@ -660,6 +745,8 @@ def _grid_charge_job_state(
             1,
         ),
         "planning_duration_min": round(planning_duration_ms / 60000.0, 1),
+        "target_ts": target_ts,
+        "charge_forecast": profile_state,
         "charge_duration_min": round(charge_duration_ms / 60000.0, 1),
         "max_charge_power_w": int(round(max_charge_power_w)) if configured_power_cap else None,
         "power_cap_source": charge_power_source if configured_power_cap else "storage_manager_hardware_limit",
@@ -691,12 +778,9 @@ def _late_fill_state(config, now_ms, job):
     job_grid_wh = max(0.0, safe_float(job.get("job_grid_wh"), 0.0))
     if charge_power_w < 300.0 or job_grid_wh <= 0.0:
         return {}
-    charge_duration_ms = int((job_grid_wh / charge_power_w) * 3600000.0)
-    safety_ms = int(max(0.0, safe_float(job.get("safety_min"), 0.0)) * 60000.0)
-    latest_start_ts = max(
-        int(now_ms),
-        int(job["window_end_ts"]) - charge_duration_ms - safety_ms,
-    )
+    charge_duration_ms = int(safe_float(job.get("charge_duration_min"), 0.0) * 60000.0)
+    safety_ms = max(0, int(job["window_end_ts"]) - int(job.get("target_ts", job["window_end_ts"])))
+    latest_start_ts = int(now_ms)
     min_delay_ms = int(
         max(
             0.0,
@@ -711,6 +795,7 @@ def _late_fill_state(config, now_ms, job):
         "window_start_ts": int(job["window_start_ts"]),
         "window_end_ts": int(job["window_end_ts"]),
         "latest_start_ts": int(latest_start_ts),
+        "target_ts": job.get("target_ts"),
         "charge_duration_min": round(charge_duration_ms / 60000.0, 1),
         "safety_min": round(safety_ms / 60000.0, 1),
         "min_delay_min": round(min_delay_ms / 60000.0, 1),
@@ -1453,7 +1538,7 @@ def _executable_future_window(annotated, idx, reserve, efficiency, horizon_end,
     job = _grid_charge_job_state(config, annotated, idx, start, independent,
                                 credit_cfg.get("capacity_wh"), efficiency,
                                 slot_allowed=allowed, reserve=projected,
-                                observed_charge_w=power, profile=profile)
+                                observed_charge_w=None, profile=profile)
     price_proof = _price_action_contract("grid_charge", annotated[idx], independent, True,
         max(int(window["end_ts"]), int(independent.get("last_shortage_end_ts_ms") or 0)))
     if not job.get("active") or not independent.get("energy_horizon_complete") or not price_proof.get("complete"):
@@ -1973,33 +2058,108 @@ def _future_need(
     }
 
 
+def _hold_replacement_sources(annotated, current_idx, need_pass, economics, efficiency,
+                              planning_charge_power_w, charge_limit_w, *, comfort_profile=False, need_buffer_wh=0.0):
+    """Bindet ausschließlich startfähige, günstigere Nachladungen an ihre Lieferzeit."""
+    result = {"slots": {}, "windows": [], "reason": "no_executable_window"}
+    current = annotated[current_idx]
+    if not current.get("price_inputs_complete"):
+        result["reason"] = "current_price_incomplete"
+        return result
+    if not need_pass.get("energy_horizon_complete") or not need_pass.get("price_horizon_complete"):
+        result["reason"] = "replacement_horizon_incomplete"
+        return result
+    battery_cost = safe_float(economics.get("battery_cost_ct_per_kwh"), 0.0)
+    safety = safe_float(economics.get("safety_correction_ct_per_kwh"), 0.0)
+    for proof in need_pass.get("future_grid_window_evidence") or []:
+        if proof.get("active") is not True:
+            continue
+        ref = _finite_float(proof.get("reference_billing_ct"), None)
+        if ref is None:
+            continue
+        if not _grid_price_profit_ok(ref, current["billing_ct"], efficiency, battery_cost, safety,
+                safe_float(economics.get("profit_hold_ct_per_kwh"), 0.0),
+                safe_float(economics.get("min_margin_pct"), 0.0)):
+            result["reason"] = "replacement_not_cheaper"
+            continue
+        cost = ref / max(0.01, efficiency) + battery_cost + safety
+        offered_wh = max(0.0, safe_float(proof.get("job_grid_wh"), 0.0)) * efficiency
+        buffer_wh = 0.0 if comfort_profile else min(offered_wh, max(0.0, safe_float(need_buffer_wh, 0.0)))
+        left = max(0.0, offered_wh - buffer_wh)
+        window_end = int(safe_float(proof.get("window_end_ts"), 0.0))
+        window_start = int(safe_float(proof.get("window_start_ts"), 0.0))
+        delivery_end = int(safe_float(proof.get("delivery_end_ts"), 0.0))
+        total = 0.0
+        for row in annotated[current_idx + 1:]:
+            ts = int(row["ts"])
+            if ts < window_start or ts >= window_end:
+                continue
+            hours = max(0.0, (min(int(row["end_ts"]), delivery_end) - ts) / 3600000.0)
+            slot_hours = (row["end_ts"] - ts) / 3600000.0
+            limit = charge_limit_w * slot_hours * efficiency
+            pv = min(float(row["surplus_wh"]) * efficiency, limit)
+            entries = result["slots"].get(ts, [])
+            room = max(0.0, limit - pv - sum(entry["amount_wh"] for entry in entries))
+            amount = min(left, planning_charge_power_w * hours * efficiency, room)
+            if amount <= 0.001:
+                continue
+            result["slots"].setdefault(ts, []).append({
+                "amount_wh": amount, "cost_ct": cost, "window_end_ts": window_end,
+            })
+            left -= amount
+            total += amount
+        if total > 0.001:
+            result["windows"].append({"window_end_ts": window_end,
+                "replacement_wh": round(total, 3), "replacement_cost_ct": round(cost, 4),
+                "buffer_wh": round(buffer_wh, 3)})
+    if result["windows"]:
+        result["reason"] = "executable_cheaper_replacement"
+    return result
+
+
 def _hold_horizon_allocation(annotated, current_idx, reserve, efficiency, now_ms,
-                             charge_limit_w=None, discharge_limit_w=None):
+                             charge_limit_w=None, discharge_limit_w=None, replacement_sources=None):
     """Verteilt vorhandene Energie und rechtzeitige PV nach Bezugskosten.
 
     Min-Cost-Max-Flow auf einem zeitgerichteten Speichernetz: erst möglichst
     viel prognostizierten Bedarf decken, dann die vermiedenen Bezugskosten
-    maximieren. Kein Netzladen, keine neue Reserve und keine Geräteausgänge.
+    maximieren. Nachgewiesenes Nachladen zählt erst ab seinem Lieferzeitpunkt
+    zu seinen Ersatzkosten; keine neue Reserve und keine Geräteausgänge.
     Die Ladekurve ist ein Ladeziel; die Hausversorgung verwendet ausschließlich
     den Bestand oberhalb der bereits gebundenen harten Reserve.
     """
     from collections import deque
     from math import isfinite
 
+    # Die Slots dienen nur der Anzeige. Sie gehen mit dem Marktplan in die Plankennung ein; neue Slots entstehen
+    # nur mit einer neuen Plangeneration, deren Kennung sich über den Erzeugungszeitpunkt ohnehin ändert.
+    diagnostics = ({
+        "replacement_total_wh": round(sum(row["replacement_wh"] for row in replacement_sources["windows"]), 3),
+        "replacement_windows": [dict(window, slots=[
+            {"start_ts": int(row["ts"]), "end_ts": int(row["end_ts"]),
+             "amount_wh": entry["amount_wh"]}
+            for row in annotated[current_idx + 1:]
+            for entry in replacement_sources["slots"].get(int(row["ts"]), [])
+            if entry["window_end_ts"] == window["window_end_ts"]
+        ]) for window in replacement_sources["windows"]],
+        "buffer_wh": round(sum(row.get("buffer_wh", 0.0) for row in replacement_sources["windows"]), 3),
+        "replacement_reason": replacement_sources["reason"],
+    } if replacement_sources is not None else {})
     eps = 1e-6
     current = annotated[current_idx]
     prefix, _quality = _future_price_prefix(annotated, current_idx)
     rows = [current] + prefix
     if len(rows) < 2 or len(rows) > 193:
-        return {"valid": False, "reason": "hold_horizon_unavailable"}
+        return {"valid": False, "reason": "hold_horizon_unavailable", **diagnostics}
     expected = current["ts"]
     for row in rows:
         if (not row.get("energy_inputs_complete") or not row.get("price_inputs_complete")
                 or abs(row["ts"] - expected) > 1000):
-            return {"valid": False, "reason": "hold_horizon_inputs_incomplete"}
+            return {"valid": False, "reason": "hold_horizon_inputs_incomplete", **diagnostics}
         expected = row["end_ts"]
     capacity = max(0.0, safe_float(reserve.get("hard_usable_capacity_wh"), 0))
     available = min(capacity, max(0.0, safe_float(reserve.get("hard_available_discharge_wh"), 0)))
+    flow_available = available
     remaining = _clamp((current["end_ts"] - now_ms) / max(1, current["end_ts"] - current["ts"]), 0, 1)
     loads = [float(row["deficit_wh"]) * (remaining if i == 0 else 1) for i, row in enumerate(rows)]
     pv = [float(row["surplus_wh"]) * efficiency * (remaining if i == 0 else 1) for i, row in enumerate(rows)]
@@ -2013,7 +2173,7 @@ def _hold_horizon_allocation(annotated, current_idx, reserve, efficiency, now_ms
             or any(v < 0 for v in loads + pv) or any(v <= 0 for v in hours)
             or any(loads[i] > eps and pv[i] > eps for i in range(len(rows)))
             or any(v is not None and v < 0 for v in (charge_limit_w, discharge_limit_w))):
-        return {"valid": False, "reason": "hold_horizon_inputs_invalid"}
+        return {"valid": False, "reason": "hold_horizon_inputs_invalid", **diagnostics}
     if charge_limit_w is not None:
         pv = [min(value, charge_limit_w * hours[i] * efficiency) for i, value in enumerate(pv)]
     demand_caps = [min(value, discharge_limit_w * hours[i]) if discharge_limit_w is not None else value
@@ -2032,6 +2192,9 @@ def _hold_horizon_allocation(annotated, current_idx, reserve, efficiency, now_ms
         sinks = []
         for i in range(count):
             edge(source, i, pv[i], 0.0)
+            if i >= 1 and replacement_sources:
+                for replacement in replacement_sources["slots"].get(int(rows[i]["ts"]), []):
+                    edge(source, i, replacement["amount_wh"], replacement["cost_ct"])
             sinks.append(edge(i, sink, demands[i], -prices[i]))
             if i + 1 < count:
                 edge(i, i + 1, capacity, 0.0)
@@ -2067,12 +2230,12 @@ def _hold_horizon_allocation(annotated, current_idx, reserve, efficiency, now_ms
         raise ValueError("hold_horizon_iteration_limit")
 
     try:
-        supplied = allocate(available, demand_caps)
-        automatic_now = min(available, demand_caps[0])
+        supplied = allocate(flow_available, demand_caps)
+        automatic_now = min(flow_available, demand_caps[0])
         forced_loads = list(demand_caps); forced_loads[0] -= automatic_now
-        forced = allocate(available - automatic_now, forced_loads)
+        forced = allocate(flow_available - automatic_now, forced_loads)
     except ValueError as exc:
-        return {"valid": False, "reason": str(exc)}
+        return {"valid": False, "reason": str(exc), **diagnostics}
     forced[0] += automatic_now
     hold_wh = max(0.0, automatic_now - supplied[0])
     saving_ct = sum((supplied[i] - forced[i]) * prices[i] / 1000 for i in range(len(rows)))
@@ -2093,7 +2256,7 @@ def _hold_horizon_allocation(annotated, current_idx, reserve, efficiency, now_ms
             "available_wh": round(available, 3), "hold_wh": round(hold_wh, 3),
             "saving_ct": round(max(0.0, saving_ct), 6), "benefit_price_ct": benefit_price,
             "hold_end_ts": end_ts, "needed_end_ts": int(rows[max(used_future)]["end_ts"]) if used_future else end_ts,
-            "baseline_uncovered_wh": round(baseline_missing, 3), "schedule": schedule}
+            "baseline_uncovered_wh": round(baseline_missing, 3), "schedule": schedule, **diagnostics}
 
 
 def _economic_state(
@@ -2775,36 +2938,6 @@ def build_market_economics_plan(
     grid_low_key = "is_comfort" if comfort_profile else "is_low"
     charge_limit_w = max(0.0, safe_float(config.get("maximumladeleistung"), 5000.0))
     discharge_limit_w = max(0.0, safe_float(config.get("maximaleentladeleistung"), charge_limit_w))
-    hold_allocation = _hold_horizon_allocation(
-        annotated, current_idx, reserve, _efficiency, now_ms,
-        charge_limit_w=charge_limit_w, discharge_limit_w=discharge_limit_w,
-    )
-    forecast["hold_horizon"] = hold_allocation
-    allocation_valid = hold_allocation.get("valid") is True
-    hold_wh = safe_float(hold_allocation.get("hold_wh"), 0.0) if allocation_valid else 0.0
-    if allocation_valid:
-        hold_benefit = safe_float(hold_allocation.get("benefit_price_ct"), current["billing_ct"])
-        hold_cost = current["billing_ct"] + economics["safety_correction_ct_per_kwh"]
-        hold_spread = hold_benefit - hold_cost
-        hold_margin = hold_spread / max(1.0, abs(hold_cost)) * 100.0
-        economics.update({
-            "future_hold_benefit_ct": round(hold_benefit, 3),
-            "hold_spread_ct_per_kwh": round(hold_spread, 3),
-            "hold_margin_pct": round(hold_margin, 3),
-            "hold_profit_ok": bool(allocation_valid and hold_wh > 0.001
-                and hold_allocation.get("saving_ct", 0) > 0.000001
-                and hold_benefit > current["billing_ct"]
-                and hold_spread >= economics["profit_hold_ct_per_kwh"]
-                and hold_margin >= economics["margin_hold_pct"]),
-        })
-    else:
-        # Unbekannte Preise bleiben unbekannt; kein Ersatzpreis und kein Halteauftrag.
-        hold_benefit = forecast.get("best_future_hold_billing_ct")
-        economics["hold_profit_ok"] = False
-    forecast.update({"economic_shift_need_wh": hold_wh,
-        "best_future_hold_billing_ct": hold_benefit,
-        "best_future_hold_end_ts": hold_allocation.get("needed_end_ts", current["end_ts"]),
-        "hold_hard_high_shortage_wh": hold_allocation.get("baseline_uncovered_wh", 0)})
     current_price_complete = bool(annotated[current_idx].get("price_inputs_complete"))
     current_price_reasons = list(annotated[current_idx].get("price_input_reasons") or [])
     price_prefix_usable = bool(
@@ -2878,10 +3011,17 @@ def build_market_economics_plan(
                 and bound_start <= int(row["ts"]) and int(row["end_ts"]) <= previous_end)
             grid_charge_window = _low_price_window(annotated, current_idx,
                 slot_allowed=grid_slot_allowed, low_key=grid_low_key)
-    planning_charge_power_w = _configured_charge_power_w(config)
+    configured_w = _configured_charge_power_w(config)
+    device_w = max(configured_w, safe_float(config.get("_market_device_charge_w"), safe_float(config.get("maximumladeleistung"), configured_w)))
     observed_power_w = max(0.0, safe_float(observed_charge_w, 0.0))
-    if planning_charge_power_w >= 300.0 and 300.0 <= observed_power_w < planning_charge_power_w:
-        planning_charge_power_w = observed_power_w
+    planning_profile = market_charge_profile(config.get("_market_charge_forecast"), now_ms / 1000.0)
+    # Ein gültiger Altwert kann auch oberhalb des vorsichtigen Startwerts
+    # liegen. Vor Hauptjob UND Folgefenstern einmal ins gemeinsame Profil übernehmen.
+    if planning_profile["0"]["ts"] <= 0 and 300 <= observed_power_w <= device_w:
+        planning_profile["0"].update(factor=max(0.1, min(1.0, observed_power_w/device_w)),
+                                     ts=now_ms/1000.0)
+        config = dict(config, _market_charge_forecast=planning_profile)
+    planning_charge_power_w = min(configured_w, device_w * planning_profile["0"]["factor"])
     # Referenzpreis des Fensters (Mittel, inkl. vergangener Fensterslots) trägt
     # die Gutschrift-Toleranz und den wirtschaftlichen Deckel (Referenz/η + Akkukosten + Sicherheitskorrektur).
     # Der Sollbestand trägt Prognosepuffer und Late-Fill-Puffer (speicherseitig).
@@ -2943,6 +3083,10 @@ def build_market_economics_plan(
         + safe_float(economics.get("safety_correction_ct_per_kwh"), 0.0)
     )
     late_fill_buffer_wh = _late_fill_buffer_wh(config, capacity)
+    need_buffer_wh = (
+        max(0.0, safe_float(config.get("market_autarky_horizon_buffer_wh"), DEFAULT_AUTARKY_HORIZON_BUFFER_WH))
+        + late_fill_buffer_wh
+    )
     need_pass = _future_need(
         annotated,
         current_idx,
@@ -2968,10 +3112,7 @@ def build_market_economics_plan(
             "slot_allowed": lambda row: _grid_charge_billing_allowed(tariff, row, grid_charge_billing_limit_ct),
         },
         econ_cut_ct=econ_cut_reference_ct,
-        need_buffer_wh=(
-            max(0.0, safe_float(config.get("market_autarky_horizon_buffer_wh"), DEFAULT_AUTARKY_HORIZON_BUFFER_WH))
-            + late_fill_buffer_wh
-        ),
+        need_buffer_wh=need_buffer_wh,
     )
     for need_key in (
         "stock_end_nogrid_wh", "window_energy_complete", "pv_credit_window_wh", "deficit_window_wh",
@@ -2982,6 +3123,41 @@ def build_market_economics_plan(
         "floor_gap_now_wh", "floor_gap_end_wh", "grid_charge_need_above_floor_wh",
     ):
         forecast[need_key] = need_pass.get(need_key)
+    replacement_sources = _hold_replacement_sources(
+        annotated, current_idx, need_pass, economics, _efficiency,
+        planning_charge_power_w, charge_limit_w, comfort_profile=comfort_profile, need_buffer_wh=need_buffer_wh,
+    )
+    hold_allocation = _hold_horizon_allocation(
+        annotated, current_idx, reserve, _efficiency, now_ms,
+        charge_limit_w=charge_limit_w, discharge_limit_w=discharge_limit_w,
+        replacement_sources=replacement_sources,
+    )
+    forecast["hold_horizon"] = hold_allocation
+    allocation_valid = hold_allocation.get("valid") is True
+    hold_wh = safe_float(hold_allocation.get("hold_wh"), 0.0) if allocation_valid else 0.0
+    if allocation_valid:
+        hold_benefit = safe_float(hold_allocation.get("benefit_price_ct"), current["billing_ct"])
+        hold_cost = current["billing_ct"] + economics["safety_correction_ct_per_kwh"]
+        hold_spread = hold_benefit - hold_cost
+        hold_margin = hold_spread / max(1.0, abs(hold_cost)) * 100.0
+        economics.update({
+            "future_hold_benefit_ct": round(hold_benefit, 3),
+            "hold_spread_ct_per_kwh": round(hold_spread, 3),
+            "hold_margin_pct": round(hold_margin, 3),
+            "hold_profit_ok": bool(allocation_valid and hold_wh > 0.001
+                and hold_allocation.get("saving_ct", 0) > 0.000001
+                and hold_benefit > current["billing_ct"]
+                and hold_spread >= economics["profit_hold_ct_per_kwh"]
+                and hold_margin >= economics["margin_hold_pct"]),
+        })
+    else:
+        # Unbekannte Preise bleiben unbekannt; kein Ersatzpreis und kein Halteauftrag.
+        hold_benefit = forecast.get("best_future_hold_billing_ct")
+        economics["hold_profit_ok"] = False
+    forecast.update({"economic_shift_need_wh": hold_wh,
+        "best_future_hold_billing_ct": hold_benefit,
+        "best_future_hold_end_ts": hold_allocation.get("needed_end_ts", current["end_ts"]),
+        "hold_hard_high_shortage_wh": hold_allocation.get("baseline_uncovered_wh", 0)})
     forecast["credit_reference_ct"] = round(safe_float(credit_reference_ct, 0.0), 2)
     # Herkunft der Referenz ('held' = gehalten, 'bound' = neu gebunden,
     # 'slot' = kein Fenster) und Bindungszeitpunkt (Diagnose).
@@ -3001,6 +3177,7 @@ def build_market_economics_plan(
         observed_charge_w=observed_charge_w,
         profile=charge_profile,
         running_grid_window_end_ts=running_grid_window_end_ts,
+        window_reference=window_reference_out,
     )
     grid_charge_job_active = bool(grid_charge_job.get("active"))
     forecast["grid_charge_remaining_job_grid_wh"] = grid_charge_job.get("remaining_job_grid_wh")
@@ -3089,7 +3266,11 @@ def build_market_economics_plan(
         if comfort_profile and grid_charge_job.get("comfort_max_soc_pct") is not None:
             target_soc_cap = min(target_soc_cap, safe_float(grid_charge_job.get("comfort_max_soc_pct"), target_soc_cap))
         target_job_grid_wh = job_grid_wh
-        if grid_charge_job.get("job_cap_source") == "time" and not comfort_profile:
+        if comfort_profile:
+            # Eine vorsichtige Leistungsprognose darf das gewählte Ziel nicht
+            # absenken: bei Rückstand bis zur Grenze aufholen, bis Fensterende.
+            target_job_grid_wh = safe_float(grid_charge_job.get("room_wh"), 0.0) / max(0.01, _efficiency)
+        elif grid_charge_job.get("job_cap_source") == "time":
             # Die lieferbare Teilmenge sinkt mit der Restzeit, das Bedarfsziel bleibt
             # am Sollbestand gebunden. Ein Zeitdeckel darf kein früheres Fertig-Latch vortäuschen.
             target_job_grid_wh = min(

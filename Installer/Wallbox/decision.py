@@ -6362,7 +6362,10 @@ def manager_stop_display_text_contract(
         not real_charging and amp < 0.5 and power_w <= 50.0
     )
     kind = "temporaerer_halt" if releasable_reason else "harter_stopp"
-    if output_confirmed_zero:
+    if code == "native_stop_ineffective":
+        state, level = "Stopp ohne Wirkung", "error"
+        text = "Box reagiert nicht auf den Stopp; keine weitere Umschaltung, bitte Ladepunkt prüfen."
+    elif output_confirmed_zero:
         state = "Stop bestätigt" if not releasable_reason else "Halt bestätigt"
         text = (
             "Budgethalt aktiv; Gerät bestätigt 0 A und 0 W."

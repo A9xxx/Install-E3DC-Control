@@ -95,9 +95,9 @@ except Exception:
 # MODE_GRID des Storage Managers (eine Quelle) für die Lesung des laufenden
 # Markt-Netzladevorgangs aus dem Zustandsfile.
 try:
-    from .storage_parallel_regulator import MODE_GRID as STORAGE_MANAGER_MODE_GRID
+    from .storage_parallel_regulator import MODE_GRID as STORAGE_MANAGER_MODE_GRID, MODE_AUTO as STORAGE_MANAGER_MODE_AUTO
 except Exception:
-    from storage_parallel_regulator import MODE_GRID as STORAGE_MANAGER_MODE_GRID
+    from storage_parallel_regulator import MODE_GRID as STORAGE_MANAGER_MODE_GRID, MODE_AUTO as STORAGE_MANAGER_MODE_AUTO
 
 try:
     from Wallbox.modes import MODE_OFF, MODE_TARGET, normalize_wb_mode
@@ -790,12 +790,90 @@ def _slot_storage_chargeable_forecast_contract(
     }
 
 
+def _market_projection_replacements(plan, horizon):
+    """Nur belegte Ersatzmengen projizieren; kein Ladeauftrag und kein Puffer.
+
+    Die Anzeige übernimmt ausschließlich die veröffentlichten Planer-Slots.
+    Fehlt die Verteilung oder eine Nachweisbindung, bleibt der bisherige Pfad.
+    """
+    try:
+        market = plan["market_plan"]
+        if (horizon.get("valid") is not True
+                or horizon.get("replacement_reason") != "executable_cheaper_replacement"
+                or market["consumer_policy"].get("storage_grid_charge") is not True):
+            return [], 1.0
+        def number(value):
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+                raise ValueError()
+            return float(value)
+        eta = number(market["economics"]["roundtrip_efficiency_pct"]) / 100
+        if not 0 < eta <= 1:
+            return [], 1.0
+        windows = horizon["replacement_windows"]
+        proofs = market["forecast"]["future_grid_window_evidence"]
+        if not isinstance(windows, list) or not windows or not isinstance(proofs, list):
+            return [], 1.0
+        actions = []
+        total = 0.0
+        for window in windows:
+            end = number(window["window_end_ts"])
+            amount = number(window["replacement_wh"])
+            buffer = number(window["buffer_wh"])
+            matches = [p for p in proofs if p.get("window_end_ts") == end]
+            if len(matches) != 1:
+                return [], 1.0
+            proof = matches[0]
+            if (proof.get("active") is not True
+                    or proof.get("basis") != "projected_executable_without_own_credit"):
+                return [], 1.0
+            start = number(proof["window_start_ts"])
+            delivery = number(proof["delivery_end_ts"])
+            job = number(proof["job_grid_wh"])
+            cap = min(number(proof["max_charge_power_w"]), number(plan["max_charge_w"]))
+            hours = (delivery - start) / 3600000
+            if (not plan["simulation_start_ts_ms"] < start < delivery <= end <= plan["horizon_end_ts_ms"]
+                    or any(value != int(value) for value in (start, delivery, end))
+                    or amount <= 0 or buffer < 0 or job <= 0 or cap < 300
+                    or amount + buffer > job * eta + 0.002
+                    or amount > cap * hours * eta + 0.002):
+                return [], 1.0
+            slots = window["slots"]
+            if not isinstance(slots, list) or not slots:
+                return [], 1.0
+            slot_total = 0.0
+            for slot in slots:
+                left = number(slot["start_ts"])
+                right = number(slot["end_ts"])
+                energy = number(slot["amount_wh"])
+                slot_hours = (right - left) / 3600000
+                if (not start <= left < delivery or not left < right <= end
+                        or left != int(left) or right != int(right) or energy <= 0
+                        or energy > cap * slot_hours * eta + 0.002):
+                    return [], 1.0
+                actions.append({"action": "grid_charge", "origin": "hold_replacement",
+                    "start_ts_ms": int(left), "end_ts_ms": int(right),
+                    "power_w": energy / slot_hours / eta})
+                slot_total += energy
+            if abs(slot_total - amount) > 0.002:
+                return [], 1.0
+            total += amount
+        actions.sort(key=lambda a: a["start_ts_ms"])
+        if (abs(total - number(horizon["replacement_total_wh"])) > 0.002
+                or any(a["end_ts_ms"] > b["start_ts_ms"] for a, b in zip(actions, actions[1:]))):
+            return [], 1.0
+        return actions, eta
+    except (ValueError, TypeError, KeyError, AttributeError, OverflowError, ZeroDivisionError):
+        return [], 1.0
+
+
 def build_market_soc_trajectory(plan, live=None):
     """Zusätzliche Anzeigeprojektion; verändert weder Plan noch Marktentscheidung.
 
-    Nur der aktive Speichervertrag ist ausgewählt. Spätere Verträge mit
-    grid_charge_candidate sind ausdrücklich keine Ladeaufträge. Der bereits
-    festgelegte Late-Fill-Start gehört dagegen zum aktiven Netzladejob.
+    Der gültige Haltehorizont beschreibt die geplante Hausversorgung. Netzladen
+    aus einem aktiven Speichervertrag oder einem belegten Ersatzfenster wird
+    projiziert. Spätere Verträge mit grid_charge_candidate sind ausdrücklich
+    keine Ladeaufträge. Der festgelegte Late-Fill-Start gehört dagegen zum
+    aktiven Netzladejob.
     """
     result = {
         "schema_version": "market_soc_trajectory_v1", "complete": False,
@@ -842,41 +920,86 @@ def build_market_soc_trajectory(plan, live=None):
         authority_error = _market_plan_contract_error(market, generated)
         if authority_error:
             return unavailable("contract_version_mismatch" if authority_error == "owner_contract_mismatch" else authority_error)
+        # Lokale Anzeigeauswahl: keine Änderung am Marktplan oder Vertrag.
+        horizon = (market.get("forecast") or {}).get("hold_horizon") or {}
+        schedule = []
+        hold_end = generated
+        if horizon.get("valid") is True and (market.get("consumer_policy") or {}).get("storage_hold") is True:
+            validated = []
+            for item in horizon.get("schedule") or []:
+                left = int(number(item.get("start_ts")))
+                right = int(number(item.get("end_ts")))
+                load = number(item.get("load_wh"))
+                supply = number(item.get("battery_pv_supply_wh"))
+                grid = number(item.get("grid_wh"))
+                number(item.get("billing_ct"))
+                if right <= left or min(load, supply, grid) < 0 or supply > load + 0.002 or abs(load - supply - grid) > 0.002:
+                    return unavailable("market_hold_horizon_invalid")
+                validated.append(item)
+            hold_end = next((int(item["end_ts"]) for item in reversed(validated) if item["battery_pv_supply_wh"] > 0), generated)
+            expected = generated
+            for item in validated:
+                left = max(generated, int(item["start_ts"]))
+                right = min(int(item["end_ts"]), hold_end)
+                if right <= generated or left >= hold_end:
+                    continue
+                if left != expected or right <= left:
+                    return unavailable("market_hold_horizon_invalid")
+                schedule.append(dict(item, start_ts=left, end_ts=right))
+                expected = right
+            if schedule and expected != hold_end:
+                return unavailable("market_hold_horizon_invalid")
         contract = market.get("active_contract")
-        if market.get("active") is not True or not isinstance(contract, dict):
-            return unavailable("no_market_actions")
-        released = contract.get("released_consumers")
-        if not isinstance(released, list) or any(not isinstance(item, str) for item in released):
+        if contract is not None and (not isinstance(contract, dict) or not isinstance(contract.get("action"), str)):
             return unavailable("market_contract_invalid")
-        if "storage" not in released:
-            return unavailable("no_market_actions")
-        if not number(contract.get("start_ts")) <= generated < number(contract.get("end_ts")):
-            return unavailable("market_contract_inactive")
-        # Auch ungenutzte verschachtelte Vertragsangaben müssen typgültig sein.
-        for parent, keys in ((market, ("consumer_policy", "economics")),
-                (contract, ("forecast",))):
-            if any(key in parent and not isinstance(parent[key], dict) for key in keys):
+        hold_wh = horizon.get("hold_wh")
+        hold_readable = isinstance(hold_wh, (int, float)) and not isinstance(hold_wh, bool) and math.isfinite(hold_wh)
+        horizon_only = (bool(schedule) and hold_readable
+            and (contract is None or contract.get("action") == "hold_discharge")
+            and (hold_wh <= 0.001 or (contract or {}).get("action") == "hold_discharge"))
+        if not horizon_only:
+            schedule = []
+        if horizon_only:
+            contract = {"start_ts": generated, "end_ts": hold_end}
+            forecast = {}
+            policy = market.get("consumer_policy") or {}
+            action = "hold_horizon"
+        else:
+            contract = market.get("active_contract")
+            if market.get("active") is not True or not isinstance(contract, dict):
+                return unavailable("no_market_actions")
+            released = contract.get("released_consumers")
+            if not isinstance(released, list) or any(not isinstance(item, str) for item in released):
                 return unavailable("market_contract_invalid")
-        forecast = contract.get("forecast", {})
-        if any(key in forecast and not isinstance(forecast[key], dict)
-                for key in ("price_action_contracts", "grid_charge_job", "late_fill")):
-            return unavailable("market_contract_invalid")
-        price_contracts = forecast.get("price_action_contracts", {})
-        if any(not isinstance(value, dict) for value in price_contracts.values()):
-            return unavailable("market_contract_invalid")
-        late = forecast.get("late_fill", {})
-        if any(key in late and not isinstance(late[key], bool) for key in ("active", "wait_active")):
-            return unavailable("market_contract_invalid")
-        policy = market.get("consumer_policy") or {}
-        action = contract.get("action")
-        if action not in ("hold_discharge", "grid_charge"):
-            return unavailable("no_market_actions")
-        if policy.get("storage_hold" if action == "hold_discharge" else "storage_grid_charge") is not True:
-            return unavailable("market_action_disabled")
-        forecast = contract.get("forecast") or {}
-        price_contract = (forecast.get("price_action_contracts") or {}).get(action) or {}
-        if price_contract.get("complete") is not True:
-            return unavailable("market_contract_invalid")
+            if "storage" not in released:
+                return unavailable("no_market_actions")
+            if not number(contract.get("start_ts")) <= generated < number(contract.get("end_ts")):
+                return unavailable("market_contract_inactive")
+            # Auch ungenutzte verschachtelte Vertragsangaben müssen typgültig sein.
+            for parent, keys in ((market, ("consumer_policy", "economics")),
+                    (contract, ("forecast",))):
+                if any(key in parent and not isinstance(parent[key], dict) for key in keys):
+                    return unavailable("market_contract_invalid")
+            forecast = contract.get("forecast", {})
+            if any(key in forecast and not isinstance(forecast[key], dict)
+                    for key in ("price_action_contracts", "grid_charge_job", "late_fill")):
+                return unavailable("market_contract_invalid")
+            price_contracts = forecast.get("price_action_contracts", {})
+            if any(not isinstance(value, dict) for value in price_contracts.values()):
+                return unavailable("market_contract_invalid")
+            late = forecast.get("late_fill", {})
+            if any(key in late and not isinstance(late[key], bool) for key in ("active", "wait_active")):
+                return unavailable("market_contract_invalid")
+            policy = market.get("consumer_policy") or {}
+            action = contract.get("action")
+            if action not in ("hold_discharge", "grid_charge"):
+                return unavailable("no_market_actions")
+            if policy.get("storage_hold" if action == "hold_discharge" else "storage_grid_charge") is not True:
+                return unavailable("market_action_disabled")
+            forecast = contract.get("forecast") or {}
+            price_contract = (forecast.get("price_action_contracts") or {}).get(action) or {}
+            if price_contract.get("complete") is not True:
+                return unavailable("market_contract_invalid")
         # Andere aktive Speicherpfade haben Vorrang vor der Marktregelung.
         # Ihre Kombination wäre eine neue Entscheidung, keine Projektion.
         if (plan.get("cheap_grid_charge") or {}).get("active") or (plan.get("storm_grid_charge") or {}).get("active"):
@@ -911,7 +1034,10 @@ def build_market_soc_trajectory(plan, live=None):
         efficiency = 1.0
         grid_budget_wh = 0.0
         target_soc = 100.0
-        if action == "hold_discharge":
+        if action == "hold_horizon":
+            replacements, efficiency = _market_projection_replacements(plan, horizon)
+            selected.extend(dict(item, contract_id=contract_id) for item in replacements)
+        elif action == "hold_discharge":
             selected.append({"action": "hold_economic", "origin": "hold_discharge",
                 "start_ts_ms": start, "end_ts_ms": end, "contract_id": contract_id,
                 "power_w": 0.0})
@@ -963,25 +1089,47 @@ def build_market_soc_trajectory(plan, live=None):
             base_power = (number(row.get("target_charge_w", row.get("charge_w")))
                 if net >= 0 else max(-discharge_cap, net))
             base_power = min(charge_cap, max(-discharge_cap, base_power))
-            cuts = sorted({left, base_end} | {int(a[k]) for a in selected for k in ("start_ts_ms", "end_ts_ms") if left < a[k] < base_end})
+            cuts = sorted({left, base_end} | {int(item[k]) for item in schedule for k in ("start_ts", "end_ts") if left < item[k] < base_end} | {int(a[k]) for a in selected for k in ("start_ts_ms", "end_ts_ms") if left < a[k] < base_end})
             for seg_start, seg_end in zip(cuts, cuts[1:]):
                 chosen = next((a for a in selected if a["start_ts_ms"] <= seg_start < a["end_ts_ms"]), None)
+                allocation = next((item for item in schedule if item["start_ts"] <= seg_start < item["end_ts"]), None)
+                if (chosen is None and horizon_only and allocation and allocation["load_wh"] > 0
+                        and allocation["battery_pv_supply_wh"] == 0 and soc > reserve + 0.001):
+                    chosen = {"action": "hold_economic", "origin": "hold_horizon",
+                        "start_ts_ms": seg_start, "end_ts_ms": seg_end,
+                        "contract_id": contract_id, "power_w": 0.0}
+                    selected.append(chosen)
                 mode = chosen["action"] if chosen else "none"
                 power = base_power
                 grid_power = 0.0
                 hours = (seg_end - seg_start) / 3600000.0
                 if chosen:
                     power = max(0.0, base_power)
-                    if mode == "grid_charge":
+                    if mode == "grid_charge" and chosen["origin"] != "hold_replacement":
                         # Netzladen ersetzt die Entladung; Hausbedarf stammt
                         # dann aus dem Netz und wird nicht nochmals abgezogen.
                         grid_power = min(chosen["power_w"], charge_cap,
                             grid_budget_wh / hours,
                             max(0.0, target_soc - soc) * capacity / 100.0 / hours / efficiency)
                         power = max(power, grid_power * efficiency)
+                # Schedule enthält bereits den Restanteil der ersten Viertelstunde.
+                if allocation and (chosen is None or chosen["origin"] in ("hold_horizon", "hold_replacement")):
+                    if chosen and chosen["origin"] == "hold_horizon":
+                        power = 0.0
+                    elif net < 0:
+                        allocation_hours = (allocation["end_ts"] - allocation["start_ts"]) / 3600000.0
+                        power = max(-discharge_cap, -number(allocation["battery_pv_supply_wh"]) / allocation_hours)
+                    else:
+                        power = max(0.0, base_power)
+                if chosen and chosen["origin"] == "hold_replacement":
+                    # Ersatzmenge ist batteriebezogen; PV und Last bleiben im
+                    # Fahrplan enthalten. Pufferenergie wird nicht addiert.
+                    grid_power = min(chosen["power_w"], max(0.0, charge_cap - max(0.0, power)) / efficiency,
+                        max(0.0, (100.0 - soc) * capacity / 100.0 / hours - power) / efficiency)
+                    power += grid_power * efficiency
                 end_soc = max(reserve, min(100.0, soc + power * hours / capacity * 100.0))
                 actual_power = (end_soc - soc) * capacity / 100.0 / hours
-                if mode == "grid_charge":
+                if mode == "grid_charge" and chosen["origin"] != "hold_replacement":
                     grid_power = min(grid_power, max(0.0, actual_power) / efficiency)
                     grid_budget_wh = max(0.0, grid_budget_wh - grid_power * hours)
                 slots.append({"start_ts_ms": seg_start, "end_ts_ms": seg_end,
@@ -995,6 +1143,11 @@ def build_market_soc_trajectory(plan, live=None):
             expected = base_end
         if not slots or expected != plan.get("horizon_end_ts_ms"):
             return unavailable("market_projection_endpoint_missing")
+        if horizon_only and not selected:
+            # Ohne zurückgehaltene Energie den bestehenden Vertragspfad rechnen.
+            fallback = dict(plan, market_plan=dict(market, forecast=dict(market.get("forecast") or {},
+                hold_horizon=dict(horizon, valid=False))))
+            return build_market_soc_trajectory(fallback, live)
         result.update({"complete": True, "reason_code": None,
             "integration_start_ts_ms": generated, "horizon_end_ts_ms": expected,
             "anchor_ts_ms": anchor_ts, "anchor_soc_pct": soc if not slots else slots[0]["soc_start_pct"],
@@ -1009,7 +1162,7 @@ def build_market_soc_trajectory(plan, live=None):
             material.append("%.6f" % number(result[key]))
         for slot in slots:
             material.extend(str(slot[k] or "") for k in ("slot_id", "action", "origin", "contract_id"))
-            material.extend("%.6f" % number(slot[k]) for k in ("start_ts_ms", "end_ts_ms", "soc_start_pct",
+            material.extend("%.6f" % (number(slot[k]) or 0.0) for k in ("start_ts_ms", "end_ts_ms", "soc_start_pct",
                 "soc_end_pct", "power_w", "grid_charge_w", "base_power_w", "reserve_soc_pct"))
         result["trajectory_revision"] = "sha256:" + hashlib.sha256("|".join(material).encode("utf-8")).hexdigest()
         return result
@@ -1072,7 +1225,7 @@ def read_market_observed_charge_w(path=None, now_s=None):
 
 def read_market_running_grid_window_end_ts(path=None, now_s=None):
     """Fensterende (ms) eines laufenden Markt-Netzladevorgangs des Storage
-    Managers (state market_grid_charge, mode MODE_GRID, Zustandsfile frisch), sonst None. Der Planer lässt den
+    Managers (state market_grid_charge, GRID oder gebundener AUTO-Ausgang mit gespeichertem AUTO/GRID-Modus, Zustandsfile frisch), sonst None. Der Planer lässt den
     Job in diesem Fenster ohne Mindestjob bis zum Ziel weiterlaufen; fehlende oder alte Daten sind kein Beleg.
     """
     state = _read_storage_manager_state(path)
@@ -1081,8 +1234,20 @@ def read_market_running_grid_window_end_ts(path=None, now_s=None):
     try:
         if str(state.get("state") or "") != "market_grid_charge":
             return None
-        if int(float(state.get("mode"))) != int(STORAGE_MANAGER_MODE_GRID):
+        mode = state.get("mode")
+        if isinstance(mode, bool):
             return None
+        if int(float(mode)) != int(STORAGE_MANAGER_MODE_GRID):
+            control = state.get("market_grid_charge_control")
+            if (int(float(mode)) != int(STORAGE_MANAGER_MODE_AUTO) or not isinstance(control, dict)
+                    or control.get("output_mode") not in (STORAGE_MANAGER_MODE_AUTO, STORAGE_MANAGER_MODE_GRID)
+                    or control.get("window_end_ts") != state.get("market_late_fill_window_end_ts")
+                    or isinstance(control.get("output_mode"), bool)
+                    or not math.isfinite(float(control.get("target_ts") or 0))
+                    or float(control.get("target_ts") or 0) <= 0
+                    or not math.isfinite(float(control.get("rate_w") or 0))
+                    or float(control.get("rate_w") or 0) < 300):
+                return None
         state_ts = float(state.get("ts") or 0.0)
         reference_s = float(time.time() if now_s is None else now_s)
         if (not math.isfinite(state_ts) or state_ts <= 0.0
@@ -5632,6 +5797,8 @@ class StorageSimulator:
         _live_power_limits_active = False
         _live_ts = 0.0
         _live_d = {}
+        # Messalter am Lesen bewerten; die eigene Simulation altert die Probe nicht.
+        _live_read_at_s = time.time()
         try:
             if os.path.exists(LIVE_DATA_FILE):
                 with open(LIVE_DATA_FILE, 'r', encoding='utf-8-sig') as f:
@@ -9304,12 +9471,12 @@ class StorageSimulator:
         # Der Marktplan verwendet dieselben frischen Gerätegrenzen wie der Writer.
         # Ein allgemeiner Leistungsrückfall ist kein Beleg für spätere Netzenergie.
         _market_live = _live_d if isinstance(_live_d, dict) else {}
-        _market_limits = effective_power_limit_cfg(self.v4_config, _market_live, now_s=time.time())
+        _market_limits = effective_power_limit_cfg(self.v4_config, _market_live, now_s=_live_read_at_s)
         _market_limit_diagnostics = _market_limits.get("_power_limit_diagnostics") or {}
         _market_power_known = bool(
             self._safe_float(self.v4_config.get("maximumladeleistung"), 0.0) >= 300.0
             or _market_limit_diagnostics.get("device_max_charge_power_w_valid") is True
-            or _fresh_rscp_charge_limits_w(self.v4_config, _market_live, now_s=time.time())
+            or _fresh_rscp_charge_limits_w(self.v4_config, _market_live, now_s=_live_read_at_s)
         )
         _market_economics_config["maximumladeleistung"] = (
             _market_limits.get("maximumladeleistung") if _market_power_known else 0
@@ -9317,7 +9484,7 @@ class StorageSimulator:
         _market_economics_config["_market_live_frame_usable"] = bool(
             _market_live.get("RSCP_Sample_Valid") is True
             and _market_live.get("Power_Decision_Usable") is True
-            and _live_ts > 0 and -5 <= time.time() - _live_ts <= min(30.0, max(1.0,
+            and _live_ts > 0 and -5 <= _live_read_at_s - _live_ts <= min(30.0, max(1.0,
                 self._safe_float(self.v4_config.get("storage_live_stale_guard_s"), 10.0)))
         )
         try:
@@ -9336,8 +9503,24 @@ class StorageSimulator:
             _market_now_ms + MARKET_HORIZON_MS,
         )
         # Beobachtete Markt-Ladeleistung (P_obs) aus dem Zustandsfile des Storage
-        # Managers; None -> konfigurierte Ladeleistung (heutiges Verhalten).
+        # Managers; ohne frische Messung gilt der vorsichtige Startwert je Band.
         _market_observed_charge_w = read_market_observed_charge_w()
+        _forecast_state = _read_storage_manager_state() or {}
+        _market_economics_config["_market_charge_forecast"] = _forecast_state.get("market_grid_observed_profile")
+        _market_economics_config["_market_device_charge_w"] = _market_live.get("device_max_charge_power_w")
+        _legacy_device_w = self._safe_float(_market_live.get("device_max_charge_power_w"), 0.0)
+        _profile_bands = _market_economics_config.get("_market_charge_forecast")
+        _profile_bands = _profile_bands if isinstance(_profile_bands, dict) else {}
+        _lower_band = _profile_bands.get("0")
+        _lower_band = _lower_band if isinstance(_lower_band, dict) else {}
+        if (_market_observed_charge_w and _legacy_device_w >= 300
+                and not _lower_band.get("samples")):
+            _market_economics_config["_market_charge_forecast"] = dict(_profile_bands,
+                **{"0": {"factor": max(0.1, min(1.0, _market_observed_charge_w/_legacy_device_w)),
+                         "ts": _forecast_state.get("market_grid_observed_charge_ts"),
+                         "samples": _forecast_state.get("market_grid_observed_charge_samples", 0)}})
+
+
         # Laufender Markt-Netzladevorgang (Fensterende) aus dem Zustandsfile.
         _market_running_grid_window_end_ts = read_market_running_grid_window_end_ts()
         # Gebundene Fensterreferenz des letzten Plans zurückreichen (fail-closed).
@@ -9793,8 +9976,7 @@ class StorageSimulator:
                     expected_topology_revision=self.pv_topology_contract.get('revision') if _backup_dc_only else None,
                 ) for row in timeline}
                 try:
-                    _backup_ml_stamp = backup_hold.number(ml_data.get('ts'))
-                    _backup_ml_ms = (None if _backup_ml_stamp is None else _backup_ml_stamp * 1000) if 'ts' in ml_data else os.path.getmtime(ML_PRED_FILE) * 1000
+                    _backup_ml_ms = self._parse_alert_ts(ml_data['ts']) if 'ts' in ml_data else os.path.getmtime(ML_PRED_FILE) * 1000
                 except OSError:
                     _backup_ml_ms = None
                 _backup_observation = backup_hold.build_observation(

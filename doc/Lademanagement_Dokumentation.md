@@ -168,14 +168,16 @@ Das System unterstützt den parallelen Betrieb von mehreren Fahrzeugen und Lades
 ### Native Wallbox Steuerung
 Das alte Wallbox-Management wurde durch den nativen **Python Wallbox Manager** ersetzt. Die sichtbaren Nutzer-Modi sind:
 
-* **Aus:** NGNA: keine aktive E3DC-Control-Ladung und keine laufenden Steuerbefehle. Nur beim bewussten Wechsel auf `Aus` in der WebUI wird einmalig die Wallbox-Grundeinstellung freigegeben. Geplantes Netzladen bleibt gesperrt.
+* **Beobachten (intern Aus):** E3DC-Control beobachtet, die Wallbox bzw. der E3DC regelt selbst. Beim bewussten Wechsel und beim Fortsetzen einer Pause in diesem Modus wird einmalig die Grundeinstellung freigegeben. Pause und Not-Aus stoppen weiterhin sofort. Geplantes Netzladen bleibt gesperrt.
 * **PV-Kurve ruhig:** Laden aus PV-Überschuss entlang der Speicher-Ladekurve mit Hysterese; über oder im Kurvenkorridor stützt der Hausspeicher nur im Rahmen des Wolken-Kontingents. Unter dem Korridor erhält die Wallbox bei ausgeschalteter zentraler PV-Aufteilung den reinen PV-Überschuss. Mit experimenteller zentraler PV-Aufteilung reserviert der Speicher zuerst seinen Kurvenbedarf; die Wallbox erhält den absoluten Rest.
 * **Grundladung stabil:** Wie PV-Kurve ruhig, aber mit stabiler 1p/3p-Grundladung, solange `wbminSoc` laut Planung erreichbar bleibt.
 * **PV + Akku bis Untergrenze:** Das Auto darf PV plus Hausspeicher oberhalb der Hausakku-Untergrenze nutzen; oberhalb der Haltezone bleibt die bisherige Speicherfreigabe. Mit experimenteller zentraler PV-Aufteilung führt unterhalb der Haltezone bei geschlossenem Tor der Kurvenbedarf den Akkuanteil. Unterhalb der Grenze lädt das Auto wie in `PV-Kurve ruhig` nur aus PV-Überschuss, der Speicher stützt nur Hausverbrauch und Wärmepumpe, Netz bleibt außen vor.
 * **Sofort bis Preislimit:** Sofortiges Netzladen, solange der aktuelle Preis das Wallbox-Preislimit erfüllt.
-* **Akku bis Abfahrt:** Lädt im Freigabefenster vor der Abfahrtszeit aus PV und Hausspeicher bis zur Hausakku-Untergrenze `wbminsoc`; Netzladen bleibt gesperrt. Gestoppt wird bei erreichter Abfahrtszeit, vollem Fahrzeug oder erreichter Untergrenze (`wb<n>_battery_departure_time`, `wb<n>_battery_departure_window_h`).
+* **Akku bis Abfahrt:** Lädt im Freigabefenster vor der Abfahrtszeit aus PV und Hausspeicher bis zur Hausakku-Untergrenze `wbminsoc`; Netzladen bleibt gesperrt. Gestoppt wird bei erreichter Abfahrtszeit und bei vollem Fahrzeug; an der Untergrenze kann mit ausreichendem PV-Anteil weitergeladen werden (`wb<n>_battery_departure_time`, `wb<n>_battery_departure_window_h`).
 
 Geplantes Netzladen per Zeitfenster/Slot ist davon getrennt: Es darf in allen aktiven Modi laden und ignoriert das globale Wallbox-Preislimit, weil die günstigsten Stunden bereits bei der Slotplanung ausgewählt werden. Im Modus **Aus** bleibt geplantes Laden gesperrt.
+
+Pause, Not-Aus und Ladepunktsperre beenden eine laufende Ladung sofort mit quittiertem Stopp, auch in „Beobachten“. Anti-Flattern und Mindestladezeit verzögern diesen Stopp nicht. Das Abbruchbit der Box zeigt, ob die Box eine Ladung freigibt oder gesperrt hat. Native E3DC-Wallboxen erhalten einen Stoppimpuls nur, wenn sie frisch „nicht abgebrochen“ melden, auch ohne Leistungsbezug. „Abgebrochen“ quittiert den Stopp ohne weitere Flanke. Fehlt die Abbruchmeldung der Box über mehrere Proben, ist genau ein Stopp mit frischem Ladebeleg zulässig; die Anzeige meldet „Zustand der Box nicht lesbar“. Andere Typen nehmen auch ein stehendes Angebot zurück. Bleibt nach einer nativen Stoppflanke der Bitwechsel 30 Sekunden aus, entsteht ein Fehler. In diesem Fehlerzustand erhalten Pause, Ladepunktsperre, Not-Aus, Notstromreserve und Hausanschluss gemeinsam genau eine zusätzliche Stoppflanke: frühestens 60 Sekunden nach dem letzten Stoppversuch, bei frischer Probe mit „nicht abgebrochen“ oder unbekanntem Bit und nur mit frischem Ladebeleg. Die Fehleranzeige erscheint ab Fehlerbeginn. Die zusätzliche Einmalflanke ist höchstens einmal je Stecksession und Dienstlauf zulässig; ist sie verbraucht oder für den Stoppgrund nicht berechtigt, bittet die Oberfläche, den Ladepunkt zu prüfen. Nach einem Neustart des Dienstes steht sie einmal neu zur Verfügung. Eine Stecksession endet erst mit bestätigtem Abstecken: mindestens drei aufeinanderfolgende frische Proben ohne gestecktes Fahrzeug über mindestens zehn Sekunden. Insgesamt sind höchstens drei Versuche je Ereignis zulässig; eine bereits verbrauchte Einmalflanke wird durch einen späteren Nutzer-Stopp nicht erneuert. Ein beobachteter externer Neustart wird bei Nutzer-Aus, Schutzgründen, Ladefensterende, Ziel erreicht, Abfahrt oder Budget-Zeitlimit erneut gestoppt, frühestens 30 Sekunden nach der letzten Flanke. Bei Unterdeckung übernimmt der Regelkern die externe Ladung und beendet sie nach seinen normalen Sitzungsregeln. Sperre, Pause und Not-Aus bleiben nach Dienst- und Host-Neustart sowie Containerstart bestehen. Die Ladepunktsperre gilt als Nutzer-Aus. Sperre und Not-Aus lassen sich nur über den Schalter mit dem Power-Symbol des jeweiligen Ladepunkts in der erweiterten Ansicht auf der Seite „Wallbox“ aufheben. Moduswahl, Abstecken und Speichern in der einfachen Ansicht heben die Sperre nicht auf. Fortsetzen, ein bewusster Moduswechsel, Sofortstart, Abstecken oder externes Fortsetzen an einer openWB Primary heben nur die Pause auf. Bleibt „Beobachten“ eingestellt, wird beim Fortsetzen oder Freigeben einmalig die Grundeinstellung freigegeben und anschließend wieder beobachtet. Bei nativen Boxen hebt Fortsetzen in „Beobachten“ nur die eigene Pause oder Ladepunktsperre derselben Stecksession genau einmal auf, wenn die Box frisch „abgebrochen“ meldet. Diese Übergabe benötigt kein Regelbudget. Eine App-Sperre wird nicht aufgehoben. Nach Not-Aus erfolgt in „Beobachten“ keine automatische Freigabe; die Box bleibt bis zur App-Freigabe gesperrt. Endet eine Pause in „Beobachten“ durch bestätigtes Abstecken, bleibt eine native Box gesperrt, bis sie in der E3DC-App freigegeben oder ein Regelmodus gewählt wird. Die bewusste Freigabe über den Schalter der Ladepunktsperre gibt die Box genau einmal frei, auch ohne gestecktes Fahrzeug, solange seit der Sperre weder eine Pause noch ein neues Anstecken dazwischenlag.
 
 ### Externe Wallboxen und MQTT
 Externe Wallboxen können gesteuert oder nur gemessen werden:
@@ -233,10 +235,9 @@ Start löst eigene Ladeende-, Untergrenzen- und Kaskadenanker derselben
 Stecksession. Nach Kontingent-Ende oder gescheitertem Phasenabstieg gilt
 derselbe Vertrag. Fremde oder geschützte Stopps bleiben erhalten.
 
-Ein bewusster Wechsel auf „PV + Akku bis Untergrenze“ oder „Akku bis Abfahrt“
-löst die Wiederanlaufsperre einmalig. „Sofort bis Preislimit“ löst sie nur
-mit tatsächlicher Akku- oder Netzfreigabe. „PV-Kurve ruhig“ und „Grundladung
-stabil“ lösen sie nicht. Ein neuer Kaskaden-Stop eröffnet eine neue Episode.
+Nach einem regulären Stopp benötigt ein PV-Start 60 Sekunden ausreichenden
+Anteil. Bei freigegebener Netzquelle entfällt diese Startqualifizierung.
+Eine zusätzliche fünfminütige Wiederanlaufsperre besteht nicht.
 Wh-Konten, Untergrenzen, Messwertgültigkeit und Hardware-Schutzfristen
 gelten weiter. Die Startflanke bleibt mindestens 60 Sekunden und mindestens
 bis zum wirksamen Start-/Stop-Abstand des Geräteprofils zuzüglich eines
@@ -257,30 +258,6 @@ keine Einstellungen.
 
 ## Experimentelle zentrale PV-Aufteilung
 
-`storage_central_pv_split_enable` ist standardmäßig aus. Eingeschaltet
-reserviert der Speicher zuerst seinen Kurvenbedarf; jeder geregelte Ladepunkt
-erhält seinen Anteil des verbleibenden Gruppenrahmens genau einmal. Einspeisung
-und laufende Eigenleistung vergrößern diesen Einzelrahmen nicht.
-
-Eine real ladende Wallbox hält ihren bestätigten Mindeststrom bis zur Grenze
-des Kontos „Kurvenrückstand“ (wie Wolken-Kontingent: 0,5 % der Kapazität,
-mindestens 50 Wh). Danach folgt 1p nur bei ausführbarer Sequenz, freier
-Phasensperre und gedecktem 1p-Wiederanlauf samt Reserve; sonst direkt Stop.
-Nach bestätigtem Wechsel und realem Wiederanlauf beginnt die 1p-Stufe bei null.
-Ein weiterer Kontodurchlauf endet im Stop. Ein unbekannter Rahmen friert Konto
-und Rücksetzuhr ein und löst keine Regelaktion aus. Nach Dienstneustart bleibt
-ein erschöpftes Konto erschöpft. Nach 60 Sekunden gültig belegtem Ende der
-Anwendbarkeit oder Ladung beginnt das Konto neu.
-
-Nach Stop startet die Wallbox erst bei stabilem Einzelrahmen über Startminimum
-plus max(230 W, 10 %); die vorhandene Stabilitätszeit beträgt standardmäßig
-120 Sekunden. Nutzer-Aus, Ladefensterende, Notstromreserve, Hausanschluss,
-Profilpause und ausdrücklich freigegebene Starts behalten Vorrang.
-
-Zum Prüfen auf einem eigenen System in „PV-Kurve ruhig“ einschalten,
-bei frischen Daten eine Wolke und anschließende Sonne beobachten. Im
-Diagnose-Export nennt `curve_backlog` je Ladepunkt `used_wh`, `limit_wh`,
-`stage`, `last_action` und `reason`; `central_frame.frame_w` ist der Einzelrahmen.
-Mindeststrom, Eigenleistung, Ist-Phasen, Akkuladung und Netzleistung gemeinsam
-prüfen. Bei unerwartetem Netzbezug oder wiederholtem Schalten ausschalten und
-Diagnose sichern.
+Das Budget ist der Rahmen für die Wallboxen; Strom, Phasen und Stopp
+entscheidet der Wallbox Manager. Schutzstopps, Unterdeckungsregel, Datenfrist
+und Wiederanlauf wirken auch bei zentraler PV-Aufteilung wie ohne sie.

@@ -217,7 +217,7 @@ def _read_checkpoint(directory_fd, *, basename=CHECKPOINT_BASENAME,
 
 
 def load_heatpump_pv_checkpoint(*, directory=None, now_s=None):
-    """Fehlend/korrupt/unsicher ergibt Quarantäne, niemals einen leeren Starttopf."""
+    """Fehlend/korrupt wird als Kontolücke gemeldet, niemals als leerer Starttopf."""
     current = _now(now_s)
     descriptor = None
     try:
@@ -278,7 +278,10 @@ def _persist_checkpoint(state, *, directory=None, now_s=None, force=False,
         except (OSError, RuntimeError, ValueError, TypeError, AttributeError, KeyError):
             # Der erste haltbare Zustand nach Datenverlust muss ausdrücklich
             # dessen Rekonsiliation bewahren; ein normaler neuer Topf ist gesperrt.
-            if quarantine_required and validated.get("uncertain_state") is not True:
+            recovery = validated.get("energy_recovery") or {}
+            if (quarantine_required and validated.get("uncertain_state") is not True
+                    and not (recovery.get("kind") == "checkpoint_loss"
+                             and recovery.get("status") == "resumed")):
                 return False
             try:
                 info = os.stat(basename, dir_fd=descriptor, follow_symlinks=False)

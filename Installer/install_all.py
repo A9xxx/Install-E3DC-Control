@@ -1026,7 +1026,7 @@ def install_all_main(headless=False, *, bind_first_install_role=False):
     print("  6. Kerndienst-Installation wird nach RAM-Disk und Backup in Schritt 10 gebündelt")
     print("  7. RAM-Disk einrichten")
     print("  8. Backup der Initialversion erstellen")
-    print("  9. Live-, Markt-, Forecast-, Storage- und WebSocket-Kerndienste einrichten")
+    print("  9. Live-, Markt-, Forecast- und Storage-Kerndienste einrichten")
     print("  10. Energy Manager erst nach bestätigtem Kern-Livepfad einrichten")
     print("  11. Watchdog & Benachrichtigungs-Dienst installieren (Silent)")
     print("  12. Finale Prüfung & Einrichtung (Berechtigungen, Services etc.)\n")
@@ -1413,10 +1413,10 @@ def install_all_main(headless=False, *, bind_first_install_role=False):
         return False
 
     # =========================================================
-    # SCHRITT 9: Pflicht-Kerndienste einschließlich WebSocket
+    # SCHRITT 9: Pflicht-Kerndienste
     # =========================================================
     print("\n" + "=" * 60)
-    print("SCHRITT 9/12: Live-, Markt-, Forecast-, Storage- und WebSocket-Kerndienste")
+    print("SCHRITT 9/12: Live-, Markt-, Forecast- und Storage-Kerndienste")
     print("=" * 60)
     def install_core_services_task():
         # Der umfangreiche Markt-/Forecast-Import darf erst nach der
@@ -1425,7 +1425,7 @@ def install_all_main(headless=False, *, bind_first_install_role=False):
 
         # True wird erst nach dem gemeinsamen Unit-/Enable-/Active-Readback
         # des vollständigen Kernbundles geliefert.
-        return install_epex_service(include_websocket=True)
+        return install_epex_service()
 
     if not safe_execute_task("Kern-Manager Services installieren", install_core_services_task):
         failed_steps.append("Kern-Manager Services")

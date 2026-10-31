@@ -1444,10 +1444,10 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
         <?php $nativeWallboxStatusEnabled = hasNativeWallboxStatusConfig($_c ?? []); ?>
         <?php if($storageStatusEnabled): ?>
         <div id="wb-native-alert" class="card shadow-sm mb-3 border-0" style="display:none; background: linear-gradient(135deg, rgba(168, 85, 247, 0.08) 0%, rgba(168, 85, 247, 0.01) 100%);">
-            <div class="card-body p-2 px-3 d-flex align-items-stretch" style="min-height:72px; gap:0;">
+            <div class="card-body p-2 px-3 d-flex align-items-stretch" style="min-height:72px; gap:12px 0; flex-wrap:wrap;">
 
                 <!-- === Spalte 1: Storage Manager & Simulator (links, groesste Spalte) === -->
-                <div class="d-flex flex-column justify-content-center pe-3 flex-grow-1" style="min-width:0; <?php if($nativeWallboxStatusEnabled || $heatManagerEnabled): ?>border-right:1px solid rgba(108,117,125,0.22);<?php endif; ?>">
+                <div class="d-flex flex-column justify-content-center pe-3" style="min-width:min(100%,280px); flex:2 1 280px; <?php if($nativeWallboxStatusEnabled || $heatManagerEnabled): ?>border-right:1px solid rgba(108,117,125,0.22);<?php endif; ?>">
                     <div class="text-uppercase fw-bold d-flex align-items-center gap-1 mb-1" style="font-size:0.6rem; letter-spacing:0.06em; color:#818cf8;">
                         <i class="fas fa-brain" style="font-size:0.62rem;"></i> Speicherregelung &amp; Prognose
                     </div>
@@ -1471,7 +1471,7 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                 </div>
 
                 <!-- === Spalte 2: Wärme Regelung === -->
-                <div id="heat-manager-col" data-heat-configured="<?= $heatManagerEnabled ? '1' : '0' ?>" class="<?= $heatManagerEnabled ? 'd-flex ' : '' ?>flex-column justify-content-center px-3" style="<?php if(!$heatManagerEnabled): ?>display:none !important; <?php endif; ?>min-width:190px; flex-shrink:0; <?php if($nativeWallboxStatusEnabled): ?>border-right:1px solid rgba(108,117,125,0.22);<?php endif; ?>">
+                <div id="heat-manager-col" data-heat-configured="<?= $heatManagerEnabled ? '1' : '0' ?>" class="<?= $heatManagerEnabled ? 'd-flex ' : '' ?>flex-column justify-content-center px-3" style="<?php if(!$heatManagerEnabled): ?>display:none !important; <?php endif; ?>min-width:min(100%,190px); flex:1 1 190px; <?php if($nativeWallboxStatusEnabled): ?>border-right:1px solid rgba(108,117,125,0.22);<?php endif; ?>">
                     <div class="text-uppercase fw-bold d-flex align-items-center gap-1 mb-1" style="font-size:0.6rem; letter-spacing:0.06em; color:#fb923c;">
                         <i class="fas fa-fire" style="font-size:0.62rem;"></i> Wärme Regelung
                     </div>
@@ -1489,7 +1489,7 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                 </div>
 
                 <!-- === Spalte 3: Wallbox Regelung (mitte) === -->
-                <div id="wb-native-col2" data-wallbox-configured="<?= $nativeWallboxStatusEnabled ? '1' : '0' ?>" class="<?= $nativeWallboxStatusEnabled ? 'd-flex ' : 'd-none ' ?>flex-column justify-content-center px-3" <?php if(!$nativeWallboxStatusEnabled): ?>hidden aria-hidden="true"<?php else: ?>aria-hidden="false"<?php endif; ?> style="<?php if(!$nativeWallboxStatusEnabled): ?>display:none !important; <?php endif; ?>min-width:210px; flex-shrink:0; border-right:1px solid rgba(108,117,125,0.22);">
+                <div id="wb-native-col2" data-wallbox-configured="<?= $nativeWallboxStatusEnabled ? '1' : '0' ?>" class="<?= $nativeWallboxStatusEnabled ? 'd-flex ' : 'd-none ' ?>flex-column justify-content-center px-3" <?php if(!$nativeWallboxStatusEnabled): ?>hidden aria-hidden="true"<?php else: ?>aria-hidden="false"<?php endif; ?> style="<?php if(!$nativeWallboxStatusEnabled): ?>display:none !important; <?php endif; ?>min-width:min(100%,210px); flex:1 1 210px; border-right:1px solid rgba(108,117,125,0.22);">
                     <div class="text-uppercase fw-bold d-flex align-items-center gap-1 mb-1" style="font-size:0.6rem; letter-spacing:0.06em; color:#a855f7;">
                         <i class="fas fa-sliders-h" style="font-size:0.62rem;"></i> Wallbox Regelung
                         <span class="badge rounded-pill bg-secondary bg-opacity-25 text-secondary ms-auto" id="wb-native-count" style="font-size:0.58rem;">-- WB</span>
@@ -1514,7 +1514,7 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                 </div>
 
                 <!-- === Spalte 4: Verbindungsstatus + WB-Name + WB-Details (rechts) === -->
-                <div id="wb-native-col3" data-wallbox-configured="<?= $nativeWallboxStatusEnabled ? '1' : '0' ?>" class="<?= $nativeWallboxStatusEnabled ? 'd-flex ' : 'd-none ' ?>flex-column justify-content-center ps-3" <?php if(!$nativeWallboxStatusEnabled): ?>hidden aria-hidden="true"<?php else: ?>aria-hidden="false"<?php endif; ?> style="<?php if(!$nativeWallboxStatusEnabled): ?>display:none !important; <?php endif; ?>min-width:290px; flex-shrink:0;">
+                <div id="wb-native-col3" data-wallbox-configured="<?= $nativeWallboxStatusEnabled ? '1' : '0' ?>" class="<?= $nativeWallboxStatusEnabled ? 'd-flex ' : 'd-none ' ?>flex-column justify-content-center ps-3" <?php if(!$nativeWallboxStatusEnabled): ?>hidden aria-hidden="true"<?php else: ?>aria-hidden="false"<?php endif; ?> style="<?php if(!$nativeWallboxStatusEnabled): ?>display:none !important; <?php endif; ?>min-width:min(100%,290px); flex:1 1 290px;">
                     <div class="d-flex align-items-center">
                         <div id="wb-native-pulse" class="rounded-circle me-2 flex-shrink-0" style="width:12px; height:12px; background:#a855f7;"></div>
                         <div style="min-width:0;">
@@ -1527,8 +1527,8 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                         </div>
                     </div>
                     <!-- Multi-WB Details (nur bei >1 WB) -->
-                    <div id="wb-native-multi-details" class="d-none d-flex gap-2 mt-2">
-                        <div id="wb-native-1-slot" class="flex-fill rounded-2 px-2 py-1 wb-native-slot" style="border:1px solid rgba(108,117,125,0.24); background:rgba(108,117,125,0.06); min-width:0;">
+                    <div id="wb-native-multi-details" class="d-none d-flex gap-2 mt-2" style="flex-wrap:wrap;">
+                        <div id="wb-native-1-slot" class="rounded-2 px-2 py-1 wb-native-slot" style="border:1px solid rgba(108,117,125,0.24); background:rgba(108,117,125,0.06); min-width:0; flex:1 1 180px;">
                             <div class="d-flex align-items-center gap-1 text-muted text-uppercase" style="font-size:0.55rem;">
                                 <span id="wb-native-1-dot" class="rounded-circle flex-shrink-0" style="width:7px;height:7px;background:#6c757d;"></span>
                                 <span>WB 1</span>
@@ -1538,7 +1538,7 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                             <div class="text-truncate" style="font-size:0.75rem;"><span id="wb-native-1-amp" class="text-info fw-bold">0 A</span> <span id="wb-native-1-phase" class="badge bg-secondary bg-opacity-25 text-secondary ms-1" style="font-size:0.6rem;">--p</span> <span class="text-muted mx-1">|</span> <span id="wb-native-1-state" class="text-muted">Idle</span></div>
                             <div id="wb-native-1-onephase" class="text-muted d-none text-truncate" style="font-size:0.6rem;"></div>
                         </div>
-                        <div id="wb-native-2-slot" class="flex-fill rounded-2 px-2 py-1 wb-native-slot" style="border:1px solid rgba(108,117,125,0.24); background:rgba(108,117,125,0.06); min-width:0;">
+                        <div id="wb-native-2-slot" class="rounded-2 px-2 py-1 wb-native-slot" style="border:1px solid rgba(108,117,125,0.24); background:rgba(108,117,125,0.06); min-width:0; flex:1 1 180px;">
                             <div class="d-flex align-items-center gap-1 text-muted text-uppercase" style="font-size:0.55rem;">
                                 <span id="wb-native-2-dot" class="rounded-circle flex-shrink-0" style="width:7px;height:7px;background:#6c757d;"></span>
                                 <span>WB 2</span>
@@ -2069,8 +2069,8 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                         ?: (($dashWb2ConfiguredName !== '' && strlen((string)($dashWbCfg['wb2_name'] ?? '')) <= 32) ? $dashWb2ConfiguredName : 'Wallbox 2');
                     ?>
                     <!-- Wallbox Card 1 -->
-                    <?php if($dashHasWb1): ?>
-                    <div class="right-card-wrapper dashboard-consumer-badge dashboard-wallbox-badge" id="card-wb-wrapper">
+                    <?php if($dashHasWb1 || e3dcWallboxMqttMeasureConfigured($dashWbCfg, 1)): ?>
+                    <div class="right-card-wrapper dashboard-consumer-badge dashboard-wallbox-badge" id="card-wb-wrapper" <?= $dashHasWb1 ? '' : 'style="display:none;"' ?>>
                         <div class="card" onclick="switchChartMode('live', 'wb')" style="cursor:pointer;">
                             <div class="card-body d-flex align-items-center p-3" style="min-height: 114px;">
                                 <div class="icon-box bg-secondary bg-opacity-10 text-secondary me-3 position-relative" id="icon-wb">
@@ -2085,18 +2085,22 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                                                 <div class="val-large text-body" id="val-wb" style="line-height:1;">–</div>
                                             </div>
                                             <div class="small text-muted text-truncate tile-detail" id="wb-status">Bereit</div>
+                                            <div class="small text-muted tile-detail" id="wb-measure-only-hint" hidden>Messung per MQTT, keine Steuerung</div>
                                             <div class="small text-muted tile-detail wallbox-identity-detail" id="wb-identity" style="display:none; font-size:0.7rem;"></div>
                                             <div class="small text-muted mt-1 tile-detail" id="wb-details" style="display:none; font-size: 0.7rem;"></div>
+                                            <div data-wallbox-emergency-notice class="small text-body bg-body-tertiary border rounded p-2 my-2" hidden><?= htmlspecialchars(e3dcWallboxEmergencyHint(), ENT_QUOTES, 'UTF-8') ?></div>
                                             <div id="wb-peak-detail" style="display:none;" class="small text-muted mt-1 tile-detail"><i class="fas fa-arrow-up text-danger opacity-75"></i> <span id="val-wb-max" class="fw-bold">--</span> (Max)</div>
                                         </div>
                                         <div class="d-flex flex-column align-items-end gap-1 ms-2 wallbox-meta-stack">
                                             <div class="d-flex gap-1">
-                                                <button type="button" id="wb-force-start-btn" class="btn btn-sm btn-outline-success rounded-circle wallbox-force-start-btn" data-dashboard-wb-force-start="1" title="Ladung sofort starten / Freigabe erzwingen" aria-label="Wallbox 1 starten" onclick="event.stopPropagation(); triggerWallboxForceStart(1);" style="width:2rem;height:2rem;display:inline-flex;align-items:center;justify-content:center;">
+                                                <?php if($dashHasWb1): ?>
+                                                <button type="button" id="wb-force-start-btn" class="btn btn-sm btn-outline-success rounded-circle wallbox-force-start-btn" data-dashboard-wb-force-start="1" <?= (e3dcWallboxEmergencyFlagActive()) ? 'disabled' : '' ?> title="Ladung sofort starten (hebt eine Pause auf, nicht Sperre oder Not-Aus)" aria-label="Wallbox 1 starten" onclick="event.stopPropagation(); triggerWallboxForceStart(1);" style="width:2rem;height:2rem;display:inline-flex;align-items:center;justify-content:center;">
                                                     <i class="fas fa-play" style="font-size: 0.75rem;"></i>
                                                 </button>
-                                                <button type="button" id="wb-pause-toggle" class="btn btn-sm btn-outline-secondary rounded-circle wallbox-pause-btn" data-dashboard-wb-pause="1" data-paused="0" title="Wallbox manuell pausieren" aria-label="Wallbox 1 pausieren" style="width:2rem;height:2rem;display:inline-flex;align-items:center;justify-content:center;">
+                                                <button type="button" id="wb-pause-toggle" class="btn btn-sm btn-outline-secondary rounded-circle wallbox-pause-btn" data-dashboard-wb-pause="1" <?= (e3dcWallboxEmergencyFlagActive()) ? 'disabled' : '' ?> data-paused="0" title="Wallbox manuell pausieren" aria-label="Wallbox 1 pausieren" style="width:2rem;height:2rem;display:inline-flex;align-items:center;justify-content:center;">
                                                     <i class="fas fa-pause"></i>
                                                 </button>
+                                                <?php endif; ?>
                                             </div>
                                             <span id="val-car-soc" class="badge text-bg-success fw-bold wallbox-car-badge" style="display:none; cursor: pointer; font-size: 0.8em;" onclick="event.stopPropagation(); forceSocUpdate()" title="SoC vom Auto abrufen"></span>
                                             <span id="wb-daily" class="badge bg-body-tertiary text-body border border-secondary-subtle tile-kwh-badge w-100 text-end" title="Wallbox 1 heute"><i class="fas fa-calendar-day text-info me-1"></i><span id="wb-daily-value">-- kWh</span></span>
@@ -2117,7 +2121,7 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                     <?php endif; ?>
 
                     <!-- Wallbox Card 2 -->
-                    <?php if($dashHasWb2): ?>
+                    <?php if($dashHasWb2 || e3dcWallboxMqttMeasureConfigured($dashWbCfg, 2)): ?>
                     <div class="right-card-wrapper dashboard-consumer-badge dashboard-wallbox-badge" id="card-wb2-wrapper" style="display:none;">
                         <div class="card" onclick="switchChartMode('live', 'wb2')" style="cursor:pointer;">
                             <div class="card-body d-flex align-items-center p-3" style="min-height: 114px;">
@@ -2133,18 +2137,22 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                                                 <div class="val-large text-body" id="val-wb2" style="line-height:1;">–</div>
                                             </div>
                                             <div class="small text-muted text-truncate tile-detail" id="wb2-status">Bereit</div>
+                                            <div class="small text-muted tile-detail" id="wb2-measure-only-hint" hidden>Messung per MQTT, keine Steuerung</div>
                                             <div class="small text-muted tile-detail wallbox-identity-detail" id="wb2-identity" style="display:none; font-size:0.7rem;"></div>
                                             <div class="small text-muted mt-1 tile-detail" id="wb2-details" style="display:none; font-size: 0.7rem;"></div>
+                                            <div data-wallbox-emergency-notice class="small text-body bg-body-tertiary border rounded p-2 my-2" hidden><?= htmlspecialchars(e3dcWallboxEmergencyHint(), ENT_QUOTES, 'UTF-8') ?></div>
                                             <div id="wb2-peak-detail" style="display:none;" class="small text-muted mt-1 tile-detail"><i class="fas fa-arrow-up text-danger opacity-75"></i> <span id="val-wb2-max" class="fw-bold">--</span> (Max)</div>
                                         </div>
                                         <div class="d-flex flex-column align-items-end gap-1 ms-2 wallbox-meta-stack">
                                             <div class="d-flex gap-1">
-                                                <button type="button" id="wb2-force-start-btn" class="btn btn-sm btn-outline-success rounded-circle wallbox-force-start-btn" data-dashboard-wb-force-start="2" title="Ladung sofort starten / Freigabe erzwingen" aria-label="Wallbox 2 starten" onclick="event.stopPropagation(); triggerWallboxForceStart(2);" style="width:2rem;height:2rem;display:inline-flex;align-items:center;justify-content:center;">
+                                                <?php if($dashHasWb2): ?>
+                                                <button type="button" id="wb2-force-start-btn" class="btn btn-sm btn-outline-success rounded-circle wallbox-force-start-btn" data-dashboard-wb-force-start="2" <?= (e3dcWallboxEmergencyFlagActive()) ? 'disabled' : '' ?> title="Ladung sofort starten (hebt eine Pause auf, nicht Sperre oder Not-Aus)" aria-label="Wallbox 2 starten" onclick="event.stopPropagation(); triggerWallboxForceStart(2);" style="width:2rem;height:2rem;display:inline-flex;align-items:center;justify-content:center;">
                                                     <i class="fas fa-play" style="font-size: 0.75rem;"></i>
                                                 </button>
-                                                <button type="button" id="wb2-pause-toggle" class="btn btn-sm btn-outline-secondary rounded-circle wallbox-pause-btn" data-dashboard-wb-pause="2" data-paused="0" title="Wallbox manuell pausieren" aria-label="Wallbox 2 pausieren" style="width:2rem;height:2rem;display:inline-flex;align-items:center;justify-content:center;">
+                                                <button type="button" id="wb2-pause-toggle" class="btn btn-sm btn-outline-secondary rounded-circle wallbox-pause-btn" data-dashboard-wb-pause="2" <?= (e3dcWallboxEmergencyFlagActive()) ? 'disabled' : '' ?> data-paused="0" title="Wallbox manuell pausieren" aria-label="Wallbox 2 pausieren" style="width:2rem;height:2rem;display:inline-flex;align-items:center;justify-content:center;">
                                                     <i class="fas fa-pause"></i>
                                                 </button>
+                                                <?php endif; ?>
                                             </div>
                                             <span id="val-car-soc2" class="badge text-bg-success fw-bold wallbox-car-badge" style="display:none; cursor: pointer; font-size: 0.8em;" onclick="event.stopPropagation(); forceSocUpdate()" title="SoC vom Auto abrufen"></span>
                                             <span id="wb2-daily" class="badge bg-body-tertiary text-body border border-secondary-subtle tile-kwh-badge w-100 text-end" title="Wallbox 2 heute"><i class="fas fa-calendar-day text-info me-1"></i><span id="wb2-daily-value">-- kWh</span></span>
@@ -2923,7 +2931,8 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                 return {value: null, bound: false, transition: false, source: 'legacy', reason: 'budget_missing'};
             }
             const explicitZero = projected === 0 && (
-                data.manual_pause === true
+                data.state === 'Gesperrt'
+                || data.manual_pause === true
                 || data.wb_runtime_manual_pause === true
                 || data.wb2_runtime_manual_pause === true
                 || String(data.operator_hint_code || '').toLowerCase() === 'emergency_stop'
@@ -3715,11 +3724,6 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
 
         function fetchData() {
             if (typeof e3dcLiveAuthBlocked === 'function' && e3dcLiveAuthBlocked()) return Promise.resolve(null);
-            const wsFresh = window.liveWs
-                && window.liveWs.readyState === WebSocket.OPEN
-                && window.liveWsLastMessageTs
-                && (Date.now() - window.liveWsLastMessageTs) < 5000;
-            if (wsFresh) return Promise.resolve(null); // WebSocket nur bevorzugen, wenn er wirklich frische Daten liefert
             if (desktopLiveFetchPromise) return desktopLiveFetchPromise;
 
             const requestGeneration = ++desktopLiveRequestGeneration;
@@ -3765,7 +3769,6 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
         let livePollGeneration = 0;
         let desktopLiveTransportStarted = false;
         let desktopLiveLastResumeMs = 0;
-        const desktopWebSocketEnabled = false;
         function livePollDelayMs() {
             return document.hidden ? 10000 : 2000;
         }
@@ -3803,20 +3806,7 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
         window.addEventListener('focus', resumeDesktopLiveTransport);
         window.addEventListener('online', resumeDesktopLiveTransport);
 
-        function initWebSocket() {
-            const protocol = window.location.protocol === 'https:' ? 'wss://' : 'ws://';
-            window.liveWs = new WebSocket(protocol + window.location.host + '/ws');
-            window.liveWs.onmessage = function(e) {
-                const data = JSON.parse(e.data);
-                window.liveWsLastMessageTs = Date.now();
-                processLiveData(data);
-                updatePeakShaving(data);
-            };
-            window.liveWs.onclose = function() { window.liveWsLastMessageTs = 0; setTimeout(initWebSocket, 3000); }; // Auto-Reconnect
-            window.liveWs.onerror = function() { window.liveWsLastMessageTs = 0; window.liveWs.close(); };
-        }
-
-        // updateChart, updateChartHistory, switchChartMode, loadArchive, refreshData entfernt -> jetzt in solar.js
+                // updateChart, updateChartHistory, switchChartMode, loadArchive, refreshData entfernt -> jetzt in solar.js
 
         // startSystemUpdate(), pollUpdate() entfernt -> jetzt in solar.js (nutze Button ID 'btn-update-config')
 
@@ -3832,11 +3822,6 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
             if (typeof window.processLiveData !== 'function') return false;
             desktopLiveTransportStarted = true;
             desktopLiveLastResumeMs = Date.now();
-            // Der WebSocket besitzt inzwischen einen nativen read-only
-            // Snapshot-Producer. Er bleibt im Browser dennoch deaktiviert,
-            // bis auch Handshake und Reconnect denselben Web-Auth-Vertrag wie
-            // der POST-Pollingpfad nachweislich erfüllen.
-            if (desktopWebSocketEnabled) initWebSocket();
             scheduleLivePoll(true);
             return true;
         }
@@ -5100,7 +5085,13 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                                 const capMapping = capContract && capContract.mapping && typeof capContract.mapping === 'object' ? capContract.mapping : {};
                                 const mappingState = String((capContract && capContract.mapping_state) || mappingProof.state || '');
                                 const showOnePhase = capContract !== null && (slotPhases === 1 || mappingState === 'unverified');
-                                if (!showOnePhase) {
+                                const sharedPhaseHint = String(wb.phase_mapping_hint || '');
+                                if (sharedPhaseHint) {
+                                    onePhaseEl.textContent = sharedPhaseHint;
+                                    onePhaseEl.title = sharedPhaseHint;
+                                    onePhaseEl.className = 'text-warning text-wrap';
+                                    onePhaseEl.style.fontSize = '0.8rem';
+                                } else if (!showOnePhase) {
                                     onePhaseEl.textContent = '';
                                     onePhaseEl.removeAttribute('title');
                                     onePhaseEl.className = 'text-muted d-none text-truncate';

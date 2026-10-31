@@ -22,7 +22,6 @@ PYTHON_PACKAGES = [
     "paho-mqtt",            # MQTT (wallbox_manager, mqtt_hub)
     "requests",             # HTTP (bluelink, APIs)
     "websocket-client",     # Luxtronik WebSocket (lux_live.py)
-    "websockets",           # e3dc_websocket.py server
     "pymodbus",             # Modbus-TCP (energy_manager, idm_live)
     "pyserial",             # pymodbus ab 3.16 braucht es schon beim Import
     "hyundai_kia_connect_api", # Bluelink / Fahrzeug SoC
@@ -159,16 +158,6 @@ def setup_service_wrapper():
     print(f"  ✓ Wrapperintegrität und sudoers atomar geprüft{suffix}.")
     return True
 
-
-def setup_websocket_service(start_service=True, defer_activation=False):
-    """Delegiert auf den kanonischen venv- und transaktionsgebundenen Helper."""
-
-    from .utils import setup_websocket_service as setup_bound_websocket_service
-
-    return setup_bound_websocket_service(
-        start_service=start_service,
-        defer_activation=defer_activation,
-    )
 
 def install_e3dc_control(headless=False):
     print("[i] E3DC-Control C++ Binary wird nicht mehr benoetigt.")

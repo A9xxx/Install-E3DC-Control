@@ -74,7 +74,6 @@ readonly -a ALLOWED_SERVICES=(
     "e3dc-forecast-evidence.service"
     "e3dc-notifier.service"
     "e3dc-mqtt-hub.service"
-    "e3dc-websocket.service"
     "e3dc-shadow-sync.service"
 )
 

@@ -4,8 +4,10 @@
 
 Dieses Programm sendet bewusst keinen RSCP-, Wallbox-, Wärmepumpen-, Phasen-
 oder CP-Befehl. Es fordert systemd auf, den Speicherschreiber anzuhalten. Dessen
-SIGTERM-Pfad beendet ausschließlich den Prozessbesitz und lässt den zuletzt
-bestätigten flüchtigen POWER_SETTINGS-Rahmen unverändert. Wenn Prozessende und
+SIGTERM-Pfad kann die flüchtigen POWER_SETTINGS vor der Besitzfreigabe
+einmalig freigeben, wenn Schreibrecht, gültige Daten und Notstromzustand dies
+erlauben. Ein hängender oder hart beendeter Schreiber kann seinen letzten
+Rahmen hinterlassen. Wenn Prozessende und
 Besitzfreigabe nicht bestätigt werden können, bleibt der Vorfall verriegelt und
 das Programm endet ungleich null. Es gibt weder einen rohen Hardware-Fallback
 noch einen Wiederholungsversuch.

@@ -217,56 +217,6 @@ function e3dcRetentionDeleteBoundFile($path, $bound, $options = []) {
     return ['success' => true, 'status' => 'deleted'];
 }
 
-function e3dcRetentionStreamPrefixMatches($left, $right, $length) {
-    if (!is_resource($left) || !is_resource($right)) return false;
-    $remaining = max(0, (int)$length);
-    if (!@rewind($left) || !@rewind($right)) return false;
-    while ($remaining > 0) {
-        $chunkSize = min(1024 * 1024, $remaining);
-        $leftChunk = @fread($left, $chunkSize);
-        $rightChunk = @fread($right, $chunkSize);
-        if (!is_string($leftChunk)
-            || !is_string($rightChunk)
-            || $leftChunk === ''
-            || strlen($leftChunk) !== strlen($rightChunk)
-            || !hash_equals($leftChunk, $rightChunk)) {
-            return false;
-        }
-        $remaining -= strlen($leftChunk);
-    }
-    return true;
-}
-
-function e3dcRetentionAppendStreamFully($target, $source, $offset, $length) {
-    if (!is_resource($target) || !is_resource($source)) return false;
-    $offset = max(0, (int)$offset);
-    $remaining = max(0, (int)$length);
-    if (@fseek($target, $offset, SEEK_SET) !== 0
-        || @fseek($source, $offset, SEEK_SET) !== 0) {
-        return false;
-    }
-    while ($remaining > 0) {
-        $chunk = @fread($source, min(1024 * 1024, $remaining));
-        if (!is_string($chunk) || $chunk === '') return false;
-        $written = 0;
-        $chunkLength = strlen($chunk);
-        while ($written < $chunkLength) {
-            $count = @fwrite($target, substr($chunk, $written));
-            if ($count === false || $count <= 0) return false;
-            $written += $count;
-        }
-        $remaining -= $chunkLength;
-    }
-    return true;
-}
-
-function e3dcRetentionCountStreamRows($handle) {
-    if (!is_resource($handle) || !@rewind($handle)) return null;
-    $rows = 0;
-    while (($line = @fgets($handle)) !== false) $rows++;
-    return @feof($handle) ? $rows : null;
-}
-
 function e3dcConfigBackupClassification($name) {
     $name = basename((string)$name);
     $result = [
@@ -554,188 +504,116 @@ function e3dcArchiveHistoryDay($source, $backupDir, $dayText, $options = []) {
     if (!is_dir($backupDir) || is_link($backupDir)) return ['success' => false, 'status' => 'archive_directory_invalid'];
     $sourceBound = e3dcRetentionRegularFileSnapshot($source);
     if (!is_array($sourceBound)) return ['success' => false, 'status' => 'archive_source_invalid'];
-
     $target = $backupDir . '/history_' . $day->format('Y-m-d') . '.txt';
-    try {
-        $random = bin2hex(random_bytes(8));
-    } catch (Throwable $error) {
-        return ['success' => false, 'status' => 'archive_name_failed'];
-    }
-    $temporary = $backupDir . '/.history_' . $day->format('Y-m-d') . '.' . $random . '.tmp';
     $input = @fopen($source, 'rb');
-    if (!is_resource($input)) {
-        return ['success' => false, 'status' => 'archive_open_failed'];
-    }
-    if (!e3dcRetentionOpenedMatchesNamedFile($input, $source, $sourceBound)) {
-        @fclose($input);
-        return ['success' => false, 'status' => 'archive_source_drift'];
-    }
-    $output = @fopen($temporary, 'x+b');
-    if (!is_resource($output)) {
-        if (is_resource($input)) @fclose($input);
-        if (file_exists($temporary) || is_link($temporary)) @unlink($temporary);
-        return ['success' => false, 'status' => 'archive_open_failed'];
-    }
-
+    if (!is_resource($input)) return ['success' => false, 'status' => 'archive_open_failed'];
+    $output = null;
+    $temporary = null;
+    $created = false;
     $rows = 0;
-    $ok = true;
-    while (($line = fgets($input)) !== false) {
-        $row = @json_decode($line, true);
-        $timestamp = is_array($row) ? (string)($row['ts'] ?? '') : '';
-        if (!preg_match('/^' . preg_quote($day->format('Y-m-d'), '/') . '(?:T| )/', $timestamp)) continue;
-        if (@fwrite($output, $line) !== strlen($line)) {
-            $ok = false;
-            break;
-        }
-        $rows++;
-    }
-    if (!feof($input)) $ok = false;
-    $sourceStable = e3dcRetentionOpenedMatchesNamedFile($input, $source, $sourceBound);
-    @fflush($output);
-    if (function_exists('fsync')) @fsync($output);
-    @fclose($input);
-    @fclose($output);
-    $sourceNamedStable = e3dcRetentionSameFileGeneration($source, $sourceBound);
-
-    if (!$ok
-        || !$sourceStable
-        || !$sourceNamedStable
-        || $rows < 1) {
-        @unlink($temporary);
-        return [
-            'success' => false,
-            'status' => !$ok
-                ? 'archive_write_failed'
-                : ((!$sourceStable || !$sourceNamedStable)
-                    ? 'archive_source_drift'
-                    : 'archive_empty'),
-            'rows' => $rows,
-        ];
-    }
-    $group = array_key_exists('group', $options) ? $options['group'] : 'www-data';
-    if ($group !== null && !@chgrp($temporary, $group)) {
-        @unlink($temporary);
-        return ['success' => false, 'status' => 'archive_group_failed', 'rows' => $rows];
-    }
-    if (!@chmod($temporary, $fileMode)) {
-        @unlink($temporary);
-        return ['success' => false, 'status' => 'archive_mode_failed', 'rows' => $rows];
-    }
-    $temporaryBound = e3dcRetentionRegularFileSnapshot($temporary);
-    $prepared = is_array($temporaryBound) ? @fopen($temporary, 'rb') : false;
-    if (!is_array($temporaryBound) || !is_resource($prepared)) {
-        if (is_resource($prepared)) @fclose($prepared);
-        @unlink($temporary);
-        return ['success' => false, 'status' => 'archive_publish_failed', 'rows' => $rows];
-    }
-
+    $older = 0;
+    $written = 0;
     try {
+        if (!@flock($input, LOCK_SH)) return ['success' => false, 'status' => 'archive_source_lock_failed'];
+        // Der Erzeuger darf vor dem Sperrerwerb noch vollständige Sätze anhängen.
+        $sourceBound = e3dcRetentionRegularFileSnapshot($source);
+        if (!e3dcRetentionOpenedMatchesNamedFile($input, $source, $sourceBound)) {
+            return ['success' => false, 'status' => 'archive_source_drift'];
+        }
         clearstatcache(true, $target);
-        $targetExists = file_exists($target) || is_link($target);
-        if (!$targetExists) {
-            // link() besitzt im Gegensatz zu rename() eine echte No-Clobber-
-            // Semantik: Ein zwischenzeitlich angelegtes Ziel wird nie ersetzt.
-            if (!@link($temporary, $target)) {
-                return ['success' => false, 'status' => 'archive_target_drift', 'rows' => $rows];
+        $created = !file_exists($target) && !is_link($target);
+        $lastEpoch = null;
+        $initialSize = 0;
+        if (!$created) {
+            $targetBound = e3dcRetentionRegularFileSnapshot($target);
+            if (!is_array($targetBound)) return ['success' => false, 'status' => 'archive_target_invalid'];
+            $output = @fopen($target, 'r+b');
+            if (!is_resource($output)) return ['success' => false, 'status' => 'archive_target_open_failed'];
+            if (!@flock($output, LOCK_EX)) return ['success' => false, 'status' => 'archive_target_lock_failed'];
+            // Ein anderer Archivierer kann vor uns angehängt haben.
+            $targetBound = e3dcRetentionRegularFileSnapshot($target);
+            if (!e3dcRetentionOpenedMatchesNamedFile($output, $target, $targetBound)) {
+                return ['success' => false, 'status' => 'archive_target_drift'];
             }
-            if (!@unlink($temporary)) {
-                return ['success' => false, 'status' => 'archive_publish_unconfirmed', 'rows' => $rows];
+            $initialSize = (int)$targetBound['size'];
+            // Nur das Ende lesen; weder Vollkopie noch erneuter Byte-Präfix-Vergleich.
+            $tail = '';
+            $offset = $initialSize;
+            while ($offset > 0 && substr_count($tail, "\n") < 2) {
+                $length = min(8192, $offset);
+                $offset -= $length;
+                if (fseek($output, $offset) !== 0) return ['success' => false, 'status' => 'archive_readback_failed'];
+                $chunk = fread($output, $length);
+                if ($chunk === false || strlen($chunk) !== $length) return ['success' => false, 'status' => 'archive_readback_failed'];
+                $tail = $chunk . $tail;
             }
-            if (!e3dcRetentionSameFileGeneration($target, $temporaryBound)) {
-                return ['success' => false, 'status' => 'archive_readback_failed', 'rows' => $rows];
+            $end = strrpos($tail, "\n");
+            $completeSize = $end === false ? 0 : $offset + $end + 1;
+            if ($completeSize < $initialSize) {
+                if (!ftruncate($output, $completeSize)) return ['success' => false, 'status' => 'archive_extension_failed'];
+                $initialSize = $completeSize;
             }
-            return [
-                'success' => true,
-                'status' => 'archive_confirmed',
-                'path' => $target,
-                'rows' => $rows,
-                'bytes' => (int)$temporaryBound['size'],
-            ];
+            if ($end !== false) {
+                $completeTail = substr($tail, 0, $end);
+                $begin = strrpos($completeTail, "\n");
+                $row = json_decode(substr($completeTail, $begin === false ? 0 : $begin + 1), true);
+                $lastEpoch = is_array($row) ? strtotime((string)($row['ts'] ?? '')) : false;
+                if ($lastEpoch === false) return ['success' => false, 'status' => 'archive_readback_failed'];
+            }
+            if (fseek($output, 0, SEEK_END) !== 0) return ['success' => false, 'status' => 'archive_extension_failed'];
         }
-
-        $targetBound = e3dcRetentionRegularFileSnapshot($target);
-        if (!is_array($targetBound)) {
-            return ['success' => false, 'status' => 'archive_target_invalid', 'rows' => $rows];
-        }
-        $existing = @fopen($target, 'r+b');
-        if (!is_resource($existing)) {
-            return ['success' => false, 'status' => 'archive_target_open_failed', 'rows' => $rows];
-        }
-        try {
-            if (!@flock($existing, LOCK_EX)) {
-                return ['success' => false, 'status' => 'archive_target_lock_failed', 'rows' => $rows];
+        while (($line = fgets($input)) !== false) {
+            if (substr($line, -1) !== "\n") continue;
+            $row = json_decode($line, true);
+            $timestamp = is_array($row) ? (string)($row['ts'] ?? '') : '';
+            if (substr($timestamp, 0, 10) !== $day->format('Y-m-d')) continue;
+            $epoch = strtotime($timestamp);
+            if ($epoch === false) continue;
+            if ($lastEpoch !== null && $epoch <= $lastEpoch) { $older++; continue; }
+            if ($created && !is_resource($output)) {
+                try { $random = bin2hex(random_bytes(8)); }
+                catch (Throwable $error) { return ['success' => false, 'status' => 'archive_name_failed']; }
+                $temporary = $backupDir . '/.history_' . $day->format('Y-m-d') . '.' . $random . '.tmp';
+                $output = @fopen($temporary, 'x+b');
+                if (!is_resource($output)) return ['success' => false, 'status' => 'archive_open_failed'];
             }
-            try {
-                if (!e3dcRetentionOpenedMatchesNamedFile($existing, $target, $targetBound)) {
-                    return ['success' => false, 'status' => 'archive_target_drift', 'rows' => $rows];
-                }
-                if (!e3dcRetentionOpenedMatchesNamedFile($existing, $target, $targetBound)) {
-                    return ['success' => false, 'status' => 'archive_target_drift', 'rows' => $rows];
-                }
-
-                $targetSize = (int)$targetBound['size'];
-                $preparedSize = (int)$temporaryBound['size'];
-                $commonSize = min($targetSize, $preparedSize);
-                if (!e3dcRetentionStreamPrefixMatches($existing, $prepared, $commonSize)) {
-                    return ['success' => false, 'status' => 'archive_target_conflict', 'rows' => $rows];
-                }
-                if (!e3dcRetentionOpenedMatchesNamedFile($existing, $target, $targetBound)) {
-                    return ['success' => false, 'status' => 'archive_target_drift', 'rows' => $rows];
-                }
-
-                if ($targetSize >= $preparedSize) {
-                    $existingRows = e3dcRetentionCountStreamRows($existing);
-                    if (!is_int($existingRows)
-                        || !e3dcRetentionOpenedMatchesNamedFile($existing, $target, $targetBound)) {
-                        return ['success' => false, 'status' => 'archive_target_drift', 'rows' => $rows];
-                    }
-                    return [
-                        'success' => true,
-                        'status' => $targetSize === $preparedSize
-                            ? 'archive_unchanged'
-                            : 'archive_existing_preserved',
-                        'path' => $target,
-                        'rows' => $existingRows,
-                        'bytes' => $targetSize,
-                    ];
-                }
-
-                $suffixLength = $preparedSize - $targetSize;
-                if (!e3dcRetentionAppendStreamFully(
-                    $existing,
-                    $prepared,
-                    $targetSize,
-                    $suffixLength
-                )
-                    || !@fflush($existing)
-                    || (function_exists('fsync') && !@fsync($existing))) {
-                    return ['success' => false, 'status' => 'archive_extension_failed', 'rows' => $rows];
-                }
-                clearstatcache(true, $target);
-                $extendedBound = e3dcRetentionOpenedRegularFileSnapshot($existing);
-                if (!is_array($extendedBound)
-                    || (int)$extendedBound['dev'] !== (int)$targetBound['dev']
-                    || (int)$extendedBound['ino'] !== (int)$targetBound['ino']
-                    || (int)$extendedBound['size'] !== $preparedSize
-                    || !e3dcRetentionOpenedMatchesNamedFile($existing, $target, $extendedBound)
-                    || !e3dcRetentionStreamPrefixMatches($existing, $prepared, $preparedSize)) {
-                    return ['success' => false, 'status' => 'archive_extension_unconfirmed', 'rows' => $rows];
-                }
-                return [
-                    'success' => true,
-                    'status' => 'archive_extended',
-                    'path' => $target,
-                    'rows' => $rows,
-                    'bytes' => $preparedSize,
-                ];
-            } finally {
-                @flock($existing, LOCK_UN);
-            }
-        } finally {
-            @fclose($existing);
+            if (@fwrite($output, $line) !== strlen($line)) return ['success' => false, 'status' => 'archive_write_failed'];
+            $written += strlen($line);
+            $rows++;
+            $lastEpoch = $epoch;
         }
+        if (!feof($input) || !e3dcRetentionOpenedMatchesNamedFile($input, $source, $sourceBound)) {
+            return ['success' => false, 'status' => 'archive_source_drift'];
+        }
+        if ($created && $rows === 0) return ['success' => false, 'status' => 'archive_empty', 'rows' => 0];
+        if (is_resource($output)) {
+            if (!@fflush($output) || (function_exists('fsync') && !@fsync($output))) {
+                return ['success' => false, 'status' => 'archive_extension_failed'];
+            }
+            $endBound = e3dcRetentionOpenedRegularFileSnapshot($output);
+            if (!is_array($endBound) || (int)$endBound['size'] !== $initialSize + $written) {
+                return ['success' => false, 'status' => 'archive_extension_unconfirmed'];
+            }
+            if ($created) {
+                $group = array_key_exists('group', $options) ? $options['group'] : 'www-data';
+                if ($group !== null && !@chgrp($temporary, $group)) return ['success' => false, 'status' => 'archive_group_failed'];
+                if (!@chmod($temporary, $fileMode)) return ['success' => false, 'status' => 'archive_mode_failed'];
+                $endBound = e3dcRetentionOpenedRegularFileSnapshot($output);
+                if (!e3dcRetentionOpenedMatchesNamedFile($output, $temporary, $endBound)
+                    || !@link($temporary, $target)) return ['success' => false, 'status' => 'archive_target_drift'];
+                if (!@unlink($temporary)) return ['success' => false, 'status' => 'archive_publish_unconfirmed'];
+                $temporary = null;
+            }
+            if (!e3dcRetentionOpenedMatchesNamedFile($output, $target, $endBound)) {
+                return ['success' => false, 'status' => 'archive_readback_failed'];
+            }
+        }
+        return ['success' => true, 'status' => $created ? 'archive_created' : ($rows ? 'archive_appended' : 'archive_nothing_new'),
+            'path' => $target, 'rows' => $rows, 'older_rows' => $older, 'bytes' => $initialSize + $written];
     } finally {
-        @fclose($prepared);
-        if (file_exists($temporary) || is_link($temporary)) @unlink($temporary);
+        if (is_resource($output)) { @flock($output, LOCK_UN); @fclose($output); }
+        @flock($input, LOCK_UN);
+        @fclose($input);
+        if ($temporary !== null && (file_exists($temporary) || is_link($temporary))) @unlink($temporary);
     }
 }

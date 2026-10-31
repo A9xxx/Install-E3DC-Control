@@ -95,14 +95,13 @@ oder die Neuerstellung auf dem Docker-Host.
 Der zentrale Service-Katalog ist die führende Quelle für Installationszentrale,
 Update, Rechte-Reparatur und Service-Wrapper. Pflichtdienste sind alle Module
 mit `optional=False`. Ihre Units entsprechen der Kernliste
-`INSTALL_CENTER_CORE_SERVICES` des Updaters. Die sieben Pflichtdienste sind:
+`INSTALL_CENTER_CORE_SERVICES` des Updaters. Die sechs Pflichtdienste sind:
 
 - `e3dc-live`
 - `e3dc-epex-manager`
 - `e3dc-weather-manager`
 - `e3dc-storage-simulator`
 - `e3dc-storage-manager`
-- `e3dc-websocket`
 - `e3dc-notifier`
 
 Optionale Dienste werden nur geprüft oder repariert, wenn ihre systemd-Unit

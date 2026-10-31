@@ -297,34 +297,6 @@ def show_system_status():
             print(f"{status_icon} Service Status: {'Aktiv (running)' if not_srv['active'] else 'Inaktiv'}")
             print(f"{enabled_icon} Autostart:     {'Aktiviert (enabled)' if not_srv['enabled'] else 'Deaktiviert (disabled)'}")
 
-    # 2f. WebSocket Server
-    print("\n--- WebSocket Server ---")
-    ws_srv = check_service_details("e3dc-websocket")
-
-    if ws_srv["status"] == "not_installed":
-        print("⚪ Pflichtdienst 'e3dc-websocket': Nicht installiert")
-        if not is_docker and not is_standby:
-            issues_found.append("websocket_failed")
-    else:
-        if print_standby_service_status(ws_srv, "websocket_running_in_standby"):
-            pass
-        elif is_docker:
-            if not ws_srv["active"]:
-                print(f"{GREEN}✓{RESET} Service Status: Inaktiv (Korrekt für Docker-Modus)")
-            else:
-                print(f"{RED}✗{RESET} Service Status: Aktiv (FEHLER: Lokaler Dienst läuft trotz Docker!)")
-                issues_found.append("docker_host_conflict")
-                docker_host_conflict_units.append("e3dc-websocket")
-            print(f"{GREEN}✓{RESET} Autostart:     {'Deaktiviert (disabled)' if not ws_srv['enabled'] else 'Aktiviert (enabled)'}")
-        else:
-            status_icon = f"{GREEN}✓{RESET}" if ws_srv["active"] else f"{RED}✗{RESET}"
-            enabled_icon = f"{GREEN}✓{RESET}" if ws_srv["enabled"] else f"{RED}✗{RESET}"
-
-            print(f"{status_icon} Service Status: {'Aktiv (running)' if ws_srv['active'] else 'Inaktiv'}")
-            print(f"{enabled_icon} Autostart:     {'Aktiviert (enabled)' if ws_srv['enabled'] else 'Deaktiviert (disabled)'}")
-            if not ws_srv["active"]:
-                 issues_found.append("websocket_failed")
-
     # 2g. MQTT Hub
     print("\n--- Smart Home MQTT-Hub ---")
     mqtt_srv = check_service_details("e3dc-mqtt-hub")
@@ -723,8 +695,6 @@ def show_system_status():
             print("• HA Cluster Fehler: Prüfe Logs mit 'journalctl -u e3dc-ha -e' auf Probleme.")
         if "ha_running_in_standby" in issues_found:
             print("• HA Cluster Warnung: Ein Dienst läuft fälschlicherweise auf dem Slave im Standby. Bitte 'journalctl -u e3dc-ha -e' prüfen.")
-        if "websocket_failed" in issues_found:
-            print("• WebSocket Fehler: Der Push-Server läuft nicht. Prüfe Logs mit 'journalctl -u e3dc-websocket -e'.")
         if "apache_issue" in issues_found:
             print("• Apache Webserver: Der Webserver ist inaktiv oder der Autostart ist deaktiviert.")
             print("  Behebung: Menüpunkt '3' (Rechte prüfen & korrigieren) zur Re-Aktivierung verwenden.")

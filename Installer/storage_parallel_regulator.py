@@ -1628,6 +1628,8 @@ class ParallelStorageRegulator:
         plan: Dict[str, Any],
         wb_budget: Dict[str, Any],
         wb_intent: Dict[str, Any],
+        *,
+        wallbox_auto_freerun: bool = True,
     ) -> Dict[str, Any]:
         trace: List[Dict[str, Any]] = []
         now_s = _safe_float(active_state.get("now_ts_s"), time.time())
@@ -2585,8 +2587,11 @@ class ParallelStorageRegulator:
             or wb_intent.get("price_boost_active")
             or wb_intent.get("price_plan_storage_protect")
         )
+        # Akkustützung gibt nur die Entladeseite frei; Abregelung bleibt
+        # auf der Ladeseite zuständig. Andere Halteauslöser bleiben erhalten.
         wb_storage_floor_active = bool(
-            wb_intent_car_present
+            wb_floor_request != "allow_discharge"
+            and wb_intent_car_present
             and wb_storage_floor_requested
             and (
                 intent_wb_mode in (4, 5)
@@ -3512,7 +3517,7 @@ class ParallelStorageRegulator:
                 ) % (headroom_discharge_gap_pct, headroom_discharge_w),
                 "headroom",
             )
-        elif (wb_auto_enter or wb_auto_keep) and wb_real_owner_active and not central_pv_split_scope(
+        elif wallbox_auto_freerun and (wb_auto_enter or wb_auto_keep) and wb_real_owner_active and not central_pv_split_scope(
             self.cfg, wb_intent, intent_wb_mode, soc, now_s
         ):
             self.price_house_discharge_w = 0
@@ -4117,7 +4122,8 @@ class ParallelStorageRegulator:
 
         decision = self._apply_transition_table(
             decision,
-            previous_state=("" if central_pv_split_scope(self.cfg, wb_intent, intent_wb_mode, soc, now_s)
+            previous_state=("" if (not wallbox_auto_freerun
+                                  or central_pv_split_scope(self.cfg, wb_intent, intent_wb_mode, soc, now_s))
                             and previous_parallel_state == "parallel_wb_auto" else previous_parallel_state),
             previous_mode=previous_parallel_mode,
             previous_val=previous_parallel_val,

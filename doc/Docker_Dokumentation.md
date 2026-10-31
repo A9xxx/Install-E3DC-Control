@@ -2,8 +2,8 @@
 
 Veröffentlichte Images entstehen ausschließlich aus einem versionierten stabilen Release-Tag. `latest` verweist damit auf die zuletzt veröffentlichte stabile Version.
 
-Der aktuelle Stable-Stand ist `v5.5.5c`. Die Tags `latest`, `v5.5.5c` und
-`5.5.5c` bezeichnen denselben Stable-Stand.
+Der aktuelle Stable-Stand ist `v5.5.6`. Die Tags `latest`, `v5.5.6` und
+`5.5.6` bezeichnen denselben Stable-Stand.
 
 **Updates im Überblick:** Der Knopf **System Update** in der Weboberfläche und
 das **Auto-Update** im Config-Editor geben dem optionalen Watchtower-Dienst das
@@ -131,14 +131,14 @@ installieren, anschließend das Ziel ausdrücklich wählen:
 
 ```bash
 curl -q -fsS --proto '=https' --tlsv1.2 \
-  -o ./docker_compose_update-5.5.5c.py \
-  https://raw.githubusercontent.com/A9xxx/Install-E3DC-Control/v5.5.5c/Installer/docker_compose_update.py
+  -o ./docker_compose_update-5.5.6.py \
+  https://raw.githubusercontent.com/A9xxx/Install-E3DC-Control/v5.5.6/Installer/docker_compose_update.py
 if [ ! -d ./Installer ]; then
   sudo install -d -m 0755 ./Installer
 fi
-sudo install -m 0644 ./docker_compose_update-5.5.5c.py ./Installer/docker_compose_update.py
+sudo install -m 0644 ./docker_compose_update-5.5.6.py ./Installer/docker_compose_update.py
 sudo python3 ./Installer/docker_compose_update.py \
-  --compose-dir . --sudo --image-tag v5.5.5c
+  --compose-dir . --sudo --image-tag v5.5.6
 ```
 
 Der aktuelle Helfer akzeptiert die gebundene gestoppte Altinstanz, ergänzt bei
@@ -631,7 +631,7 @@ maßgeblichen OMV-Konfiguration beibehalten.
 Für zwei eigenständige Instanzen auf demselben Host getrennte Datenquellen,
 Bridge-Netze und getrennte Portfreigaben verwenden. Unterschiedliche Webports
 über `E3DC_WEB_PORT` allein reichen im gemeinsamen Hostnetz nicht aus, weil
-der interne WebSocket-Port 8765 dort kollidiert. Ein physischer
+die lokalen Dienste und Ports dort kollidieren können. Ein physischer
 E3DC-Master/Slave-Verbund ist keine automatische Festlegung der Software-HA-Rolle;
 die bestehende Rollen-Konfiguration nicht allein wegen des Updates ändern.
 
@@ -692,7 +692,7 @@ Ohne ausdrücklichen Tag verwendet der Helfer das Image des ausgewählten Dienst
 Die mitgelieferte variable Zeile folgt ohne `E3DC_IMAGE_TAG` dem geprüften Stable-Tag
 `latest`. Ein vorhandener fester Tag bleibt absichtlich bestehen.
 
-`--image-tag v5.5.5c` funktioniert auch bei einer fest eingetragenen OMV-Imagezeile.
+`--image-tag v5.5.6` funktioniert auch bei einer fest eingetragenen OMV-Imagezeile.
 Der Helfer schreibt diese Auswahl dauerhaft nur in das `image:`-Feld des
 Zieldienstes. Die `.env` und das Image anderer E3DC-Dienste bleiben unverändert.
 Bei einem gescheiterten Update wird die vorherige Zeile im Rahmen des verifizierten
@@ -714,7 +714,7 @@ sudo docker compose config --images e3dc-control
 
 Gezielte Rückfallversion:
 
-Den Stable-Container `v5.5.5c` auf den veröffentlichten Rollback-Root
+Den Stable-Container `v5.5.6` auf den veröffentlichten Rollback-Root
 `v5.3.2b` zurücksetzen:
 
 ```bash
@@ -974,8 +974,8 @@ Container endet mit Fehler. Nach erfolgreichem Start erreichst du das Dashboard
 ## Optionaler Bridge-Betrieb
 
 `docker-compose.bridge.yml` bietet einen ausdrücklich wählbaren Betrieb mit
-eigenem Docker-Netz. Nur der Webport wird veröffentlicht; WebSockets laufen
-weiter über Apache unter `/ws`. Die Vorlage verwendet dieselben fünf Named
+eigenem Docker-Netz. Nur der Webport wird veröffentlicht. Der E3DC-WebSocket-Dienst ist seit
+5.5.6 entfernt; externe Smart-Home-Systeme verwenden MQTT. Die Vorlage verwendet dieselben fünf Named
 Volumes wie die Standarddatei. Installationen mit `./data`-/`./logs`-Bind-Mounts
 dürfen sie nicht übernehmen, weil dadurch andere Datenbereiche gewählt würden.
 Der automatische Installer und bestehende Installationen behalten Hostnetz.
@@ -999,7 +999,7 @@ Port, etwa `E3DC_PUBLISH_BIND=192.0.2.20` und `E3DC_PUBLISH_PORT=8085`.
 Verwende denselben Compose-Ordner und Projektnamen. Sichere vorher die
 funktionierende `docker-compose.yml` als `docker-compose.host.bak`, die
 vorhandene `.env` und die persistenten Daten. Halte den aktuell eingesetzten
-versionierten Runtime-Image-Tag für den Rückweg fest, beispielsweise `v5.5.5c`.
+versionierten Runtime-Image-Tag für den Rückweg fest, beispielsweise `v5.5.6`.
 Ein älterer Root-Tag eignet sich nicht für diesen ersten Netzwerk-Rückweg.
 Prüfe eine administrativ zugängliche Kopie der aktuellen
 Konfiguration, ohne ihren Inhalt auszugeben:
@@ -1029,7 +1029,7 @@ dem bestätigten Wechsel funktionieren Update-Knopf und Auto-Update auch im
 Bridge-Betrieb: Watchtower liegt dann im gemeinsamen Compose-Netz und wird
 unter `http://watchtower:8080` angesprochen.
 
-Prüfe anschließend Webzugang, `/ws`, frische RSCP-Livewerte und alle genutzten
+Prüfe anschließend Webzugang, MQTT, frische RSCP-Livewerte und alle genutzten
 MQTT-, Wallbox- und Wärmeanbindungen. Ein erfolgreicher Start allein bestätigt
 noch nicht die Anlagenkommunikation. Beim ersten Wechsel ist der alte
 Hostcontainer bereits entfernt; es gibt deshalb keinen automatischen
@@ -1169,7 +1169,6 @@ Folgende Python-Dienste startet die `entrypoint.sh`. Persistente Dienstlogs lieg
 
 | Dienst | Startbedingung | Log-Datei |
 |--------|----------------|-----------|
-| `e3dc_websocket.py` | Immer | `e3dc_websocket.log` |
 | `energy_manager.py` | Wärmeintegration aktiviert und gültige Wärmequelle oder SG-Ready-Shelly konfiguriert | Docker-Engine-Log |
 | `lux_live.py` | Wärmeintegration aktiviert, Typ Luxtronik und gültige Luxtronik-IP | `lux_live.log` |
 | `idm_live.py` | Wärmeintegration aktiviert, Typ IDM und gültige IDM-IP | `idm_live.log` |
@@ -1343,7 +1342,7 @@ ihre Weboberfläche nennt höchstens die Host-Befehle.
    beschrieben: die unveränderte mitgelieferte Datei ersetzen; eine vom
    Installer erzeugte Datei mit `./data`- und `./logs`-Ordnern sowie OMV- und
    eigene Dateien nicht ersetzen, sondern die Änderungen übertragen.
-2. Einen festen Pin in `.env` gegebenenfalls bewusst auf `v5.5.5c` ändern.
+2. Einen festen Pin in `.env` gegebenenfalls bewusst auf `v5.5.6` ändern.
    Wer noch kein Watchtower-Token hat (`grep -c '^E3DC_WATCHTOWER_API_TOKEN=.' .env`
    zählt nicht leere Einträge, ohne das Token auszugeben; `0` bedeutet kein Eintrag), trägt es jetzt mit dem zweiten Befehl aus
    „Watchtower einmalig freischalten“ in `.env` ein. Dann erstellt der

@@ -286,6 +286,7 @@ def _build_observation(config, plan, *, now_ms, pv_rows, pv_meta, load_rows,
 
     forecast = _axis(pv_rows)
     loads = _axis(load_rows)
+    pv_meta = pv_meta if isinstance(pv_meta, dict) else {}
     issued = _issued_ms(pv_meta, zone)
     result['source_age_s'] = None if issued is None else (now_ms - issued) / 1000
     # Ausgabezeit des Produzenten hat Vorrang vor der Verpackungszeit.
@@ -338,6 +339,15 @@ def _build_observation(config, plan, *, now_ms, pv_rows, pv_meta, load_rows,
         bound = chargeable.get(ts)
         if normalized_row is None or bound is None or bound.get('complete') is not True:
             return invalid('chargeable_forecast_unbound')
+        if row.get('pv_topology_reason') == 'RESOURCE_COUPLING_MISSING':
+            resources = row.get('pv_resources')
+            if (not isinstance(resources, list) or not resources
+                    or any(not isinstance(resource, dict) for resource in resources)):
+                return invalid('pv_topology_coupling_missing')
+            topology = pv_meta.get('pv_topology')
+            external_ac_known = topology.get('external_ac_source_configured') if isinstance(topology, dict) else None
+            if not isinstance(external_ac_known, bool) or external_ac_known:
+                return invalid('pv_topology_coupling_missing')
         # Der Bestandsvertrag enthält Haus, WP, Klima und geplante Lasten genau einmal.
         normal[ts] = max(sum(amounts) * 1000, number(normalized_row.get('normal_load_w')) or 0)
         surplus = max(0, pv[ts] - normal[ts])
@@ -510,7 +520,7 @@ def read_observation(plan, config, now_ms, *, current_live=None):
     return fallback
 
 
-REASON_TEXT = {'backup_live_unknown_or_stale': 'Speichermessung unbekannt oder zu alt', 'backup_disabled': 'Beobachtung ausgeschaltet', 'backup_plan_missing': 'Speicherplan fehlt', 'backup_binding_config_or_age_invalid': 'Planbindung, Konfiguration oder Planalter ungültig', 'backup_switch_invalid': 'Schalterwert ungültig', 'backup_energy_missing_or_invalid': 'Speicherinhalt fehlt oder ist ungültig', 'backup_reference_times_missing_or_invalid': 'Bestätigte Bezugszeiten fehlen oder sind ungültig', 'backup_grid_price_missing_or_invalid': 'Explizite Reservepreisgrenze fehlt oder ist ungültig', 'backup_timezone_invalid': 'Ortszeit ungültig', 'backup_reference_duration_invalid': 'Bezugsdauer nach Sommerzeitauflösung ungültig', 'backup_capacity_energy_or_limits_unknown': 'Kapazität, Speicherinhalt, Reserve oder Ladegrenze unbekannt', 'backup_calculation_invalid': 'Zusatzrechnung mit diesen Daten nicht möglich', 'pv_forecast_age_unknown_or_stale': 'PV-Prognosealter unbekannt oder zu alt', 'load_forecast_age_unknown_or_stale': 'Lastprognosealter unbekannt oder zu alt', 'forecast_missing_or_invalid': 'Prognose fehlt oder ist ungültig', 'forecast_horizon_gap': 'Prognosehorizont lückenhaft', 'pv_forecast_value_or_provenance_invalid': 'PV-Wert oder Quellenfrische ungültig', 'load_forecast_value_invalid': 'Lastprognosewert ungültig', 'forecast_source_revision_invalid': 'Quellenrevision ungültig', 'pv_forecast_issue_mismatch': 'PV-Prognose und Metadaten passen nicht zusammen', 'chargeable_forecast_unbound': 'Ladbarer PV-Anteil nicht gebunden', 'chargeable_forecast_unknown': 'Ladbarer PV-Anteil unbekannt', 'chargeable_dc_forecast_unknown': 'Ladbarer DC-Anteil unbekannt', 'pv_takeover_unknown': 'PV-Übernahme unbekannt', 'recommendation_only': 'Berechnete Empfehlung ohne Gerätewirkung', 'target_exceeds_capacity': 'Bedarf übersteigt Kapazität', 'backup_observation_stale_or_unknown': 'Beobachtung fehlt oder ist zu alt'}
+REASON_TEXT = {'backup_live_unknown_or_stale': 'Speichermessung unbekannt oder zu alt', 'backup_disabled': 'Beobachtung ausgeschaltet', 'backup_plan_missing': 'Speicherplan fehlt', 'backup_binding_config_or_age_invalid': 'Planbindung, Konfiguration oder Planalter ungültig', 'backup_switch_invalid': 'Schalterwert ungültig', 'backup_energy_missing_or_invalid': 'Speicherinhalt fehlt oder ist ungültig', 'backup_reference_times_missing_or_invalid': 'Bestätigte Bezugszeiten fehlen oder sind ungültig', 'backup_grid_price_missing_or_invalid': 'Explizite Reservepreisgrenze fehlt oder ist ungültig', 'backup_timezone_invalid': 'Ortszeit ungültig', 'backup_reference_duration_invalid': 'Bezugsdauer nach Sommerzeitauflösung ungültig', 'backup_capacity_energy_or_limits_unknown': 'Kapazität, Speicherinhalt, Reserve oder Ladegrenze unbekannt', 'backup_calculation_invalid': 'Zusatzrechnung mit diesen Daten nicht möglich', 'pv_forecast_age_unknown_or_stale': 'PV-Prognosealter unbekannt oder zu alt', 'load_forecast_age_unknown_or_stale': 'Lastprognosealter unbekannt oder zu alt', 'forecast_missing_or_invalid': 'Prognose fehlt oder ist ungültig', 'forecast_horizon_gap': 'Prognosehorizont lückenhaft', 'pv_forecast_value_or_provenance_invalid': 'PV-Wert oder Quellenfrische ungültig', 'load_forecast_value_invalid': 'Lastprognosewert ungültig', 'forecast_source_revision_invalid': 'Quellenrevision ungültig', 'pv_forecast_issue_mismatch': 'PV-Prognose und Metadaten passen nicht zusammen', 'pv_topology_coupling_missing': 'Kopplung oder Angaben der PV-Flächen unvollständig oder ungültig; Vorhaltung rechnet ohne Prognose', 'chargeable_forecast_unbound': 'Ladbarer PV-Anteil nicht gebunden', 'chargeable_forecast_unknown': 'Ladbarer PV-Anteil unbekannt', 'chargeable_dc_forecast_unknown': 'Ladbarer DC-Anteil unbekannt', 'pv_takeover_unknown': 'PV-Übernahme unbekannt', 'recommendation_only': 'Berechnete Empfehlung ohne Gerätewirkung', 'target_exceeds_capacity': 'Bedarf übersteigt Kapazität', 'backup_observation_stale_or_unknown': 'Beobachtung fehlt oder ist zu alt'}
 
 def reason_text(code):
     return "; ".join(REASON_TEXT.get(part, "Beobachtungsdaten unbekannt") for part in str(code).split(";"))
@@ -675,10 +685,13 @@ def control_context(config, plan, *, now_s, monotonic_s, live, reserve_wh,
         result['reason'] = ';'.join(contract['reasons'])
     last_stamp = number(previous.get('measured_at_s'))
     last_mono = number(previous.get('monotonic_s'))
-    # Wiederholte/ältere Proben verdienen keine Dauer; eine Messlücke schließt sofort.
+    last_now = number(previous.get('now_s'))
+    # Wiederholungen erhalten die Abdeckungsuhr, verdienen aber keine Wh.
+    # Nur eine neue Live-Probe darf die Entladesperre öffnen.
     continuous = bool(previous.get('valid') and stamp is not None and last_stamp is not None
-        and 0 < stamp - last_stamp <= 5 and last_mono is not None and 0 < monotonic_s - last_mono <= 5
-        and 0 < now_s - (number(previous.get('now_s')) or now_s) <= 5)
+        and 0 <= stamp - last_stamp <= LIVE_MAX_AGE_MS / 1000
+        and last_mono is not None and 0 < monotonic_s - last_mono <= LIVE_MAX_AGE_MS / 1000
+        and last_now is not None and now_s - last_now >= 0)
     reaction_s = 35.0
     buffer = capacity_wh / 100 + max_discharge_w * reaction_s / 3600
     hysteresis = max(capacity_wh / 100, max_discharge_w * reaction_s / 3600, 50)
@@ -801,7 +814,7 @@ def control_context(config, plan, *, now_s, monotonic_s, live, reserve_wh,
     locked = previous.get('locked', True)
     if energy <= result['floor_wh'] + buffer or not continuous:
         locked = True
-    if coverage and since is not None and monotonic_s - since >= 120:
+    if continuous and stamp > last_stamp and coverage and since is not None and monotonic_s - since >= 120:
         locked = False
     result['export_cap_w'] = int(min(max_discharge_w, result['pv_recharge_credit_wh'] * 3600 / reaction_s))
     result.update(locked=bool(locked), coverage_since_mono=since,

@@ -8,7 +8,7 @@ require_once __DIR__ . '/helpers.php';
 try {
     $lines = preg_split('/\r?\n/', trim(stream_get_contents(STDIN)));
     $args = getopt('', ['now:', 'climate-day:']);
-    $options = [];
+    $options = ['require_day_start' => true];
     if (isset($args['now'])) {
         if (!is_numeric($args['now']) || !is_finite((float)$args['now'])) throw new InvalidArgumentException('Ungültige Berechnungszeit');
         $options['now'] = (float)$args['now'];

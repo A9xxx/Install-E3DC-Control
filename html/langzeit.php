@@ -120,6 +120,7 @@ function lzBuildBalanceRestFromStats($stats, $pv, $gridIn, $gridOut, $batIn, $ba
 }
 
 function lzAddPvTotalFields(&$row) {
+    if (array_key_exists('pv', $row) && $row['pv'] === null) { $row['pv_total'] = null; return; }
     $pv = lzFloat($row, 'pv');
     $extPv = lzFloat($row, 'ext_pv');
     $gridOut = lzFloat($row, 'grid_out');
@@ -321,6 +322,8 @@ if (file_exists($dbPath)) {
             try { $db->exec("ALTER TABLE daily_stats ADD COLUMN $col REAL DEFAULT 0"); } catch (Exception $e) { }
         }
 
+        try { $db->exec("ALTER TABLE daily_stats ADD COLUMN house_unknown_wallbox_minutes INTEGER"); } catch (Exception $e) { }
+
 // --- Auto-Migration: Index für massive Beschleunigung der Langzeit-Statistiken ---
         try {
             $db->exec("CREATE INDEX IF NOT EXISTS idx_ml_date ON ml_training_data(date)");
@@ -334,6 +337,7 @@ if (file_exists($dbPath)) {
         // Hole Tagesdaten (letzte 30 Tage) inkl. ML-Trainingsdaten
         $queryDay = "SELECT
             d.date as day,
+            d.house_unknown_wallbox_minutes,
             d.pv_yield as pv,
             d.home_consumption as home,
             COALESCE(d.house_includes_unknown_wallbox,0) as house_includes_unknown_wallbox,
@@ -341,11 +345,11 @@ if (file_exists($dbPath)) {
             d.grid_out as grid_out,
             d.bat_in as bat_in,
             d.bat_out as bat_out,
-            COALESCE(d.wb_consumption, 0) as wb1,
-            COALESCE(d.wb2_consumption, 0) as wb2,
-            (COALESCE(d.wb_consumption, 0) + COALESCE(d.wb2_consumption, 0)) as wb,
+            d.wb_consumption as wb1,
+            d.wb2_consumption as wb2,
+            (d.wb_consumption + d.wb2_consumption) as wb,
             d.wp_consumption as wp,
-            COALESCE(d.climate_consumption, 0) as climate,
+            d.climate_consumption as climate,
             COALESCE(d.cost_total, 0) as cost_total,
             COALESCE(d.cost_home, 0) as cost_home,
             (COALESCE(d.cost_wb, 0) + COALESCE(d.cost_wb2, 0)) as cost_wb,
@@ -355,19 +359,19 @@ if (file_exists($dbPath)) {
             COALESCE(d.pv_balance_rest, 0) as pv_balance_rest,
             COALESCE(d.bat_balance_rest, 0) as bat_balance_rest,
             COALESCE(d.balance_unknown_rest, 0) as balance_unknown_rest,
-            COALESCE(d.pv_e3dc, 0) as pv_e3dc,
-            COALESCE(d.pv_external, 0) as pv_external,
-            COALESCE(d.pv_source_rest, 0) as pv_source_rest,
-            COALESCE(d.pv_grid, 0) as pv_grid,
-            COALESCE(d.bat_grid, 0) as bat_grid,
+            d.pv_e3dc as pv_e3dc,
+            d.pv_external as pv_external,
+            d.pv_source_rest as pv_source_rest,
+            d.pv_grid as pv_grid,
+            d.bat_grid as bat_grid,
             COALESCE(d.saved_u, 0) as saved_u,
             COALESCE(d.saved_td, 0) as saved_td,
             COALESCE(d.saved_wb, 0) as saved_wb,
             CASE WHEN $realCostDayExpr THEN d.grid_in ELSE 0 END as grid_in_real,
             CASE WHEN $realCostDayExpr THEN d.home_consumption ELSE 0 END as home_real,
-            CASE WHEN $realCostDayExpr THEN (COALESCE(d.wb_consumption, 0) + COALESCE(d.wb2_consumption, 0)) ELSE 0 END as wb_real,
+            CASE WHEN $realCostDayExpr THEN (d.wb_consumption + d.wb2_consumption) ELSE 0 END as wb_real,
             CASE WHEN $realCostDayExpr THEN d.wp_consumption ELSE 0 END as wp_real,
-            CASE WHEN $realCostDayExpr THEN COALESCE(d.climate_consumption, 0) ELSE 0 END as climate_real,
+            CASE WHEN $realCostDayExpr THEN d.climate_consumption ELSE 0 END as climate_real,
             CASE WHEN $realCostDayExpr THEN 0 ELSE d.bat_in END as bat_in_sim
         FROM (SELECT * FROM daily_stats ORDER BY date DESC) d
         ORDER BY d.date DESC";
@@ -503,8 +507,9 @@ if (file_exists($dbPath)) {
         // Hole Monatsdaten
         $queryMonth = "SELECT
             strftime('%Y-%m', date) as month,
+            (COUNT(*) > MIN(COUNT(pv_yield), COUNT(home_consumption), COUNT(wp_consumption), COUNT(wb_consumption), COUNT(wb2_consumption), COUNT(climate_consumption), COUNT(grid_in), COUNT(grid_out), COUNT(bat_in), COUNT(bat_out))) as incomplete,
             SUM(pv_yield) as pv,
-            SUM(CASE WHEN COALESCE(grid_out, 0) > 0.5 AND COALESCE(grid_out, 0) > COALESCE(pv_yield, 0) + 0.5 AND COALESCE(grid_out, 0) > MAX(1.0, COALESCE(bat_out, 0) * 1.5) THEN COALESCE(pv_yield, 0) + COALESCE(grid_out, 0) ELSE COALESCE(pv_yield, 0) END) as pv_total,
+            SUM(CASE WHEN pv_yield IS NULL THEN NULL WHEN COALESCE(grid_out, 0) > 0.5 AND COALESCE(grid_out, 0) > COALESCE(pv_yield, 0) + 0.5 AND COALESCE(grid_out, 0) > MAX(1.0, COALESCE(bat_out, 0) * 1.5) THEN COALESCE(pv_yield, 0) + COALESCE(grid_out, 0) ELSE COALESCE(pv_yield, 0) END) as pv_total,
             SUM(home_consumption) as home,
             MAX(COALESCE(house_includes_unknown_wallbox,0)) as house_includes_unknown_wallbox,
             SUM(grid_in) as grid_in,
@@ -549,8 +554,9 @@ if (file_exists($dbPath)) {
         // Hole Jahresdaten
         $queryYear = "SELECT
             strftime('%Y', date) as year,
+            (COUNT(*) > MIN(COUNT(pv_yield), COUNT(home_consumption), COUNT(wp_consumption), COUNT(wb_consumption), COUNT(wb2_consumption), COUNT(climate_consumption), COUNT(grid_in), COUNT(grid_out), COUNT(bat_in), COUNT(bat_out))) as incomplete,
             SUM(pv_yield) as pv,
-            SUM(CASE WHEN COALESCE(grid_out, 0) > 0.5 AND COALESCE(grid_out, 0) > COALESCE(pv_yield, 0) + 0.5 AND COALESCE(grid_out, 0) > MAX(1.0, COALESCE(bat_out, 0) * 1.5) THEN COALESCE(pv_yield, 0) + COALESCE(grid_out, 0) ELSE COALESCE(pv_yield, 0) END) as pv_total,
+            SUM(CASE WHEN pv_yield IS NULL THEN NULL WHEN COALESCE(grid_out, 0) > 0.5 AND COALESCE(grid_out, 0) > COALESCE(pv_yield, 0) + 0.5 AND COALESCE(grid_out, 0) > MAX(1.0, COALESCE(bat_out, 0) * 1.5) THEN COALESCE(pv_yield, 0) + COALESCE(grid_out, 0) ELSE COALESCE(pv_yield, 0) END) as pv_total,
             SUM(home_consumption) as home,
             MAX(COALESCE(house_includes_unknown_wallbox,0)) as house_includes_unknown_wallbox,
             SUM(grid_in) as grid_in,
@@ -1040,6 +1046,7 @@ document.addEventListener("DOMContentLoaded", function() {
     }
 
     function lzKwh(value, digits = 1) {
+        if (value === null || value === undefined || !Number.isFinite(parseFloat(value))) return 'unbekannt';
         return (parseFloat(value) || 0).toLocaleString('de-DE', {
             minimumFractionDigits: digits,
             maximumFractionDigits: digits
@@ -1294,17 +1301,17 @@ document.addEventListener("DOMContentLoaded", function() {
                 <button class="btn btn-sm btn-outline-danger ms-1 lz-delete-row" title="Löschen"><i class="fas fa-trash-alt"></i></button>
             ` : '';
             tr.innerHTML = `
-                <td class="fw-bold text-start">${lzPeriodLabel(d)}</td>
-                <td>${lzKwh(lzNum(d, 'pv_total') || lzNum(d, 'pv'))}</td>
-	                <td>${lzKwh(lzNum(d, 'home'))}${d.house_includes_unknown_wallbox ? '<div class="small text-warning">Haus inkl. Wallbox (unbekannt)</div>' : ''}</td>
-	                <td>${lzKwh(lzNum(d, 'wp'))}</td>
-	                <td>${lzKwh(lzNum(d, 'climate'))}${lzClimateBreakdownHtml(d)}</td>
-	                <td>${lzKwh(lzNum(d, 'wb1') || Math.max(0, lzNum(d, 'wb') - lzNum(d, 'wb2')))}</td>
-                <td>${lzKwh(lzNum(d, 'wb2'))}</td>
-                <td>${lzKwh(lzNum(d, 'grid_in'))}</td>
-                <td>${lzKwh(lzNum(d, 'grid_out'))}</td>
-                <td>${lzKwh(lzNum(d, 'bat_in'))}</td>
-                <td>${lzKwh(lzNum(d, 'bat_out'))}</td>
+                <td class="fw-bold text-start">${lzPeriodLabel(d)}${d.incomplete ? '<div class="small text-warning">unvollständig</div>' : ''}</td>
+                <td>${lzKwh(d.pv_total ?? d.pv)}</td>
+	                <td>${lzKwh(d.home)}${d.house_includes_unknown_wallbox ? '<div class="small text-warning">' + (currentViewMode === 'day' && d.house_unknown_wallbox_minutes != null ? 'Haus inkl. Wallbox (unbekannt, ' + d.house_unknown_wallbox_minutes + ' Min. ohne Messwert)' : 'Haus inkl. Wallbox (unbekannt)') + '</div>' : ''}</td>
+	                <td>${lzKwh(d.wp)}</td>
+	                <td>${lzKwh(d.climate)}${lzClimateBreakdownHtml(d)}</td>
+	                <td>${lzKwh(d.wb1)}</td>
+                <td>${lzKwh(d.wb2)}</td>
+                <td>${lzKwh(d.grid_in)}</td>
+                <td>${lzKwh(d.grid_out)}</td>
+                <td>${lzKwh(d.bat_in)}</td>
+                <td>${lzKwh(d.bat_out)}</td>
                 <td><div class="d-flex justify-content-center">${dayActions}</div></td>
             `;
             const edit = tr.querySelector('.lz-edit-row');

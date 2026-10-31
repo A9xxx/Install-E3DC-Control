@@ -186,17 +186,6 @@ MODULES: dict[str, ServiceModule] = {
         optional=False,
         actions=READ_ACTIONS + SERVICE_ACTIONS,
     ),
-    "websocket": ServiceModule(
-        key="websocket",
-        display_name="WebUI Live-Animationen",
-        group=CORE,
-        description="WebSocket-Pflichtdienst; die Weboberfläche nutzt derzeit HTTP-Abfragen und verwendet ihn noch nicht.",
-        service="e3dc-websocket",
-        script="e3dc_websocket.py",
-        log_file="/var/www/html/logs/e3dc_websocket.log",
-        optional=False,
-        actions=READ_ACTIONS + SERVICE_ACTIONS,
-    ),
     "wallbox": ServiceModule(
         key="wallbox",
         display_name="Wallbox Manager",

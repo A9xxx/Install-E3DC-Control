@@ -1093,7 +1093,7 @@ cd /app/pi/Install/Installer
 # E3DC Live RSCP Client ZUERST starten -- liefert live_data_py.json fuer storage_simulator.
 # Ohne diesen Schritt wuerde storage_simulator mit SOC=0% starten -> Discharge-Sperre!
 echo "-> E3DC Live RSCP Client (zuerst, liefert Live-SoC)..."
-nohup "${EMS_EXEC[@]}" -- "$PYTHON_EXEC" e3dc_live.py --write --loops 0 --interval 3 2>&1 &
+nohup "${EMS_EXEC[@]}" -- "$PYTHON_EXEC" e3dc_live.py --write --loops 0 --interval 2 2>&1 &
 E3DC_LIVE_STARTED=1
 echo "   -> Warte 10s auf erste RSCP-Messung..."
 sleep 10
@@ -1121,8 +1121,6 @@ else
     echo "   -> Kein ML-Modell vorhanden (< 50 Samples) -- Storage Simulator nutzt Fallback."
 fi
 
-# WebSocket Server (immer)
-nohup "${EMS_EXEC[@]}" --log e3dc_websocket.log -- "$PYTHON_EXEC" e3dc_websocket.py &
 
 # Klimaanlage Live (read-only, nur bei kanonischer Aktivierung)
 if optional_service_selected "e3dc-climate-live"; then
@@ -1220,7 +1218,7 @@ nohup "${EMS_EXEC[@]}" -- "$PYTHON_EXEC" storage_manager.py 2>&1 &
 # E3DC Live RSCP Client (Immer aktiv - Python-nativer Datenstream fuer V4 KI/Forecast)
 if [ "${E3DC_LIVE_STARTED:-0}" != "1" ]; then
     echo "   -> E3DC Live RSCP Client aktiv."
-    nohup "${EMS_EXEC[@]}" -- "$PYTHON_EXEC" e3dc_live.py --write --loops 0 --interval 3 2>&1 &
+    nohup "${EMS_EXEC[@]}" -- "$PYTHON_EXEC" e3dc_live.py --write --loops 0 --interval 2 2>&1 &
 else
     echo "   -> E3DC Live RSCP Client bereits aktiv."
 fi

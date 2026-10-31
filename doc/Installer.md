@@ -1,6 +1,6 @@
 # E3DC-Control Installer
 
-Dokumentation Stand: 5.5.5c
+Dokumentation Stand: 5.5.6
 
 Der Installer verwaltet Bare-Metal-Installation, Update, Rechte, Dienste,
 Backup, Rollback und optionale Produktmodule. Er ermittelt Benutzer, Home,
@@ -349,10 +349,10 @@ gebundenen Home-Verzeichnis. Wird das venv abgelehnt oder die abschließende
 Bestätigung nicht erteilt, endet der Lauf vor dem Schreiben der venv-, Pfad-
 und Webmetadaten mit einem Fehlerstatus.
 Die Kern-Units werden erst nach Konfiguration, RAM-Disk und Initialbackup
-gebündelt eingerichtet; der Paket-Schritt startet den WebSocket-Dienst nicht
+gebündelt eingerichtet; der Paket-Schritt startet die Kerndienste nicht
 vorzeitig.
 
-Eine vollständige Bare-Metal-Installation besitzt anschließend diese sieben
+Eine vollständige Bare-Metal-Installation besitzt anschließend diese sechs
 Pflichtdienste. Diese Liste entspricht den Pflichtmodulen des Service-Katalogs
 und `INSTALL_CENTER_CORE_SERVICES` des Updaters:
 
@@ -361,13 +361,12 @@ und `INSTALL_CENTER_CORE_SERVICES` des Updaters:
 - `e3dc-weather-manager`
 - `e3dc-storage-simulator`
 - `e3dc-storage-manager`
-- `e3dc-websocket`
 - `e3dc-notifier`
 
 Jeder Unit-Schreib-, `daemon-reload`-, Enable- oder Startfehler bricht den
 betroffenen Installationsschritt ab. Ein gestarteter Pflichtdienst gilt erst
 nach erfolgreichem `systemctl is-active` als eingerichtet. Webportal,
-Konfiguration, RAM-Disk, Initialbackup, Kerndienste und WebSocket bauen strikt
+Konfiguration, RAM-Disk, Initialbackup und Kerndienste bauen strikt
 aufeinander auf; nach dem ersten Fehler wird kein folgender Pflichtschritt
 ausgeführt. Bei einem Abbruch
 nicht blind erneut installieren, sondern zuerst die erste sichtbare
@@ -377,7 +376,7 @@ Fehlermeldung und den belegten Zustand sichern:
 tail -n 200 "$E3DC_INSTALL_PATH/logs/install.log"
 systemctl --failed --no-pager
 systemctl status e3dc-live e3dc-epex-manager e3dc-weather-manager \
-  e3dc-storage-simulator e3dc-storage-manager e3dc-websocket e3dc-notifier \
+  e3dc-storage-simulator e3dc-storage-manager e3dc-notifier \
   --no-pager
 ```
 

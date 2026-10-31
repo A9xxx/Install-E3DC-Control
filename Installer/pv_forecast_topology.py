@@ -51,6 +51,105 @@ def _safe_float(value: Any, default: Optional[float] = 0.0) -> Optional[float]:
         return default
 
 
+def external_ac_limit_w(value):
+    """Endliche, nicht negative AC-Leistung; bool und unlesbare Werte sind unbekannt."""
+    number = _safe_float(value, None)
+    return number if number is not None and number >= 0.0 else None
+
+
+def _configured_true(value):
+    return str(value).strip().lower() in ("1", "true", "yes", "on", "ja", "ein")
+
+
+def normalize_aux_ac_storage_mode(config):
+    """Liest den neuen AC-Modus fail-safe und migriert nur explizite Altfreigaben.
+
+    Der frühere Bool-Schalter war eine Nutzerfreigabe, enthielt aber keine
+    wirtschaftliche Aussage. ``true`` wird deshalb ausschließlich auf den
+    konservativen Modus ``reserve_only`` abgebildet. Fehlende, leere oder
+    unbekannte Werte bleiben ``off``.
+    """
+
+    config = config or {}
+    canonical_keys = (
+        "direct_marketing_aux_inverter_ac_storage_mode",
+        "direct_marketing_pv_store_aux_ac_mode",
+    )
+    for key in canonical_keys:
+        if key not in config:
+            continue
+        raw = str(config.get(key) or "").strip().lower().replace("-", "_").replace(" ", "_")
+        aliases = {
+            "aus": "off",
+            "disabled": "off",
+            "reserve": "reserve_only",
+            "reserve_sichern": "reserve_only",
+            "reserve_only": "reserve_only",
+            "hausversorgung": "house_supply",
+            "hausversorgung_sichern": "house_supply",
+            "house_supply": "house_supply",
+            "wirtschaftlich": "economic",
+            "economical": "economic",
+            "economic": "economic",
+        }
+        mode = aliases.get(raw, raw)
+        return (
+            mode if mode in {"off", "reserve_only", "house_supply", "economic"} else "off",
+            key if mode in {"off", "reserve_only", "house_supply", "economic"} else "%s_invalid" % key,
+        )
+
+    legacy_key = "direct_marketing_aux_inverter_ac_storage_enable"
+    if legacy_key in config and _configured_true(config.get(legacy_key)):
+        return "reserve_only", "legacy_bool_explicit_true"
+    return "off", "default_off"
+
+
+def external_ac_source_configured(config, *, resources=None):
+    """True, wenn die Konfiguration einen externen AC-PV-Pfad erkennen lässt."""
+
+    config = config or {}
+    raw_limit = config.get("pv_external_ac_inverter_limit_w")
+    limit = external_ac_limit_w(raw_limit)
+    if (raw_limit is not None and str(raw_limit).strip() != ""
+            and (limit is None or limit > 0.0)):
+        return True
+    aux_ac_mode, _mode_source = normalize_aux_ac_storage_mode(config)
+    if aux_ac_mode != "off":
+        return True
+    if resources is None:
+        try:
+            resources = build_pv_forecast_topology(config).get("resources", [])
+        except Exception:
+            resources = []
+    if any(
+        str(item.get("coupling") or "").strip().upper() == "EXTERNAL_AC"
+        for item in resources
+        if isinstance(item, dict)
+    ):
+        return True
+    if _configured_true(config.get("direct_marketing_aux_inverter_ac_storage_enable")):
+        return True
+    if str(config.get("direct_marketing_aux_inverter_shelly_override") or "").strip().lower() == "central":
+        return True
+    if str(config.get("direct_marketing_aux_inverter_shelly_ip") or "").strip():
+        return True
+    nested = config.get("direct_marketing_aux_inverter_shelly")
+    if isinstance(nested, dict):
+        if str(nested.get("override") or "").strip().lower() == "central":
+            return True
+        if str(nested.get("ip") or "").strip():
+            return True
+    return any(
+        str(config.get(key) or "").strip().upper().replace("-", "_") == "EXTERNAL_AC"
+        for key in (
+            "pv_forecast_coupling_fc1",
+            "pv_forecast_coupling_fc2",
+            "pv_forecast_coupling_fc3",
+            "pv_forecast_coupling_fc4",
+        )
+    )
+
+
 def _canonical_hash(value: Any) -> str:
     raw = json.dumps(
         value,
@@ -550,7 +649,7 @@ def build_pv_forecast_topology(config: Optional[Mapping[str, Any]]) -> Dict[str,
     missing = sorted(str(item) for item in missing if str(item))
     missing_geometry = sorted(str(item) for item in missing_geometry if str(item))
     provider_invalid = sorted(str(item) for item in provider_invalid if str(item))
-    external_limit = max(0.0, _safe_float(cfg.get(EXTERNAL_AC_LIMIT_KEY), 0.0) or 0.0)
+    external_limit = external_ac_limit_w(cfg.get(EXTERNAL_AC_LIMIT_KEY)) or 0.0
     e3dc_limit = max(0.0, _safe_float(cfg.get(E3DC_DC_LIMIT_KEY), 0.0) or 0.0)
     external_bound = any(item["coupling"] == COUPLING_EXTERNAL_AC for item in resources)
     e3dc_bound = any(item["coupling"] == COUPLING_E3DC_DC for item in resources)
@@ -662,6 +761,7 @@ def build_pv_forecast_topology(config: Optional[Mapping[str, Any]]) -> Dict[str,
         "provider_split_usable": provider_status == "bound",
         "e3dc_dc_bound": bool(e3dc_bound),
         "external_ac_bound": bool(external_bound),
+        "external_ac_source_configured": external_ac_source_configured(cfg, resources=resources),
         "contract_mode": "explicit_generator_groups" if use_explicit_contract else "legacy_read_compatibility",
         "config_schema": TOPOLOGY_CONFIG_SCHEMA if use_explicit_contract else None,
         "provider_bindings": binding_diagnostics,

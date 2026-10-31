@@ -152,6 +152,8 @@ Das Untermenü „Backup-Verwaltung“ bietet vier Punkte:
 
 ## Konfigurationsstände und Tageshistorien
 
+Die Minutenhistorie wird stündlich gesichert. Bei einem Neustart gehen höchstens die Sätze seit der letzten erfolgreichen Sicherung verloren. Eine Tagesdatei wächst durch Anhängen neuer Zeitpunkte und wird niemals durch eine kürzere Ramdisk-Historie ersetzt. Ein abgebrochener letzter Satz wird vor dem Ergänzen entfernt. Fehlt der Tagesanfang um mindestens eine Stunde, bleiben integrierte Tageswerte unbekannt statt 0; gültige Tageszähler bleiben erhalten.
+
 Zusätzlich zu den vollständigen Update-Sicherungen führt das Webportal kleine
 Konfigurationsstände und detaillierte Tageshistorien. Für diese Daten gelten
 eigene Grenzen:
@@ -182,10 +184,10 @@ eigene Grenzen:
   lokalen Rotation.
 - Detaillierte Tagesdateien bleiben für 30 Kalendertage direkt auswählbar.
   Ein neu angelegtes Tagesarchiv wird ohne Überschreiben veröffentlicht. Ist
-  der Tag bereits vorhanden, bleibt ein identischer oder vollständigerer
-  Bestand unverändert; nur eine bytegenaue Erweiterung wird unter Dateisperre
-  ergänzt. Abweichende, kürzere oder währenddessen ausgetauschte Bestände
-  werden niemals überschrieben.
+  der Tag bereits vorhanden, werden unter Dateisperre nur Sätze mit späterem
+  Zeitpunkt angehängt. Bereits gesicherte Zeitpunkte bleiben erhalten; fehlende
+  ältere Sätze werden nicht nachträglich eingefügt. Ein kürzerer oder währenddessen
+  ausgetauschter Bestand ersetzt niemals die Tagesdatei.
   Ein älterer Tag wird nur gelöscht, wenn sein Datum gültig aus dem Dateinamen
   gelesen wurde und genau dieser Tag in `e3dc_stats.db` bestätigt vorhanden
   ist. Fehlt die Datenbank, die Tabellenzeile oder eine sichere Dateibindung,

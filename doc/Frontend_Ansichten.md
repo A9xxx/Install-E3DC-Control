@@ -150,6 +150,16 @@ Die Bedeutungen sind:
 - **Beobachten**
   E3DC-Control beobachtet nur und sendet keine Ladebefehle. Mit `PV` folgt der Speicher seiner normalen Ladekurve. Mit `PV + Akku` führt nur der Storage Manager den Speicher bis zur Hausakku-Reserve; wenn das Auto nicht mehr erkannt wird, gilt wieder die normale Ladekurve.
 
+Beide Ansichten verwenden beim Beobachten dieselben Namen: „PV (Speicher folgt Ladekurve)“ und „PV + Akku (Speicher oberhalb Hausreserve)“. „Netz erlaubt“ ist dabei deaktiviert: Beim Beobachten regelt E3DC; Netzladen steuert E3DC-Control dabei nicht. Die gespeicherten Speicherpolitiken bleiben `curve` und `reserve`.
+
+Jeder konfigurierte, nicht deaktivierte Ladepunkt verwendet denselben
+Regelkern. Seine Betriebsart bleibt je Ladepunkt wählbar. Die Seite
+„Wallbox“ zeigt, auch in der mobilen Ansicht, den Entscheidungssatz aus dem
+Managerstatus: Anteil, Strom, Phasen und Wartegrund. Ohne gültigen Satz bleibt
+die Aussage verborgen. Das Dashboard, auch das mobile, zeigt den Entscheidungssatz nicht. Eine zusätzliche Reglerauswahl gibt es nicht.
+
+Im Not-Aus bleiben gemessene Leistung und Ladezustand sichtbar; ungültige Gesamtleistung bleibt unbekannt. Start und Pause sind deaktiviert. **Not-Aus aktiv – Freigabe über den Ein/Aus-Schalter (Power-Symbol) der Ladepunktkarte in der erweiterten Ansicht auf der Seite „Wallbox“.** Das Speichern einer Betriebsart hebt den Not-Aus nicht auf. Ein echter Datenausfall wird weiterhin gemeldet.
+
 Die erweiterte Wallbox-Ansicht enthält weiterhin alle bisherigen Details wie Modi, Phasen, Schützschutz, Verzögerungen, Fahrzeugdaten und Treiberoptionen.
 
 ## Warum die Ansicht nicht global gesetzt wird
@@ -188,3 +198,7 @@ auf `none`; ein bewusst gewählter Pufferfühler beeinflusst nur die Anzeige.
    setzen. Betroffene Ansicht, erwartetes und beobachtetes Verhalten nennen
    und ein **Diagnosepaket aus der Installationszentrale** beifügen; das Paket
    vor dem Teilen prüfen.
+
+## Kopfzeile der Prognosegrafik
+
+Bei „Heute“ zeigt der PV-Wert die **Tagesprognose** für den ganzen Tag, auch am Abend. Der Hausverbrauch daneben ist die **Restprognose Verbrauch ab jetzt**. Beschriftung und Tooltip kennzeichnen die unterschiedlichen Zeiträume.

@@ -1197,6 +1197,7 @@ def rsync_data(target_ip, push=True, owner_lease=None, peer_state_getter=query_p
         "--exclude", "*.tmp",
         "--exclude", "*.tmp.*",
         "--exclude", "*.flag",
+        "--exclude", "*.lock",
         "--exclude", "*_status.json",
         "--exclude", "*_cache.json",
         "--exclude", "*_history.json",
@@ -1280,6 +1281,9 @@ def rsync_data(target_ip, push=True, owner_lease=None, peer_state_getter=query_p
                 return True
             except subprocess.CalledProcessError as exc:
                 if exc.returncode != 24:
+                    logger.error("HA rsync: Exit %s.", exc.returncode)
+                    for line in (exc.stderr or "").splitlines()[-10:]:
+                        logger.error("HA rsync stderr: %s", line[:300])
                     raise
                 # Verschwundene Quelldateien ändern weder Rolle noch Lease.
                 logger.warning(
@@ -1313,6 +1317,7 @@ def rsync_data(target_ip, push=True, owner_lease=None, peer_state_getter=query_p
                 "-o", "-path", "/var/www/html/ramdisk/.e3dc_config_cache.*",
                 "-o", "-path", "/var/www/html/ramdisk/.wb_sessions_aggregate_*",
                 "-o", "-path", "/var/www/html/ramdisk/.get_live_json_*",
+                "-o", "-name", "*.lock",
                 ")", "-prune", "-o",
             ]
             protected_data = [
@@ -1331,6 +1336,7 @@ def rsync_data(target_ip, push=True, owner_lease=None, peer_state_getter=query_p
                 "-path", "/var/www/html/data/.wallbox_plan_jobs", "-o",
                 "-path", "/var/www/html/data/wallbox_mode5_user_start_request.json", "-o",
                 "-path", "/var/www/html/data/wallbox_mode5_user_start_request.json.lock",
+                "-o", "-name", "*.lock",
                 ")", "-prune", "-o",
             ]
             subprocess.run([
@@ -1484,7 +1490,10 @@ def get_managed_services(action="start"):
     `e3dc-live` vorhanden ist. Beim Stop werden beide gestoppt, damit ein
     Standby-Slave sicher stumm bleibt.
     """
-    services = list(MANAGED_SERVICES)
+    # Die entfernte Alt-Unit bleibt ausschließlich im Stilllegungswissen.
+    services = [s for s in MANAGED_SERVICES if s != "e3dc-websocket.service"]
+    if action == "stop":
+        services.append("e3dc-websocket.service")
     if action == "start" and service_exists(NATIVE_LIVE_SERVICE):
         services = [s for s in services if s != LEGACY_E3DC_SERVICE]
     return services
@@ -1916,7 +1925,7 @@ def main_loop():
                     if local_stop_ok and rsync_data(peer_ip, push=False, owner_lease=owner_lease):
                         logger.info("HA auto-recovery completed.")
                     else:
-                        logger.warning("HA auto-recovery blocked; no unverified restore was applied.")
+                        logger.warning("HA auto-recovery unvollständig oder gesperrt; Ursache in der vorherigen Meldung.")
                 elif peer_online:
                     logger.warning("HA auto-recovery blocked by peer writer state %s.", peer_writer_state)
                 master_auto_recovered = True
@@ -1951,7 +1960,7 @@ def main_loop():
                     elif sync_result is None:
                         logger.warning("HA backup sync unvollständig; letzter vollständiger Erfolgszeitpunkt bleibt unverändert.")
                     else:
-                        logger.warning("HA backup sync blocked by ambiguous peer/owner state.")
+                        logger.warning("HA backup sync fehlgeschlagen oder gesperrt; Ursache in der vorherigen Meldung.")
                 else:
                     logger.warning("HA peer offline; backup sync skipped.")
             write_status("master", "active", peer_online, last_sync, owner_lease=owner_lease)

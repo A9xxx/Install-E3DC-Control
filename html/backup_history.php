@@ -9,6 +9,7 @@ $backupDir = '/var/www/html/data/history_backups';
 $database = '/var/www/html/data/e3dc_stats.db';
 $configBackupDir = '/var/www/html/data/config_backups';
 $yesterday = date('Y-m-d', strtotime('yesterday'));
+$hourly = PHP_SAPI === 'cli' && in_array('--heute', $argv ?? [], true);
 $configRaw = e3dcReadRegularFileBound('/var/www/html/data/e3dc_v4.json', 4 * 1024 * 1024);
 $configData = is_string($configRaw) ? @json_decode($configRaw, true) : null;
 if (!is_array($configData)) {
@@ -27,20 +28,25 @@ if (!is_dir($backupDir)) {
     @chmod($backupDir, $historyDirMode);
 }
 
-$archive = e3dcArchiveHistoryDay(
-    $source,
-    $backupDir,
-    $yesterday,
-    ['mode' => $historyFileMode]
-);
-if (empty($archive['success'])) {
-    error_log(
-        'Backup-Fehler: Tageshistorie wurde nicht bestätigt ('
-        . (string)($archive['status'] ?? 'unknown')
-        . '). Bestehende Archive werden nicht bereinigt.'
-    );
-    exit(1);
+$days = $hourly ? [$yesterday, date('Y-m-d')] : [$yesterday];
+$archiveFailed = false;
+foreach ($days as $archiveDay) {
+    $archive = e3dcArchiveHistoryDay($source, $backupDir, $archiveDay, ['mode' => $historyFileMode]);
+    if (empty($archive['success'])) {
+        if ($hourly && (($archive['status'] ?? '') === 'archive_empty'
+            || (($archive['status'] ?? '') === 'archive_source_invalid' && !file_exists($source) && !is_link($source)))) continue;
+        error_log('Backup-Fehler: Tageshistorie wurde nicht bestätigt ('
+            . (string)($archive['status'] ?? 'unknown') . '). Bestehende Archive werden nicht bereinigt.');
+        if (!$hourly) exit(1);
+        $archiveFailed = true;
+        continue;
+    }
+    if (!$hourly || (int)$archive['rows'] > 0 || $archive['status'] === 'archive_created') {
+        echo 'Tageshistorie: ' . (string)$archive['status'] . ': ' . basename((string)$archive['path'])
+            . ' (' . (int)$archive['rows'] . " neue Datensätze).\n";
+    }
 }
+if ($hourly) exit($archiveFailed ? 1 : 0);
 
 $historyRetention = e3dcPruneDetailedHistory($backupDir, $database, 30);
 if (($historyRetention['status'] ?? '') === 'longterm_archive_unconfirmed') {
@@ -73,16 +79,6 @@ if (($configRetention['status'] ?? '') !== 'ok'
     );
 }
 
-$archiveStatus = (string)($archive['status'] ?? 'archive_confirmed');
-$archiveLabel = $archiveStatus === 'archive_extended'
-    ? 'Tageshistorie vollständig erweitert'
-    : ($archiveStatus === 'archive_existing_preserved'
-        ? 'Bereits vollständigere Tageshistorie unverändert erhalten'
-        : ($archiveStatus === 'archive_unchanged'
-            ? 'Tageshistorie bereits identisch vorhanden'
-            : 'Tageshistorie bestätigt'));
-echo $archiveLabel . ': ' . basename((string)$archive['path'])
-    . ' (' . (int)$archive['rows'] . " Datensätze).\n";
 echo 'Tageshistorien entfernt: ' . count($historyRetention['deleted'] ?? []) . ".\n";
 echo 'Automatische Konfigurationssicherungen entfernt: '
     . count($configRetention['deleted'] ?? []) . ".\n";

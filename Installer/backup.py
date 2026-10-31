@@ -66,6 +66,7 @@ SYSTEMD_UNIT_DIRS = (
     Path("/usr/lib/systemd/system"),
     Path("/lib/systemd/system"),
 )
+APACHE_DEFAULT_SITE = Path("/etc/apache2/sites-available/000-default.conf")
 APACHE_SECURITY_CONFIG = Path("/etc/apache2/conf-available/e3dc-control-security.conf")
 MANAGER_LOCK_TMPFILES_CONFIG = Path("/etc/tmpfiles.d/e3dc-control-locks.conf")
 WEB_ROOT = Path("/var/www/html")
@@ -211,7 +212,7 @@ def _prepare_private_ml_store_for_backup(
 
 
 def _systemd_unit_paths():
-    units = sorted(set(allowed_services()) | {"piguard.service", "e3dc.service"})
+    units = sorted(set(allowed_services()) | {"piguard.service", "e3dc.service", "e3dc-websocket.service"})
     paths = []
     for unit_dir in SYSTEMD_UNIT_DIRS:
         current = Path("/")
@@ -456,6 +457,12 @@ def _persistent_sources(
             allow_live_drift=options.tolerate_replaceable_entries,
         ),
         PersistentSource(
+            "apache-vhost",
+            APACHE_DEFAULT_SITE,
+            unsafe_entry_policy=replaceable_policy,
+            allow_live_drift=options.tolerate_replaceable_entries,
+        ),
+        PersistentSource(
             "apache-config",
             APACHE_SECURITY_CONFIG,
             unsafe_entry_policy=replaceable_policy,
@@ -561,6 +568,7 @@ def _restore_allowlist(install_path=None):
             Path("/usr/local/sbin/e3dc-module-installer"),
             Path("/etc/sudoers.d/020_e3dc_services"),
             APACHE_SECURITY_CONFIG,
+            APACHE_DEFAULT_SITE,
             MANAGER_LOCK_TMPFILES_CONFIG,
         )
     )

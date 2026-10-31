@@ -267,6 +267,11 @@ foreach ($lines as $line) {
             unset($item);
         }
     }
+    $d = e3dcWallboxMeasureHistoryDisplay($d);
+    foreach (['wb', 'wb2'] as $prefix) {
+        if (array_key_exists($prefix, $d) && $d[$prefix] === null
+            && !empty($d[$prefix . '_measure_only_reason'])) $b[$prefix . '_unknown'] = true;
+    }
     $wb = isset($d['wb']) ? $d['wb'] : 0;
     $wb2 = isset($d['wb2']) ? $d['wb2'] : 0;
     // Die History-Spalte wp enthält den Heizstab; hs ist nur dessen Diagnoseanteil.
@@ -384,6 +389,7 @@ foreach ($lines as $line) {
     }
 }
 
+unset($b);
 ksort($buckets);
 
 $climateDualHistory = false;
@@ -400,8 +406,8 @@ foreach ($buckets as $ts => $b) {
     $data['home'][] = round($b['home'] / $c);
     $data['bat'][] = round($b['bat'] / $c);
     $data['grid'][] = round($b['grid'] / $c);
-    $data['wb'][] = round($b['wb'] / $c);
-    $data['wb2'][] = round($b['wb2'] / $c);
+    $data['wb'][] = !empty($b['wb_unknown']) ? null : round($b['wb'] / $c);
+    $data['wb2'][] = !empty($b['wb2_unknown']) ? null : round($b['wb2'] / $c);
     $data['wp'][] = $b['wp_power_cnt'] > 0 ? round($b['wp'] / $b['wp_power_cnt']) : null;
     $data['hs'][] = round($b['hs'] / $c);
     $data['climate'][] = !empty($b['climate_unknown']) ? null : round($b['climate'] / $c);

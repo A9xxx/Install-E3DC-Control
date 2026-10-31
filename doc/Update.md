@@ -5,12 +5,26 @@ Updates werden ausschließlich über den Installer ausgeführt. Ein manuelles
 Nutzerinstallation ist für den regulären Ziel-Updater weder Voraussetzung noch
 Updateautorität.
 
-Der aktuelle Stable-Stand ist `v5.5.5c`. Das Dashboard startet ausschließlich
+Der aktuelle Stable-Stand ist `v5.5.6`. Das Dashboard startet ausschließlich
 den root-eigenen Systemjob ohne freie Argumente. Die einzige Ausnahme ist
 die tokengebundene Driftfreigabe. Dieser installiert den neuesten
 veröffentlichten Stable-Stand oder repariert dieselbe Version. Der
 Stable-Versionscheck ist nur eine Anzeige und keine Startfreigabe. Freie Pfade,
 Release-Tags, Neuinstallationen und Rückfälle bleiben im Web gesperrt.
+
+5.5.6 ist ein Funktions- und Korrekturupdate zu 5.5.5c (gemeinsamer
+Wallbox-Regelkern, Hausanschluss je Phase aus den Phasenwerten des
+E3DC-Leistungsmessers, neustartfeste Pause, Not-Aus und Ladepunktsperre,
+Speicher-Netzladen und Wärmepumpen-PV-Boost). Bestehende Installationen
+aktualisieren wie gewohnt über **System Update** bzw. das
+[Docker-Update](#docker-update); eine Konfigurationsänderung ist nicht nötig.
+Die entfallenen Einstellfelder für Phasenwechsel bleiben in der Konfiguration
+gespeichert, werden aber nicht mehr ausgewertet. Der E3DC-WebSocket-Dienst ist
+entfernt: Bei Bare Metal stoppt und entfernt das Update ihn und die
+mitgelieferte Apache-Weiterleitung `/ws` erst nach bestätigtem Start der neuen
+Version; eigene Anwendungen vorher auf die MQTT-Topics des MQTT-Hubs umstellen.
+Ein fester Docker-Pin wird bewusst auf `E3DC_IMAGE_TAG=v5.5.6` geändert.
+Einzelheiten stehen in den [Release Notes](../RELEASE_NOTES.md).
 
 5.5.5c ist ein Sicherheitsupdate zu 5.5.5b: Das Docker-Image enthält PHP 8.2.35
 mit den Korrekturen für die kritischen Lücken CVE-2026-109618 und

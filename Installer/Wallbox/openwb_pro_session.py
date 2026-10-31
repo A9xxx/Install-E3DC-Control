@@ -1094,13 +1094,12 @@ UNPLUG_OFFER_TARGET_AMP = {
     UNPLUG_OFFER_MODE_FAST_START: 6.0,
 }
 UNPLUG_OFFER_CONTRACT = "openwb_pro_unplug_offer_v1"
-# Ein Befehl und höchstens zwei Wiederholungen je bestätigtem Sessionende.
-UNPLUG_OFFER_MAX_SENDS = 3
+# Stehendes Angebot: erneuter Versuch nur nach dem vorhandenen Readback-Abstand.
 UNPLUG_OFFER_RETRY_AFTER_S = 20.0
 UNPLUG_OFFER_READBACK_TOLERANCE_A = 0.25
 # Höchstens etwa ein Regelzyklus: ältere Samples sind kein Beleg.
 UNPLUG_OFFER_STATUS_MAX_AGE_S = 10.0
-UNPLUG_OFFER_ACTIVE_STAGES = ("pending", "await_readback")
+UNPLUG_OFFER_ACTIVE_STAGES = ("pending", "await_readback", "confirmed")
 
 
 def unplug_offer_mode(
@@ -1216,8 +1215,8 @@ def unplug_offer_step_contract(
     ``send`` (genau ein Strombefehl auf das Ziel), sowie die Endzustände
     ``confirm``, ``superseded`` und ``exhausted``. Gesendet wird nur bei
     frischem, ausdrücklich getrenntem Status, bekanntem Box-Angebot, das vom
-    Ziel abweicht, ohne Ausgangssperre und höchstens ``UNPLUG_OFFER_MAX_SENDS``
-    mal je Sessionende.
+    Ziel abweicht und keine Ausgangssperre vorliegt. Bestätigte Ziele bleiben
+    als stehendes Angebot aktiv; Wiederholungen beachten den Readback-Abstand.
     """
 
     item = dict(offer) if isinstance(offer, dict) else {}
@@ -1268,6 +1267,9 @@ def unplug_offer_step_contract(
     reported = float(readback["offered_amp"])
     item["reported_amp"] = reported
     if abs(reported - target) <= UNPLUG_OFFER_READBACK_TOLERANCE_A:
+        if stage == "confirmed":
+            result.update(action="none", reason="standing_offer_confirmed")
+            return result
         reason = "readback_matches_target" if sends > 0 else "already_at_target"
         item.update({
             "stage": "confirmed",
@@ -1276,13 +1278,6 @@ def unplug_offer_step_contract(
             "reason": reason,
         })
         result.update({"action": "confirm", "reason": reason})
-        return result
-    if sends >= UNPLUG_OFFER_MAX_SENDS:
-        item.update({"stage": "unconfirmed", "reason": "readback_mismatch_after_retries"})
-        result.update({
-            "action": "exhausted",
-            "reason": "readback_mismatch_after_retries",
-        })
         return result
     if sends > 0 and now_value - sent_ts < UNPLUG_OFFER_RETRY_AFTER_S:
         return _wait("retry_interval")
@@ -5391,6 +5386,7 @@ def mark_phase_wait(
     else:
         amp_value = 0.0
     cooldown_s = phase_wait_s(config)
+    state["_phase_change_cooldown_s"] = cooldown_s
     min_settle_s = phase_min_settle_s(config)
     state["_openwb_pro_phase_wait_target"] = target
     state["_openwb_pro_phase_wait_until"] = now_value + min_settle_s
@@ -5473,7 +5469,11 @@ def phase_wait_active(
             result="confirmed_after_hold" if confirmed_after_hold else "timeout",
         )
         clear_phase_wait(state)
-        state["_last_phase_switch_ts"] = now_value
+        # Eine erstmals beobachtete Quittung erhält den bestehenden Beleg;
+        # ein Timeout bestätigt keinen neuen Wechsel. Ein bereits vom Ausgang
+        # gebundener Wechselzeitpunkt und die Phasensperre bleiben unverändert.
+        if confirmed_after_hold and _safe_float(state.get("_last_phase_switch_ts"), 0.0) <= 0.0:
+            state["_last_phase_switch_ts"] = now_value
         return False
     if status_target not in (0, target):
         return True

@@ -1,3 +1,67 @@
+# E3DC-Control v5.5.6
+
+E3DC-Control 5.5.6 ist ein Funktions- und Korrekturupdate zu 5.5.5c. Alle geregelten Wallboxen nutzen einen gemeinsamen, einfacheren Regelkern: Start nach 60 Sekunden ausreichendem Anteil, Stopp nach drei Minuten Unterdeckung, Abstieg auf eine Phase schon nach 60 Sekunden. Der Hausanschluss je Phase folgt den Phasenwerten des E3DC-Leistungsmessers. Pause, Not-Aus und Ladepunktsperre stoppen sofort und bleiben über Neustarts erhalten. Netzladen im Marktfenster behält Vorrang, und die Wärmepumpe wartet nach einem Neustart nicht mehr pauschal 24 Stunden. Der E3DC-WebSocket-Dienst ist entfernt.
+
+## Änderungen
+
+- **Wallbox-Regelkern:**
+  - Jeder konfigurierte, nicht deaktivierte Ladepunkt nutzt denselben Regelkern; die Betriebsart bleibt je Ladepunkt wählbar. Der Strom folgt im 10-Sekunden-Takt direkt dem zugeteilten Anteil mit 1 A Totband; die Anhebungstreppe entfällt.
+  - Eine PV- oder Akkuladung startet nach 60 Sekunden ausreichendem Anteil, eine freigegebene Netzquelle sofort. Startet das Fahrzeug nicht, nennt der Entscheidungssatz das nach spätestens 30 Sekunden; ein späterer Ladebeginn wird übernommen.
+  - Bei Unterdeckung hält die Ladung den Mindeststrom und endet nach drei Minuten Unterdeckung und mindestens fünf Minuten Ladezeit, auch wenn die Akkustützung endet. Die zusätzliche Wiederanlaufsperre entfällt.
+  - Phasen: Aufstieg nach 60 Sekunden Deckung des dreiphasigen Mindeststroms, Abstieg nach 60 Sekunden Unterdeckung, danach mindestens 480 Sekunden Sperre. Die Felder „Beharrung 3p→1p (s)“, „Vorlauf 1p→3p (s)“, „Export-Wh 1p→3p (Wh)“, „Symmetrie-Klausel 1p→3p“ und „Phasen-Halt (s)“ entfallen.
+  - Das Wolken-Kontingent in „PV-Kurve ruhig“ gilt für die ganze Ladeepisode und bleibt beim Phasenwechsel erhalten.
+  - Die Netzbremse begrenzt nach zwei Regeltakten über 300 W Netzbezug bis zum Mindeststrom; Einschwingfrist, 2-A-Anhebung und Grid-Wächter entfallen.
+  - Bleibt das Budget des Speicherreglers gesperrt, stoppt die Ladung nach der 300-Sekunden-Datenfrist, statt unbefristet mit Mindeststrom weiterzulaufen; liefert der Speicherregler 45 Sekunden lang kein neues Budget, endet eine PV- oder Akkuladung bereits dann.
+  - „Akku bis Abfahrt“ lädt an der Hausakku-Untergrenze mit ausreichendem PV-Anteil weiter. „Nach dem Abstecken: Schneller Start (6 A)“ an der openWB Pro hält 6 A nur bereit, solange ein Start gerade erlaubt ist.
+- **Hausanschluss je Phase:**
+  - Maßgeblich sind die frischen Phasenwerte des E3DC-Leistungsmessers; „Reserve für übrige Hausverbraucher (A)“ begrenzt nur die Summe der Wallboxströme.
+  - Ohne eingetragene Netzphase einer ein- oder zweiphasigen Wallbox rechnet E3DC-Control mit Sicherheitsabstand auf allen Phasen; der Hinweis nennt das Feld „WB1 lokale L1 liegt auf Netzphase“ bzw. „WB2 lokale L1 liegt auf Netzphase“.
+  - Ohne gültige Phasenwerte gibt es keinen neuen Start; eine laufende Ladung hält den Mindeststrom bis zum Ende der Datenfrist. Eine Abweichung zwischen Netzwert und Zählersumme ist nur ein Hinweis.
+- **Pause, Not-Aus und Ladepunktsperre:**
+  - Alle drei beenden eine laufende Ladung sofort mit quittiertem Stopp, auch in „Beobachten“, und bleiben nach Dienst- und Rechnerneustart sowie Containerstart bestehen.
+  - Sperre und Not-Aus lassen sich nur über den Schalter mit dem Power-Symbol in der erweiterten Ansicht der Seite „Wallbox“ aufheben; ein Sofortstart wird dann abgelehnt.
+  - Native E3DC-Wallboxen erhalten Stoppflanken anhand ihres Abbruchbits; reagiert die Box nicht, meldet die Anzeige „Box reagiert nicht auf den Stopp“.
+- **Wallbox nur per MQTT messen:** Eine gemessene, aber nicht gesteuerte Wallbox erscheint in Übersicht, Verlauf, Tagesstatistik und Kosten getrennt vom Hausverbrauch; Prognose und Regelung bleiben unverändert.
+- **Speicher und Preissteuerung:**
+  - Markt-Netzladen behält Vorrang vor dem Entladungsschutz für die Wallbox. Netzladen verteilt sich gleichmäßig über die günstigen Fenster, mit Ziel etwa 30 Minuten vor Fensterende und gelernter Ladeleistung je Ladezustand.
+  - Halten rechnet nachweisbares günstiges Nachladen an. Unterbrechungen der Planquelle werden höchstens 20 Sekunden überbrückt.
+  - Die Preisplanung bewertet die Frische der Livewerte zum Lesezeitpunkt; langsame Geräte mit großem Archiv verlieren dadurch keine Netzladefenster mehr mit „Livewerte nicht nutzbar“.
+  - Ist das Reservefeld („Hausreserve (%)“ bzw. „Fallback-Reserve (%)“) leer oder 0 und bildet die frisch gelesene Gerätereserve den wirksamen Boden, hält der E3DC die Notstromreserve selbst; eigene Entladebefehle bleiben an der Reserve gesperrt. Ein eingetragener Wert gilt weiter.
+  - Beim geordneten Dienstende gibt der Speicherregler seine flüchtigen Akkugrenzen unter sicheren Bedingungen einmal frei. Nach einem Notfall-Stillsetzen nennt der Watchdog-Hinweis die aktiven Akkugrenzen.
+  - Die experimentelle Notstrom-Vorhaltung hält bei offener PV-Fläche und bekanntem Zusatzwechselrichter die volle Energie, bis alle Flächen zugeordnet sind.
+- **Wärmepumpe:**
+  - Die pauschale 24-Stunden-Sperre des PV-Boosts nach einem Neustart entfällt; ohne vertrauenswürdiges Konto gelten Akku- und Netzkontingente als verbraucht, reiner PV-Boost ist sofort möglich.
+  - Bei direkt angesteuerten Wärmepumpen (SG-Ready über Shelly oder Stiebel ISG, iDM, Dimplex) endet die Anforderung bei Aus sofort; ein laufender Verdichter behält seine Mindestlaufzeit.
+- **Anzeige:** Der Entscheidungssatz steht auf der Seite „Wallbox“; die Entscheidungsansicht nennt Kernsatz, Kernbudget, Phasen und einen vorbereiteten Phasenwechsel. Die Cloud-SoC-Frist folgt dem Abfrage-Intervall. Das Preislimit speichert in der erweiterten Ansicht automatisch. Die Tarifvorschau unter „Tarif & Strompreise“ rechnet einen Beispieltag mit Leistungs- und Ladezustandsverlauf und vergleicht die Kosten von „nur PV“, „nur halten“ sowie „halten und nachladen“; die Datenbasis ist wählbar. Die Konfigurationsprüfung nennt den Ort im Config-Editor. Die Fußzeile zeigt keinen veralteten Git-Hash mehr.
+- **Statistik und Telegram:** Die Minutenhistorie wird stündlich gesichert. Fehlende Werte erscheinen als unbekannt statt 0; der Tagesbericht enthält Wallbox 2.
+- **Installation und Docker:** Der E3DC-WebSocket-Dienst ist entfernt; das Update entfernt Dienst und Apache-Weiterleitung `/ws` erst nach bestätigtem Start der neuen Version. Livewerte kommen im 2-Sekunden-Takt.
+
+## Grenzen
+
+- Eine Pause an einer Wallbox ohne gestecktes Fahrzeug wird sofort wieder aufgehoben. Für „nicht laden“ ohne Fahrzeug die Ladepunktsperre verwenden.
+- Entfällt die Akkustützung genau in einem kurzen Datenhalt oder in der Erholung danach, läuft die Box bis zu deren Ende mit dem bisherigen Strom weiter und folgt dann mit Mindeststrom der Unterdeckungsregel, statt sofort zu stoppen. Nach einem Dienststopp mit Aussetzer kurz davor und langer Ausfallzeit, etwa bei einem Update, kann die erste Ladung sofort durch die Datenfrist stoppen.
+- Bis 5.5.7 gilt auf Anlagen ohne bestätigte Zeitsynchronisation nach einem Neustart bis zu 24 Stunden nur reiner PV-Boost ohne Akku- oder Netzüberbrückung.
+- Steigt eine andere Last sprunghaft, kann der Strom je Phase für einen Regeltakt über dem eingestellten Hausanschluss liegen. Falsche, aber gültige Zählerwerte oder eine falsch eingetragene Netzphase können zu einer dauerhaften Überschreitung führen.
+- Eine in der E3DC-App gesetzte Sperre einer nativen E3DC-Wallbox hebt E3DC-Control nicht auf; nach Not-Aus folgt in „Beobachten“ keine automatische Freigabe.
+- Wird ein beim Halten eingeplantes Nachladen nicht ausgeführt, kann in teuren Stunden Netzbezug entstehen.
+- Die neue Wallbox-Regelung ersetzt keinen Feldnachweis der konkreten Geräte und Fahrzeuge. Bei unerwartetem Verhalten ein Diagnosepaket aus der Installationszentrale beifügen.
+
+## Updatehinweise
+
+- **Bare Metal:** Wie gewohnt über „System Update“ aktualisieren und anschließend die Seite neu laden. Der WebSocket-Dienst wird erst nach bestätigtem Start der neuen Version entfernt.
+- **Docker:** Mit eingerichtetem Watchtower über „System Update“, sonst im bestehenden Compose-Ordner auf dem Host mit `sudo docker compose pull` und `sudo docker compose up -d` aktualisieren. Ein fester Pin wird bewusst auf `E3DC_IMAGE_TAG=v5.5.6` geändert.
+- **WebSocket-Nutzer:** Eigene Anwendungen, die den E3DC-WebSocket-Dienst genutzt haben, vor dem Update auf die MQTT-Topics des MQTT-Hubs umstellen.
+- **Netzphase eintragen:** Bei ein- oder zweiphasig ladenden Wallboxen „WB1 lokale L1 liegt auf Netzphase“ bzw. „WB2 lokale L1 liegt auf Netzphase“ unter „Wallbox & Fahrzeug“ eintragen; sonst rechnet E3DC-Control mit Sicherheitsabstand.
+- **Keine Phasenwerte:** Meldet die Seite „Wallbox“ „Keine Phasenwerte vom E3DC-Leistungsmesser“, starten keine neuen Ladungen. Dann unter „E3DC System-Verbindung“ die Felder „Wurzelzähler / PM-Index“ (0 = automatische Suche) und „Phasen invertieren“ prüfen.
+- **Entfallene Phasenfelder:** Gespeicherte Werte bleiben in der Konfiguration erhalten, werden aber nicht mehr ausgewertet. Eine Konfigurationsänderung ist nicht nötig.
+- **Von 5.5.5b oder älter:** Das Update führt direkt auf 5.5.6; die Updatehinweise von 5.5.5c, 5.5.5b und 5.5.5a gelten weiter, bei Bare Metal auch das Systemupdate für PHP.
+
+## Rückfall
+
+Rückfall auf 5.5.5c: Docker in `.env` `E3DC_IMAGE_TAG=v5.5.5c` setzen und `sudo docker compose up -d` ausführen. Auf Bare Metal ist das beim Update angelegte verifizierte Backup der Rückweg; es stellt auch den WebSocket-Dienst von 5.5.5c wieder her. Bei Docker entfernt 5.5.5c beim Start gespeicherte Pausen und Ladepunktsperren aus der Konfiguration; danach Pause, Sperre und Not-Aus auf der Seite „Wallbox“ prüfen und bei Bedarf neu setzen. Einzelheiten stehen in der [Rückfall-Dokumentation](doc/Rollback.md), Abschnitt „Rückfall von 5.5.6 auf 5.5.5c“.
+
+---
+
 # E3DC-Control v5.5.5c
 
 E3DC-Control 5.5.5c ist ein Sicherheitsupdate auf Basis von 5.5.5b. Das Docker-Image enthält PHP mit den Korrekturen für die kritischen Lücken CVE-2026-109618 und CVE-2026-109619 („PHP2Shell“). Die Funktionen sind gegenüber 5.5.5b unverändert.

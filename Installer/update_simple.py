@@ -58,7 +58,6 @@ CORE_RESULT_SERVICES = (
     "e3dc-weather-manager.service",
     "e3dc-storage-simulator.service",
     "e3dc-storage-manager.service",
-    "e3dc-websocket.service",
     "e3dc-notifier.service",
 )
 EXPLICIT_CUTOVER_SERVICES = frozenset(
@@ -69,6 +68,7 @@ EXPLICIT_CUTOVER_SERVICES = frozenset(
         "piguard.service",
         "apache2.service",
         "e3dc.service",
+        "e3dc-websocket.service",  # Altbestand nur für Stop und Rückfall
     }
 )
 LEGACY_SERVICE_MIGRATIONS = {
@@ -219,6 +219,7 @@ class ServicePrestate:
             sorted(
                 set(self.target_bound_unknown_units)
                 - set(self.confirmed_unknown_writers)
+                - {"e3dc-websocket.service"}
             )
         )
 
@@ -870,7 +871,7 @@ def _capture_service_prestate(target_root: Path | None = None) -> ServicePrestat
         for unit in active
         if unit.startswith("e3dc")
         and unit not in catalog
-        and unit != "e3dc.service"
+        and unit not in {"e3dc.service", "e3dc-websocket.service"}
     }
     confirmed_unknown_writers = {
         unit for unit in unknown_active if _is_confirmed_competing_hardware_writer(unit)
@@ -4761,7 +4762,7 @@ def _ensure_core_services(
             "unit": "e3dc-live.service",
             "description": "E3DC RSCP Live Data Service (Python Native)",
             "script": "e3dc_live.py",
-            "args": ("--write", "--loops", "0", "--interval", "3"),
+            "args": ("--write", "--loops", "0", "--interval", "2"),
             "restart": 15,
             "after": ("network-online.target",),
             "wants": ("network-online.target",),
@@ -4796,14 +4797,6 @@ def _ensure_core_services(
             "start_limit": True,
             "manager_lock": True,
             "emergency_quiesce_gate": True,
-        },
-        {
-            "unit": "e3dc-websocket.service",
-            "description": "E3DC WebSocket Server für flüssige Dashboard-Animationen",
-            "script": "e3dc_websocket.py",
-            "restart": 5,
-            "after": ("apache2.service",),
-            "syslog": "e3dc-websocket",
         },
         {
             "unit": "e3dc-notifier.service",
@@ -7072,6 +7065,8 @@ def _repair_units_and_permissions(
             timeout=30,
         )
         enabled = _run(["/usr/sbin/a2enconf", "e3dc-control-security"], timeout=30)
+        from Installer.retired_websocket import remove_proxy
+        warnings.extend(remove_proxy(_run))
         syntax = _run(["/usr/sbin/apache2ctl", "configtest"], timeout=30)
         if installed.returncode != 0 or enabled.returncode != 0 or syntax.returncode != 0:
             _fail(
@@ -7132,13 +7127,15 @@ def _services_to_start(
         services = [role_service] if role_intended and role_service else []
         if role in {"master", "slave"} and "piguard.service" in active_before:
             services.append("piguard.service")
-    services.append("apache2.service")
+    if "apache2.service" in active_before:
+        services.append("apache2.service")
     masked = {_normalize_unit(unit) for unit in masked_units}
     seen: set[str] = set()
     return tuple(
         unit
         for unit in services
-        if unit not in masked and not (unit in seen or seen.add(unit))
+        if unit not in masked and unit != "e3dc-websocket.service"
+        and not (unit in seen or seen.add(unit))
     )
 
 
@@ -7161,7 +7158,8 @@ def _services_to_enable(
         if role_service_intended is None
         else role_service_intended
     )
-    enabled.add("apache2.service")
+    if "apache2.service" in enabled_before:
+        enabled.add("apache2.service")
     for source, target in LEGACY_SERVICE_MIGRATIONS.items():
         if source in enabled_before or (
             role in {"master", "slave"} and source in set(prestate.active)
@@ -7265,6 +7263,7 @@ def _forbidden_services_after_start(
         *prestate.cutover_unknown_units,
         *prestate.masked,
         "e3dc.service",
+        "e3dc-websocket.service",  # Altbestand nur für Stop und Rückfall
         *LEGACY_SERVICE_MIGRATIONS,
         *(
             unit
@@ -7576,7 +7575,7 @@ def _start_services(
         )
     warnings: list[str] = []
     masked = {_normalize_unit(unit) for unit in masked_units}
-    required_set = (set(required) | {"apache2.service"}) - masked
+    required_set = (set(required) | ({"apache2.service"} & set(services))) - masked
     enable_set = set(enable_services) - masked
     storage_unit = "e3dc-storage-manager.service"
     for unit in services:
@@ -7640,6 +7639,7 @@ def _final_confirmation(
     forbidden_services: Iterable[str] = (),
     *,
     required_writer_admission_mode: str = "",
+    apache_was_active: bool = True,
     masked_units: Iterable[str] = (),
 ) -> list[str]:
     _assert_named_directory_binding(target_binding)
@@ -7660,7 +7660,7 @@ def _final_confirmation(
         )
 
     masked = {_normalize_unit(unit) for unit in masked_units}
-    required = (set(required_services) | {"apache2.service"}) - masked
+    required = (set(required_services) | ({"apache2.service"} if apache_was_active else set())) - masked
     storage_unit = "e3dc-storage-manager.service"
     forbidden = {_normalize_unit(unit) for unit in forbidden_services}
     pending = set(required)
@@ -7731,6 +7731,10 @@ def _final_confirmation(
             f"Zeige die Ursache mit: sudo journalctl -u {unit} --no-pager -n 120",
         )
 
+    if not apache_was_active:
+        if _service_active("apache2.service"):
+            _fail("E3DC-UPD-END-APACHE", "Zuvor inaktiver Apache wurde aktiv.", "Stoppe Apache und prüfe seine Startkonfiguration.")
+        return []
     http_ok = False
     http_deadline = time.monotonic() + 20.0
     while time.monotonic() < http_deadline:
@@ -8891,6 +8895,7 @@ def perform_update(
                         role_service_intended=role_service_intended,
                     ),
                     required_writer_admission_mode=required_writer_admission_mode,
+                    apache_was_active="apache2.service" in service_prestate.active,
                     masked_units=service_prestate.masked,
                 )
             )
@@ -8906,6 +8911,8 @@ def perform_update(
                     (*services, *required),
                 )
             )
+            from Installer.retired_websocket import retire_service
+            warnings.extend(retire_service(_run))
             warnings.extend(_retire_unknown_active_e3dc(service_prestate))
             warnings.extend(
                 _restart_target_bound_observers_after_success(service_prestate)

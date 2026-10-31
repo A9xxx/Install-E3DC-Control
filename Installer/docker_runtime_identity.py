@@ -30,7 +30,7 @@ BUNDLED_IDENTITY_PATH = "/usr/local/lib/e3dc-control/docker_runtime_identity.py"
 CONTROL_STATE_ROOT = "/var/lib/e3dc-control/runtime"
 CONTROL_STATE_DIRECTORY = CONTROL_STATE_ROOT + "/private-control"
 RUNTIME_PYTHON_SCRIPTS = (
-    "e3dc_live.py", "e3dc_websocket.py", "climate_live.py", "climate_control.py",
+    "e3dc_live.py", "climate_live.py", "climate_control.py",
     "luxtronik/energy_manager.py", "luxtronik/lux_live.py", "idm/idm_live.py",
     "stiebel/stiebel_live.py", "dimplex/dimplex_live.py", "heizstab_manager.py",
     "wallbox_manager.py", "e3dc_mqtt_hub.py", "bluelink_client.py", "epex_manager.py",

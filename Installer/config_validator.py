@@ -89,12 +89,16 @@ except Exception:  # pragma: no cover - direct script execution fallback
 try:
     from .pv_forecast_topology import (
         build_pv_forecast_topology,
+        external_ac_source_configured,
+        external_ac_limit_w,
         has_explicit_topology_config,
         legacy_provider_resource_duplicate_keys,
     )
 except Exception:  # pragma: no cover - direct script execution fallback
     from pv_forecast_topology import (  # type: ignore
         build_pv_forecast_topology,
+        external_ac_source_configured,
+        external_ac_limit_w,
         has_explicit_topology_config,
         legacy_provider_resource_duplicate_keys,
     )
@@ -419,15 +423,14 @@ def validate_solcast_config(cfg: Optional[Dict[str, Any]]) -> Dict[str, Dict[str
         elif label in duplicate_labels:
             severity = "warning"
             message = (
-                f"{label}: Resource ID ist mehrfach gebunden; "
-                "M3 bleibt vollständig gesperrt."
+                f'Die Solcast-Fläche {label} ist mehrfach eingetragen; die erweiterte Prognose bleibt aus. Im Config-Editor unter „Standort & PV-Prognose“ das Feld „Resource IDs FC1 bis FC4“ prüfen.'
             )
         elif not valid_slot:
             severity = "warning"
-            message = f"{label}: Accountslot muss 1 oder 2 sein; M3 bleibt gesperrt."
+            message = f'Die Kontoauswahl für {label} ist ungültig; die erweiterte Prognose bleibt aus. Im Config-Editor unter „Standort & PV-Prognose“ das Feld „Konto je Site“ prüfen.'
         elif not key_available[effective_slot]:
             severity = "warning"
-            message = f"{label}: Gewähltes Konto {effective_slot} besitzt keinen Schlüssel; M3 bleibt gesperrt."
+            message = f'Dem gewählten Solcast-Konto {effective_slot} fehlt der Zugangsschlüssel; die erweiterte Prognose bleibt aus. Im Config-Editor unter „Standort & PV-Prognose“ das Feld „API Key Konto 1“ beziehungsweise „API Key Konto 2“ prüfen.'
         result[mapping_key] = _entry(
             key=mapping_key,
             label=f"Solcast {label} Konto",
@@ -443,7 +446,7 @@ def validate_solcast_config(cfg: Optional[Dict[str, Any]]) -> Dict[str, Dict[str
     return result
 
 
-def validate_pv_forecast_topology_config(cfg: Optional[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+def validate_pv_forecast_topology_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[str, Any]] = None) -> Dict[str, Dict[str, Any]]:
     """Projiziert den typisierten Topologievertrag in die Config-Diagnose."""
 
     cfg = {str(k).lower(): v for k, v in (cfg or {}).items()}
@@ -475,11 +478,7 @@ def validate_pv_forecast_topology_config(cfg: Optional[Dict[str, Any]]) -> Dict[
         source="user" if _has_user_value(cfg, "forecast_diagnostics_enable") else "default",
         severity="info" if diagnostics_valid else "warning",
         message=(
-            "Rein diagnostische Auswertung; keine automatische Regelungs- oder Modellwirkung."
-            if diagnostics_enabled
-            else "Diagnose ist ausgeschaltet und erzeugt keine Hintergrundlast."
-            if diagnostics_valid
-            else "Ungültiger Schalterwert; Diagnose bleibt ausgeschaltet."
+            ('Rein diagnostische Auswertung; keine automatische Regelungs- oder Modellwirkung.' if diagnostics_enabled else 'Diagnose ist ausgeschaltet und erzeugt keine Hintergrundlast.' if diagnostics_valid else 'Der Schalterwert ist ungültig; die Diagnose bleibt aus. Im Config-Editor unter „Standort & PV-Prognose“ das Feld „PV-Prognosediagnose“ prüfen.') if ('info' if diagnostics_valid else 'warning') in ("warning", "error") else ('Rein diagnostische Auswertung; keine automatische Regelungs- oder Modellwirkung.' if diagnostics_enabled else 'Diagnose ist ausgeschaltet und erzeugt keine Hintergrundlast.' if diagnostics_valid else 'Ungültiger Schalterwert; Diagnose bleibt ausgeschaltet.')
         ),
     )
     explicit_contract = contract.get("contract_mode") == "explicit_generator_groups"
@@ -491,7 +490,7 @@ def validate_pv_forecast_topology_config(cfg: Optional[Dict[str, Any]]) -> Dict[
         provider_ok = provider_status in {"bound", "disabled_no_bindings"}
         result["pv_forecast_topology_config"] = _entry(
             key="pv_forecast_topology_config",
-            label="PV-Prognose-Topologie",
+            label='Zuordnung der PV-Flächen',
             unit="-",
             configured=group_count if _has_user_value(cfg, "pv_forecast_topology_config") else None,
             live_value=None,
@@ -500,14 +499,7 @@ def validate_pv_forecast_topology_config(cfg: Optional[Dict[str, Any]]) -> Dict[
             source="user",
             severity="ok" if topology_ok and provider_ok else "warning",
             message=(
-                (
-                    f"Lokale Topologie enthält {group_count} Generatorgruppe(n); "
-                    f"Providerbindung bleibt gesperrt ({contract.get('provider_reason')})."
-                )
-                if topology_ok and not provider_ok
-                else f"Schema enthält {group_count} Generatorgruppe(n) und {binding_count} Providerressource(n)."
-                if topology_ok
-                else f"Topologievertrag ist nicht vollständig bindbar ({contract.get('reason')}); Quellsplit bleibt gesperrt."
+                (f'Die {group_count} PV-Flächen sind erfasst, aber ihre Zuordnung zum Prognoseanbieter ist unvollständig; die Anbieterprognose bleibt aus. Im Config-Editor unter „Standort & PV-Prognose“ den Kasten „PV-Flächen und Wechselrichtergruppen“ prüfen.' if topology_ok and not provider_ok else f'Schema enthält {group_count} Generatorgruppe(n) und {binding_count} Providerressource(n).' if topology_ok else 'Die PV-Flächen sind unvollständig zugeordnet; ihre Erträge können nicht nach Wechselrichter getrennt werden. Im Config-Editor unter „Standort & PV-Prognose“ den Kasten „PV-Flächen und Wechselrichtergruppen“ prüfen.') if ('ok' if topology_ok and provider_ok else 'warning') in ("warning", "error") else (f"Lokale Topologie enthält {group_count} Generatorgruppe(n); Providerbindung bleibt gesperrt ({contract.get('provider_reason')})." if topology_ok and (not provider_ok) else f'Schema enthält {group_count} Generatorgruppe(n) und {binding_count} Providerressource(n).' if topology_ok else f"Topologievertrag ist nicht vollständig bindbar ({contract.get('reason')}); Quellsplit bleibt gesperrt.")
             ),
         )
     by_key = {
@@ -531,8 +523,7 @@ def validate_pv_forecast_topology_config(cfg: Optional[Dict[str, Any]]) -> Dict[
             severity = "warning"
             effective = None
             message = (
-                f"{_label} besitzt keine lokale Geometrie; "
-                "M1/M2-Quellsplit bleibt gesperrt."
+                f'Der Fläche {_label} fehlen Angaben zu Größe und Ausrichtung; ihre Prognose kann nicht getrennt berechnet werden. Im Config-Editor unter „Standort & PV-Prognose“ den Kasten „PV-Flächen und Wechselrichtergruppen“ prüfen.'
             )
         elif item.get("coupling") in {"E3DC_DC", "EXTERNAL_AC"}:
             severity = "ok"
@@ -541,7 +532,13 @@ def validate_pv_forecast_topology_config(cfg: Optional[Dict[str, Any]]) -> Dict[
         else:
             severity = "warning"
             effective = None
-            message = f"{_label} ist topologisch nicht gebunden; zusätzlicher DC-Headroom bleibt gesperrt."
+            if not configured and contract.get("reason") == "RESOURCE_COUPLING_MISSING":
+                external_ac_known = contract["external_ac_source_configured"]
+                message = (
+                    f'{_label}: Ohne vollständige Flächenzuordnung bleiben zusätzliche Speicherladung und Entladung für freie Speicherkapazität eingeschränkt; bei bekanntem Zusatzwechselrichter bleibt die volle Notstrom-Vorhaltung bestehen. Im Config-Editor unter „Standort & PV-Prognose“ die Kopplungsauswahl und den Kasten „PV-Flächen und Wechselrichtergruppen“ vervollständigen.' if external_ac_known else f'{_label}: Ohne vollständige Flächenzuordnung bleiben zusätzliche Speicherladung und Entladung für freie Speicherkapazität eingeschränkt; die Notstrom-Vorhaltung nutzt ohne bekannten Zusatzwechselrichter die Gesamtprognose, bei ausschließlicher E3DC-DC-Ladung bleibt sie vollständig bestehen. Im Config-Editor unter „Standort & PV-Prognose“ die Kopplungsauswahl und den Kasten „PV-Flächen und Wechselrichtergruppen“ vervollständigen.'
+                )
+            else:
+                message = f'Die Fläche {_label} ist keinem Wechselrichter eindeutig zugeordnet; zusätzliche freie Speicherkapazität wird nicht eingeplant. Im Config-Editor unter „Standort & PV-Prognose“ den Kasten „PV-Flächen und Wechselrichtergruppen“ prüfen.'
         result[coupling_key] = _entry(
             key=coupling_key,
             label=f"PV-Topologie {_label}",
@@ -555,26 +552,41 @@ def validate_pv_forecast_topology_config(cfg: Optional[Dict[str, Any]]) -> Dict[
             message=message,
         )
 
-    external_limit = safe_float(cfg.get("pv_external_ac_inverter_limit_w"), 0.0)
+    external_raw = cfg.get("pv_external_ac_inverter_limit_w")
+    external_value = external_ac_limit_w(external_raw)
+    external_unreadable = _has_user_value(cfg, "pv_external_ac_inverter_limit_w") and external_value is None
+    external_limit = external_value or 0.0
     external_required = bool(contract.get("external_ac_bound"))
     result["pv_external_ac_inverter_limit_w"] = _entry(
         key="pv_external_ac_inverter_limit_w",
-        label="Externer AC-Wechselrichter",
+        label='Externe AC-WR-Leistung (W)',
         unit="W",
-        configured=external_limit if _has_user_value(cfg, "pv_external_ac_inverter_limit_w") else None,
+        configured=external_value if _has_user_value(cfg, "pv_external_ac_inverter_limit_w") else None,
         live_value=None,
         live_key=None,
         effective=external_limit if external_limit > 0.0 else None,
         source="user" if external_limit > 0.0 else "missing",
-        severity="warning" if external_required and external_limit <= 0.0 else "ok",
+        severity="warning" if external_unreadable or (external_required and external_limit <= 0.0) else "ok",
         message=(
-            "Für EXTERNAL_AC fehlt das separate AC-WR-Limit; der Topologiesplit bleibt gesperrt."
-            if external_required and external_limit <= 0.0
-            else "Das externe AC-WR-Limit ist typisiert gebunden."
-            if external_limit > 0.0
-            else "Kein externer AC-Wechselrichter gebunden."
+            ('Die Leistung des Zusatzwechselrichters ist unlesbar; seine Leistung bleibt unbekannt und die Notstrom-Vorhaltung berücksichtigt ihn vorsorglich. Im Config-Editor unter „Standort & PV-Prognose“ das Feld „Externe AC-WR-Leistung (W)“ prüfen.' if external_unreadable else 'Für den Zusatzwechselrichter fehlt die Leistungsgrenze; die Prognose kann nicht nach Wechselrichter getrennt werden. Im Config-Editor unter „Standort & PV-Prognose“ das Feld „Externe AC-WR-Leistung (W)“ ergänzen.' if external_required and external_limit <= 0.0 else 'Das externe AC-WR-Limit ist typisiert gebunden.' if external_limit > 0.0 and external_required else 'AC-Leistung eingetragen, aber keiner Fläche als „Externer AC-WR“ zugeordnet; solange eine Fläche offen ist, hält die Notstrom-Vorhaltung die volle Energie.' if external_limit > 0.0 else 'Kein externer AC-Wechselrichter gebunden.') if ('warning' if external_unreadable or (external_required and external_limit <= 0.0) else 'ok') in ("warning", "error") else ('Der Wert in „Externe AC-WR-Leistung (W)“ ist unlesbar; der Zusatz-WR gilt vorsorglich als bekannt, die Leistung bleibt unbekannt.' if external_unreadable else 'Für „Externer AC-WR“ fehlt das separate AC-WR-Limit; der Topologiesplit bleibt gesperrt.' if external_required and external_limit <= 0.0 else 'Das externe AC-WR-Limit ist typisiert gebunden.' if external_limit > 0.0 and external_required else 'AC-Leistung eingetragen, aber keiner Fläche als „Externer AC-WR“ zugeordnet; solange eine Fläche offen ist, hält die Notstrom-Vorhaltung die volle Energie.' if external_limit > 0.0 else 'Kein externer AC-Wechselrichter gebunden.')
         ),
     )
+    # Vorhandene RSCP-Livewerte wie bei den übrigen beratenden Abweichungshinweisen.
+    additional, additional_key = None, None
+    for key in ("EMS_POWER_ADD", "Power_ADD", "ADD_POWER", "add_power"):
+        raw = (live or {}).get(key)
+        if raw is None or isinstance(raw, bool) or str(raw).strip() == "":
+            continue
+        value = safe_float(raw, float("nan"))
+        if math.isfinite(value) and int(round(value)) < 0:
+            additional, additional_key = int(round(value)), key
+            break
+    guard_w = max(0, int(round(safe_float(cfg.get("direct_marketing_pv_store_external_ac_guard_w"), 100))))
+    if additional is not None and abs(additional) > guard_w and not external_ac_source_configured(cfg):
+        result["pv_external_ac_inverter_limit_w"].update(
+            severity="warning", rscp=additional, rscp_key=additional_key,
+            message=f'Der E3DC meldet Zusatzleistung, obwohl kein Zusatzwechselrichter eingetragen ist; die Zuordnung ist unvollständig. Im Config-Editor unter „Standort & PV-Prognose“ die Kopplung „Externer AC-WR“, den Kasten „PV-Flächen und Wechselrichtergruppen“ oder „Externe AC-WR-Leistung (W)“ prüfen.',
+        )
     e3dc_limit = safe_float(cfg.get("pv_e3dc_dc_inverter_limit_w"), 0.0)
     meter_mode = cfg.get("pv_external_ac_observation_mode", "unverified")
     known_meter_modes = ("unverified", "generation_meter", "generation_meter_uncontrolled")
@@ -584,8 +596,7 @@ def validate_pv_forecast_topology_config(cfg: Optional[Dict[str, Any]]) -> Dict[
         effective=meter_mode if meter_mode in known_meter_modes else "unverified",
         source="user" if meter_mode in known_meter_modes[1:] else "unverified",
         severity="info" if meter_mode in known_meter_modes else "warning",
-        message="Die Betreiberangabe gilt ab Erfassung. Begrenzungsstatus und AC-Limit werden separat geprüft."
-                if meter_mode in known_meter_modes[1:] else "Die Messzuordnung ist noch nicht bestätigt; kein neuer Kalibrierfaktor aus diesen Messungen.",
+        message=('Die Betreiberangabe gilt ab Erfassung. Begrenzungsstatus und AC-Limit werden separat geprüft.' if meter_mode in known_meter_modes[1:] else 'Die Messzuordnung ist noch nicht bestätigt; kein neuer Kalibrierfaktor aus diesen Messungen.' if meter_mode in known_meter_modes else 'Die Messzuordnung ist unbekannt; aus diesen Messungen wird keine neue Prognosekorrektur ermittelt. Im Config-Editor unter „Standort & PV-Prognose“ das Feld „Ist-Messung des Zusatzwechselrichters“ prüfen.') if ('info' if meter_mode in known_meter_modes else 'warning') in ("warning", "error") else ('Die Betreiberangabe gilt ab Erfassung. Begrenzungsstatus und AC-Limit werden separat geprüft.' if meter_mode in known_meter_modes[1:] else 'Die Messzuordnung ist noch nicht bestätigt; kein neuer Kalibrierfaktor aus diesen Messungen.'),
     )
     result["pv_e3dc_dc_inverter_limit_w"] = _entry(
         key="pv_e3dc_dc_inverter_limit_w",
@@ -615,17 +626,17 @@ def validate_heatpump_pv_config(cfg: Dict[str, Any]) -> Dict[str, Dict[str, Any]
     entries = {}
     invalid_fields = []
     rules = (
-        ("wp_pv_max_power_w", "WP: maximale elektrische Aufnahme", "W", "max_power_w", 0.0),
-        ("wp_pv_battery_limit_wh", "WP: Akkuenergie in 24 Stunden", "Wh", "battery_limit_wh", 0.0),
-        ("wp_pv_grid_limit_wh", "WP: Netzenergie in 24 Stunden", "Wh", "grid_limit_wh", 0.0),
-        ("wp_pv_battery_max_w", "WP: Akku-Überbrückungsleistung", "W", "battery_max_w", 0.0),
-        ("wp_pv_grid_max_w", "WP: Netz-Überbrückungsleistung", "W", "grid_max_w", 0.0),
-        ("wp_pv_reaction_s", "WP: Reaktionsfrist", "s", "reaction_s", 30.0),
-        ("wp_pv_start_wait_s", "WP: Verdichter-Startwartefrist", "s", "start_wait_s", 600.0),
-        ("wp_pv_handoff_timeout_s", "WP: Übergabefrist Wallbox", "s", "handoff_timeout_s", 120.0),
+        ("wp_pv_max_power_w", 'Elektrischer Profilwert (W, optional bei Ist-Regelung)', "W", "max_power_w", 0.0),
+        ("wp_pv_battery_limit_wh", 'Energiekontingent innerhalb von 24 Stunden (Wh)', "Wh", "battery_limit_wh", 0.0),
+        ("wp_pv_grid_limit_wh", 'Energiekontingent innerhalb von 24 Stunden (Wh)', "Wh", "grid_limit_wh", 0.0),
+        ("wp_pv_battery_max_w", 'Maximale Leistung (W)', "W", "battery_max_w", 0.0),
+        ("wp_pv_grid_max_w", 'Maximale Leistung (W)', "W", "grid_max_w", 0.0),
+        ("wp_pv_reaction_s", 'Berücksichtigte Reaktionszeit (s)', "s", "reaction_s", 30.0),
+        ("wp_pv_start_wait_s", 'Wartezeit auf den Verdichterstart (s)', "s", "start_wait_s", 600.0),
+        ("wp_pv_handoff_timeout_s", 'Wartezeit auf die Leistungsreduzierung der Wallbox (s)', "s", "handoff_timeout_s", 120.0),
     )
     if measured or "wp_pv_start_power_w" in cfg:
-        rules += (("wp_pv_start_power_w", "WP: Startleistung", "W", "start_power_w", 0.0),)
+        rules += (("wp_pv_start_power_w", 'Startleistung (W), 0 = bestehende Start-Grenze', "W", "start_power_w", 0.0),)
     mode = str(cfg.get("wp_pv_control_mode", "reserved")).strip().lower()
     if mode not in {"measured", "reserved"}:
         invalid_fields.append("wp_pv_control_mode")
@@ -644,7 +655,7 @@ def validate_heatpump_pv_config(cfg: Dict[str, Any]) -> Dict[str, Dict[str, Any]
         message = "Konfigurationswert ist plausibel; aktuelle Quellen- und Schutzgrenzen werden zusätzlich geprüft."
         if not valid:
             invalid_fields.append(key)
-            message = "Profilwert fehlt oder ist ungültig. Neue optionale PV-Starts warten; normale Heizung und Warmwasser bleiben unabhängig."
+            message = f'Der Wert für „{label}“ fehlt oder ist ungültig; zusätzliche PV-Starts warten, normale Heizung und Warmwasser bleiben unabhängig. Im Config-Editor unter „Smart Home & Verbrauchsprognose“ das Feld „{label}“ prüfen.'
         elif key == "wp_pv_max_power_w" and effective == 0:
             message = "Keine elektrische Obergrenze eingetragen. Die Automatik verwendet die Startleistung; aktuelle Quellen- und Hardwaregrenzen bleiben wirksam."
         elif key == "wp_pv_start_power_w":
@@ -688,20 +699,16 @@ def validate_heatpump_pv_config(cfg: Dict[str, Any]) -> Dict[str, Dict[str, Any]
     missing_wh = max(0.0, required_wh - available_wh)
     funded = profile["valid"] and available_wh + 1e-6 >= required_wh
     message = (
-        "Die eingestellten Quellen können rechnerisch die volle Schutzfrist tragen. Bereits verbrauchte oder gebundene Wh, Speicherreserve und aktuelle Leistungsgrenzen werden vor jedem Start zusätzlich berücksichtigt."
-        if funded else
-        "Die eingestellte Überbrückungsenergie reicht für die abgesicherte Start- und Laufzeit nicht aus. Neue zusätzliche PV-Starts warten; normale Heizung und Warmwasserbereitung bleiben unabhängig."
+        'Die eingestellten Quellen können rechnerisch die volle Schutzfrist tragen. Bereits verbrauchte oder gebundene Wh, Speicherreserve und aktuelle Leistungsgrenzen werden vor jedem Start zusätzlich berücksichtigt.' if funded else f'Die Überbrückungsenergie reicht mit {available_wh:.0f} Wh für die benötigten {required_wh:.0f} Wh während Start und Mindestlaufzeit nicht aus; zusätzliche PV-Starts warten. Im Config-Editor unter „Smart Home & Verbrauchsprognose“ die Angaben unter „Luxtronik: PV-Automatik und Wolkenüberbrückung“ prüfen.'
     )
     if measured:
         message = (
-            "Die eingestellten Quellen decken rechnerisch den kurzen Puffer ihrer erlaubten Überbrückungsleistung. Die Startfreigabe folgt der eingestellten PV-Startleistung und Startverzögerung; im Lauf zählt die Istaufnahme. Erreichte Wh-Wächter beenden den zusätzlichen Boost nach der geschützten Laufzeit; der Verbrauch bis dahin wird weitergezählt."
-            if funded else
-            "Das Quellenkontingent begrenzt die mögliche Überbrückungsleistung innerhalb der Reaktionsfrist. Es ist keine zusätzliche PV-Startsperre. Für den Start müssen die eingestellte PV-Startleistung und Startverzögerung erfüllt sein."
+            'Die eingestellten Quellen decken rechnerisch den kurzen Puffer ihrer erlaubten Überbrückungsleistung. Die Startfreigabe folgt der eingestellten PV-Startleistung und Startverzögerung; im Lauf zählt die Istaufnahme. Erreichte Wh-Wächter beenden den zusätzlichen Boost nach der geschützten Laufzeit; der Verbrauch bis dahin wird weitergezählt.' if funded else f'Die {available_wh:.0f} Wh Überbrückungsenergie begrenzen die mögliche Leistung während der Reaktionsfrist; ein PV-Start wird dadurch nicht zusätzlich gesperrt. Im Config-Editor unter „Smart Home & Verbrauchsprognose“ die Angaben unter „Luxtronik: PV-Automatik und Wolkenüberbrückung“ prüfen.'
         )
     if not profile["valid"]:
-        message = "Das Leistungsprofil ist noch unvollständig oder ungültig. Bitte die markierten Profilwerte prüfen. Normale Heizung und Warmwasserbereitung bleiben unabhängig."
+        message = f'Das Leistungsprofil ist unvollständig oder ungültig; normale Heizung und Warmwasser bleiben unabhängig. Im Config-Editor unter „Smart Home & Verbrauchsprognose“ den Abschnitt „Luxtronik: PV-Automatik und Wolkenüberbrückung“ prüfen.'
     entries["wp_pv_energy_reservation"] = _entry(
-        key="wp_pv_energy_reservation", label="WP: Energie vor PV-Start", unit="Wh",
+        key="wp_pv_energy_reservation", label='Energie für den zusätzlichen Wärmepumpenstart', unit="Wh",
         configured=None, live_value=None, live_key=None, effective=required_wh,
         source="derived", severity="ok" if funded else "warning",
         message=message,
@@ -752,7 +759,7 @@ def _ext_inverter_int_entry(
     effective = candidate if valid else default
     if user and not valid:
         severity = "warning"
-        message = "%s muss eine ganze Zahl zwischen %d und %d sein; wirksam ist der Standard %d." % (label, minimum, maximum, default)
+        message = f'Der Verbindungswert liegt außerhalb {minimum} bis {maximum}; verwendet wird {default}. Im Config-Editor unter „Zusatzwechselrichter“ den angezeigten Verbindungswert prüfen.'
     elif not active:
         severity = "ok"
         message = "Nur mit Typ sungrow_modbus wirksam."
@@ -761,7 +768,7 @@ def _ext_inverter_int_entry(
         message = "%s der Modbus-TCP-Direktlesung (Standard %d)." % (label, default)
     return _entry(
         key=key,
-        label=label,
+        label={'ext_inverter_unit_id': 'Modbus-Gerätenummer'}.get(key, label),
         unit=unit,
         configured=candidate if valid else (cfg.get(key) if user else None),
         live_value=None,
@@ -785,7 +792,7 @@ def validate_ext_inverter_config(cfg: Dict[str, Any]) -> Dict[str, Dict[str, Any
     active = settings["type"] != "none"
     if kind_user and not kind_valid:
         kind_severity = "warning"
-        kind_message = "Der Typ des Zusatzwechselrichters kennt nur none oder sungrow_modbus; wirksam ist none (keine Direktlesung)."
+        kind_message = f'Der Wechselrichtertyp ist unbekannt; die direkte Abfrage bleibt aus. Im Config-Editor unter „Zusatzwechselrichter“ die Typauswahl prüfen.'
     elif active and settings["enabled"]:
         kind_severity = "info"
         kind_message = (
@@ -794,13 +801,13 @@ def validate_ext_inverter_config(cfg: Dict[str, Any]) -> Dict[str, Dict[str, Any
         )
     elif active:
         kind_severity = "warning"
-        kind_message = "Direktlesung konfiguriert, aber deaktiviert: %s. IP-Adresse, Port, Unit-ID und Intervall prüfen." % settings["error"]
+        kind_message = f'Der Zusatzwechselrichter kann wegen unvollständiger Verbindungseinstellungen nicht direkt abgefragt werden. Im Config-Editor unter „Zusatzwechselrichter“ die Typauswahl prüfen.'
     else:
         kind_severity = "ok"
         kind_message = "Kein Zusatzwechselrichter (Standard). Nur setzen, wenn ein zweiter Wechselrichter über LAN erreichbar ist."
     entries["ext_inverter_type"] = _entry(
         key="ext_inverter_type",
-        label="Zusatzwechselrichter Typ",
+        label='Zusatzwechselrichtertyp',
         unit="-",
         configured=kind_raw if kind_user else None,
         live_value=None,
@@ -819,10 +826,10 @@ def validate_ext_inverter_config(cfg: Dict[str, Any]) -> Dict[str, Dict[str, Any
         ip_valid = False
     if active and not ip_valid:
         ip_severity = "warning"
-        ip_message = "IPv4-Adresse des Zusatzwechselrichters fehlt oder ist ungültig; die Direktlesung bleibt deaktiviert."
+        ip_message = f'Die Adresse des Zusatzwechselrichters fehlt oder ist ungültig; die direkte Abfrage bleibt aus. Im Config-Editor unter „Zusatzwechselrichter“ die Adresse prüfen.'
     elif ip_user and not ip_valid:
         ip_severity = "warning"
-        ip_message = "Keine gültige IPv4-Adresse (z. B. 192.0.2.10)."
+        ip_message = f'Die Adresse des Zusatzwechselrichters ist keine gültige IPv4-Adresse; sie kann nicht verwendet werden. Im Config-Editor unter „Zusatzwechselrichter“ die Adresse prüfen.'
     elif not active:
         ip_severity = "ok"
         ip_message = "Nur mit Typ sungrow_modbus wirksam."
@@ -831,7 +838,7 @@ def validate_ext_inverter_config(cfg: Dict[str, Any]) -> Dict[str, Dict[str, Any
         ip_message = "Adresse des Wechselrichters bzw. seines Kommunikationsmoduls (Modbus TCP)."
     entries["ext_inverter_ip"] = _entry(
         key="ext_inverter_ip",
-        label="Zusatzwechselrichter IP",
+        label='Adresse des Zusatzwechselrichters',
         unit="-",
         configured=ip_raw if ip_user else None,
         live_value=None,
@@ -870,18 +877,18 @@ def validate_heatpump_display_config(cfg: Dict[str, Any]) -> Dict[str, Dict[str,
         if raw not in _WP_BUFFER_SENSORS:
             severity = "warning"
             effective = "none"
-            message = "Unbekannter Pufferfühler; die Ansicht zeigt keinen Pufferspeicher. Erlaubt: keiner, externer Rücklauf der Luxtronik oder Pufferfühler der Stiebel-ISG."
+            message = f'Der Pufferfühler ist unbekannt; die Ansicht zeigt keinen Pufferspeicher. Im Config-Editor unter „Smart Home & Verbrauchsprognose“ das Feld „Pufferfühler (neue Ansicht)“ prüfen.'
         elif _WP_BUFFER_SENSORS[raw] is not None and _WP_BUFFER_SENSORS[raw] != wp_type:
             severity = "warning"
             effective = raw
-            message = "Der gewählte Pufferfühler passt nicht zum Wärmepumpen-Typ; die Ansicht zeigt den Puffer ohne Wert („--“)."
+            message = f'Der Pufferfühler passt nicht zum Wärmepumpentyp; die Ansicht zeigt keinen Messwert. Im Config-Editor unter „Smart Home & Verbrauchsprognose“ das Feld „Pufferfühler (neue Ansicht)“ prüfen.'
         else:
             severity = "ok"
             effective = raw
             message = "Pufferfühler für die Anzeige der neuen Wärmepumpen-Ansicht."
         entries.update({
             "wp_buffer_sensor": _entry(
-                key="wp_buffer_sensor", label="WP-Ansicht: Pufferfühler", unit="",
+                key="wp_buffer_sensor", label='Pufferfühler (neue Ansicht)', unit="",
                 configured=cfg.get("wp_buffer_sensor"), live_value=None, live_key=None,
                 effective=effective, source="user" if severity == "ok" else "invalid",
                 severity=severity, message=message,
@@ -892,17 +899,17 @@ def validate_heatpump_display_config(cfg: Dict[str, Any]) -> Dict[str, Dict[str,
         if raw not in {"hup", "fup1", "zup", "none"}:
             severity = "warning"
             effective = None
-            message = "Unbekanntes Heizkreispumpensignal; der Heizkreiszustand bleibt in der Ansicht unbekannt. Erlaubt: HUP, FUP 1, ZUP oder Kein Pumpensignal."
+            message = f'Das Heizkreispumpensignal ist unbekannt; der Heizkreiszustand bleibt unbekannt. Im Config-Editor unter „Smart Home & Verbrauchsprognose“ das Feld „Heizkreispumpe (neue Ansicht)“ prüfen.'
         elif wp_type != 0 and raw != "none":
             severity = "warning"
             effective = "none"
-            message = "Das Heizkreispumpensignal ist nur für Luxtronik wählbar; bei diesem Wärmepumpen-Typ bleibt die bisherige Anzeige erhalten."
+            message = f'Das Heizkreispumpensignal ist nur für Luxtronik verfügbar; die bisherige Anzeige bleibt erhalten. Im Config-Editor unter „Smart Home & Verbrauchsprognose“ das Feld „Heizkreispumpe (neue Ansicht)“ prüfen.'
         else:
             severity = "ok"
             effective = raw
             message = "Heizkreispumpensignal für die Anzeige der neuen Wärmepumpen-Ansicht; keine Regelwirkung."
         entries["wp_heating_circuit_pump"] = _entry(
-            key="wp_heating_circuit_pump", label="WP-Ansicht: Heizkreispumpe", unit="",
+            key="wp_heating_circuit_pump", label='Heizkreispumpe (neue Ansicht)', unit="",
             configured=cfg.get("wp_heating_circuit_pump"), live_value=None, live_key=None,
             effective=effective, source="user" if severity == "ok" else "invalid",
             severity=severity, message=message,
@@ -927,18 +934,17 @@ def validate_stiebel_sg_ready_config(cfg: Dict[str, Any]) -> Dict[str, Dict[str,
     severity = "warning"
     effective = 0
     if wp_type != 4:
-        message = "Wirkt nur beim Wärmepumpen-Typ Stiebel Eltron ISG / WPM; es wird nichts geschrieben."
+        message = f'Der experimentelle SG-Ready-Ausgang ist für diesen Wärmepumpentyp nicht verfügbar; es wird nichts geschrieben. Im Config-Editor unter „Smart Home & Verbrauchsprognose“ das Feld „SG Ready schreiben“ prüfen.'
     elif not _is_enabled(cfg, "luxtronik"):
-        message = "WP-/Verbrauchslogging ist aus; der SG-Ready-Ausgang bleibt inaktiv."
+        message = f'Die Wärmepumpenerfassung ist aus; der experimentelle SG-Ready-Ausgang bleibt inaktiv. Im Config-Editor unter „Smart Home & Verbrauchsprognose“ das Feld „SG Ready schreiben“ prüfen.'
     elif not _address_configured(cfg, "stiebel_isg_ip"):
-        message = "ISG-Adresse fehlt; der SG-Ready-Ausgang bleibt inaktiv."
+        message = f'Die ISG-Adresse fehlt; der experimentelle SG-Ready-Ausgang bleibt inaktiv. Im Config-Editor unter „Smart Home & Verbrauchsprognose“ das Feld „SG Ready schreiben“ prüfen.'
     elif _address_configured(cfg, "shelly_sg_ip") or _address_configured(cfg, "shelly_pause_ip"):
         message = (
-            "Ein Shelly-SG-Ready- oder EVU-Kontakt ist eingetragen und behält Vorrang. "
-            "Das ISG wird nicht beschrieben; nur eine SG-Ready-Steuerung darf aktiv sein."
+            f'Ein eingetragener Shelly-Kontakt hat Vorrang; der experimentelle ISG-Ausgang schreibt nichts. Im Config-Editor unter „Smart Home & Verbrauchsprognose“ das Feld „SG Ready schreiben“ prüfen.'
         )
     elif str(cfg.get("auto_mode", "1")).strip().lower() in {"0", "false", "off", "aus", "nein"}:
-        message = "„Automatik darf Geräte steuern“ ist aus; der SG-Ready-Ausgang schreibt dann nicht."
+        message = f'Die Gerätesteuerung ist aus; der experimentelle SG-Ready-Ausgang schreibt nichts. Im Config-Editor unter „Smart Home & Verbrauchsprognose“ das Feld „Automatik darf Geräte steuern“ prüfen.'
     else:
         severity = "ok"
         effective = 1
@@ -950,7 +956,7 @@ def validate_stiebel_sg_ready_config(cfg: Dict[str, Any]) -> Dict[str, Dict[str,
         )
     return {
         "stiebel_isg_sg_ready_write": _entry(
-            key="stiebel_isg_sg_ready_write", label="Stiebel: SG Ready schreiben (experimentell)", unit="",
+            key="stiebel_isg_sg_ready_write", label='SG Ready schreiben', unit="",
             configured=cfg.get("stiebel_isg_sg_ready_write"), live_value=None, live_key=None,
             effective=effective, source="user", severity=severity, message=message,
         )
@@ -968,15 +974,10 @@ def validate_heatpump_start_config(cfg: Dict[str, Any]) -> Dict[str, Dict[str, A
     duration = heatpump_start_reservation_duration_s(dict(cfg, pv_boost_delay=0))
     entries = {}
     for key, label, unit, value, warning, message in (
-        ("grid_start_limit", "WP-Startgrenze", "W", start, start < minimum,
-         f"Der Betrag ist die benötigte Freigabe aus dem freien Verbraucherbudget nach Akkuladung. "
-         f"Die Zuteilung benötigt mindestens {minimum} W; ein kleinerer Betrag ermöglicht keinen Start. "
-         "Die Einspeisung am Netzpunkt ist nicht der Vergleichswert."),
-        ("pv_boost_delay", "WP-Startverzögerung", "s", delay, delay >= duration,
-         f"Die Startverzögerung erreicht ab {duration:g} s das normale Reservierungsfenster dieser Startart. "
-         + ("Bei SG Ready wird das Fenster auf mindestens Verzögerung plus 120 s erweitert; "
-            "lange Verzögerungen binden entsprechend lange Verbraucherbudget."
-            if sg_ready else "Direkte Sollwertangebote behalten ihre kurze Budgetreservierung; die Verzögerung bitte prüfen.")),
+        ("grid_start_limit", 'Start-Grenze (Betrag in Watt)', "W", start, start < minimum,
+         (f'Die Startgrenze von {start:g} W liegt unter der benötigten Mindestleistung von {minimum} W; ein kleinerer Wert ermöglicht keinen Start. Im Config-Editor unter „Smart Home & Verbrauchsprognose“ das Feld „Start-Grenze (Betrag in Watt)“ prüfen.') if start < minimum else (f'Der Betrag ist die benötigte Freigabe aus dem freien Verbraucherbudget nach Akkuladung. Die Zuteilung benötigt mindestens {minimum} W; ein kleinerer Betrag ermöglicht keinen Start. Die Einspeisung am Netzpunkt ist nicht der Vergleichswert.')),
+        ("pv_boost_delay", 'Start-Verzögerung (Sek)', "s", delay, delay >= duration,
+         (f'Die Startverzögerung von {delay:g} s hält bei SG Ready die Leistung zum Start mindestens {delay + 120:g} s bereit; andere Verbraucher können sie so lange nicht nutzen. Im Config-Editor unter „Smart Home & Verbrauchsprognose“ das Feld „Start-Verzögerung (Sek)“ nur für bewusst längeres Warten so belassen.' if sg_ready else f'Die Startverzögerung von {delay:g} s ist mindestens so lang wie die {duration:g} s, für die Leistung zum Start bereitgehalten wird; diese Zeit wird bei direkter Sollwertvorgabe nicht verlängert. Im Config-Editor unter „Smart Home & Verbrauchsprognose“ das Feld „Start-Verzögerung (Sek)“ prüfen.') if delay >= duration else (f'Die Startverzögerung erreicht ab {duration:g} s das normale Reservierungsfenster dieser Startart. ' + ('Bei SG Ready wird das Fenster auf mindestens Verzögerung plus 120 s erweitert; lange Verzögerungen binden entsprechend lange Verbraucherbudget.' if sg_ready else 'Direkte Sollwertangebote behalten ihre kurze Budgetreservierung; die Verzögerung bitte prüfen.'))),
     ):
         entries[key] = _entry(key=key, label=label, unit=unit, configured=cfg.get(key),
             live_value=None, live_key=None, effective=value, source="user",
@@ -984,13 +985,11 @@ def validate_heatpump_start_config(cfg: Dict[str, Any]) -> Dict[str, Dict[str, A
     if str(cfg.get("wp_type", "")).strip() == "4":
         standby = safe_float(cfg.get("stiebel_isg_standby_w"), 35.0)
         entries["stiebel_isg_standby_w"] = _entry(
-            key="stiebel_isg_standby_w", label="Stiebel Standby", unit="W",
+            key="stiebel_isg_standby_w", label='Bereitschaftsleistung der Stiebel-Wärmepumpe', unit="W",
             configured=cfg.get("stiebel_isg_standby_w"), live_value=None, live_key=None,
             effective=heatpump_idle_threshold_w(cfg), source="user",
             severity="warning" if not 0 <= standby <= 75 else "ok",
-            message="Leerlaufgrenze: Standby plus 25 W Messspielraum, mindestens 50 und höchstens 100 W. "
-                    "Nur frische Leistungsdaten, ein bestätigter stehender Verdichter und eine zurückgenommene "
-                    "Startfreigabe erlauben das Entsperren. Standard 35 W ergibt eine Grenze von 60 W.")
+            message=((f'Die eingestellte Bereitschaftsleistung liegt außerhalb 0 bis 75 W; wirksam ist eine Leerlaufgrenze von {heatpump_idle_threshold_w(cfg):g} W. Im Config-Editor unter „Smart Home & Verbrauchsprognose“ das Feld „Standby (W)“ prüfen.') if not 0 <= standby <= 75 else ('Leerlaufgrenze: Standby plus 25 W Messspielraum, mindestens 50 und höchstens 100 W. Nur frische Leistungsdaten, ein bestätigter stehender Verdichter und eine zurückgenommene Startfreigabe erlauben das Entsperren. Standard 35 W ergibt eine Grenze von 60 W.')) if ('warning' if not 0 <= standby <= 75 else 'ok') in ("warning", "error") else ('Leerlaufgrenze: Standby plus 25 W Messspielraum, mindestens 50 und höchstens 100 W. Nur frische Leistungsdaten, ein bestätigter stehender Verdichter und eine zurückgenommene Startfreigabe erlauben das Entsperren. Standard 35 W ergibt eine Grenze von 60 W.'))
     return entries
 
 
@@ -1027,10 +1026,10 @@ def validate_climate_meter_config(cfg: Dict[str, Any]) -> Dict[str, Dict[str, An
     if not (a & b) and "unknown" not in a | b:
         return {}
     return {"climate_meter2_ip": _entry(
-        key="climate_meter2_ip", label="Klima: Messziele prüfen", unit="",
+        key="climate_meter2_ip", label='Zweiter Shelly-Zähler IP', unit="",
         configured=cfg.get("climate_meter2_ip"), live_value=None, live_key=None,
         effective=None, source="user", severity="warning",
-        message="Beide Klima-Zähler verwenden dieselbe Adresse mit gleichen, überlappenden oder automatisch erkannten Kanälen. Messziele prüfen, um Doppelzählung zu vermeiden.",
+        message=f'Beide Klima-Zähler verwenden dieselbe Adresse mit überlappenden oder unklaren Kanälen; Verbrauch kann doppelt gezählt werden. Im Config-Editor unter „Smart Home & Verbrauchsprognose“ das Feld „Zweiter Shelly-Zähler IP“ prüfen.',
     )}
 
 
@@ -1059,11 +1058,11 @@ def validate_forecast_location_config(cfg):
         except (TypeError, ValueError, OverflowError):
             pass
     if missing:
-        message = 'Standort für die PV-Prognose prüfen: Standort fehlt.'
+        message = f'Der Standort fehlt; die PV-Prognose kann für den falschen Ort rechnen. Im Config-Editor unter „Standort & PV-Prognose“ das Feld „Breitengrad (Latitude)“ und „Längengrad (Longitude)“ prüfen.'
     elif not readable:
-        message = 'Standort nicht lesbar. Standort für die PV-Prognose prüfen.'
+        message = f'Der Standort ist nicht lesbar; die PV-Prognose kann für den falschen Ort rechnen. Im Config-Editor unter „Standort & PV-Prognose“ das Feld „Breitengrad (Latitude)“ und „Längengrad (Longitude)“ prüfen.'
     elif default_pair:
-        message = 'Standort für die PV-Prognose prüfen: Es ist noch eine Vorgabe eingetragen.'
+        message = f'Es ist noch ein vorgegebener Standort eingetragen; die PV-Prognose passt möglicherweise nicht zur Anlage. Im Config-Editor unter „Standort & PV-Prognose“ das Feld „Breitengrad (Latitude)“ und „Längengrad (Longitude)“ prüfen.'
     else:
         message = 'Eigener Standort für die PV-Prognose eingetragen.'
     warning = missing or not readable or default_pair
@@ -1076,7 +1075,10 @@ def validate_forecast_location_config(cfg):
     )}
 
 
-def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+def validate_storage_config(
+    cfg: Optional[Dict[str, Any]], live: Optional[Dict[str, Any]],
+    *, reserve_sample_fresh: Optional[bool] = None,
+) -> Dict[str, Any]:
     """Liefert die beratende Prüfung der Speicherkonfiguration.
 
     Quellenreihenfolge:
@@ -1098,25 +1100,24 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
     consumer.update(validate_stiebel_sg_ready_config(cfg))
     if shelly_relay_conflict(cfg):
         consumer["shelly_3em_relay_id"] = _entry(
-            key="shelly_3em_relay_id", label="Shelly-Relais: doppelte Zuordnung", unit="",
+            key="shelly_3em_relay_id", label='Doppelt zugeordnetes Shelly-Relais', unit="",
             configured=cfg.get("shelly_3em_relay_id"), live_value=None, live_key=None,
-            effective=None, source="user", severity="warning", message=SHELLY_OWNER_WARNING,
+            effective=None, source="user", severity="warning", message='Zwei Verbraucher verwenden dasselbe Shelly-Relais; die Relaissteuerung ist widersprüchlich. Im Config-Editor unter „Smart Home & Verbrauchsprognose“ das Feld „Relais-ID“ beim Heizstab sowie „SG-Ready Shelly IP (Boost)“ und „EVU-Pause Shelly IP (Sperre)“ bei der Wärmepumpe prüfen.',
         )
     consumer.update(validate_heatpump_start_config(cfg))
     price: Dict[str, Dict[str, Any]] = {}
     cap = safe_float(cfg.get("ml_home_daily_cap_kwh"), 24.0)
     cap_warning = cap < 8 or cap > 80
     forecast = {"ml_home_daily_cap_kwh": _entry(
-        key="ml_home_daily_cap_kwh", label="Haus-Tagesreferenz für ML", unit="kWh",
+        key="ml_home_daily_cap_kwh", label='Haus-Tagesreferenz für ML (kWh)', unit="kWh",
         configured=cfg.get("ml_home_daily_cap_kwh"), live_value=None, live_key=None,
         effective=cap, source="user" if _has_user_value(cfg, "ml_home_daily_cap_kwh") else "default",
         severity="warning" if cap_warning else "info",
-        message="Obergrenze der Referenzbasis für die Haus-Plausibilitätsprüfung, keine Grenze der ausgegebenen Prognose."
-                + (" Werte unter 8 oder über 80 kWh bitte auf Plausibilität prüfen." if cap_warning else ""),
+        message=(f'Die Haus-Tagesreferenz von {cap:g} kWh liegt außerhalb 8 bis 80 kWh; sie begrenzt die Vergleichsbasis der Verbrauchsprüfung, nicht die Prognose. Im Config-Editor unter „Standort & PV-Prognose“ das Feld „Haus-Tagesreferenz für ML (kWh)“ prüfen.' if cap_warning else 'Obergrenze der Referenzbasis für die Haus-Plausibilitätsprüfung, keine Grenze der ausgegebenen Prognose.' + '') if ('warning' if cap_warning else 'info') in ("warning", "error") else ('Obergrenze der Referenzbasis für die Haus-Plausibilitätsprüfung, keine Grenze der ausgegebenen Prognose.' + (' Werte unter 8 oder über 80 kWh bitte auf Plausibilität prüfen.' if cap_warning else '')),
     )}
     forecast.update(validate_forecast_location_config(cfg))
     forecast.update(validate_solcast_config(cfg))
-    forecast.update(validate_pv_forecast_topology_config(cfg))
+    forecast.update(validate_pv_forecast_topology_config(cfg, live))
     forecast.update(validate_ext_inverter_config(cfg))
 
     power_rules = {
@@ -1154,8 +1155,7 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
                 if delta >= 2000.0 and rel >= 0.30:
                     severity = "warning"
                     message = (
-                        "Nutzereingabe weicht deutlich vom E3DC-RSCP-Wert ab. "
-                        "Die Eingabe bleibt aktiv; bitte bewusst prüfen."
+                        f'Die Eingabe von {effective:g} W weicht deutlich von den Leistungsangaben des E3DC ab und bleibt wirksam. Im Config-Editor unter „Speicher & Konfiguration“ das Feld „{dict(maximumladeleistung="Max. Laden (W)", maximaleentladeleistung="Max. Entladen (W)")[key]}“ prüfen.'
                     )
         elif live_value is not None:
             source = "rscp"
@@ -1195,7 +1195,7 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
         hint = limits[prefix + "_hint"]
         if hint and hint != "device_limit_unknown":
             entry["severity"] = "warning"
-            entry["message"] = label + ": " + hint
+            entry["message"] = f'Die Leistungseingabe passt nicht zu den Angaben oder Empfehlungen des Speichers; wirksam sind {entry["effective"]:g} W. Im Config-Editor unter „Speicher & Konfiguration“ das Feld „{label}“ prüfen.'
         elif hint == "device_limit_unknown":
             entry["device_limit_status"] = hint
 
@@ -1215,8 +1215,7 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
             if delta >= 2.0 and rel >= 0.20:
                 capacity_severity = "warning"
                 capacity_message = (
-                    "Nutzbare Speichergröße weicht deutlich vom E3DC-Wert ab. "
-                    "Die Eingabe bleibt aktiv; bitte Datenblatt/RSCP prüfen."
+                    f'Die nutzbare Speichergröße von {capacity_effective:g} kWh weicht deutlich vom E3DC-Wert ab und bleibt wirksam. Im Config-Editor unter „Speicher & Konfiguration“ das Feld „Kapazität (kWh)“ prüfen.'
                 )
     elif capacity_live is not None:
         capacity_effective = capacity_live
@@ -1225,7 +1224,7 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
         capacity_message = "RSCP-Wert wird als Default/Fallback genutzt."
     storage["speichergroesse"] = _entry(
         key="speichergroesse",
-        label="Speichergröße",
+        label='Kapazität (kWh)',
         unit="kWh",
         configured=capacity_cfg if capacity_cfg is not None and math.isfinite(capacity_cfg) else None,
         live_value=capacity_live,
@@ -1258,15 +1257,24 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
         reserve_message = "Kein RSCP-Reservewert verfügbar; die Rückfallreserve wirkt."
     elif reserve_cfg is not None and math.isfinite(reserve_cfg):
         delta, _rel = _deviation(reserve_cfg, safe_float(reserve_live, 0.0))
-        if delta >= 2.0 and not reserve_details.get("normalised"):
-            reserve_severity = "warning"
-            reserve_message = (
-                "Fallback-Reserve weicht vom E3DC-Wert ab. "
-                "Die Regelung nutzt sicherheitshalber den höheren Wert."
-            )
+        # Der aufrufende Dienst liefert die Frische aus seinem bestehenden Vertrag.
+        # Ohne bestätigte Frische bleibt die Gerätereserve für Hinweise unsicher.
+        if delta >= 2.0 and reserve_sample_fresh is True:
+            if reserve_cfg < reserve_live:
+                reserve_severity = "warning"
+                reserve_message = 'Die eigene Notstromreserve %.2f %% liegt unter der Gerätereserve %.2f %%; der höhere Wert bleibt wirksam. Im Config-Editor unter „Speicher & Konfiguration“ das Feld „Fallback-Reserve (%%)“ prüfen.' % (reserve_cfg, reserve_live)
+            else:
+                reserve_severity = "info"
+                reserve_message = (
+                    "Gerätereserve angleichen: Eigene Notstromreserve %.2f %% liegt über "
+                    "der Gerätereserve %.2f %%. Der höhere Wert bleibt wirksam; "
+                    "die Einstellung im Gerät kann manuell angeglichen werden."
+                ) % (reserve_cfg, reserve_live)
+            if reserve_details.get("normalised"):
+                reserve_message += '' if reserve_severity == 'warning' else ' Die Gerätereserve wurde auf die Gesamtspeicherkapazität normalisiert.'
     storage["ep_reserve_pct"] = _entry(
         key="ep_reserve_pct",
-        label="Notstromreserve Fallback",
+        label='Notstromreserve als Ersatzwert',
         unit="%",
         configured=reserve_cfg if reserve_cfg is not None and math.isfinite(reserve_cfg) else None,
         live_value=safe_float(reserve_live, float("nan")) if reserve_live is not None else None,
@@ -1324,12 +1332,11 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
     elif dc_first_enabled:
         dc_first_severity = "warning"
         dc_first_message = (
-            "Aktiv, aber der frische E3DC-/Zusatz-PV-Split fehlt. "
-            "Kurvenladung und DV-PV-Speichern bleiben deshalb sicher auf 0 W begrenzt."
+            f'Die Begrenzung auf E3DC-PV ist an, aber die aktuelle Aufteilung zwischen E3DC und Zusatzwechselrichter fehlt; Kurvenladung und PV-Speichern der Direktvermarktung bleiben auf 0 W begrenzt. Im Config-Editor unter „Speicher & Konfiguration“ das Feld „Speicherladung auf E3DC-DC begrenzen“ prüfen.'
         )
     storage["storage_dc_first_charge_limit_enable"] = _entry(
         key="storage_dc_first_charge_limit_enable",
-        label="Laden an E3DC-PV koppeln",
+        label='Speicherladung auf E3DC-DC begrenzen',
         unit="",
         configured=dc_first_enabled,
         live_value=dc_first_e3dc_pv_w if dc_first_source_valid else None,
@@ -1352,23 +1359,12 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
     else:
         shortfall_aux_ac_severity = "warning"
         shortfall_aux_ac_message = (
-            "Konfiguration erkannt, aber nicht freigegeben (EVIDENCE_LIMIT): "
-            "Getrennte PV- und "
-            "Lastquantile dürfen nicht zu einem vermeintlichen Quantil des "
-            "Speicherüberschusses verrechnet werden. Erst eine historisch "
-            "kalibrierte gemeinsame Horizontverteilung der tatsächlich im "
-            "Speicher ankommenden E3DC-DC-Energie und eine fachlich beschlossene "
-            "Risikoschwelle dürfen einen versiegelten Plan-/Slot-/Action-Nachweis "
-            "freigeben. Beides wird derzeit nicht erzeugt; E3DC_DC_ONLY bleibt "
-            "wirksam. Fehlende oder schlechte Daten sind keine Freigabe, "
-            "Netzbezug bleibt gesperrt. Die DV-Zusatzwechselrichter-Auswahl "
-            "bleibt davon getrennt."
+            f'Die angeforderte Speicherladung aus dem Zusatzwechselrichter ist nicht freigegeben, weil ein belastbarer gemeinsamer Prognosenachweis fehlt; nur E3DC-PV bleibt zulässig. Im Config-Editor unter „Speicher & Konfiguration“ das Feld „Nicht freigegeben: Zusatz-AC bei probabilistisch belegtem DC-Defizit“ prüfen.'
         )
     storage["storage_forecast_shortfall_aux_ac_charge_enable"] = _entry(
         key="storage_forecast_shortfall_aux_ac_charge_enable",
         label=(
-            "Prognose 100%: Zusatz-AC bei belegtem "
-            "Prognoseminderertrag (nicht freigegeben)"
+            'Zusatzwechselrichterladung bei Prognoseminderertrag (nicht freigegeben)'
         ),
         unit="",
         configured=shortfall_aux_ac_enabled,
@@ -1408,8 +1404,7 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
         late_full_severity = "warning"
         late_full_source = "invalid"
         late_full_message = (
-            "Leerer Wert wirkt wie Aus: Das späte 100-%-Kurvenende wird nie geplant. "
-            "Für den Standard 1 (an) eintragen oder 0 für bewusst aus."
+            f'Ein leerer Wert wirkt wie ausgeschaltet; ein spätes Erreichen von 100 % wird nie geplant. Im Config-Editor unter „Speicher & Konfiguration“ das Feld „Später Vollstand nur mit Grund“ prüfen.'
         )
     elif not late_full_forecast_mode:
         late_full_severity = "info"
@@ -1437,7 +1432,7 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
         )
     storage["storage_forecast100_late_full_guard_enable"] = _entry(
         key="storage_forecast100_late_full_guard_enable",
-        label="Prognose 100%: später Vollstand nur mit Grund",
+        label='Später Vollstand nur mit Grund',
         unit="",
         configured=late_full_raw if late_full_present else None,
         live_value=None,
@@ -1462,14 +1457,13 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
     elif guard_min_raw is None or not math.isfinite(guard_min_raw):
         guard_min_effective, guard_min_source, guard_min_severity = 45.0, "invalid", "warning"
         guard_min_message = (
-            "Kein gültiger Wert ('%s'); wirksam bleibt der Standard 45 min (Bereich 30–120)."
-            % str(cfg.get("storage_curve_end_guard_min"))[:20]
+            f'Der Zeitpuffer ist unlesbar; verwendet werden 45 min. Im Config-Editor unter „Speicher & Konfiguration“ das Feld „Kurvenende-Puffer (min)“ prüfen.'
         )
     elif guard_min_raw < 30.0 or guard_min_raw > 120.0:
         guard_min_effective = max(30.0, min(120.0, guard_min_raw))
         guard_min_source, guard_min_severity = "user", "warning"
         guard_min_message = (
-            "%.0f min liegt außerhalb 30–120 min; wirksam sind %.0f min." % (guard_min_raw, guard_min_effective)
+            f'Der Zeitpuffer von {guard_min_raw:g} min liegt außerhalb 30 bis 120 min; wirksam sind {guard_min_effective:g} min. Im Config-Editor unter „Speicher & Konfiguration“ das Feld „Kurvenende-Puffer (min)“ prüfen.'
         )
     else:
         guard_min_effective, guard_min_source, guard_min_severity = guard_min_raw, "user", "ok"
@@ -1479,7 +1473,7 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
         )
     storage["storage_curve_end_guard_min"] = _entry(
         key="storage_curve_end_guard_min",
-        label="Kurvenende-Puffer",
+        label='Kurvenende-Puffer (min)',
         unit="min",
         configured=cfg.get("storage_curve_end_guard_min") if guard_min_user else None,
         live_value=None,
@@ -1509,17 +1503,14 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
         grid_source = "invalid"
         grid_severity = "warning"
         grid_message = (
-            "Hausabsicherung ist ungültig (Wert <= 0 oder keine Zahl). "
-            "Bitte einen gültigen Wert je Phase wie z. B. 35, 40, 50 oder 63 A "
-            "in den Einstellungen hinterlegen. Gesteuerte Wallbox-Ladung bleibt "
-            "aus Sicherheitsgründen gesperrt."
+            f'Die Hausabsicherung ist ungültig; gesteuertes Wallboxladen bleibt gesperrt. Im Config-Editor unter „Wallbox & Fahrzeug“ das Feld „Hausabsicherung/SLS (A je Phase)“ prüfen.'
         )
     elif grid_candidate is not None and math.isfinite(grid_candidate) and grid_candidate > 0.0:
         grid_amps = grid_candidate
         grid_source = "user"
         if grid_amps < 16.0 or grid_amps > 100.0:
             grid_severity = "warning"
-            grid_message = "Hausanschlusslimit wirkt unplausibel; typische Werte liegen etwa zwischen 16 A und 100 A je Phase."
+            grid_message = f'Die Hausabsicherung von {grid_amps:g} A liegt außerhalb des üblichen Bereichs von 16 bis 100 A je Phase. Im Config-Editor unter „Wallbox & Fahrzeug“ das Feld „Hausabsicherung/SLS (A je Phase)“ prüfen.'
         else:
             grid_severity = "ok"
             grid_message = "Hausanschlusslimit ist plausibel."
@@ -1537,14 +1528,12 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
         )
         grid_severity = "warning" if _one_phase_over_20_configured else "info"
         grid_message = (
-            "Hausanschlusslimit verwendet den Standardwert von 35 A je Phase. "
-            "Für eine einphasige openWB-Pro-Freigabe über 20 A die Hausabsicherung "
-            "ausdrücklich eintragen."
+            (f'Es gelten 35 A je Phase als Standard; für einphasiges Laden über 20 A fehlt eine ausdrücklich eingetragene Hausabsicherung. Im Config-Editor unter „Wallbox & Fahrzeug“ das Feld „Hausabsicherung/SLS (A je Phase)“ prüfen.') if _one_phase_over_20_configured else ('Hausanschlusslimit verwendet den Standardwert von 35 A je Phase. Für eine einphasige openWB-Pro-Freigabe über 20 A die Hausabsicherung ausdrücklich eintragen.')
         )
 
     wallbox["grid_max_amps"] = _entry(
         key="grid_max_amps",
-        label="Hausanschluss",
+        label='Hausabsicherung/SLS (A je Phase)',
         unit="A",
         configured=(
             grid_candidate
@@ -1588,18 +1577,16 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
     if grid_reserve_invalid:
         grid_reserve_severity = "warning"
         grid_reserve_message = (
-            "Die globale Wallbox-Reserve ist ungültig; der sichere Rückfallwert "
-            "von 2 A wird verwendet."
+            f'Die Wallbox-Reserve ist ungültig; verwendet werden 2 A. Im Config-Editor unter „Wallbox & Fahrzeug“ das Feld „Reserve für übrige Hausverbraucher (A)“ prüfen.'
         )
     elif grid_reserve >= grid_amps:
         grid_reserve_severity = "warning"
         grid_reserve_message = (
-            "Die globale Wallbox-Reserve muss nichtnegativ und kleiner als die "
-            "Hausabsicherung je Phase sein."
+            f'Die Wallbox-Reserve von {grid_reserve:g} A erreicht die Hausabsicherung von {grid_amps:g} A; es bleibt kein Spielraum zum Laden. Im Config-Editor unter „Wallbox & Fahrzeug“ das Feld „Reserve für übrige Hausverbraucher (A)“ prüfen.'
         )
     wallbox["grid_wallbox_reserve_amps"] = _entry(
         key="grid_wallbox_reserve_amps",
-        label="Globale Wallbox-Reserve",
+        label='Reserve für übrige Hausverbraucher (A)',
         unit="A",
         configured=(
             grid_reserve_candidate
@@ -1673,15 +1660,14 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
         if limit_invalid or reserve_invalid:
             phase_severity = "warning"
             phase_message = (
-                "Ein expliziter Phasenwert ist ungültig; diese Netzphase "
-                "bleibt für dynamische Freigaben gesperrt."
+                f'Ein Wert für Netzphase L{phase} ist unlesbar; diese Phase bleibt für zusätzliche Leistung gesperrt. Im Config-Editor unter „Wallbox & Fahrzeug“ das Feld „Netz L{phase} Limit (A)“ und „Netz L{phase} Reserve (A)“ prüfen.'
             )
         elif limit_effective <= 0.0 or phase_reserve_effective < 0.0:
             phase_severity = "warning"
-            phase_message = "Phasenlimit und Reserve müssen positiv bzw. nichtnegativ sein."
+            phase_message = f'Die Stromgrenze von {limit_effective:g} A oder die Reserve von {phase_reserve_effective:g} A für Netzphase L{phase} ist ungültig; die Grenze muss größer als null und die Reserve mindestens null sein. Im Config-Editor unter „Wallbox & Fahrzeug“ das Feld „Netz L{phase} Limit (A)“ und „Netz L{phase} Reserve (A)“ prüfen.'
         elif phase_reserve_effective >= limit_effective:
             phase_severity = "warning"
-            phase_message = "Die Wallbox-Reserve muss kleiner als das Phasenlimit sein."
+            phase_message = f'Die Reserve von {phase_reserve_effective:g} A erreicht die Stromgrenze von {limit_effective:g} A für Netzphase L{phase}; es bleibt kein Spielraum zum Laden. Im Config-Editor unter „Wallbox & Fahrzeug“ das Feld „Netz L{phase} Limit (A)“ und „Netz L{phase} Reserve (A)“ prüfen.'
         phase_grid_contract_valid[phase] = phase_severity == "ok"
         wallbox[limit_key] = _entry(
             key=limit_key,
@@ -1718,9 +1704,9 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
 
     global_wb_max = safe_float(cfg.get("wbmaxladestrom"), 16.0)
     for key, label, fallback in (
-        ("wbmaxladestrom", "Standard-Maximalstrom je Wallbox", 16.0),
-        ("wb1_max_amp", "WB1 max. Ladestrom", global_wb_max),
-        ("wb2_max_amp", "WB2 max. Ladestrom", global_wb_max),
+        ("wbmaxladestrom", 'Standard-Maximalstrom je Wallbox (6–32 A)', 16.0),
+        ("wb1_max_amp", 'WB1 Max. Ladestrom (A)', global_wb_max),
+        ("wb2_max_amp", 'WB2 Max. Ladestrom (A)', global_wb_max),
     ):
         configured = safe_float(cfg.get(key), float("nan")) if _has_user_value(cfg, key) else None
         effective = configured if configured is not None and math.isfinite(configured) else float(fallback)
@@ -1733,16 +1719,12 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
         if effective < 6.0 or effective > 32.0:
             severity = "warning"
             message = (
-                "Der Standard-Maximalstrom je Wallbox muss zwischen 6 A und 32 A liegen."
-                if key == "wbmaxladestrom"
-                else "Der Wallbox-Ladestrom je Ladepunkt muss zwischen 6 A und 32 A liegen."
+                f'Der Ladestrom von {effective:g} A liegt außerhalb 6 bis 32 A. Im Config-Editor unter „Wallbox & Fahrzeug“ das Feld „{label}“ prüfen.'
             )
         elif effective > grid_amps:
             severity = "warning"
             message = (
-                "Der Standard-Maximalstrom je Wallbox liegt über der Hausabsicherung je Phase."
-                if key == "wbmaxladestrom"
-                else "Der Wallbox-Ladestrom je Ladepunkt liegt über der Hausabsicherung je Phase."
+                f'Der Ladestrom von {effective:g} A liegt über der Hausabsicherung von {grid_amps:g} A je Phase. Im Config-Editor unter „Wallbox & Fahrzeug“ das Feld „{label}“ prüfen.'
             )
         wallbox[key] = _entry(
             key=key,
@@ -1774,9 +1756,7 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
     if pcc_basis_unknown:
         pcc_basis_severity = "warning"
         pcc_basis_message = (
-            "Unbekannter Wert „%s“ für die Messbasis des 1p-Deckels; er wirkt wie „off“ "
-            "(fest 20 A). Gültig sind e3dc_pm_active_power und off."
-            % str(cfg.get("wb_pcc_phase_basis"))
+            f'Die Messbasis ist unbekannt; einphasiges Laden bleibt auf 20 A begrenzt. Im Config-Editor unter „Wallbox & Fahrzeug“ das Feld „Messbasis 1p-Deckel openWB Pro“ prüfen.'
         )
     elif pcc_basis_effective == "off":
         pcc_basis_severity = "ok"
@@ -1815,8 +1795,7 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
     if pf_user and not pf_valid:
         pf_severity = "warning"
         pf_message = (
-            "Die Leistungsfaktor-Reserve muss zwischen 0,8 und 1,0 liegen; "
-            "der Standard 0,9 wird verwendet."
+            f'Die Reserve für die Stromberechnung liegt außerhalb 0,8 bis 1,0; verwendet wird 0,9. Im Config-Editor unter „Wallbox & Fahrzeug“ das Feld „Leistungsfaktor-Reserve Fremdlast“ prüfen.'
         )
     else:
         pf_severity = "ok"
@@ -1850,8 +1829,7 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
     if imbalance_user and not imbalance_valid:
         imbalance_severity = "warning"
         imbalance_message = (
-            "Der Schieflast-Wächter muss zwischen 10 A und 32 A liegen; "
-            "der Standard 20 A (4,6 kVA) wird verwendet."
+            f'Die Schieflastgrenze liegt außerhalb 10 bis 32 A; verwendet werden 20 A. Im Config-Editor unter „Wallbox & Fahrzeug“ das Feld „Schieflast-Wächter am Netzpunkt (A)“ prüfen.'
         )
     elif imbalance_valid and imbalance_candidate > 20.0:
         imbalance_severity = "info"
@@ -1867,7 +1845,7 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
         )
     wallbox["grid_pcc_imbalance_max_a"] = _entry(
         key="grid_pcc_imbalance_max_a",
-        label="Schieflast-Wächter am Netzpunkt",
+        label='Schieflast-Wächter am Netzpunkt (A)',
         unit="A",
         configured=imbalance_candidate if imbalance_valid else (cfg.get("grid_pcc_imbalance_max_a") if imbalance_user else None),
         live_value=None,
@@ -1876,85 +1854,6 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
         source="user" if imbalance_valid else ("invalid" if imbalance_user else "default"),
         severity=imbalance_severity,
         message=imbalance_message,
-    )
-
-    # Hochschaltung 1p→3p – Vorlauf (Standard 60 s, Untergrenze 30 s,
-    # die Sperre nach einem Wechsel bleibt davon getrennt) und Symmetrie-Klausel (0/1) am
-    # Schieflastwert grid_pcc_imbalance_max_a.
-    up_hold_user = _has_user_value(cfg, "wb_phase_up_forecast_hold_s")
-    up_hold_candidate = safe_float(cfg.get("wb_phase_up_forecast_hold_s"), float("nan")) if up_hold_user else None
-    up_hold_valid = bool(
-        up_hold_candidate is not None
-        and math.isfinite(up_hold_candidate)
-        and 30.0 <= up_hold_candidate <= 3600.0
-    )
-    up_hold_effective = up_hold_candidate if up_hold_valid else 60.0
-    if up_hold_user and not up_hold_valid:
-        up_hold_severity = "warning"
-        up_hold_message = (
-            "Der Vorlauf 1p→3p muss zwischen 30 s und 3600 s liegen; die Regelung hebt kleinere "
-            "Werte auf 30 s an, wirksam ist sonst der Standard 60 s."
-        )
-    elif up_hold_valid and up_hold_candidate >= 480.0:
-        up_hold_severity = "info"
-        up_hold_message = (
-            "Vorlauf 1p→3p von %.0f s: Die Hochschaltbedingung (Überschuss ≥ 3p-Minimum + Puffer und "
-            "1p ausgereizt, 30-s-Mittel) muss so lange ununterbrochen gelten; Standard 60 s. Die Sperre "
-            "nach jedem Phasenwechsel (480 s) bleibt davon getrennt." % up_hold_candidate
-        )
-    else:
-        up_hold_severity = "ok"
-        up_hold_message = (
-            "Vorlauf 1p→3p: So lange muss die Hochschaltbedingung (Überschuss ≥ 3p-Minimum + Puffer "
-            "und 1p ausgereizt, 30-s-Mittel) ununterbrochen gelten, zusätzlich zum Export-Wh-Konto; "
-            "die Sperre nach jedem Phasenwechsel (480 s) bleibt davon getrennt."
-        )
-    wallbox["wb_phase_up_forecast_hold_s"] = _entry(
-        key="wb_phase_up_forecast_hold_s",
-        label="Vorlauf 1p→3p",
-        unit="s",
-        configured=up_hold_candidate if up_hold_valid else (cfg.get("wb_phase_up_forecast_hold_s") if up_hold_user else None),
-        live_value=None,
-        live_key=None,
-        effective=up_hold_effective,
-        source="user" if up_hold_valid else ("invalid" if up_hold_user else "default"),
-        severity=up_hold_severity,
-        message=up_hold_message,
-    )
-
-    symmetry_user = _has_user_value(cfg, "wb_phase_up_symmetry_enable")
-    symmetry_raw = str(cfg.get("wb_phase_up_symmetry_enable") if symmetry_user else "").strip().lower()
-    symmetry_valid = bool(symmetry_user and symmetry_raw in ("0", "1", "true", "false", "on", "off", "ja", "nein", "yes", "no"))
-    symmetry_effective = bool(symmetry_valid and symmetry_raw in ("1", "true", "on", "ja", "yes"))
-    if symmetry_user and not symmetry_valid:
-        symmetry_severity = "warning"
-        symmetry_message = (
-            "Die Symmetrie-Klausel kennt nur 0 (aus) oder 1 (ein); der Standard aus wird verwendet."
-        )
-    elif symmetry_effective:
-        symmetry_severity = "info"
-        symmetry_message = (
-            "Symmetrie-Klausel ein: Eine einphasige Ladung ab %.0f A (Schieflast-Wächter) gilt als "
-            "ausgereizt und darf mit ausreichend Überschuss auf drei Phasen wechseln. Die "
-            "Unsymmetriegrenze des Netzbetreibers (4,6 kVA) muss auch für die Einspeiseseite gelten." % imbalance_effective
-        )
-    else:
-        symmetry_severity = "ok"
-        symmetry_message = (
-            "Symmetrie-Klausel aus (Standard): Die Hochschaltung 1p→3p folgt nur dem Überschuss "
-            "und dem wirksamen 1p-Deckel."
-        )
-    wallbox["wb_phase_up_symmetry_enable"] = _entry(
-        key="wb_phase_up_symmetry_enable",
-        label="Symmetrie-Klausel 1p→3p",
-        unit="",
-        configured=(1 if symmetry_effective else 0) if symmetry_valid else (cfg.get("wb_phase_up_symmetry_enable") if symmetry_user else None),
-        live_value=None,
-        live_key=None,
-        effective=1 if symmetry_effective else 0,
-        source="user" if symmetry_valid else ("invalid" if symmetry_user else "default"),
-        severity=symmetry_severity,
-        message=symmetry_message,
     )
 
     # Experimenteller E3DC-Direktvertrag für Phasenwechsel sichtbar und
@@ -1978,12 +1877,7 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
     if _rm_direct_on_ids:
         _rm_direct_severity = "warning"
         _rm_direct_message = (
-            "E3DC-Direktvertrag eingeschaltet (%s): experimentell. Bei ausdrücklich gewählter efy oder "
-            "Multi Connect schreibt die Regelung je Phasenwechsel die Geräteeinstellungen Sonnenmodus, "
-            "automatische Phasenumschaltung und Phasenzahl und stellt sie bei der Rückgabe wieder her. "
-            "Ob die Wallbox diese Einstellungen dauerhaft speichert, ist nicht belegt – nicht für den "
-            "Dauerbetrieb empfohlen. Die Sonnenmodus-Übergabe an die E3/DC-Automatik ist in dieser Zeit "
-            "stillgelegt." % ", ".join("WB%d" % i for i in _rm_direct_on_ids)
+            f'Die experimentelle direkte Phasensteuerung ist für {", ".join("WB%d" % i for i in _rm_direct_on_ids)} an; bei efy oder Multi Connect ändert sie bei Phasenwechseln Geräteeinstellungen mit ungeklärter Dauerspeicherung und setzt die Übergabe an die E3DC-Sonnenautomatik aus. Im Config-Editor unter „Wallbox & Fahrzeug“ das Feld „E3DC-Direktvertrag (experimentell)“ prüfen; die Funktion nur zum Testen und nicht im Dauerbetrieb nutzen.'
         )
     else:
         _rm_direct_severity = "ok"
@@ -1993,7 +1887,7 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
         )
     wallbox["wb_e3dc_direct_phase_control_enable"] = _entry(
         key="wb_e3dc_direct_phase_control_enable",
-        label="E3DC-Direktvertrag Phasenwechsel (experimentell)",
+        label='Direkte Phasensteuerung (experimentell)',
         unit="",
         configured=cfg.get("wb_e3dc_direct_phase_control_enable") if _rm_direct_global_user else None,
         live_value=None,
@@ -2042,7 +1936,7 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
             key='e3dc_device_family', label='E3/DC-Modell', unit='',
             configured=_family_configured, live_value=None, live_key=None,
             effective=_family_effective, source='user', severity=_family_severity,
-            message=' '.join(_family_rows),
+            message=((f'Die Modellauswahl ist unbekannt; es gelten die geräteabhängigen Ersatzmodelle. Im Config-Editor unter „Wallbox & Fahrzeug“ das Nachfolgefeld „Modell“ am jeweiligen Ladepunkt prüfen.') if _family_severity == 'warning' else (' '.join(_family_rows))) if (_family_severity) in ("warning", "error") else (' '.join(_family_rows)),
         )
 
     # Startfenster der openWB Pro – Startfenster, Wiederholzyklus,
@@ -2055,8 +1949,7 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
         if user and not valid:
             severity = "warning"
             message = (
-                "Der Wert liegt außerhalb von %d–%d %s; wirksam ist der Standard %d %s."
-                % (int(low), int(high), unit, int(default), unit)
+                f'Der Zeitwert liegt außerhalb {int(low)} bis {int(high)} {unit}; verwendet werden {int(default)} {unit}. Im Config-Editor unter „Wallbox & Fahrzeug“ das Feld „{label}“ prüfen.'
             )
         else:
             severity = "ok"
@@ -2076,7 +1969,7 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
 
     _openwb_pro_start_window_entry(
         "openwb_pro_start_hold_s",
-        "Pro Startfenster",
+        'Pro Startfenster (s)',
         180.0,
         60.0,
         600.0,
@@ -2086,7 +1979,7 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
     )
     _openwb_pro_start_window_entry(
         "openwb_pro_start_retry_cycle_s",
-        "Pro Start-Wiederholzyklus",
+        'Pro Start-Wiederholzyklus (s)',
         300.0,
         180.0,
         1200.0,
@@ -2103,16 +1996,15 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
         grace_effective = 60.0
     if grace_user and not grace_numeric:
         grace_severity = "warning"
-        grace_message = "Die CP-Karenz ist keine Zahl; wirksam sind 60 s."
+        grace_message = f'Die Wartezeit vor dem ersten Weckimpuls ist unlesbar; verwendet werden 60 s. Im Config-Editor unter „Wallbox & Fahrzeug“ das Feld „Pro Start-CP-Karenz (s)“ prüfen.'
     elif grace_numeric and grace_candidate < 60.0:
         grace_severity = "warning"
         grace_message = (
-            "Eine Karenz unter 60 s wird auf 60 s angehoben: ein normal startendes Auto zieht innerhalb von "
-            "10–60 s Strom und wird nicht unterbrochen; ein Fahrzeugprofil verkürzt die Karenz nicht."
+            f'Die Wartezeit vor dem ersten Weckimpuls liegt unter 60 s und wird auf 60 s angehoben, damit ein normal startendes Auto nicht unterbrochen wird. Im Config-Editor unter „Wallbox & Fahrzeug“ das Feld „Pro Start-CP-Karenz (s)“ prüfen.'
         )
     elif grace_numeric and grace_candidate > 600.0:
         grace_severity = "warning"
-        grace_message = "Die CP-Karenz ist auf 600 s begrenzt."
+        grace_message = f'Die Wartezeit vor dem ersten Weckimpuls liegt über 600 s und wird auf 600 s begrenzt. Im Config-Editor unter „Wallbox & Fahrzeug“ das Feld „Pro Start-CP-Karenz (s)“ prüfen.'
     else:
         grace_severity = "ok"
         grace_message = (
@@ -2121,7 +2013,7 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
         )
     wallbox["openwb_pro_start_cp_grace_s"] = _entry(
         key="openwb_pro_start_cp_grace_s",
-        label="Pro Start-CP-Karenz",
+        label='Pro Start-CP-Karenz (s)',
         unit="s",
         configured=grace_candidate if grace_numeric else (cfg.get("openwb_pro_start_cp_grace_s") if grace_user else None),
         live_value=None,
@@ -2151,9 +2043,7 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
         source="user" if cp_valid else ("invalid" if cp_user else "default"),
         severity="info" if cp_valid else ("warning" if cp_user else "ok"),
         message=(
-            "Deckel der Weckimpulse je Stecksession über alle Wiederholzyklen (1–3)."
-            if cp_valid or not cp_user
-            else "Nur 1 bis 3 Weckimpulse je Stecken sind gültig; wirksam sind 3."
+            ('Deckel der Weckimpulse je Stecksession über alle Wiederholzyklen (1–3).' if cp_valid or not cp_user else 'Die Anzahl der Weckimpulse liegt außerhalb 1 bis 3; verwendet werden 3 je Anstecken. Kein eigenes Feld im Config-Editor; die Konfiguration durch den Fachbetrieb prüfen lassen.') if ('info' if cp_valid else 'warning' if cp_user else 'ok') in ("warning", "error") else ('Deckel der Weckimpulse je Stecksession über alle Wiederholzyklen (1–3).' if cp_valid or not cp_user else 'Nur 1 bis 3 Weckimpulse je Stecken sind gültig; wirksam sind 3.')
         ),
     )
 
@@ -2205,12 +2095,11 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
             limit_source = "invalid"
             severity = "warning"
             message = (
-                "Die einphasige openWB-Pro-Grenze ist ungültig; "
-                "der sichere 20-A-Fallback bleibt aktiv."
+                f'Die einphasige Stromgrenze ist unlesbar; es gelten höchstens 20 A. Im Config-Editor unter „Wallbox & Fahrzeug“ das Feld „WB{charger_id} openWB Pro 1p Max. (A)“ prüfen.'
             )
         elif requested_limit < 6.0 or requested_limit > 32.0:
             severity = "warning"
-            message = "Die einphasige openWB-Pro-Grenze muss zwischen 6 A und 32 A liegen."
+            message = f'Die einphasige Stromgrenze von {effective_limit:g} A liegt außerhalb 6 bis 32 A. Im Config-Editor unter „Wallbox & Fahrzeug“ das Feld „WB{charger_id} openWB Pro 1p Max. (A)“ prüfen.'
         elif requested_limit > 20.0:
             limit_source = "user_capped_fail_closed"
             phase_limit_explicit = bool(
@@ -2223,27 +2112,22 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
             if pcc_basis_effective == "off":
                 severity = "warning"
                 message = (
-                    "Mehr als 20 A bleiben gesperrt, weil die Messbasis des "
-                    "1p-Deckels auf „Aus“ steht."
+                    f'Mehr als 20 A bleiben gesperrt, weil die Messbasis ausgeschaltet ist. Im Config-Editor unter „Wallbox & Fahrzeug“ das Feld „WB{charger_id} openWB Pro 1p Max. (A)“ prüfen.'
                 )
             elif not phase_valid:
                 severity = "warning"
                 message = (
-                    "Mehr als 20 A bleiben gesperrt, bis lokale Wallbox-L1 "
-                    "eindeutig einer Netzphase zugeordnet ist."
+                    f'Mehr als 20 A bleiben gesperrt, weil die Netzphase der Wallbox nicht eindeutig zugeordnet ist. Im Config-Editor unter „Wallbox & Fahrzeug“ das Feld „WB{charger_id} openWB Pro 1p Max. (A)“ prüfen.'
                 )
             elif not phase_limit_explicit:
                 severity = "warning"
                 message = (
-                    "Mehr als 20 A bleiben gesperrt, bis die Hausabsicherung "
-                    "ausdrücklich eingetragen ist (global oder für die zugeordnete "
-                    "Netzphase); der Standard 35 A zählt dafür nicht."
+                    f'Mehr als 20 A bleiben gesperrt, weil eine ausdrücklich eingetragene Hausabsicherung fehlt. Im Config-Editor unter „Wallbox & Fahrzeug“ das Feld „WB{charger_id} openWB Pro 1p Max. (A)“ prüfen.'
                 )
             elif not phase_grid_contract_valid.get(mapped_phase, False):
                 severity = "warning"
                 message = (
-                    "Mehr als 20 A bleiben gesperrt, weil Phasenlimit oder "
-                    "Reserve ungültig sind."
+                    f'Mehr als 20 A bleiben gesperrt, weil Stromgrenze oder Reserve der Netzphase ungültig sind. Im Config-Editor unter „Wallbox & Fahrzeug“ das Feld „WB{charger_id} openWB Pro 1p Max. (A)“ prüfen.'
                 )
             else:
                 operating_limit = (
@@ -2252,14 +2136,14 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
                 )
                 if operating_limit < 6.0:
                     severity = "warning"
-                    message = "Das phasenbezogene Betriebslimit lässt keinen sicheren Ladestrom zu."
+                    message = f'Die Stromgrenze der Netzphase lässt mit {effective_limit:g} A keinen ausreichenden Ladestrom zu. Im Config-Editor unter „Wallbox & Fahrzeug“ das Feld „WB{charger_id} openWB Pro 1p Max. (A)“ prüfen.'
                 else:
                     effective_limit = min(requested_limit, operating_limit)
                     limit_source = "user_dynamic_pcc_pm"
                     severity = "ok"
                     message = (
-                        "Freigabe > 20 A zur Laufzeit nach Software-Nachweis der "
-                        "Phasenzuordnung (Dashboard: Zuordnung bestätigt); ohne "
+                        "Freigabe > 20 A zur Laufzeit nach Messung der zugeordneten "
+                        "Netzphase; ohne "
                         "frische Messwerte 20 A."
                     )
         wallbox[phase_key] = _entry(
@@ -2277,10 +2161,7 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
                 else "warning"
             ),
             message=(
-                "Phasenzuordnung ist gebunden; E3DC-Control bestätigt sie beim "
-                "einphasigen Laden automatisch (Dashboard: Zuordnung bestätigt)."
-                if phase_valid
-                else "Keine Phasenzuordnung hinterlegt."
+                ('Phasenzuordnung ist gebunden; E3DC-Control bestätigt sie beim einphasigen Laden automatisch (Dashboard: Zuordnung bestätigt).' if phase_valid else f'Die Netzphase der Wallbox ist nicht zugeordnet; eine einphasige Freigabe über 20 A bleibt gesperrt. Im Config-Editor unter „Wallbox & Fahrzeug“ das Feld „WB{charger_id} lokale L1 liegt auf Netzphase“ prüfen.' if requested_limit > 20.0 else 'Keine Phasenzuordnung hinterlegt.') if ('ok' if phase_valid or requested_limit <= 20.0 else 'warning') in ("warning", "error") else ('Phasenzuordnung ist gebunden; E3DC-Control bestätigt sie beim einphasigen Laden automatisch (Dashboard: Zuordnung bestätigt).' if phase_valid else 'Keine Phasenzuordnung hinterlegt.')
             ),
         )
         wallbox[limit_key] = _entry(
@@ -2315,15 +2196,7 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
             ),
             severity="warning" if unplug_user and not unplug_valid else "ok",
             message=(
-                "Nach dem Abstecken einmalig 6 A: das Fahrzeug startet beim "
-                "Anstecken sofort, danach regelt die normale Logik."
-                if unplug_effective == "fast_start"
-                else (
-                    "Ungültiger Wert; wirksam ist die Sicherheitsvariante (0 A)."
-                    if unplug_user and not unplug_valid
-                    else "Nach dem Abstecken einmalig 0 A: beim Anstecken "
-                    "startet nichts, bevor die Regelung entscheidet."
-                )
+                ('Nach dem Abstecken einmalig 6 A: das Fahrzeug startet beim Anstecken sofort, danach regelt die normale Logik.' if unplug_effective == 'fast_start' else f'Die Auswahl ist ungültig; nach dem Abstecken gelten 0 A. Im Config-Editor unter „Wallbox & Fahrzeug“ das Feld „WB{charger_id} openWB Pro nach dem Abstecken“ prüfen.' if unplug_user and (not unplug_valid) else 'Nach dem Abstecken einmalig 0 A: beim Anstecken startet nichts, bevor die Regelung entscheidet.') if ('warning' if unplug_user and (not unplug_valid) else 'ok') in ("warning", "error") else ('Nach dem Abstecken einmalig 6 A: das Fahrzeug startet beim Anstecken sofort, danach regelt die normale Logik.' if unplug_effective == 'fast_start' else 'Ungültiger Wert; wirksam ist die Sicherheitsvariante (0 A).' if unplug_user and (not unplug_valid) else 'Nach dem Abstecken einmalig 0 A: beim Anstecken startet nichts, bevor die Regelung entscheidet.')
             ),
         )
 
@@ -2353,23 +2226,22 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
     wbminsoc_val = safe_float(cfg.get("wbminsoc"), 70.0)
     if wbminsoc_val < reserve_effective:
         raise ValueError(
-            f"Wallbox-Mindest-SoC (wbminsoc={wbminsoc_val}%) darf nicht kleiner als "
-            f"die effektive Notstromreserve ({reserve_effective}%) sein."
+            f"Der Wallbox-Mindestladestand von {wbminsoc_val:g} % liegt unter der Notstromreserve von {reserve_effective:g} %; diese Einstellung ist unzulässig. "
+            "Im Config-Editor unter „Wallbox & Fahrzeug“ das Feld „Haus-Priorität (Batterie-Reserve SoC %)“ mindestens auf die Notstromreserve anheben."
         )
     wbminsoc_severity = "ok"
     wbminsoc_message = "Wallbox-Mindest-SoC schützt die Hausreserve plausibel."
     if wbminsoc_val < 20.0:
         wbminsoc_severity = "warning"
         wbminsoc_message = (
-            "Wallbox-Mindest-SoC ist sehr niedrig; nachts kann der Hausspeicher durch Fahrzeugladung "
-            "stärker entladen werden."
+            f'Der Mindestladestand von {wbminsoc_val:g} % ist sehr niedrig; Fahrzeugladen kann den Hausspeicher nachts stärker entladen. Im Config-Editor unter „Wallbox & Fahrzeug“ das Feld „Haus-Priorität (Batterie-Reserve SoC %)“ prüfen.'
         )
     elif wbminsoc_val > 90.0:
         wbminsoc_severity = "warning"
-        wbminsoc_message = "Wallbox-Mindest-SoC ist sehr hoch; die Wallbox wird selten freigegeben."
+        wbminsoc_message = f'Der Mindestladestand von {wbminsoc_val:g} % ist sehr hoch; die Wallbox wird selten freigegeben. Im Config-Editor unter „Wallbox & Fahrzeug“ das Feld „Haus-Priorität (Batterie-Reserve SoC %)“ prüfen.'
     wallbox["wbminsoc"] = _entry(
         key="wbminsoc",
-        label="Wallbox Mindest-SoC",
+        label='Haus-Priorität (Batterie-Reserve SoC %)',
         unit="%",
         configured=wbminsoc_val if _has_user_value(cfg, "wbminsoc") else None,
         live_value=None,
@@ -2385,7 +2257,7 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
     wb_bat_target_soc_message = "Ziel-SoC am Abend liegt plausibel zur Wallbox-Reserve."
     if wb_bat_target_soc_val < wbminsoc_val:
         wb_bat_target_soc_severity = "warning"
-        wb_bat_target_soc_message = "Ziel-SoC am Abend liegt unter dem Wallbox-Mindest-SoC."
+        wb_bat_target_soc_message = f'Der abendliche Zielladestand von {wb_bat_target_soc_val:g} % liegt unter dem Wallbox-Mindestladestand. Kein eigenes Feld im Config-Editor; die Konfiguration durch den Fachbetrieb prüfen lassen.'
     wallbox["wb_bat_target_soc"] = _entry(
         key="wb_bat_target_soc",
         label="Wallbox Ziel-SoC Abend",
@@ -2420,23 +2292,21 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
     if pv_only_reserve_user and not pv_only_reserve_finite:
         pv_only_reserve_severity = "warning"
         pv_only_reserve_message = (
-            "Reserve unter der Kurve ist nicht numerisch; die Regelung nutzt den Standard 300 W."
+            f'Die Reserve unter der Ladekurve ist unlesbar; verwendet werden 300 W. Im Config-Editor unter „Wallbox & Fahrzeug“ das Feld „Reserve unter der Kurve (W)“ prüfen.'
         )
     elif pv_only_reserve_user and pv_only_reserve_configured < pv_only_reserve_default_w:
         pv_only_reserve_severity = "warning"
         pv_only_reserve_message = (
-            "Reserve unter der Kurve liegt unter 300 W; die Regelung hebt sie automatisch auf 300 W an, "
-            "damit Hauslastsprünge nicht bis zum nächsten Heartbeat aus dem Netz kommen."
+            f'Die Reserve unter der Ladekurve liegt unter 300 W und wird auf 300 W angehoben, um Netzbezug bei Lastsprüngen zu vermeiden. Im Config-Editor unter „Wallbox & Fahrzeug“ das Feld „Reserve unter der Kurve (W)“ prüfen.'
         )
     elif pv_only_reserve_user and pv_only_reserve_configured > 3000.0:
         pv_only_reserve_severity = "warning"
         pv_only_reserve_message = (
-            "Reserve unter der Kurve ist sehr hoch; der Akku darf dann weit über die Hauslast hinaus "
-            "entladen und finanziert die Wallboxen wieder teilweise mit."
+            f'Die Reserve unter der Ladekurve von {pv_only_reserve_effective_w:g} W ist sehr hoch; der Akku kann dadurch zusätzlich zu Haus und Wärmepumpe auch Wallboxstrom liefern. Im Config-Editor unter „Wallbox & Fahrzeug“ das Feld „Reserve unter der Kurve (W)“ prüfen.'
         )
     wallbox["wb_curve_pv_only_house_reserve_w"] = _entry(
         key="wb_curve_pv_only_house_reserve_w",
-        label="Reserve unter der Ladekurve",
+        label='Reserve unter der Kurve (W)',
         unit="W",
         configured=(
             pv_only_reserve_configured if pv_only_reserve_user and pv_only_reserve_finite
@@ -2487,8 +2357,7 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
     if home_wp_split_unknown:
         home_wp_split_severity = "warning"
         home_wp_split_message = (
-            "Unbekannter Wert „%s“ für „Wärmepumpe im Hauswert“; die Regelung behandelt ihn wie „auto“ "
-            "(Heuristik). Gültig sind auto, include und separate." % str(cfg.get("storage_home_wp_split"))
+            f'Die Zuordnung der Wärmepumpe zum Hausverbrauch ist unbekannt; die automatische Schätzung kann zwischen enthaltener und zusätzlicher Messung wechseln. Im Config-Editor unter „Speicher & Konfiguration“ das Feld „Wärmepumpe im Hauswert“ prüfen.'
         )
     elif (
         home_wp_split_mode == "auto"
@@ -2514,8 +2383,8 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
     )
 
     backup = backup_hold.config_contract(cfg)
-    backup_labels = ('Notstrom-Vorhaltung (Aus/Beobachten/Halten)', 'Notstrom-Vorhalt am Abend',
-        'Bezugszeit', 'Versorgung mindestens bis', 'Reserve-Netzladen (bei Halten)', 'Reservepreisgrenze')
+    backup_labels = ('Notstrom-Vorhaltung', 'Notstrom-Vorhalt am Abend (kWh Speicherinhalt)',
+        'Bezugszeit (Ortszeit)', 'Versorgung mindestens bis (bestätigte Ortszeit)', 'Reserve-Netzladen (bei Halten)', 'Höchster Bezugspreis (ct/kWh)')
     for key, label in zip(backup_hold.KEYS, backup_labels):
         effective = backup['values'][key]
         if key == 'storage_backup_hold_enable':
@@ -2524,8 +2393,7 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
             configured=cfg.get(key), live_value=None, live_key=None, effective=effective,
             source='user' if _has_user_value(cfg, key) else 'default',
             severity='info' if backup['valid'] else 'warning',
-            message=('Halten; nachts mehr Netzbezug möglich. Reserve-Netzladen kostet den Bezugspreis.' if backup['mode'] == 2 else 'Nur Beobachtung; Verluste und Notstromfähigkeit der Anlage prüft E3DC-Control nicht.')
-                if backup['valid'] else 'Beobachtung ungültig: ' + backup_hold.reason_text(';'.join(backup['reasons'])))
+            message=(('Halten; nachts mehr Netzbezug möglich. Reserve-Netzladen kostet den Bezugspreis.' if backup['mode'] == 2 else 'Nur Beobachtung; Verluste und Notstromfähigkeit der Anlage prüft E3DC-Control nicht.') if backup['valid'] else f'Die Notstrom-Vorhaltung kann nicht verwendet werden: {backup_hold.reason_text(";".join(backup["reasons"]))}. Im Config-Editor unter „Speicher & Konfiguration“ das Feld „{label}“ und die übrigen Angaben zur Notstrom-Vorhaltung prüfen.') if ('info' if backup['valid'] else 'warning') in ("warning", "error") else (('Halten; nachts mehr Netzbezug möglich. Reserve-Netzladen kostet den Bezugspreis.' if backup['mode'] == 2 else 'Nur Beobachtung; Verluste und Notstromfähigkeit der Anlage prüft E3DC-Control nicht.') if backup['valid'] else 'Beobachtung ungültig: ' + backup_hold.reason_text(';'.join(backup['reasons']))))
 
     storage["storage_central_pv_split_enable"] = _entry(
         key="storage_central_pv_split_enable",
@@ -2551,13 +2419,11 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
     if openwb_pro_phase_wait_configured is not None and openwb_pro_phase_wait_configured < 480.0:
         openwb_pro_phase_wait_severity = "warning"
         openwb_pro_phase_wait_message = (
-            "Phasenwechsel-Cooldown ist kleiner als 480s; die Regelung hebt ihn automatisch an. "
-            "Der Cooldown ist kein CP-Dauernachweis; die reale CP-Unterbrechung besitzt einen "
-            "getrennten Schutzwert."
+            f'Der Abstand zwischen Phasenwechseln liegt unter 480 s und wird auf 480 s angehoben; die kurze Signalunterbrechung wird getrennt eingestellt. Im Config-Editor unter „Wallbox & Fahrzeug“ das Feld „Pro Phasen-Cooldown (s)“ prüfen.'
         )
     wallbox["openwb_pro_phase_wait_s"] = _entry(
         key="openwb_pro_phase_wait_s",
-        label="openWB Pro Phasen-Cooldown",
+        label='Mindestabstand zwischen Phasenwechseln',
         unit="s",
         configured=openwb_pro_phase_wait_configured,
         live_value=None,
@@ -2583,18 +2449,16 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
     if phase_cp_legacy:
         phase_cp_severity = "warning"
         phase_cp_message = (
-            "Der frühere 480-s-CP-Wert wird als Altvertrag erkannt und wirksam auf 5s migriert. "
-            "Der 480-s-Schutz bleibt getrennt als Sperre gegen den nächsten Phasenwechsel bestehen."
+            f'Der alte Unterbrechungswert von 480 s wird auf 5 s umgestellt; zwischen Phasenwechseln gelten weiterhin mindestens 480 s. Im Config-Editor unter „Wallbox & Fahrzeug“ das Feld „Kurzer CP-Impuls (s)“ prüfen.'
         )
     elif phase_cp_configured is not None and not 2.0 <= phase_cp_configured <= 30.0:
         phase_cp_severity = "warning"
         phase_cp_message = (
-            "Die CP-Dauer liegt außerhalb 2 bis 30s und wird auf den sicheren Bereich begrenzt. "
-            "Der Phasenwechsel-Cooldown bleibt davon getrennt."
+            f'Die Signalunterbrechung liegt außerhalb 2 bis 30 s; wirksam sind {phase_cp_effective:g} s. Im Config-Editor unter „Wallbox & Fahrzeug“ das Feld „Kurzer CP-Impuls (s)“ prüfen.'
         )
     wallbox["openwb_pro_phase_cp_interrupt_duration_s"] = _entry(
         key="openwb_pro_phase_cp_interrupt_duration_s",
-        label="openWB Pro Phasen-CP-Unterbrechung",
+        label='Kurzer CP-Impuls (s)',
         unit="s",
         configured=phase_cp_configured,
         live_value=None,
@@ -2630,12 +2494,11 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
     if pv_only_release_hold_configured is not None and pv_only_release_hold_configured < 30.0:
         pv_only_release_hold_severity = "warning"
         pv_only_release_hold_message = (
-            "Die Halt-Freigabe ist kleiner als 30s; die Regelung hebt sie auf 30s an. Unter 30s "
-            "schlägt das Zuteilungs-Pendeln (Slot 0 <-> voller Slot) wieder auf den Draht durch."
+            f'Die Wartezeit vor erneuter PV-Ladefreigabe liegt unter 30 s und wird auf 30 s angehoben, um häufiges Anhalten und Anlaufen zu vermeiden. Im Config-Editor unter „Wallbox & Fahrzeug“ das Feld „PV-only Halt-Freigabe (s)“ prüfen.'
         )
     wallbox["wb_pv_only_release_hold_s"] = _entry(
         key="wb_pv_only_release_hold_s",
-        label="PV-only Halt-Freigabe",
+        label='Wartezeit vor erneuter PV-Ladefreigabe',
         unit="s",
         configured=pv_only_release_hold_configured,
         live_value=None,
@@ -2666,13 +2529,11 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
     if pv_only_stale_guard_configured is not None and not 10.0 <= pv_only_stale_guard_configured <= 300.0:
         pv_only_stale_guard_severity = "warning"
         pv_only_stale_guard_message = (
-            "Die Gnadenfrist liegt außerhalb 10 bis 300s und wird auf den sicheren Bereich begrenzt. "
-            "Zu kurz verliert ein einzelner Aussetzer die Halt-Freigabe, zu lang trägt ein abgesteckter "
-            "Zustand unnötig lange."
+            f'Die Überbrückungszeit bei kurz fehlenden Daten liegt außerhalb 10 bis 300 s; wirksam sind {pv_only_stale_guard_effective:g} s. Im Config-Editor unter „Wallbox & Fahrzeug“ das Feld „PV-only Halt-Gnadenfrist (s)“ prüfen.'
         )
     wallbox["wb_pv_only_hold_stale_guard_s"] = _entry(
         key="wb_pv_only_hold_stale_guard_s",
-        label="PV-only Halt-Gnadenfrist",
+        label='Überbrückung kurzer Datenlücken bei PV-Ladefreigabe',
         unit="s",
         configured=pv_only_stale_guard_configured,
         live_value=None,
@@ -2704,7 +2565,7 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
     if settle_configured is not None and not 0.0 <= settle_configured <= 30.0:
         settle_severity = "warning"
         settle_message = (
-            "Die Einschwingfrist liegt außerhalb 0 bis 30s und wird auf diesen Bereich begrenzt."
+            f'Die Wartezeit bei neuem Netzbezug liegt außerhalb 0 bis 30 s; wirksam sind {settle_effective:g} s. Im Config-Editor unter „Wallbox & Fahrzeug“ das Feld „Einschwingfrist Netzbezug (s)“ prüfen.'
         )
     elif settle_configured is not None and settle_effective <= 0.0:
         settle_message = (
@@ -2714,12 +2575,11 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
     elif settle_configured is not None and settle_effective < 5.0:
         settle_severity = "warning"
         settle_message = (
-            "Die Einschwingfrist ist kürzer als die Reaktionszeit des Speichers (etwa 5 bis 8s); die Wallbox "
-            "kann dann Lastspitzen nachregeln, die der Speicher selbst ausgleicht."
+            f'Die Wartezeit von {settle_effective:g} s ist kürzer als die Speicherreaktion von etwa 5 bis 8 s; die Wallbox kann dadurch kurzzeitige Lastspitzen unnötig ausregeln. Im Config-Editor unter „Wallbox & Fahrzeug“ das Feld „Einschwingfrist Netzbezug (s)“ prüfen.'
         )
     wallbox["wb_grid_import_settle_s"] = _entry(
         key="wb_grid_import_settle_s",
-        label="Einschwingfrist Netzbezug",
+        label='Einschwingfrist Netzbezug (s)',
         unit="s",
         configured=settle_configured,
         live_value=None,
@@ -2744,13 +2604,13 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
     priority_message = "Verbraucherpriorität ist plausibel."
     if sorted(order) != sorted(valid_priority) or len(set(order)) != len(order):
         priority_severity = "warning"
-        priority_message = "Verbraucherpriorität muss heatpump, wallbox und heater genau einmal enthalten."
+        priority_message = f'Die Verbraucherreihenfolge ist unvollständig oder enthält doppelte Einträge; Wärmepumpe, Wallbox und Heizstab müssen jeweils einmal vorkommen. Im Config-Editor unter „Smart Home & Verbrauchsprognose“ das Feld „PV-/Kurven-Budget zuerst an“ prüfen.'
     elif "heatpump" in active_consumers and order[0] != "heatpump":
         priority_severity = "warning"
-        priority_message = "Die Wärmepumpe ist aktiv, steht aber nicht an erster Stelle; Nachlauf und Komfort bitte bewusst prüfen."
+        priority_message = f'Die aktive Wärmepumpe steht nicht an erster Stelle; ein Prioritätswechsel kann ihren Betrieb beeinflussen. Im Config-Editor unter „Smart Home & Verbrauchsprognose“ das Feld „PV-/Kurven-Budget zuerst an“ prüfen.'
     consumer["consumer_priority_order"] = _entry(
         key="consumer_priority_order",
-        label="Verbraucherpriorität",
+        label='PV-/Kurven-Budget zuerst an',
         unit="",
         configured=order_raw,
         live_value=None,
@@ -2764,7 +2624,7 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
     wp_runon = safe_float(cfg.get("consumer_priority_wp_runon_s"), 600.0)
     consumer["consumer_priority_wp_runon_s"] = _entry(
         key="consumer_priority_wp_runon_s",
-        label="WP-Nachlaufzeit",
+        label='WP-Nachlauf bei Prioritätswechsel (s)',
         unit="s",
         configured=wp_runon if _has_user_value(cfg, "consumer_priority_wp_runon_s") else None,
         live_value=None,
@@ -2773,8 +2633,7 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
         source="user" if _has_user_value(cfg, "consumer_priority_wp_runon_s") else "default",
         severity="warning" if wp_runon < 60.0 or wp_runon > 3600.0 else "ok",
         message=(
-            "WP-Nachlaufzeit wirkt unplausibel; empfohlen sind grob 60 bis 3600 Sekunden."
-            if wp_runon < 60.0 or wp_runon > 3600.0 else "WP-Nachlaufzeit ist plausibel."
+            (f'Die Nachlaufzeit von {wp_runon:g} s liegt außerhalb der empfohlenen 60 bis 3600 s und beeinflusst den Prioritätswechsel. Im Config-Editor unter „Smart Home & Verbrauchsprognose“ das Feld „WP-Nachlauf bei Prioritätswechsel (s)“ prüfen.' if wp_runon < 60.0 or wp_runon > 3600.0 else 'WP-Nachlaufzeit ist plausibel.') if ('warning' if wp_runon < 60.0 or wp_runon > 3600.0 else 'ok') in ("warning", "error") else ('WP-Nachlaufzeit wirkt unplausibel; empfohlen sind grob 60 bis 3600 Sekunden.' if wp_runon < 60.0 or wp_runon > 3600.0 else 'WP-Nachlaufzeit ist plausibel.')
         ),
     )
 
@@ -2792,7 +2651,7 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
     luxtronik_pause_in_range = 15.0 <= luxtronik_pause_raw <= 22.0
     consumer["luxtronik_pause_setpoint_c"] = _entry(
         key="luxtronik_pause_setpoint_c",
-        label="Luxtronik Absenk-Sollwert",
+        label='Luxtronik Absenk-Soll (°C)',
         unit="°C",
         configured=luxtronik_pause_configured,
         live_value=None,
@@ -2801,9 +2660,7 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
         source="user" if luxtronik_pause_configured is not None else "default",
         severity="ok" if luxtronik_pause_in_range else "warning",
         message=(
-            "Weiche SHI-Sollwertsperre liegt im EMS-Sicherheitsbereich von 15 bis 22 °C."
-            if luxtronik_pause_in_range
-            else "Wert außerhalb 15 bis 22 °C; die Laufzeitregelung begrenzt ihn auf den Sicherheitsbereich."
+            ('Weiche SHI-Sollwertsperre liegt im EMS-Sicherheitsbereich von 15 bis 22 °C.' if luxtronik_pause_in_range else f'Der Absenk-Sollwert liegt außerhalb 15 bis 22 °C; wirksam sind {luxtronik_pause_effective:g} °C. Im Config-Editor unter „Smart Home & Verbrauchsprognose“ das Feld „Luxtronik Absenk-Soll (°C)“ prüfen.') if ('ok' if luxtronik_pause_in_range else 'warning') in ("warning", "error") else ('Weiche SHI-Sollwertsperre liegt im EMS-Sicherheitsbereich von 15 bis 22 °C.' if luxtronik_pause_in_range else 'Wert außerhalb 15 bis 22 °C; die Laufzeitregelung begrenzt ihn auf den Sicherheitsbereich.')
         ),
     )
 
@@ -2973,35 +2830,31 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
     }
     peak_messages = {
         "peak_shaving_grid_import_limit_w": (
-            "Die 15-Minuten-Grenze muss mindestens 1.000 W betragen."
+            'Die 15-Minuten-Grenze muss mindestens 1.000 W betragen.' + ' Im Config-Editor unter „Tarif & Strompreise“ das Feld „Maximaler 15-Minuten-Netzbezug“ prüfen.'
         ),
         "peak_shaving_reserve_soc_pct": (
-            "Die Lastspitzen-Schwelle muss über der wirksamen "
-            f"Notstromreserve von {reserve_effective:.1f} % liegen und darf "
-            "100 % nicht überschreiten."
+            f'Die Lastspitzen-Schwelle muss über der wirksamen Notstromreserve von {reserve_effective:.1f} % liegen und darf 100 % nicht überschreiten.' + ' Im Config-Editor unter „Tarif & Strompreise“ das Feld „Speicherschwelle für Lastspitzen“ prüfen.'
         ),
         "peak_shaving_max_discharge_w": (
-            "Die Entladeobergrenze muss mindestens 0 W betragen."
+            'Die Entladeobergrenze muss mindestens 0 W betragen.' + ' Im Config-Editor unter „Tarif & Strompreise“ das Feld „Maximale Entladeleistung“ prüfen.'
         ),
         "peak_shaving_recharge_max_w": (
-            "Die Netz-Nachladegrenze muss mindestens 0 W betragen."
+            'Die Netz-Nachladegrenze muss mindestens 0 W betragen.' + ' Im Config-Editor unter „Tarif & Strompreise“ das Feld „Maximale Netz-Nachladung“ prüfen.'
         ),
         "peak_shaving_control_margin_w": (
-            "Der Sicherheitsabstand muss mindestens 0 W betragen und "
-            "mindestens 300 W Regelraum unter der Bezugsgrenze lassen."
+            'Der Sicherheitsabstand muss mindestens 0 W betragen und mindestens 300 W Regelraum unter der Bezugsgrenze lassen.' + ' Im Config-Editor unter „Tarif & Strompreise“ das Feld „Sicherheitsabstand“ prüfen.'
         ),
         "peak_shaving_hysteresis_w": (
-            "Die Leistungshysterese muss strikt größer als die kleinste "
-            "300-W-Leistungsgrenze sein; empfohlen sind mindestens 600 W."
+            'Die Leistungshysterese muss strikt größer als die kleinste 300-W-Leistungsgrenze sein; empfohlen sind mindestens 600 W.' + ' Im Config-Editor unter „Tarif & Strompreise“ das Feld „Leistungshysterese“ prüfen.'
         ),
         "peak_shaving_soc_hysteresis_pct": (
-            "Die SoC-Hysterese muss zwischen 0,1 und 5,0 Prozentpunkten liegen."
+            'Die SoC-Hysterese muss zwischen 0,1 und 5,0 Prozentpunkten liegen.' + ' Im Config-Editor unter „Tarif & Strompreise“ das Feld „SoC-Hysterese“ prüfen.'
         ),
         "peak_shaving_max_sample_gap_s": (
-            "Die größte Messlücke muss zwischen 2 und 60 Sekunden liegen."
+            'Die größte Messlücke muss zwischen 2 und 60 Sekunden liegen.' + ' Im Config-Editor unter „Tarif & Strompreise“ das Feld „Maximale Messlücke“ prüfen.'
         ),
         "peak_shaving_release_debounce_s": (
-            "Die Freigabe-Entprellung muss zwischen 5 und 120 Sekunden liegen."
+            'Die Freigabe-Entprellung muss zwischen 5 und 120 Sekunden liegen.' + ' Im Config-Editor unter „Tarif & Strompreise“ das Feld „Freigabe-Entprellung“ prüfen.'
         ),
     }
     peak_labels = {
@@ -3042,15 +2895,7 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
             source="user" if _has_user_value(cfg, key) else "default",
             severity="warning" if relevant and not valid else "ok",
             message=(
-                peak_messages[key]
-                if relevant and not valid
-                else (
-                    "Wert ist plausibel; die Regelung greift nur ein, wenn "
-                    "der Netzbezug seit Beginn der aktuellen festen "
-                    "Viertelstunde lückenlos belegt ist."
-                    if peak_enabled
-                    else "Lastspitzenbegrenzung ist aus; der Wert wirkt nicht."
-                )
+                (('Die Eingabe ist keine gültige Zahl; die Lastspitzenbegrenzung bleibt aus. ' + peak_messages[key].split('. ', 1)[1] if not typed else f'Bei {value:g} {unit} bleibt die Lastspitzenbegrenzung aus; ' + peak_messages[key][0].lower() + peak_messages[key][1:]) if relevant and not valid else 'Wert ist plausibel; die Regelung greift nur ein, wenn der Netzbezug seit Beginn der aktuellen festen Viertelstunde lückenlos belegt ist.' if peak_enabled else 'Lastspitzenbegrenzung ist aus; der Wert wirkt nicht.') if ('warning' if relevant and (not valid) else 'ok') in ("warning", "error") else (peak_messages[key] if relevant and (not valid) else 'Wert ist plausibel; die Regelung greift nur ein, wenn der Netzbezug seit Beginn der aktuellen festen Viertelstunde lückenlos belegt ist.' if peak_enabled else 'Lastspitzenbegrenzung ist aus; der Wert wirkt nicht.')
             ),
         )
     price["peak_shaving_enable"] = _entry(
@@ -3072,16 +2917,7 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
             else "ok"
         ),
         message=(
-            "Konfiguration ungültig: Die Regelung bleibt passiv und übernimmt "
-            "keine Speicherentscheidung."
-            if peak_enabled and not peak_contract_valid
-            else (
-                "Aktiv: Der Speicher begrenzt den 15-Minuten-Netzbezug nur "
-                "mit E3/DC-AUTO und flüchtiger Entladeobergrenze; er fordert "
-                "weder Entladung noch Einspeisung an."
-                if peak_enabled
-                else "Aus: keine Regelhoheit und keine Speicherwirkung."
-            )
+            ('Die Lastspitzenbegrenzung ist eingeschaltet, aber ihre Einstellungen sind ungültig; sie übernimmt keine Speicherentscheidung. Im Config-Editor unter „Tarif & Strompreise“ die Angaben unter „Lastspitzenbegrenzung am Netzanschluss“ prüfen.' if peak_enabled and not peak_contract_valid else 'Aktiv: Der Speicher begrenzt den 15-Minuten-Netzbezug nur mit E3/DC-AUTO und flüchtiger Entladeobergrenze; er fordert weder Entladung noch Einspeisung an.' if peak_enabled else 'Aus: keine Regelhoheit und keine Speicherwirkung.') if ('warning' if peak_enabled and (not peak_contract_valid) else 'ok') in ("warning", "error") else ('Konfiguration ungültig: Die Regelung bleibt passiv und übernimmt keine Speicherentscheidung.' if peak_enabled and (not peak_contract_valid) else 'Aktiv: Der Speicher begrenzt den 15-Minuten-Netzbezug nur mit E3/DC-AUTO und flüchtiger Entladeobergrenze; er fordert weder Entladung noch Einspeisung an.' if peak_enabled else 'Aus: keine Regelhoheit und keine Speicherwirkung.')
         ),
     )
     usable_peak_pct = max(0.0, peak_reserve_soc - reserve_effective)
@@ -3101,16 +2937,12 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
             else "ok"
         ),
         message=(
-            f"Von der eingestellten {peak_reserve_soc:.1f}-%-Schwelle bis zur "
-            f"wirksamen Notstromreserve von {reserve_effective:.1f} % sind "
-            f"{usable_peak_pct:.1f} Prozentpunkte ausschließlich als "
-            "Lastspitzenpuffer reserviert. Bei einer echten Lastspitze darf "
-            "dieser Puffer bis zur physischen Reserve genutzt werden."
+            (('Die Speicherschwelle ist nicht als Zahl verwendbar; die Lastspitzenbegrenzung bleibt aus. Im Config-Editor unter „Tarif & Strompreise“ das Feld „Speicherschwelle für Lastspitzen“ prüfen.' if not peak_values['peak_shaving_reserve_soc_pct'][1] else f'Die Speicherschwelle von {peak_reserve_soc:g} % muss über der Notstromreserve von {reserve_effective:g} % und höchstens bei 100 % liegen; die Lastspitzenbegrenzung bleibt aus. Im Config-Editor unter „Tarif & Strompreise“ das Feld „Speicherschwelle für Lastspitzen“ prüfen.') if peak_enabled and not peak_validation['peak_shaving_reserve_soc_pct'] else (f'Von der eingestellten {peak_reserve_soc:.1f}-%-Schwelle bis zur wirksamen Notstromreserve von {reserve_effective:.1f} % sind {usable_peak_pct:.1f} Prozentpunkte ausschließlich als Lastspitzenpuffer reserviert. Bei einer echten Lastspitze darf dieser Puffer bis zur physischen Reserve genutzt werden.')) if ('warning' if peak_enabled and (not peak_validation['peak_shaving_reserve_soc_pct']) else 'ok') in ("warning", "error") else (f'Von der eingestellten {peak_reserve_soc:.1f}-%-Schwelle bis zur wirksamen Notstromreserve von {reserve_effective:.1f} % sind {usable_peak_pct:.1f} Prozentpunkte ausschließlich als Lastspitzenpuffer reserviert. Bei einer echten Lastspitze darf dieser Puffer bis zur physischen Reserve genutzt werden.')
         ),
     )
     price["strompreis_cheap"] = _entry(
         key="strompreis_cheap",
-        label="Günstigpreis",
+        label='Günstig (LT)',
         unit="ct/kWh",
         configured=cheap if _has_user_value(cfg, "strompreis_cheap") else None,
         live_value=None,
@@ -3119,13 +2951,12 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
         source="user" if _has_user_value(cfg, "strompreis_cheap") else "default",
         severity="warning" if octopus_bad_order else "ok",
         message=(
-            "Octopus-Heat-Preise sollten günstig < normal < Hochpreis sein."
-            if octopus_bad_order else "Preisfeld ist plausibel."
+            (f'Die Tarifpreise günstig {cheap:g}, normal {basis:g} und teuer {uht:g} ct/kWh sind nicht aufsteigend; die Zuordnung günstiger und teurer Zeiten passt dadurch nicht. Im Config-Editor unter „Tarif & Strompreise“ die Felder „Günstig (LT)“, „Normal (HT)“ und „Teuer (UHT)“ prüfen.' if octopus_bad_order else 'Preisfeld ist plausibel.') if ('warning' if octopus_bad_order else 'ok') in ("warning", "error") else ('Octopus-Heat-Preise sollten günstig < normal < Hochpreis sein.' if octopus_bad_order else 'Preisfeld ist plausibel.')
         ),
     )
     price["strompreis_basis"] = _entry(
         key="strompreis_basis",
-        label="Normalpreis",
+        label='Normalpreis oder Arbeitspreis',
         unit="ct/kWh",
         configured=basis if _has_user_value(cfg, "strompreis_basis") else None,
         live_value=None,
@@ -3133,11 +2964,11 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
         effective=basis,
         source="user" if _has_user_value(cfg, "strompreis_basis") else "default",
         severity="warning" if basis <= 0.0 or octopus_bad_order else "ok",
-        message="Normalpreis wirkt unplausibel." if basis <= 0.0 else ("Octopus-Heat-Preise sollten günstig < normal < Hochpreis sein." if octopus_bad_order else "Preisfeld ist plausibel."),
+        message=(f'Der Normalpreis von {basis:g} ct/kWh ist nicht positiv; die Preisbewertung kann dadurch unplausibel werden. Im Config-Editor unter „Tarif & Strompreise“ das Feld „Normal (HT)“ beziehungsweise „Arbeitspreis“ prüfen.' if basis <= 0.0 else f'Die Tarifpreise günstig {cheap:g}, normal {basis:g} und teuer {uht:g} ct/kWh sind nicht aufsteigend; die Preisbewertung passt dadurch nicht. Im Config-Editor unter „Tarif & Strompreise“ die Felder „Günstig (LT)“, „Normal (HT)“ und „Teuer (UHT)“ prüfen.' if octopus_bad_order else 'Preisfeld ist plausibel.') if ('warning' if basis <= 0.0 or octopus_bad_order else 'ok') in ("warning", "error") else ('Normalpreis wirkt unplausibel.' if basis <= 0.0 else 'Octopus-Heat-Preise sollten günstig < normal < Hochpreis sein.' if octopus_bad_order else 'Preisfeld ist plausibel.'),
     )
     price["strompreis_uht"] = _entry(
         key="strompreis_uht",
-        label="Hochpreis",
+        label='Teuer (UHT)',
         unit="ct/kWh",
         configured=uht if _has_user_value(cfg, "strompreis_uht") else None,
         live_value=None,
@@ -3146,17 +2977,16 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
         source="user" if _has_user_value(cfg, "strompreis_uht") else "default",
         severity="warning" if octopus_bad_order else "ok",
         message=(
-            "Octopus-Heat-Preise sollten günstig < normal < Hochpreis sein."
-            if octopus_bad_order else "Preisfeld ist plausibel."
+            (f'Die Tarifpreise günstig {cheap:g}, normal {basis:g} und teuer {uht:g} ct/kWh sind nicht aufsteigend; die Zuordnung günstiger und teurer Zeiten passt dadurch nicht. Im Config-Editor unter „Tarif & Strompreise“ die Felder „Günstig (LT)“, „Normal (HT)“ und „Teuer (UHT)“ prüfen.' if octopus_bad_order else 'Preisfeld ist plausibel.') if ('warning' if octopus_bad_order else 'ok') in ("warning", "error") else ('Octopus-Heat-Preise sollten günstig < normal < Hochpreis sein.' if octopus_bad_order else 'Preisfeld ist plausibel.')
         ),
     )
     fixed_stages = recurring_tariff_stages(cfg)
     if fixed_stages is not None and not fixed_stages["valid"]:
         if tariff == "octopus_heat":
             field_labels = {
-                "strompreis_basis": "Arbeitspreis (ct/kWh)",
+                "strompreis_basis": "Normal (HT)",
                 "strompreis_cheap": "Günstig (LT)",
-                "strompreis_uht": "Extrem Teuer (UHT)",
+                "strompreis_uht": "Teuer (UHT)",
             }
             for key, label in field_labels.items():
                 raw = cfg.get(key)
@@ -3171,7 +3001,7 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
                     key=key, label=label, unit="ct/kWh", configured=raw,
                     live_value=None, live_key=None, effective=None, source="invalid",
                     severity="warning",
-                    message=f"{label}: {reason}. Preis-Netzladen erhält ohne vollständige Octopus-Stufen keine Freigabe. Die Eingabe bleibt erhalten.",
+                    message=f'Die Octopus-Tarifstufen sind unvollständig oder ungültig; preisabhängiges Netzladen erhält keine Freigabe. Im Config-Editor unter „Tarif & Strompreise“ das Feld „{label}“ prüfen.',
                 )
         else:
             reason = {
@@ -3182,7 +3012,7 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
                 key="strompreis_spezial", label="Spezialtarif-Zeitpreise", unit="ct/kWh",
                 configured=cfg.get("strompreis_spezial"), live_value=None, live_key=None,
                 effective=None, source="invalid", severity="warning",
-                message=f"Spezialtarif-Zeitpreise: {reason}. Preis-Netzladen erhält keine Freigabe. Format beispielsweise 00:00 16,71 und 05:00 26,7. Die Eingabe bleibt erhalten.",
+                message=f'Die Zeitpreise des Spezialtarifs sind unvollständig oder ungültig; preisabhängiges Netzladen erhält keine Freigabe. Im Config-Editor unter „Tarif & Strompreise“ das Feld „Spezialtarif-Zeitpreise“ prüfen.',
             )
     price_order_warning = price_limit > price_pause
     heat_price_pilot_ready = bool(
@@ -3198,7 +3028,7 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
     )
     price["price_boost_enable"] = _entry(
         key="price_boost_enable",
-        label="Experimenteller Wärmepumpen-Netzboost",
+        label='Zusätzliches Wärmepumpenheizen bei Negativpreisen (experimentell)',
         unit="-",
         configured=(
             cfg.get("price_boost_enable")
@@ -3213,23 +3043,12 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
         )),
         severity="warning" if heat_price_boost_requested else "ok",
         message=(
-            "Aus: Der experimentelle Wärmepumpen-Netzboost ist nicht freigegeben."
-            if not heat_price_boost_requested else (
-                "Experimenteller Testbetrieb freigegeben: Eine Luxtronik darf bei "
-                "einem bestätigten Negativpreisfenster, Wärmebedarf und aktueller "
-                "Speicherzusage boosten. Die Konfiguration bestätigt keinen laufenden "
-                "Boost. Allgemeine günstige Preisfenster bleiben ohne Steuerwirkung."
-                if heat_price_pilot_ready else
-                "Experimenteller Testbetrieb gesperrt: Benötigt Luxtronik mit Automatik, "
-                "gemeinsame Wärmeplanung, echten Börsentarif, beide Negativpreisfreigaben "
-                "sowie eine aktuelle Speicherzusage. Allgemeine günstige "
-                "Preisfenster bleiben ohne Steuerwirkung."
-            )
+            ('Aus: Der experimentelle Wärmepumpen-Netzboost ist nicht freigegeben.' if not heat_price_boost_requested else 'Der experimentelle Testbetrieb ist freigegeben; eine Luxtronik darf bei negativem Abrechnungspreis, Wärmebedarf und aktueller Speicherzusage zusätzlich heizen, eine laufende Heizung ist damit nicht bestätigt. Im Config-Editor unter „Smart Home & Verbrauchsprognose“ den Block „Negativpreis-Netzboost“ nur für Tests eingeschaltet lassen.' if heat_price_pilot_ready else 'Der experimentelle Testbetrieb ist angefordert, aber Voraussetzungen fehlen; zusätzliche Wärmepumpenheizung bei Negativpreis bleibt aus. Im Config-Editor unter „Smart Home & Verbrauchsprognose“ den Block „Negativpreis-Netzboost“ sowie Luxtronik, Automatik, gemeinsame Wärmeplanung, Börsentarif und beide Negativpreisfreigaben prüfen; zusätzlich ist eine aktuelle Speicherzusage nötig.') if ('warning' if heat_price_boost_requested else 'ok') in ("warning", "error") else ('Aus: Der experimentelle Wärmepumpen-Netzboost ist nicht freigegeben.' if not heat_price_boost_requested else 'Experimenteller Testbetrieb freigegeben: Eine Luxtronik darf bei einem bestätigten Negativpreisfenster, Wärmebedarf und aktueller Speicherzusage boosten. Die Konfiguration bestätigt keinen laufenden Boost. Allgemeine günstige Preisfenster bleiben ohne Steuerwirkung.' if heat_price_pilot_ready else 'Experimenteller Testbetrieb gesperrt: Benötigt Luxtronik mit Automatik, gemeinsame Wärmeplanung, echten Börsentarif, beide Negativpreisfreigaben sowie eine aktuelle Speicherzusage. Allgemeine günstige Preisfenster bleiben ohne Steuerwirkung.')
         ),
     )
     price["heat_price_boost_scope"] = _entry(
         key="heat_price_boost_scope",
-        label="Wärmepumpen-Preisverschiebung Ziel",
+        label='Wärmeziel',
         unit="-",
         configured=(
             cfg.get("heat_price_boost_scope")
@@ -3250,12 +3069,7 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
             else "ok"
         ),
         message=(
-            "Ungültiges Wärmeziel; Tarif- und Negativpreis-Boost sind gesperrt."
-            if not heat_price_scope_valid
-            else (
-                "Zielauswahl ist plausibel; sie erzeugt ohne vollständigen "
-                "Intent-Vertrag keinen Aktorbefehl."
-            )
+            ('Das Wärmeziel ist ungültig; zusätzliches Heizen nach Tarif oder Negativpreis bleibt aus. Im Config-Editor unter „Smart Home & Verbrauchsprognose“ das Feld „Wärmeziel“ prüfen.' if not heat_price_scope_valid else 'Zielauswahl ist plausibel; sie erzeugt ohne vollständigen Intent-Vertrag keinen Aktorbefehl.') if ('warning' if heat_price_boost_requested and (not heat_price_scope_valid) else 'ok') in ("warning", "error") else ('Ungültiges Wärmeziel; Tarif- und Negativpreis-Boost sind gesperrt.' if not heat_price_scope_valid else 'Zielauswahl ist plausibel; sie erzeugt ohne vollständigen Intent-Vertrag keinen Aktorbefehl.')
         ),
     )
     price["heat_price_boost_windows"] = _entry(
@@ -3279,25 +3093,25 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
         message="Gespeicherte Altfenster sind ohne Wirkung auf den Negativpreis-Boost.",
     )
     for key, label, value in (
-        ("price_limit", "Boost-Preislimit", price_limit),
-        ("price_pause_limit", "Sperr-Preislimit", price_pause),
-        ("cheap_grid_price_limit_ct", "Speicher-Netzladen Preislimit", cheap_grid_limit),
+        ("price_limit", 'Preis-Limit', price_limit),
+        ("price_pause_limit", 'Sperr-Limit', price_pause),
+        ("cheap_grid_price_limit_ct", 'Preisgrenze (Legacy)', cheap_grid_limit),
     ):
         enabled = key != "cheap_grid_price_limit_ct" or cheap_grid_enabled
         severity = "ok"
         message = "Preislimit ist plausibel."
         if key != "cheap_grid_price_limit_ct" and enabled and value < 0.0:
             severity = "warning"
-            message = "Preislimit sollte nicht negativ sein."
+            message = f'Das Preislimit von {value:g} ct/kWh ist negativ; es liegt unter dem erwarteten Bereich. Im Config-Editor unter „Smart Home & Verbrauchsprognose“ das Feld „{label}“ prüfen.'
         elif key in {"price_limit", "price_pause_limit"} and price_order_warning:
             severity = "warning"
-            message = "Das Boost-Preislimit liegt über dem Sperr-Preislimit; bitte die Reihenfolge prüfen."
+            message = f'Das Heizpreislimit von {price_limit:g} ct/kWh liegt über dem Sperrpreis von {price_pause:g} ct/kWh; die Preisgrenzen widersprechen einander. Im Config-Editor unter „Smart Home & Verbrauchsprognose“ das Feld „{label}“ prüfen.'
         elif key == "cheap_grid_price_limit_ct" and cheap_grid_enabled and not cheap_grid_supported:
             severity = "warning"
-            message = "Negativpreis-Freigaben sind nur bei echten Börsenpreistarifen wirksam."
+            message = f'Der gewählte Tarif liefert keine echten Börsenpreise; die Negativpreisfreigabe bleibt ohne Wirkung. Im Config-Editor unter „Tarif & Strompreise“ das Feld „{label}“ prüfen.'
         elif key == "cheap_grid_price_limit_ct" and enabled and value > 0.0:
             severity = "warning"
-            message = "Positive Werte öffnen keinen Günstigpreis-Pfad; der Sonderpfad bleibt strikt auf negative Abrechnungspreise begrenzt."
+            message = f'Das positive Preislimit von {value:g} ct/kWh erlaubt keine Ladung zu günstigen positiven Preisen; zusätzliche Ladung bleibt auf negative Abrechnungspreise begrenzt. Im Config-Editor unter „Tarif & Strompreise“ das Feld „{label}“ prüfen.'
         elif key == "cheap_grid_price_limit_ct" and enabled:
             message = "0 ct/kWh bedeutet: nur bei tatsächlich negativem Abrechnungspreis; ein negativer Wert verschärft die Grenze."
         price[key] = _entry(
@@ -3339,23 +3153,23 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
             severity = "warning"
             if not math.isfinite(value):
                 effective = None
-                message = "Keine endliche Zahl; wirksamer Wert nicht verfügbar. Eingabe bleibt gespeichert."
+                message = f'Die Eingabe ist keine endliche Zahl; ein wirksamer Wert steht nicht zur Verfügung. Im Config-Editor unter „Tarif & Strompreise“ das Feld „{label}“ prüfen.'
             else:
-                message = "Keine gültige Zahl; die Planung verwendet den Standard %s %s. Eingabe bleibt gespeichert." % (_fmt_de(default, 2), unit)
+                message = f'Die Eingabe ist unlesbar; die Planung verwendet {default:g} {unit}. Im Config-Editor unter „Tarif & Strompreise“ das Feld „{label}“ prüfen.'
         elif value < low or (high is not None and value > high):
             severity = "warning"
-            message = "Wert außerhalb des sinnvollen Bereichs; die Planung begrenzt ihn auf %s %s. Eingabe bleibt gespeichert." % (_fmt_de(effective, 2), unit)
+            message = f'Die Eingabe liegt außerhalb des gültigen Bereichs; die Planung verwendet {effective:g} {unit}. Im Config-Editor unter „Tarif & Strompreise“ das Feld „{label}“ prüfen.'
         elif key == "market_roundtrip_efficiency_pct" and value < 50.0:
             severity = "warning"
-            message = "Sehr niedriger Speicher-Wirkungsgrad: Netzladen benötigt einen großen späteren Preisabstand."
+            message = f'Der Speicherwirkungsgrad von {value:g} % ist sehr niedrig; Netzladen lohnt erst bei großem späterem Preisabstand. Im Config-Editor unter „Tarif & Strompreise“ das Feld „{label}“ prüfen.'
         elif key == "market_degradation_ct_per_kwh" and value > 20.0:
             severity = "warning"
-            message = "Hoher Akkuverschleiß-Aufschlag: wirtschaftliches Netzladen wird selten lohnend."
+            message = f'Der Verschleißaufschlag von {value:g} ct/kWh ist hoch; wirtschaftliches Netzladen lohnt sich selten. Im Config-Editor unter „Tarif & Strompreise“ das Feld „{label}“ prüfen.'
         elif key == "market_grid_charge_min_job_wh" and value > capacity_effective * 1000.0:
             severity = "warning"
-            message = "Mindestmenge größer als die Speicherkapazität: kleine Netzladeaufträge werden voraussichtlich vollständig unterdrückt."
+            message = f'Die Mindestlademenge von {value:g} Wh ist größer als die Speicherkapazität; kleinere Netzladungen werden voraussichtlich ganz unterdrückt. Im Config-Editor unter „Tarif & Strompreise“ das Feld „{label}“ prüfen.'
         if key in ("market_grid_charge_min_job_wh", "market_grid_charge_min_job_pct"):
-            message += " Standard: 5 % der nutzbaren Kapazität ohne festen Sockel (Wh-Wert 0). Mindestmenge = max(Wh-Wert, Kapazität × Prozent/100), bezogen auf die Netzenergie je Auftrag. Nur beide Werte 0 heben das Minimum auf."
+            message += '' if severity == 'warning' else ' Standard: 5 % der nutzbaren Kapazität ohne festen Sockel (Wh-Wert 0). Mindestmenge = max(Wh-Wert, Kapazität × Prozent/100), bezogen auf die Netzenergie je Auftrag. Nur beide Werte 0 heben das Minimum auf.'
         price[key] = _entry(
             key=key, label=label, unit=unit,
             configured=cfg.get(key) if _has_user_value(cfg, key) else None,
@@ -3366,7 +3180,7 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
     # Ladeprofil und Komfort-Preislimit bewerten (vor Marge/Sicherheit).
     price["market_charge_profile"] = _entry(
         key="market_charge_profile",
-        label="Ladeprofil Speicher-Netzladen",
+        label='Ladeprofil',
         unit="-",
         configured=cfg.get("market_charge_profile") if _has_user_value(cfg, "market_charge_profile") else None,
         live_value=None,
@@ -3378,17 +3192,7 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
         ),
         severity="warning" if market_profile_unknown else "ok",
         message=(
-            "Unbekanntes Ladeprofil, es gilt Wirtschaftlich."
-            if market_profile_unknown
-            else (
-                "Profil %s: Marge %s %%, Sicherheitskorrektur %s ct/kWh%s."
-                % (
-                    _market_profile_label(market_profile_name),
-                    _fmt_de(safe_float(market_profile.get("min_margin_pct"), 0.0), 1),
-                    _fmt_de(safe_float(market_profile.get("safety_ct"), 0.0), 2),
-                    (", Netzladen im Preisfenster bis zum Zielstand am Fensterende (PV zuerst)" if market_profile_comfort else ""),
-                )
-            )
+            ('Das Ladeprofil ist unbekannt; verwendet wird „Wirtschaftlich“. Im Config-Editor unter „Tarif & Strompreise“ das Feld „Ladeprofil“ prüfen.' if market_profile_unknown else 'Profil %s: Marge %s %%, Sicherheitskorrektur %s ct/kWh%s.' % (_market_profile_label(market_profile_name), _fmt_de(safe_float(market_profile.get('min_margin_pct'), 0.0), 1), _fmt_de(safe_float(market_profile.get('safety_ct'), 0.0), 2), ', Netzladen im Preisfenster bis zum Zielstand am Fensterende (PV zuerst)' if market_profile_comfort else '')) if ('warning' if market_profile_unknown else 'ok') in ("warning", "error") else ('Unbekanntes Ladeprofil, es gilt Wirtschaftlich.' if market_profile_unknown else 'Profil %s: Marge %s %%, Sicherheitskorrektur %s ct/kWh%s.' % (_market_profile_label(market_profile_name), _fmt_de(safe_float(market_profile.get('min_margin_pct'), 0.0), 1), _fmt_de(safe_float(market_profile.get('safety_ct'), 0.0), 2), ', Netzladen im Preisfenster bis zum Zielstand am Fensterende (PV zuerst)' if market_profile_comfort else ''))
         ),
     )
     if market_profile_comfort:
@@ -3408,13 +3212,13 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
                     limit_message = "Preisfenster gilt erst mit gültigem Tagesplan (Spezialtarif-Zeitpreise)."
                 if tariff_prices and market_price_limit + 0.001 < min(tariff_prices):
                     limit_severity = "warning"
-                    limit_message = "Komfort lädt nie: Limit %s ct liegt unter dem günstigsten Tarifpreis %s ct." % (_fmt_de(market_price_limit, 1), _fmt_de(min(tariff_prices), 2))
+                    limit_message = f'Das Komfortprofil lädt nie, weil das Limit von {market_price_limit:g} ct/kWh unter dem günstigsten Tarifpreis liegt. Im Config-Editor unter „Tarif & Strompreise“ das Feld „Komfort-Preislimit“ prüfen.'
                 elif tariff == "octopus_heat" and market_price_limit + 0.001 >= basis:
                     limit_severity = "warning"
-                    limit_message = "Komfort lädt auch zu Normalpreis-Stunden (Limit %s ≥ Basis %s ct)." % (_fmt_de(market_price_limit, 1), _fmt_de(basis, 2))
+                    limit_message = f'Das Limit von {market_price_limit:g} ct/kWh erlaubt im Komfortprofil auch Laden zum Normalpreis. Im Config-Editor unter „Tarif & Strompreise“ das Feld „Komfort-Preislimit“ prüfen.'
                 elif tariff != "octopus_heat" and tariff_prices and market_price_limit + 0.001 >= max(tariff_prices):
                     limit_severity = "warning"
-                    limit_message = "Komfort lädt zu allen Tarifzeiten (Limit %s ≥ höchster Tarifpreis %s ct)." % (_fmt_de(market_price_limit, 1), _fmt_de(max(tariff_prices), 2))
+                    limit_message = f'Das Limit von {market_price_limit:g} ct/kWh erlaubt im Komfortprofil Laden zu allen Tarifzeiten. Im Config-Editor unter „Tarif & Strompreise“ das Feld „Komfort-Preislimit“ prüfen.'
             else:
                 limit_message = "Fester Wert %s ct/kWh; ohne Wert gilt der Mittelpreis des gebundenen Preishorizonts." % _fmt_de(market_price_limit, 1)
         else:
@@ -3433,12 +3237,12 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
         )
         if not _is_enabled(cfg, "market_battery_grid_charge_enable"):
             price["market_charge_profile"]["severity"] = "warning"
-            price["market_charge_profile"]["message"] = "Komfort-Profil ohne Speicher-Netzladen-Freigabe bleibt wirkungslos (Speicher-Netzladen einschalten)."
+            price["market_charge_profile"]["message"] = f'Das Komfortprofil ist gewählt, aber Speicher-Netzladen ist aus; das Profil bewirkt keine Netzladung. Im Config-Editor unter „Tarif & Strompreise“ das Feld „Speicher-Netzladen“ prüfen.'
     for key, label, value, unit, low, high in (
         ("market_min_margin_pct", "Preis-Mindestmarge", market_min_margin, "%", 0.0, None),
         ("market_safety_correction_ct_per_kwh", "Preis-Sicherheitskorrektur", market_safety_correction, "ct/kWh", -10.0, 50.0),
-        ("market_autarky_low_soc_pct", "PV-autark Low-SOC-Ausnahme", market_autarky_low_soc, "%", 0.0, 100.0),
-        ("market_autarky_horizon_buffer_wh", "PV-autark Horizontpuffer", market_autarky_buffer_wh, "Wh", 0.0, None),
+        ("market_autarky_low_soc_pct", 'Low-SOC-Ausnahme', market_autarky_low_soc, "%", 0.0, 100.0),
+        ("market_autarky_horizon_buffer_wh", 'Autarkie-Puffer', market_autarky_buffer_wh, "Wh", 0.0, None),
     ):
         configured = cfg.get(key) if _has_user_value(cfg, key) else None
         source = (
@@ -3460,40 +3264,36 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
         message = "Wert ist plausibel."
         if low is not None and value < low:
             severity = "warning"
-            message = "Wert liegt unter der erlaubten Untergrenze."
+            message = f'Der Wert von {value:g} {unit} liegt unter der Untergrenze von {low:g} {unit}. Im Config-Editor unter „Tarif & Strompreise“ das Feld „{label}“ prüfen.'
         elif high is not None and value > high:
             severity = "warning"
-            message = "Wert liegt über der erlaubten Obergrenze."
+            message = f'Der Wert von {value:g} {unit} liegt über der Obergrenze von {high:g} {unit}. Im Config-Editor unter „Tarif & Strompreise“ das Feld „{label}“ prüfen.'
         # Profilbewusst – bei economic/balanced/comfort setzt das Profil Marge und
         # Sicherheitskorrektur; abweichende Schlüsselwerte werden nicht verwendet (Warnung, kein Fehler).
         elif key == "market_min_margin_pct" and not market_profile_custom and abs(value - safe_float(market_profile.get("min_margin_pct"), 10.0)) > 0.05:
             severity = "warning"
             message = (
-                "Mindestmarge %s %% wird im Profil %s nicht verwendet (das Profil setzt %s %%). "
-                "Für eigene Werte „Eigene Einstellungen“ wählen."
-                % (_fmt_de(value, 1), _market_profile_label(market_profile_name), _fmt_de(safe_float(market_profile.get("min_margin_pct"), 10.0), 0))
+                f'Die eingetragene Mindestmarge von {value:g} % wird durch das Ladeprofil ersetzt; wirksam sind {safe_float(market_profile.get("min_margin_pct"),10):g} %. Im Config-Editor unter „Tarif & Strompreise“ das Feld „{label}“ prüfen.'
             )
         elif key == "market_safety_correction_ct_per_kwh" and not market_profile_custom and abs(value) > 0.005:
             severity = "warning"
             message = (
-                "Sicherheitskorrektur %s ct wird im Profil %s nicht verwendet (das Profil setzt 0). "
-                "Meintest Du Profil Ausgeglichen oder Komfort? Für eigene Werte „Eigene Einstellungen“ wählen."
-                % (_fmt_de(value, 2), _market_profile_label(market_profile_name))
+                f'Die eingetragene Preiskorrektur von {value:g} ct/kWh wird durch das Ladeprofil ersetzt; wirksam ist 0 ct/kWh. Im Config-Editor unter „Tarif & Strompreise“ das Feld „{label}“ prüfen.'
             )
         elif key == "market_min_margin_pct" and market_profile_custom and value < 10.0:
             severity = "warning"
-            message = "Mindestmarge unter 10 Prozent; preisbasierte Speicherladung wird aggressiver."
+            message = f'Die Mindestmarge von {value:g} % liegt unter 10 %; der Speicher lädt schon bei kleineren erwarteten Preisvorteilen aus dem Netz. Im Config-Editor unter „Tarif & Strompreise“ das Feld „{label}“ prüfen.'
         elif key == "market_safety_correction_ct_per_kwh" and market_profile_custom and value < 0.0:
             message = "Negative Korrektur macht die Preisregelung aggressiver; Mindestmarge bleibt als Schutz aktiv."
         elif key == "market_autarky_low_soc_pct" and value < 15.0:
             severity = "warning"
-            message = "Low-SOC-Ausnahme unter 15 Prozent lässt Markt-Netzladen erst sehr spät wieder zu."
+            message = f'Die Ausnahmegrenze von {value:g} % liegt unter 15 %; Netzladen wird bei niedrigem Speicherstand erst sehr spät wieder zugelassen. Im Config-Editor unter „Tarif & Strompreise“ das Feld „{label}“ prüfen.'
         elif key == "market_autarky_horizon_buffer_wh" and value > 5000.0:
             severity = "warning"
-            message = "Sehr hoher Autarkie-Puffer kann Netzladen trotz eigentlich ausreichender Tagesprognose wieder erlauben."
+            message = f'Der zusätzliche Energiepuffer von {value:g} Wh ist sehr hoch; Netzladen kann trotz ausreichender Tagesprognose erlaubt werden. Im Config-Editor unter „Tarif & Strompreise“ das Feld „{label}“ prüfen.'
         price[key] = _entry(
             key=key,
-            label=label,
+            label={'market_autarky_low_soc_pct': 'Ausnahme bei niedrigem Speicherstand'}.get(key, label),
             unit=unit,
             configured=configured,
             live_value=None,
@@ -3540,7 +3340,7 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
             user_enabled = _is_enabled(cfg, key) if _has_user_value(cfg, key) else False
             price[key] = _entry(
                 key=key,
-                label=label,
+                label={'market_heatpump_enable': 'Alte Freigabe für preisabhängige Wärmepumpenheizung'}.get(key, label),
                 unit="-",
                 configured=configured,
                 live_value=None,
@@ -3549,10 +3349,7 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
                 source="legacy_ignored" if _has_user_value(cfg, key) else "default",
                 severity="warning" if user_enabled else "ok",
                 message=(
-                    "Der normale Marktpfad steuert Wärmepumpen nicht mehr. "
-                    "Wärmepumpen laufen über PV-/Forecast-Budget, Pre-Dump oder den separaten Negativpreis-Boost."
-                    if user_enabled
-                    else "Normale Marktpfad-Freigabe für Wärmepumpen ist aus."
+                    ('Die alte Wärmepumpenfreigabe wird nicht mehr ausgewertet und bewirkt keine preisabhängige Wärmepumpensteuerung. Im Config-Editor unter „Smart Home & Verbrauchsprognose“ den Abschnitt „Luxtronik: PV-Automatik und Wolkenüberbrückung“ oder für Negativpreise das Feld „Experimentellen Netzboost aktivieren“ verwenden.' if user_enabled else 'Normale Marktpfad-Freigabe für Wärmepumpen ist aus.') if ('warning' if user_enabled else 'ok') in ("warning", "error") else ('Der normale Marktpfad steuert Wärmepumpen nicht mehr. Wärmepumpen laufen über PV-/Forecast-Budget, Pre-Dump oder den separaten Negativpreis-Boost.' if user_enabled else 'Normale Marktpfad-Freigabe für Wärmepumpen ist aus.')
                 ),
             )
             continue
@@ -3568,7 +3365,7 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
             source = "grid_charge_includes_hold"
         price[key] = _entry(
             key=key,
-            label=label,
+            label={'market_heatpump_enable': 'Alte Freigabe für preisabhängige Wärmepumpenheizung'}.get(key, label),
             unit="-",
             configured=configured,
             live_value=None,
@@ -3595,7 +3392,7 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
             effective=False,
             source="legacy_ignored",
             severity="warning",
-            message="Alt-Schalter wird für normales Prognose-Netzladen und Speicher-Halten nicht mehr ausgewertet.",
+            message='Die alte Einstellung wird nicht mehr ausgewertet; sie schaltet weder Netzladen noch Speicherhalten ein. Im Config-Editor unter „Tarif & Strompreise“ die Nachfolgefelder „Speicher-Netzladen“ und „Speicher halten“ verwenden.',
         )
 
     heat_policy_runtime = _is_enabled(cfg, "heat_policy_runtime_enable")
@@ -3615,7 +3412,7 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
 
     price["heat_policy_runtime_enable"] = _entry(
         key="heat_policy_runtime_enable",
-        label="Central Heat Policy Runtime",
+        label='Gemeinsame Wärmeplanung (experimentell)',
         unit="-",
         configured=cfg.get("heat_policy_runtime_enable") if _has_user_value(cfg, "heat_policy_runtime_enable") else None,
         live_value=None,
@@ -3624,15 +3421,12 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
         source="user" if _has_user_value(cfg, "heat_policy_runtime_enable") else "default",
         severity="warning" if heat_policy_runtime else "ok",
         message=(
-            "Pilot aktiv: zentrale Wärme-Policy darf WP-Starts und Heizstab-Netzboost begrenzen. "
-            "Dieser Schalter allein aktiviert keinen Wärmepumpen-Preis-Boost."
-            if heat_policy_runtime
-            else "Shadow-Betrieb: zentrale Wärme-Policy schreibt Diagnose, bestehende Logik bleibt führend; der Wärmepumpen-Preis-Boost bleibt effektiv aus."
+            ('Die experimentelle gemeinsame Wärmeplanung ist eingeschaltet und darf Wärmepumpenstarts und zusätzliches Heizstabheizen mit Netzstrom begrenzen; sie aktiviert allein kein preisabhängiges Wärmepumpenheizen. Im Config-Editor unter „Smart Home & Verbrauchsprognose“ im Block „Wärme in die Gesamtplanung einbeziehen“ das Feld „Aktiv nutzen“ nur zum Testen eingeschaltet lassen.' if heat_policy_runtime else 'Shadow-Betrieb: zentrale Wärme-Policy schreibt Diagnose, bestehende Logik bleibt führend; der Wärmepumpen-Preis-Boost bleibt effektiv aus.') if ('warning' if heat_policy_runtime else 'ok') in ("warning", "error") else ('Pilot aktiv: zentrale Wärme-Policy darf WP-Starts und Heizstab-Netzboost begrenzen. Dieser Schalter allein aktiviert keinen Wärmepumpen-Preis-Boost.' if heat_policy_runtime else 'Shadow-Betrieb: zentrale Wärme-Policy schreibt Diagnose, bestehende Logik bleibt führend; der Wärmepumpen-Preis-Boost bleibt effektiv aus.')
         ),
     )
     price["ems_budget_runtime_enable"] = _entry(
         key="ems_budget_runtime_enable",
-        label="EMS-Budget-Runtime",
+        label='Gemeinsame Verbraucherleistung (experimentell)',
         unit="-",
         configured=cfg.get("ems_budget_runtime_enable") if _has_user_value(cfg, "ems_budget_runtime_enable") else None,
         live_value=None,
@@ -3641,14 +3435,12 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
         source="user" if _has_user_value(cfg, "ems_budget_runtime_enable") else "default",
         severity="warning" if ems_budget_runtime else "ok",
         message=(
-            "Pilot aktiv: produktive Verbraucherbudgets werden nur noch nach zentralem Budget-Latch und gültigem Ack freigegeben; bei Datenverlust fällt das System auf AUTO-Freilauf zurück."
-            if ems_budget_runtime
-            else "Shadow-Betrieb: Budget-Arbitration wird diagnostiziert, greift aber nicht produktiv in Verbraucherbudgets ein."
+            ('Die experimentelle gemeinsame Leistungsverteilung ist eingeschaltet; zusätzliche Verbraucherleistung benötigt eine aktuelle bestätigte Gesamtplanung, bei Datenverlust entfällt diese zusätzliche Freigabe. Im Config-Editor unter „Tarif & Strompreise“ im Block „Gemeinsame Verbraucherbudgets“ das Feld „Aktiv nutzen“ nur zum Testen eingeschaltet lassen.' if ems_budget_runtime else 'Shadow-Betrieb: Budget-Arbitration wird diagnostiziert, greift aber nicht produktiv in Verbraucherbudgets ein.') if ('warning' if ems_budget_runtime else 'ok') in ("warning", "error") else ('Pilot aktiv: produktive Verbraucherbudgets werden nur noch nach zentralem Budget-Latch und gültigem Ack freigegeben; bei Datenverlust fällt das System auf AUTO-Freilauf zurück.' if ems_budget_runtime else 'Shadow-Betrieb: Budget-Arbitration wird diagnostiziert, greift aber nicht produktiv in Verbraucherbudgets ein.')
         ),
     )
     price["heat_heater_grid_boost_enable"] = _entry(
         key="heat_heater_grid_boost_enable",
-        label="Heizstab-Netzboost",
+        label='Zusätzliches Heizstabheizen mit Netzstrom',
         unit="-",
         configured=cfg.get("heat_heater_grid_boost_enable") if _has_user_value(cfg, "heat_heater_grid_boost_enable") else None,
         live_value=None,
@@ -3657,14 +3449,12 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
         source="user" if _has_user_value(cfg, "heat_heater_grid_boost_enable") else "default",
         severity="warning" if heater_grid_boost else "ok",
         message=(
-            "Heizstab-Netzboost ist freigegeben; COP=1 nur mit Preislimit, Defizit und Temperaturgrenzen sinnvoll."
-            if heater_grid_boost
-            else "Heizstab-Netzboost ist aus."
+            ('Zusätzliches Heizstabheizen mit Netzstrom ist freigegeben; eine Kilowattstunde Strom liefert dabei nur etwa eine Kilowattstunde Wärme. Im Config-Editor unter „Tarif & Strompreise“ das Feld „Heizstab-Netzboost prüfen“ nur bei bewusst gewünschten Kosten und passenden Preis-, Bedarfs- und Temperaturgrenzen eingeschaltet lassen.' if heater_grid_boost else 'Heizstab-Netzboost ist aus.') if ('warning' if heater_grid_boost else 'ok') in ("warning", "error") else ('Heizstab-Netzboost ist freigegeben; COP=1 nur mit Preislimit, Defizit und Temperaturgrenzen sinnvoll.' if heater_grid_boost else 'Heizstab-Netzboost ist aus.')
         ),
     )
     price["heat_heater_grid_boost_ack"] = _entry(
         key="heat_heater_grid_boost_ack",
-        label="Heizstab COP=1 bestätigt",
+        label='COP=1-Warnung verstanden',
         unit="-",
         configured=cfg.get("heat_heater_grid_boost_ack") if _has_user_value(cfg, "heat_heater_grid_boost_ack") else None,
         live_value=None,
@@ -3673,14 +3463,12 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
         source="user" if _has_user_value(cfg, "heat_heater_grid_boost_ack") else "default",
         severity="warning" if heater_grid_boost and not heater_grid_ack else "ok",
         message=(
-            "COP=1-Warnung nicht bestätigt; die Policy blockiert Heizstab-Netzboost."
-            if heater_grid_boost and not heater_grid_ack
-            else "COP=1-Warnung bestätigt." if heater_grid_ack else "Keine Bestätigung nötig, solange Heizstab-Netzboost aus ist."
+            ('Die Kostenwarnung ist nicht bestätigt; zusätzliches Heizstabheizen mit Netzstrom bleibt gesperrt. Im Config-Editor unter „Tarif & Strompreise“ das Feld „COP=1-Warnung verstanden“ nur nach Prüfung der Kosten bestätigen.' if heater_grid_boost and (not heater_grid_ack) else 'COP=1-Warnung bestätigt.' if heater_grid_ack else 'Keine Bestätigung nötig, solange Heizstab-Netzboost aus ist.') if ('warning' if heater_grid_boost and (not heater_grid_ack) else 'ok') in ("warning", "error") else ('COP=1-Warnung nicht bestätigt; die Policy blockiert Heizstab-Netzboost.' if heater_grid_boost and (not heater_grid_ack) else 'COP=1-Warnung bestätigt.' if heater_grid_ack else 'Keine Bestätigung nötig, solange Heizstab-Netzboost aus ist.')
         ),
     )
     price["heat_heater_grid_boost_requires_deficit"] = _entry(
         key="heat_heater_grid_boost_requires_deficit",
-        label="Heizstab nur Prognose-Defizit",
+        label='Heizstab auf fehlenden Wärmebedarf begrenzen',
         unit="-",
         configured=cfg.get("heat_heater_grid_boost_requires_deficit") if _has_user_value(cfg, "heat_heater_grid_boost_requires_deficit") else None,
         live_value=None,
@@ -3689,38 +3477,36 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
         source="user" if _has_user_value(cfg, "heat_heater_grid_boost_requires_deficit") else "default",
         severity="ok" if heater_requires_deficit else "warning",
         message=(
-            "Heizstab-Netzboost wird auf die berechnete Wärme-Defizitdeckung begrenzt."
-            if heater_requires_deficit
-            else "Defizitbindung ist ausgeschaltet; das ist nur für bewusst freigegebene Sonderfälle sinnvoll."
+            ('Heizstab-Netzboost wird auf die berechnete Wärme-Defizitdeckung begrenzt.' if heater_requires_deficit else 'Die Begrenzung auf den vorhergesagten fehlenden Wärmebedarf ist ausgeschaltet; der Heizstab kann dadurch mehr Netzstrom verbrauchen. Im Config-Editor unter „Tarif & Strompreise“ das Feld „nur Prognose-Defizit“ einschalten oder nur für bewusst gewünschte Sonderfälle ausgeschaltet lassen.') if ('ok' if heater_requires_deficit else 'warning') in ("warning", "error") else ('Heizstab-Netzboost wird auf die berechnete Wärme-Defizitdeckung begrenzt.' if heater_requires_deficit else 'Defizitbindung ist ausgeschaltet; das ist nur für bewusst freigegebene Sonderfälle sinnvoll.')
         ),
     )
     for key, label, value, unit, low, high in (
         ("heat_heater_grid_boost_price_limit_ct", "Heizstab Preislimit", heater_price_limit, "ct/kWh", None, None),
         ("heat_heater_grid_boost_max_w", "Heizstab Netzlimit", heater_grid_max_w, "W", 0.0, None),
-        ("heat_heater_min_temp_c", "Heizstab Mindesttemperatur", heater_min_temp, "°C", 0.0, 95.0),
-        ("heat_heater_max_temp_c", "Heizstab Maximaltemperatur", heater_max_temp, "°C", 0.0, 95.0),
+        ("heat_heater_min_temp_c", 'Boost ab unter', heater_min_temp, "°C", 0.0, 95.0),
+        ("heat_heater_max_temp_c", 'Sperre ab', heater_max_temp, "°C", 0.0, 95.0),
         ("heat_wp_daily_kwh", "Fallback Wärmebedarf", heat_daily_fallback, "kWh/24h", 0.0, 120.0),
     ):
         severity = "ok"
         message = "Wert ist plausibel."
         if low is not None and value < low:
             severity = "warning"
-            message = "Wert liegt unter der erlaubten Untergrenze."
+            message = f'Der Wert von {value:g} {unit} liegt unter der Untergrenze von {low:g} {unit}. Im Config-Editor unter „Tarif & Strompreise“ das Feld „{label}“ prüfen.'
         elif high is not None and value > high:
             severity = "warning"
-            message = "Wert liegt über der erwarteten Obergrenze."
+            message = f'Der Wert von {value:g} {unit} liegt über der Obergrenze von {high:g} {unit}. Im Config-Editor unter „Tarif & Strompreise“ das Feld „{label}“ prüfen.'
         elif key == "heat_heater_grid_boost_price_limit_ct" and heater_grid_boost and value > 0.0:
             severity = "warning"
-            message = "Positives Heizstab-Preislimit: COP=1 kann teurer sein als Wärmepumpe oder späterer PV-Betrieb."
+            message = f'Das Heizstabpreislimit von {value:g} ct/kWh ist positiv; Netzstromwärme kann teurer als Wärmepumpe oder spätere PV-Wärme werden. Im Config-Editor unter „Tarif & Strompreise“ das Feld „{label}“ prüfen.'
         elif key == "heat_heater_grid_boost_max_w" and heater_grid_boost and value <= 0.0:
             severity = "warning"
-            message = "Heizstab-Netzboost ist aktiv, aber das Netzlimit ist 0 W."
+            message = f'Zusätzliches Heizstabheizen mit Netzstrom ist an, aber 0 W Leistungsgrenze lassen keine Netzleistung zu. Im Config-Editor unter „Tarif & Strompreise“ das Feld „{label}“ prüfen.'
         elif key == "heat_heater_max_temp_c" and heater_max_temp <= heater_min_temp:
             severity = "warning"
-            message = "Maximaltemperatur muss über der Mindesttemperatur liegen."
+            message = f'Die Höchsttemperatur von {value:g} °C liegt nicht über der Mindesttemperatur; die Temperaturgrenzen widersprechen einander. Im Config-Editor unter „Tarif & Strompreise“ das Feld „{label}“ prüfen.'
         price[key] = _entry(
             key=key,
-            label=label,
+            label={'heat_wp_daily_kwh': 'Ersatzwert für den täglichen Wärmebedarf'}.get(key, label),
             unit=unit,
             configured=cfg.get(key) if _has_user_value(cfg, key) else None,
             live_value=None,
@@ -3733,7 +3519,7 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
 
     price["price_hard_limit"] = _entry(
         key="price_hard_limit",
-        label="Zwangs-Preislimit",
+        label='Sehr günstig',
         unit="ct/kWh",
         configured=price_hard if _has_user_value(cfg, "price_hard_limit") else None,
         live_value=None,
@@ -3742,8 +3528,7 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
         source="user" if _has_user_value(cfg, "price_hard_limit") else "default",
         severity="warning" if price_hard != -99.0 and price_hard > price_limit else "ok",
         message=(
-            "Zwangs-Limit sollte unter oder gleich dem normalen Preislimit liegen; -99 deaktiviert es."
-            if price_hard != -99.0 and price_hard > price_limit else "Zwangs-Preislimit ist plausibel oder deaktiviert."
+            (f'Das Zwangspreislimit von {price_hard:g} ct/kWh liegt über dem normalen Preislimit von {price_limit:g} ct/kWh; die Preisgrenzen widersprechen einander. Im Config-Editor unter „Smart Home & Verbrauchsprognose“ das Feld „Sehr günstig“ auf höchstens das normale Preislimit setzen oder mit -99 deaktivieren.' if price_hard != -99.0 and price_hard > price_limit else 'Zwangs-Preislimit ist plausibel oder deaktiviert.') if ('warning' if price_hard != -99.0 and price_hard > price_limit else 'ok') in ("warning", "error") else ('Zwangs-Limit sollte unter oder gleich dem normalen Preislimit liegen; -99 deaktiviert es.' if price_hard != -99.0 and price_hard > price_limit else 'Zwangs-Preislimit ist plausibel oder deaktiviert.')
         ),
     )
 
@@ -3919,7 +3704,7 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
     )
     price["direct_marketing_mode"] = _entry(
         key="direct_marketing_mode",
-        label="Direktvermarktungsmodus",
+        label='Direktvermarktungsstrategie',
         unit="-",
         configured=cfg.get("direct_marketing_mode") if _has_user_value(cfg, "direct_marketing_mode") else None,
         live_value=None,
@@ -3927,22 +3712,22 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
         effective=dm_mode,
         source="user" if _has_user_value(cfg, "direct_marketing_mode") else "default",
         severity="warning" if dm_enabled and dm_mode_warning else "ok",
-        message="Unbekannter Modus; Safe wird als konservativer Fallback genutzt." if dm_enabled and dm_mode_warning else "Direktvermarktungsmodus ist plausibel.",
+        message=('Der Direktvermarktungsmodus ist unbekannt; es gilt der vorsichtige Standardmodus. Im Config-Editor unter „Tarif & Strompreise“ das Feld „Strategie“ prüfen.' if dm_enabled and dm_mode_warning else 'Direktvermarktungsmodus ist plausibel.') if ('warning' if dm_enabled and dm_mode_warning else 'ok') in ("warning", "error") else ('Unbekannter Modus; Safe wird als konservativer Fallback genutzt.' if dm_enabled and dm_mode_warning else 'Direktvermarktungsmodus ist plausibel.'),
     )
     dm_profit_profile_severity = "ok"
     dm_profit_profile_message = "Standardprofil berücksichtigt Wirkungsgrad, LCOS und alle Mindestgates."
     if dm_profit_profile_warning:
         dm_profit_profile_severity = "warning"
-        dm_profit_profile_message = "Unbekanntes Profitprofil; Standard wird als wirtschaftlicher Fallback genutzt."
+        dm_profit_profile_message = f'Das Wirtschaftlichkeitsprofil ist unbekannt; verwendet wird das Standardprofil. Im Config-Editor unter „Tarif & Strompreise“ das Feld „Profitprofil“ prüfen.'
     elif dm_profit_profile == "aggressive":
         dm_profit_profile_severity = "warning" if dm_enabled and dm_export_enabled else "ok"
-        dm_profit_profile_message = "Aggressiv erlaubt positive Kleinstgewinne nach Wirkungsgrad und kann zusätzliche Batteriezyklen verursachen."
+        dm_profit_profile_message = f'Das aggressive Profil akzeptiert kleinste Gewinne nach Ladeverlusten und kann zusätzliche Batteriezyklen verursachen. Im Config-Editor unter „Tarif & Strompreise“ das Feld „Profitprofil“ prüfen.'
     elif dm_profit_profile == "expert":
         dm_profit_profile_severity = "warning" if dm_enabled else "ok"
-        dm_profit_profile_message = "Experte umgeht Wirtschaftlichkeitsgates; Notstrom-, Reserve- und Datenqualitätsgrenzen bleiben hart."
+        dm_profit_profile_message = f'Das Expertenprofil überspringt Wirtschaftlichkeitsprüfungen; Reserve- und Datengrenzen bleiben wirksam. Im Config-Editor unter „Tarif & Strompreise“ das Feld „Profitprofil“ prüfen.'
     price["direct_marketing_profit_profile"] = _entry(
         key="direct_marketing_profit_profile",
-        label="DV-Profitprofil",
+        label='Profitprofil',
         unit="-",
         configured=cfg.get("direct_marketing_profit_profile") if _has_user_value(cfg, "direct_marketing_profit_profile") else None,
         live_value=None,
@@ -3954,7 +3739,7 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
     )
     price["direct_marketing_settlement_basis"] = _entry(
         key="direct_marketing_settlement_basis",
-        label="DV-Abrechnungsbasis",
+        label='Abrechnung',
         unit="-",
         configured=(
             cfg.get("direct_marketing_settlement_basis")
@@ -3967,10 +3752,7 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
         source="user" if _has_user_value(cfg, "direct_marketing_settlement_basis") else "default",
         severity="warning" if dm_enabled and not dm_settlement_active_supported else "ok",
         message=(
-            "Aktive DV-Regelung ist derzeit nur mit Day-Ahead-Viertelstundenpreisen freigegeben. "
-            "Die gewählte Basis bleibt reine Analyse und erzeugt keine Steuerbefehle."
-            if dm_enabled and not dm_settlement_active_supported
-            else "Day-Ahead-Viertelstundenpreise sind für die aktive DV-Regelung freigegeben."
+            ('Die gewählte Preisbasis ist nur zur Auswertung verfügbar; aktive Direktvermarktung benötigt die viertelstündlichen Preise des Vortagsmarkts. Im Config-Editor unter „Tarif & Strompreise“ das Feld „Abrechnung“ prüfen.' if dm_enabled and (not dm_settlement_active_supported) else 'Day-Ahead-Viertelstundenpreise sind für die aktive DV-Regelung freigegeben.') if ('warning' if dm_enabled and (not dm_settlement_active_supported) else 'ok') in ("warning", "error") else ('Aktive DV-Regelung ist derzeit nur mit Day-Ahead-Viertelstundenpreisen freigegeben. Die gewählte Basis bleibt reine Analyse und erzeugt keine Steuerbefehle.' if dm_enabled and (not dm_settlement_active_supported) else 'Day-Ahead-Viertelstundenpreise sind für die aktive DV-Regelung freigegeben.')
         ),
     )
     price["direct_marketing_pv_store_enable"] = _entry(
@@ -4017,7 +3799,7 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
     )
     price["direct_marketing_eeg_rate_source"] = _entry(
         key="direct_marketing_eeg_rate_source",
-        label="DV-EEG-Vergütungsquelle",
+        label='Vergütungsquelle',
         unit="-",
         configured=dm_eeg_rate_source if _has_user_value(cfg, "direct_marketing_eeg_rate_source") else None,
         live_value=None,
@@ -4026,26 +3808,12 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
         source="user" if _has_user_value(cfg, "direct_marketing_eeg_rate_source") else "default",
         severity="warning" if dm_eeg_enabled and (eeg_source_invalid or eeg_auto_date_outside or eeg_archive_date_missing or eeg_archive_date_outside) else "ok",
         message=(
-            "Unbekannte EEG-Vergütungsquelle; bitte manuelle Stufen verwenden."
-            if eeg_source_invalid
-            else (
-                "Die aktuelle BNetzA-Tabelle gilt nur für Inbetriebnahmen vom 2026-02-01 bis 2026-07-31."
-                if eeg_auto_date_outside
-                else (
-                    "BNetzA-Archiv automatisch braucht ein Inbetriebnahmedatum."
-                    if eeg_archive_date_missing
-                    else (
-                        "Eingebettetes BNetzA-Archiv deckt aktuell nur 2018-01-01 bis 2026-07-31 ab."
-                        if eeg_archive_date_outside
-                        else "EEG-Vergütungsquelle ist plausibel."
-                    )
-                )
-            )
+            ('Die Vergütungsquelle ist unbekannt; die EEG-Vergütung kann nicht zuverlässig bestimmt werden. Im Config-Editor unter „Tarif & Strompreise“ das Feld „Vergütungsquelle“ und das Inbetriebnahmedatum prüfen.' if eeg_source_invalid else 'Das Inbetriebnahmedatum liegt außerhalb der aktuellen Vergütungstabelle vom 1. Februar bis 31. Juli 2026; diese Tabelle passt nicht zur Anlage. Im Config-Editor unter „Tarif & Strompreise“ das Feld „Vergütungsquelle“ und das Inbetriebnahmedatum prüfen.' if eeg_auto_date_outside else 'Für die automatische Vergütung aus dem Archiv fehlt das Inbetriebnahmedatum; der passende Satz kann nicht bestimmt werden. Im Config-Editor unter „Tarif & Strompreise“ das Feld „Vergütungsquelle“ und das Inbetriebnahmedatum prüfen.' if eeg_archive_date_missing else 'Das Inbetriebnahmedatum liegt außerhalb des eingebauten Archivs vom 1. Januar 2018 bis 31. Juli 2026; ein passender Vergütungssatz fehlt. Im Config-Editor unter „Tarif & Strompreise“ das Feld „Vergütungsquelle“ und das Inbetriebnahmedatum prüfen.' if eeg_archive_date_outside else 'EEG-Vergütungsquelle ist plausibel.') if ('warning' if dm_eeg_enabled and (eeg_source_invalid or eeg_auto_date_outside or eeg_archive_date_missing or eeg_archive_date_outside) else 'ok') in ("warning", "error") else ('Unbekannte EEG-Vergütungsquelle; bitte manuelle Stufen verwenden.' if eeg_source_invalid else 'Die aktuelle BNetzA-Tabelle gilt nur für Inbetriebnahmen vom 2026-02-01 bis 2026-07-31.' if eeg_auto_date_outside else 'BNetzA-Archiv automatisch braucht ein Inbetriebnahmedatum.' if eeg_archive_date_missing else 'Eingebettetes BNetzA-Archiv deckt aktuell nur 2018-01-01 bis 2026-07-31 ab.' if eeg_archive_date_outside else 'EEG-Vergütungsquelle ist plausibel.')
         ),
     )
     price["direct_marketing_eeg_system_type"] = _entry(
         key="direct_marketing_eeg_system_type",
-        label="DV-EEG-Anlagenart",
+        label='Anlagenart',
         unit="-",
         configured=dm_eeg_system_type if _has_user_value(cfg, "direct_marketing_eeg_system_type") else None,
         live_value=None,
@@ -4053,11 +3821,11 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
         effective=dm_eeg_system_type,
         source="user" if _has_user_value(cfg, "direct_marketing_eeg_system_type") else "default",
         severity="warning" if dm_eeg_enabled and dm_eeg_system_type not in {"building", "other"} else "ok",
-        message="Anlagenart ist plausibel." if dm_eeg_system_type in {"building", "other"} else "Unbekannte Anlagenart.",
+        message=('Anlagenart ist plausibel.' if dm_eeg_system_type in {'building', 'other'} else 'Die Anlagenart ist unbekannt; die Vergütungsberechnung kann nicht passend zugeordnet werden. Im Config-Editor unter „Tarif & Strompreise“ das Feld „Anlagenart“ prüfen.') if ('warning' if dm_eeg_enabled and dm_eeg_system_type not in {'building', 'other'} else 'ok') in ("warning", "error") else ('Anlagenart ist plausibel.' if dm_eeg_system_type in {'building', 'other'} else 'Unbekannte Anlagenart.'),
     )
     price["direct_marketing_eeg_feed_type"] = _entry(
         key="direct_marketing_eeg_feed_type",
-        label="DV-EEG-Einspeiseart",
+        label='Einspeiseart',
         unit="-",
         configured=dm_eeg_feed_type if _has_user_value(cfg, "direct_marketing_eeg_feed_type") else None,
         live_value=None,
@@ -4065,11 +3833,11 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
         effective=dm_eeg_feed_type,
         source="user" if _has_user_value(cfg, "direct_marketing_eeg_feed_type") else "default",
         severity="warning" if dm_eeg_enabled and dm_eeg_feed_type not in {"partial", "full"} else "ok",
-        message="Einspeiseart ist plausibel." if dm_eeg_feed_type in {"partial", "full"} else "Unbekannte Einspeiseart.",
+        message=('Einspeiseart ist plausibel.' if dm_eeg_feed_type in {'partial', 'full'} else 'Die Einspeiseart ist unbekannt; die Vergütungsberechnung kann nicht passend zugeordnet werden. Im Config-Editor unter „Tarif & Strompreise“ das Feld „Einspeiseart“ prüfen.') if ('warning' if dm_eeg_enabled and dm_eeg_feed_type not in {'partial', 'full'} else 'ok') in ("warning", "error") else ('Einspeiseart ist plausibel.' if dm_eeg_feed_type in {'partial', 'full'} else 'Unbekannte Einspeiseart.'),
     )
     price["direct_marketing_eeg_compensation_basis"] = _entry(
         key="direct_marketing_eeg_compensation_basis",
-        label="DV-EEG-Rechengrundlage",
+        label='Rechengrundlage',
         unit="-",
         configured=dm_eeg_compensation_basis if _has_user_value(cfg, "direct_marketing_eeg_compensation_basis") else None,
         live_value=None,
@@ -4078,15 +3846,13 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
         source="user" if _has_user_value(cfg, "direct_marketing_eeg_compensation_basis") else "default",
         severity="warning" if dm_eeg_enabled and dm_eeg_compensation_basis not in {"feed_in_tariff", "market_premium"} else "ok",
         message=(
-            "Rechengrundlage ist plausibel."
-            if dm_eeg_compensation_basis in {"feed_in_tariff", "market_premium"}
-            else "Unbekannte Rechengrundlage."
+            ('Rechengrundlage ist plausibel.' if dm_eeg_compensation_basis in {'feed_in_tariff', 'market_premium'} else 'Die Rechengrundlage ist unbekannt; die Vergütungsberechnung ist nicht eindeutig. Im Config-Editor unter „Tarif & Strompreise“ das Feld „Rechengrundlage“ prüfen.') if ('warning' if dm_eeg_enabled and dm_eeg_compensation_basis not in {'feed_in_tariff', 'market_premium'} else 'ok') in ("warning", "error") else ('Rechengrundlage ist plausibel.' if dm_eeg_compensation_basis in {'feed_in_tariff', 'market_premium'} else 'Unbekannte Rechengrundlage.')
         ),
     )
     eeg_date_invalid = bool(dm_eeg_commissioning and not re.match(r"^\d{4}-\d{2}-\d{2}$", dm_eeg_commissioning))
     price["direct_marketing_eeg_commissioning_date"] = _entry(
         key="direct_marketing_eeg_commissioning_date",
-        label="DV-EEG-Inbetriebnahme",
+        label='Inbetriebnahme',
         unit="-",
         configured=dm_eeg_commissioning if _has_user_value(cfg, "direct_marketing_eeg_commissioning_date") else None,
         live_value=None,
@@ -4094,11 +3860,11 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
         effective=dm_eeg_commissioning,
         source="user" if _has_user_value(cfg, "direct_marketing_eeg_commissioning_date") else "default",
         severity="warning" if dm_eeg_enabled and eeg_date_invalid else "ok",
-        message="Datum bitte als YYYY-MM-DD hinterlegen." if dm_eeg_enabled and eeg_date_invalid else "Inbetriebnahmedatum ist plausibel oder leer.",
+        message=('Das Inbetriebnahmedatum ist ungültig; ein passender Vergütungssatz kann nicht bestimmt werden. Im Config-Editor unter „Tarif & Strompreise“ das Feld „Inbetriebnahme“ prüfen.' if dm_eeg_enabled and eeg_date_invalid else 'Inbetriebnahmedatum ist plausibel oder leer.') if ('warning' if dm_eeg_enabled and eeg_date_invalid else 'ok') in ("warning", "error") else ('Datum bitte als YYYY-MM-DD hinterlegen.' if dm_eeg_enabled and eeg_date_invalid else 'Inbetriebnahmedatum ist plausibel oder leer.'),
     )
     price["direct_marketing_eeg_tariff_tiers"] = _entry(
         key="direct_marketing_eeg_tariff_tiers",
-        label="DV-EEG-Vergütungsstufen",
+        label='Vergütungsstufen',
         unit="ct/kWh",
         configured=dm_eeg_tiers if _has_user_value(cfg, "direct_marketing_eeg_tariff_tiers") else None,
         live_value=None,
@@ -4107,14 +3873,13 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
         source="user" if _has_user_value(cfg, "direct_marketing_eeg_tariff_tiers") else "default",
         severity="warning" if dm_eeg_enabled and not eeg_auto_source and not dm_eeg_tiers else "ok",
         message=(
-            "EEG-Anlage ist aktiv, aber es sind keine Vergütungsstufen hinterlegt."
-            if dm_eeg_enabled and not eeg_auto_source and not dm_eeg_tiers else "Vergütungsstufen sind hinterlegt, automatisch ableitbar oder EEG ist aus."
+            ('Die EEG-Bewertung ist an, aber Vergütungsstufen fehlen; die Vergütung kann nicht berechnet werden. Im Config-Editor unter „Tarif & Strompreise“ das Feld „Vergütungsstufen“ prüfen.' if dm_eeg_enabled and (not eeg_auto_source) and (not dm_eeg_tiers) else 'Vergütungsstufen sind hinterlegt, automatisch ableitbar oder EEG ist aus.') if ('warning' if dm_eeg_enabled and (not eeg_auto_source) and (not dm_eeg_tiers) else 'ok') in ("warning", "error") else ('EEG-Anlage ist aktiv, aber es sind keine Vergütungsstufen hinterlegt.' if dm_eeg_enabled and (not eeg_auto_source) and (not dm_eeg_tiers) else 'Vergütungsstufen sind hinterlegt, automatisch ableitbar oder EEG ist aus.')
         ),
     )
     eeg_grid_export_risk = bool(dm_enabled and dm_eeg_enabled and dm_grid_charge_enabled and dm_export_enabled)
     price["direct_marketing_eeg_grid_export_risk_ack"] = _entry(
         key="direct_marketing_eeg_grid_export_risk_ack",
-        label="DV-EEG-Netzstrom-Risiko",
+        label='Ich bestätige, dass Messkonzept, Direktvermarktervertrag und Netzbetreiberfreigabe diese Betriebsweise erlauben.',
         unit="-",
         configured=cfg.get("direct_marketing_eeg_grid_export_risk_ack") if _has_user_value(cfg, "direct_marketing_eeg_grid_export_risk_ack") else None,
         live_value=None,
@@ -4123,9 +3888,7 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
         source="user" if _has_user_value(cfg, "direct_marketing_eeg_grid_export_risk_ack") else "default",
         severity="warning" if eeg_grid_export_risk and not dm_eeg_grid_export_ack else "ok",
         message=(
-            "Eine EEG-Anlage mit Netzladen und Einspeisung benötigt ein bestätigtes Mess-/Vertragskonzept; sonst bleiben Arbitrage-Befehle blockiert."
-            if eeg_grid_export_risk and not dm_eeg_grid_export_ack
-            else "Kein unbestätigter Risikobetrieb mit EEG-Netzstromexport."
+            ('Für Netzladen und spätere Einspeisung der EEG-Anlage fehlt das bestätigte Mess- und Vertragskonzept; entsprechende Speicherbefehle bleiben gesperrt. Im Config-Editor unter „Tarif & Strompreise“ das Feld „Ich bestätige, dass Messkonzept, Direktvermarktervertrag und Netzbetreiberfreigabe diese Betriebsweise erlauben.“ prüfen.' if eeg_grid_export_risk and (not dm_eeg_grid_export_ack) else 'Kein unbestätigter Risikobetrieb mit EEG-Netzstromexport.') if ('warning' if eeg_grid_export_risk and (not dm_eeg_grid_export_ack) else 'ok') in ("warning", "error") else ('Eine EEG-Anlage mit Netzladen und Einspeisung benötigt ein bestätigtes Mess-/Vertragskonzept; sonst bleiben Arbitrage-Befehle blockiert.' if eeg_grid_export_risk and (not dm_eeg_grid_export_ack) else 'Kein unbestätigter Risikobetrieb mit EEG-Netzstromexport.')
         ),
     )
 
@@ -4148,14 +3911,12 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
         source="derived",
         severity="warning" if threshold_contract_warning else "ok",
         message=(
-            "PV-Speichern nach EEG-/Direktvermarktungsschwelle braucht eine manuelle Schwelle oder gültige Vergütungsstufen; sonst bleibt nur die Preis-Score-Logik."
-            if threshold_contract_warning else
-            "Schwelle ist manuell, automatisch ableitbar oder PV-Speichern nutzt bewusst die Score-Logik."
+            ('Für PV-Speichern fehlt eine manuelle Vergütungsschwelle oder eine gültige Vergütungstabelle; es bleibt nur die Preisbewertung. Im Config-Editor unter „Tarif & Strompreise“ das Feld „PV-Speicher-Schwelle“ prüfen.' if threshold_contract_warning else 'Schwelle ist manuell, automatisch ableitbar oder PV-Speichern nutzt bewusst die Score-Logik.') if ('warning' if threshold_contract_warning else 'ok') in ("warning", "error") else ('PV-Speichern nach EEG-/Direktvermarktungsschwelle braucht eine manuelle Schwelle oder gültige Vergütungsstufen; sonst bleibt nur die Preis-Score-Logik.' if threshold_contract_warning else 'Schwelle ist manuell, automatisch ableitbar oder PV-Speichern nutzt bewusst die Score-Logik.')
         ),
     )
     price["direct_marketing_pv_store_dc_only_enable"] = _entry(
         key="direct_marketing_pv_store_dc_only_enable",
-        label="DV-PV-Speichern E3DC-DC-Standard",
+        label='Nur direkte E3DC-PV als Speicherquelle',
         unit="-",
         configured=cfg.get("direct_marketing_pv_store_dc_only_enable") if _has_user_value(cfg, "direct_marketing_pv_store_dc_only_enable") else None,
         live_value=None,
@@ -4168,12 +3929,7 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
         ),
         severity="warning" if dm_aux_ac_storage_requested else "ok",
         message=(
-            "Wirksam bleibt E3DC_DC_ONLY: Die gewählte Zusatz-AC-Route ist "
-            "EVIDENCE_LIMIT, bis eine kalibrierte gemeinsame "
-            "Horizontverteilung erzeugt wird und die Risikoschwelle fachlich "
-            "beschlossen ist."
-            if dm_aux_ac_storage_requested
-            else "E3DC-DC ist die einzige freigegebene PV-Speicherquelle."
+            ('Die gewählte Zusatzwechselrichterladung ist mangels belastbarem Prognosenachweis nicht freigegeben; nur E3DC-PV bleibt zulässig. Im Config-Editor unter „Tarif & Strompreise“ das Feld „AC-Speicherroute“ prüfen.' if dm_aux_ac_storage_requested else 'E3DC-DC ist die einzige freigegebene PV-Speicherquelle.') if ('warning' if dm_aux_ac_storage_requested else 'ok') in ("warning", "error") else ('Wirksam bleibt E3DC_DC_ONLY: Die gewählte Zusatz-AC-Route ist EVIDENCE_LIMIT, bis eine kalibrierte gemeinsame Horizontverteilung erzeugt wird und die Risikoschwelle fachlich beschlossen ist.' if dm_aux_ac_storage_requested else 'E3DC-DC ist die einzige freigegebene PV-Speicherquelle.')
         ),
     )
     aux_ac_validation_warning = bool(
@@ -4191,7 +3947,7 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
     )
     price["direct_marketing_aux_inverter_ac_storage_mode"] = _entry(
         key="direct_marketing_aux_inverter_ac_storage_mode",
-        label="DV-Zusatz-WR-AC-Speichermodus",
+        label='AC-Speicherroute',
         unit="-",
         configured=configured_aux_ac_mode,
         live_value=None,
@@ -4208,34 +3964,12 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
             else "info"
         ),
         message=(
-            "Unbekannter AC-Speichermodus; sicherer Standard ist Aus."
-            if dm_aux_ac_mode_source.endswith("_invalid")
-            else (
-                "Die AC-Freigabe wird vom gesetzten Legacy-DC-Veto überstimmt."
-                if dm_aux_ac_storage_requested and dm_pv_store_legacy_dc_only_veto
-                else (
-                    "Auswahl gespeichert, wirksam bleibt E3DC_DC_ONLY: Zusätzlich "
-                    "zur vollständigen E3DC-DC-/EXTERNAL-AC-Topologie fehlen der "
-                    "Produzent einer historisch kalibrierten gemeinsamen "
-                    "Horizontverteilung und die fachlich beschlossene "
-                    "Risikoschwelle. Die Route bleibt EVIDENCE_LIMIT."
-                    if dm_aux_ac_storage_requested and not dm_aux_ac_topology_ready
-                    else (
-                        "Auswahl gespeichert, aber nicht wirksam: Ohne Produzent "
-                        "einer historisch kalibrierten gemeinsamen "
-                        "Horizontverteilung und ohne fachlich beschlossene "
-                        "Risikoschwelle bleibt die Zusatz-AC-Route EVIDENCE_LIMIT; "
-                        "E3DC_DC_ONLY ist der steuernde Standard."
-                        if dm_aux_ac_storage_requested
-                        else "Aus: Zusatz-WR-AC ist keine Speicherquelle; E3DC-DC bleibt Standard."
-                    )
-                )
-            )
+            ('Die Speicherroute des Zusatzwechselrichters ist unbekannt; verwendet wird „Aus“. Im Config-Editor unter „Tarif & Strompreise“ das Feld „AC-Speicherroute“ prüfen; eine Auswahl ersetzt den fehlenden Nachweis nicht.' if dm_aux_ac_mode_source.endswith('_invalid') else 'Die gewählte Zusatzwechselrichterladung wird durch die Einstellung für ausschließliche E3DC-PV-Ladung überstimmt; sie bleibt aus. Im Config-Editor unter „Tarif & Strompreise“ das Feld „AC-Speicherroute“ prüfen; eine Auswahl ersetzt den fehlenden Nachweis nicht.' if dm_aux_ac_storage_requested and dm_pv_store_legacy_dc_only_veto else 'Die Zusatzwechselrichterladung ist gespeichert, aber Flächenzuordnung und belastbarer gemeinsamer Prognosenachweis fehlen; nur E3DC-PV bleibt zulässig. Im Config-Editor unter „Tarif & Strompreise“ das Feld „AC-Speicherroute“ prüfen; eine Auswahl ersetzt den fehlenden Nachweis nicht.' if dm_aux_ac_storage_requested and (not dm_aux_ac_topology_ready) else 'Die Zusatzwechselrichterladung ist gespeichert, aber mangels belastbarem gemeinsamen Prognosenachweis nicht freigegeben; nur E3DC-PV bleibt zulässig. Im Config-Editor unter „Tarif & Strompreise“ das Feld „AC-Speicherroute“ prüfen; eine Auswahl ersetzt den fehlenden Nachweis nicht.' if dm_aux_ac_storage_requested else 'Aus: Zusatz-WR-AC ist keine Speicherquelle; E3DC-DC bleibt Standard.') if ('warning' if aux_ac_validation_warning else 'info') in ("warning", "error") else ('Unbekannter AC-Speichermodus; sicherer Standard ist Aus.' if dm_aux_ac_mode_source.endswith('_invalid') else 'Die AC-Freigabe wird vom gesetzten Legacy-DC-Veto überstimmt.' if dm_aux_ac_storage_requested and dm_pv_store_legacy_dc_only_veto else 'Auswahl gespeichert, wirksam bleibt E3DC_DC_ONLY: Zusätzlich zur vollständigen E3DC-DC-/EXTERNAL-AC-Topologie fehlen der Produzent einer historisch kalibrierten gemeinsamen Horizontverteilung und die fachlich beschlossene Risikoschwelle. Die Route bleibt EVIDENCE_LIMIT.' if dm_aux_ac_storage_requested and (not dm_aux_ac_topology_ready) else 'Auswahl gespeichert, aber nicht wirksam: Ohne Produzent einer historisch kalibrierten gemeinsamen Horizontverteilung und ohne fachlich beschlossene Risikoschwelle bleibt die Zusatz-AC-Route EVIDENCE_LIMIT; E3DC_DC_ONLY ist der steuernde Standard.' if dm_aux_ac_storage_requested else 'Aus: Zusatz-WR-AC ist keine Speicherquelle; E3DC-DC bleibt Standard.')
         ),
     )
     price["direct_marketing_aux_inverter_ac_storage_enable"] = _entry(
         key="direct_marketing_aux_inverter_ac_storage_enable",
-        label="DV-Zusatz-WR-AC Altfreigabe",
+        label='Alte Freigabe für Zusatzwechselrichterladung',
         unit="-",
         configured=(
             cfg.get("direct_marketing_aux_inverter_ac_storage_enable")
@@ -4256,26 +3990,13 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
             else "info"
         ),
         message=(
-            "Explizites Legacy-Ein wird als gespeicherte Auswahl gelesen, bleibt "
-            "aber bis zum gemeinsamen Horizontnachweis und zur beschlossenen "
-            "Risikoschwelle EVIDENCE_LIMIT."
-            if dm_aux_ac_mode_source == "legacy_bool_explicit_true"
-            else (
-                "Die Legacy-Freigabe wird vom gesetzten DC-Veto überstimmt."
-                if dm_aux_ac_storage_requested and dm_pv_store_legacy_dc_only_veto
-                else (
-                    "Nur Kompatibilitätsanzeige; die kanonische Moduswahl ist "
-                    "gespeichert, erteilt derzeit aber keine AC-Freigabe."
-                    if dm_aux_ac_storage_requested
-                    else "Nur Kompatibilitätsanzeige; Zusatz-AC ist aus."
-                )
-            )
+            ('Die alte Freigabe wird als Auswahl übernommen, erlaubt mangels belastbarem Prognosenachweis aber keine Zusatzwechselrichterladung. Im Config-Editor unter „Tarif & Strompreise“ das Nachfolgefeld „AC-Speicherroute“ verwenden.' if dm_aux_ac_mode_source == 'legacy_bool_explicit_true' else 'Die alte Freigabe wird durch die Beschränkung auf E3DC-PV überstimmt; Zusatzwechselrichterladung bleibt aus. Im Config-Editor unter „Tarif & Strompreise“ das Nachfolgefeld „AC-Speicherroute“ verwenden.' if dm_aux_ac_storage_requested and dm_pv_store_legacy_dc_only_veto else 'Die alte Freigabe zeigt nur die gespeicherte Auswahl an; sie erlaubt derzeit keine Zusatzwechselrichterladung. Im Config-Editor unter „Tarif & Strompreise“ das Nachfolgefeld „AC-Speicherroute“ verwenden.' if dm_aux_ac_storage_requested else 'Nur Kompatibilitätsanzeige; Zusatz-AC ist aus.') if ('warning' if aux_ac_validation_warning else 'info') in ("warning", "error") else ('Explizites Legacy-Ein wird als gespeicherte Auswahl gelesen, bleibt aber bis zum gemeinsamen Horizontnachweis und zur beschlossenen Risikoschwelle EVIDENCE_LIMIT.' if dm_aux_ac_mode_source == 'legacy_bool_explicit_true' else 'Die Legacy-Freigabe wird vom gesetzten DC-Veto überstimmt.' if dm_aux_ac_storage_requested and dm_pv_store_legacy_dc_only_veto else 'Nur Kompatibilitätsanzeige; die kanonische Moduswahl ist gespeichert, erteilt derzeit aber keine AC-Freigabe.' if dm_aux_ac_storage_requested else 'Nur Kompatibilitätsanzeige; Zusatz-AC ist aus.')
         ),
     )
     market_value_source_ok = dm_market_value_solar_source in {"netztransparenz_hochrechnung_solar"}
     price["direct_marketing_market_value_solar_enable"] = _entry(
         key="direct_marketing_market_value_solar_enable",
-        label="DV-Marktwert Solar Monitor",
+        label='Monatswert-Trend berechnen',
         unit="-",
         configured=cfg.get("direct_marketing_market_value_solar_enable") if _has_user_value(cfg, "direct_marketing_market_value_solar_enable") else None,
         live_value=None,
@@ -4284,18 +4005,12 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
         source="user" if _has_user_value(cfg, "direct_marketing_market_value_solar_enable") else "default",
         severity="warning" if dm_market_value_solar_enabled and (not nt_client_id or not nt_client_secret or not market_value_source_ok) else "ok",
         message=(
-            "Marktwert-Solar-Monitor ist aktiv, aber Netztransparenz-Zugangsdaten oder Quelle sind unvollständig."
-            if dm_market_value_solar_enabled and (not nt_client_id or not nt_client_secret or not market_value_source_ok)
-            else (
-                "Marktwert-Solar-Monitor ist aktiv und bleibt read-only ohne Regelwirkung."
-                if dm_market_value_solar_enabled else
-                "Marktwert-Solar-Monitor ist aus."
-            )
+            ('Die Marktwert-Solar-Auswertung ist an, aber Zugangsdaten oder Quelle fehlen; die Auswertung kann nicht vollständig arbeiten. Im Config-Editor unter „Tarif & Strompreise“ das Feld „Monatswert-Trend berechnen“ prüfen.' if dm_market_value_solar_enabled and (not nt_client_id or not nt_client_secret or (not market_value_source_ok)) else 'Marktwert-Solar-Monitor ist aktiv und bleibt read-only ohne Regelwirkung.' if dm_market_value_solar_enabled else 'Marktwert-Solar-Monitor ist aus.') if ('warning' if dm_market_value_solar_enabled and (not nt_client_id or not nt_client_secret or (not market_value_source_ok)) else 'ok') in ("warning", "error") else ('Marktwert-Solar-Monitor ist aktiv, aber Netztransparenz-Zugangsdaten oder Quelle sind unvollständig.' if dm_market_value_solar_enabled and (not nt_client_id or not nt_client_secret or (not market_value_source_ok)) else 'Marktwert-Solar-Monitor ist aktiv und bleibt read-only ohne Regelwirkung.' if dm_market_value_solar_enabled else 'Marktwert-Solar-Monitor ist aus.')
         ),
     )
     price["direct_marketing_market_value_solar_source"] = _entry(
         key="direct_marketing_market_value_solar_source",
-        label="DV-Marktwert Solar Quelle",
+        label='Quelle',
         unit="-",
         configured=dm_market_value_solar_source if _has_user_value(cfg, "direct_marketing_market_value_solar_source") else None,
         live_value=None,
@@ -4303,11 +4018,11 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
         effective=dm_market_value_solar_source,
         source="user" if _has_user_value(cfg, "direct_marketing_market_value_solar_source") else "default",
         severity="warning" if dm_market_value_solar_enabled and not market_value_source_ok else "ok",
-        message="Quelle ist plausibel." if market_value_source_ok else "Unbekannte Marktwert-Solar-Quelle.",
+        message=('Quelle ist plausibel.' if market_value_source_ok else 'Die Marktwert-Solar-Quelle ist unbekannt; ihre Daten können nicht zugeordnet werden. Im Config-Editor unter „Tarif & Strompreise“ das Feld „Quelle“ prüfen.') if ('warning' if dm_market_value_solar_enabled and (not market_value_source_ok) else 'ok') in ("warning", "error") else ('Quelle ist plausibel.' if market_value_source_ok else 'Unbekannte Marktwert-Solar-Quelle.'),
     )
     price["netztransparenz_client_id"] = _entry(
         key="netztransparenz_client_id",
-        label="Netztransparenz Client-ID",
+        label='Zugangskennung für Netztransparenz',
         unit="-",
         configured="gesetzt" if _has_user_value(cfg, "netztransparenz_client_id") and nt_client_id else None,
         live_value=None,
@@ -4315,11 +4030,11 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
         effective=bool(nt_client_id),
         source="user" if _has_user_value(cfg, "netztransparenz_client_id") else "default",
         severity="warning" if dm_market_value_solar_enabled and not nt_client_id else "ok",
-        message="Client-ID ist gesetzt." if nt_client_id else "Client-ID fehlt für den Marktwert-Solar-Monitor.",
+        message=('Client-ID ist gesetzt.' if nt_client_id else 'Die Zugangskennung für Netztransparenz fehlt; die Marktwert-Solar-Auswertung kann sich nicht anmelden. Im Config-Editor unter „Tarif & Strompreise“ das Feld „Netztransparenz Client-ID“ prüfen.') if ('warning' if dm_market_value_solar_enabled and (not nt_client_id) else 'ok') in ("warning", "error") else ('Client-ID ist gesetzt.' if nt_client_id else 'Client-ID fehlt für den Marktwert-Solar-Monitor.'),
     )
     price["netztransparenz_client_secret"] = _entry(
         key="netztransparenz_client_secret",
-        label="Netztransparenz Client-Secret",
+        label='Zugangsschlüssel für Netztransparenz',
         unit="-",
         configured="***" if _has_user_value(cfg, "netztransparenz_client_secret") and nt_client_secret else None,
         live_value=None,
@@ -4327,11 +4042,11 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
         effective=bool(nt_client_secret),
         source="user" if _has_user_value(cfg, "netztransparenz_client_secret") else "default",
         severity="warning" if dm_market_value_solar_enabled and not nt_client_secret else "ok",
-        message="Client-Secret ist gesetzt und wird nicht ausgegeben." if nt_client_secret else "Client-Secret fehlt für den Marktwert-Solar-Monitor.",
+        message=('Client-Secret ist gesetzt und wird nicht ausgegeben.' if nt_client_secret else 'Der Zugangsschlüssel für Netztransparenz fehlt; die Marktwert-Solar-Auswertung kann sich nicht anmelden. Im Config-Editor unter „Tarif & Strompreise“ das Feld „Netztransparenz Client-Secret“ prüfen.') if ('warning' if dm_market_value_solar_enabled and (not nt_client_secret) else 'ok') in ("warning", "error") else ('Client-Secret ist gesetzt und wird nicht ausgegeben.' if nt_client_secret else 'Client-Secret fehlt für den Marktwert-Solar-Monitor.'),
     )
     price["direct_marketing_aux_inverter_shelly_contract_status"] = _entry(
         key="direct_marketing_aux_inverter_shelly_contract_status",
-        label="DV-Zusatz-WR Konfigurationsvertrag",
+        label='Konflikt in der Zusatzwechselrichtersteuerung',
         unit="-",
         configured=None,
         live_value=None,
@@ -4340,14 +4055,12 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
         source=str(dm_aux_migration.get("source") or "safe_defaults"),
         severity="warning" if dm_aux_contract_blocked else "ok",
         message=(
-            "Widersprüchliche oder unvollständige Zusatz-WR-Konfiguration: Zentralsteuerung bleibt sicher deaktiviert."
-            if dm_aux_contract_blocked
-            else "Kanonischer Zusatz-WR-Vertrag ist vollständig und konfliktfrei."
+            ('Die Angaben zum Zusatzwechselrichter sind widersprüchlich oder unvollständig; seine zentrale Steuerung bleibt aus. Im Config-Editor unter „Tarif & Strompreise“ das Feld „Steuerung“ prüfen.' if dm_aux_contract_blocked else 'Kanonischer Zusatz-WR-Vertrag ist vollständig und konfliktfrei.') if ('warning' if dm_aux_contract_blocked else 'ok') in ("warning", "error") else ('Widersprüchliche oder unvollständige Zusatz-WR-Konfiguration: Zentralsteuerung bleibt sicher deaktiviert.' if dm_aux_contract_blocked else 'Kanonischer Zusatz-WR-Vertrag ist vollständig und konfliktfrei.')
         ),
     )
     price["direct_marketing_aux_inverter_shelly_override"] = _entry(
         key="direct_marketing_aux_inverter_shelly_override",
-        label="DV-Zusatz-WR Shelly-Steuerung",
+        label='Steuerung',
         unit="-",
         configured=str(aux_inverter_contract.get("override") or "local"),
         live_value=None,
@@ -4356,18 +4069,12 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
         source=str(dm_aux_migration.get("source") or "default"),
         severity="warning" if dm_aux_contract_blocked else "ok",
         message=(
-            "Konfigurationskonflikt; lokales Shelly-Skript bleibt als sicherer Fallback maßgeblich."
-            if dm_aux_contract_blocked
-            else (
-                "E3DC-Control übernimmt die Shelly-Relaissteuerung für den ungeregelten Zusatzwechselrichter."
-                if dm_aux_shelly_override
-                else "Shelly-Zusatzwechselrichter bleibt lokal/fallback-gesteuert; E3DC-Control sendet keine Relaisbefehle."
-            )
+            ('Die Steuerungsangaben widersprechen einander; das lokale Shelly-Skript bleibt zuständig. Im Config-Editor unter „Tarif & Strompreise“ das Feld „Steuerung“ prüfen.' if dm_aux_contract_blocked else 'E3DC-Control übernimmt die Shelly-Relaissteuerung für den ungeregelten Zusatzwechselrichter.' if dm_aux_shelly_override else 'Shelly-Zusatzwechselrichter bleibt lokal/fallback-gesteuert; E3DC-Control sendet keine Relaisbefehle.') if ('warning' if dm_aux_contract_blocked else 'ok') in ("warning", "error") else ('Konfigurationskonflikt; lokales Shelly-Skript bleibt als sicherer Fallback maßgeblich.' if dm_aux_contract_blocked else 'E3DC-Control übernimmt die Shelly-Relaissteuerung für den ungeregelten Zusatzwechselrichter.' if dm_aux_shelly_override else 'Shelly-Zusatzwechselrichter bleibt lokal/fallback-gesteuert; E3DC-Control sendet keine Relaisbefehle.')
         ),
     )
     price["direct_marketing_aux_inverter_shelly_ip"] = _entry(
         key="direct_marketing_aux_inverter_shelly_ip",
-        label="DV-Zusatz-WR Shelly-IP",
+        label='Shelly-IP',
         unit="-",
         configured="konfiguriert" if dm_aux_shelly_ip else None,
         live_value=None,
@@ -4376,18 +4083,12 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
         source=str(dm_aux_migration.get("source") or "default"),
         severity="warning" if dm_aux_shelly_override and not dm_aux_shelly_ip_valid else "ok",
         message=(
-            "Zentrale Shelly-Steuerung ist aktiv, aber es ist keine gültige IPv4-Adresse hinterlegt."
-            if dm_aux_shelly_override and not dm_aux_shelly_ip_valid
-            else (
-                "Shelly-IP ist plausibel."
-                if dm_aux_shelly_ip
-                else "Keine Shelly-IP hinterlegt; ohne zentrale Freigabe ist das in Ordnung."
-            )
+            ('Die zentrale Shelly-Steuerung ist an, aber ihre IPv4-Adresse fehlt oder ist ungültig; das Relais kann nicht angesprochen werden. Im Config-Editor unter „Tarif & Strompreise“ das Feld „Shelly-IP“ prüfen.' if dm_aux_shelly_override and (not dm_aux_shelly_ip_valid) else 'Shelly-IP ist plausibel.' if dm_aux_shelly_ip else 'Keine Shelly-IP hinterlegt; ohne zentrale Freigabe ist das in Ordnung.') if ('warning' if dm_aux_shelly_override and (not dm_aux_shelly_ip_valid) else 'ok') in ("warning", "error") else ('Zentrale Shelly-Steuerung ist aktiv, aber es ist keine gültige IPv4-Adresse hinterlegt.' if dm_aux_shelly_override and (not dm_aux_shelly_ip_valid) else 'Shelly-IP ist plausibel.' if dm_aux_shelly_ip else 'Keine Shelly-IP hinterlegt; ohne zentrale Freigabe ist das in Ordnung.')
         ),
     )
     price["direct_marketing_aux_inverter_shelly_invert"] = _entry(
         key="direct_marketing_aux_inverter_shelly_invert",
-        label="DV-Zusatz-WR Shelly-Schütz invertiert",
+        label='Invertiert / NC-Schütz',
         unit="-",
         configured=bool(dm_aux_shelly_invert),
         live_value=None,
@@ -4396,14 +4097,12 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
         source=str(dm_aux_migration.get("source") or "default"),
         severity="warning" if dm_aux_shelly_override and dm_aux_shelly_invert else "ok",
         message=(
-            "Invertiert aktiv: Shelly-Relais EIN bedeutet Zusatzwechselrichter AUS (NC-Schütz/stromlos geschlossen)."
-            if dm_aux_shelly_invert
-            else "Normale Logik: Shelly-Relais EIN bedeutet Zusatzwechselrichter EIN."
+            ('Die umgekehrte Relaissteuerung ist an; ein eingeschaltetes Relais schaltet den Zusatzwechselrichter aus. Im Config-Editor unter „Tarif & Strompreise“ das Feld „Invertiert / NC-Schütz“ nur für ein passendes, stromlos geschlossenes Schütz eingeschaltet lassen.' if dm_aux_shelly_override and dm_aux_shelly_invert else 'Invertiert aktiv: Shelly-Relais EIN bedeutet Zusatzwechselrichter AUS (NC-Schütz/stromlos geschlossen).' if dm_aux_shelly_invert else 'Normale Logik: Shelly-Relais EIN bedeutet Zusatzwechselrichter EIN.') if ('warning' if dm_aux_shelly_override and dm_aux_shelly_invert else 'ok') in ("warning", "error") else ('Invertiert aktiv: Shelly-Relais EIN bedeutet Zusatzwechselrichter AUS (NC-Schütz/stromlos geschlossen).' if dm_aux_shelly_invert else 'Normale Logik: Shelly-Relais EIN bedeutet Zusatzwechselrichter EIN.')
         ),
     )
     price["direct_marketing_aux_inverter_shelly_dynamic_unblock_enable"] = _entry(
         key="direct_marketing_aux_inverter_shelly_dynamic_unblock_enable",
-        label="DV-Zusatz-WR dynamische Last-Freigabe",
+        label='Dynamische Last-Freigabe',
         unit="-",
         configured=bool(dm_aux_shelly_dynamic_unblock),
         live_value=None,
@@ -4412,14 +4111,12 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
         source=str(dm_aux_migration.get("source") or "default"),
         severity="warning" if dm_aux_shelly_override and dm_aux_shelly_dynamic_unblock else "ok",
         message=(
-            "Dynamische Freigabe ist bewusst aktiviert. Sie nutzt gültige Netz-/Lastwerte und eine 600-s-Schaltsperre; der gewählte Lastwert garantiert allein keinen exportfreien Betrieb."
-            if dm_aux_shelly_dynamic_unblock
-            else "Sicherer Standard: Bei Negativpreis bleibt der Zusatzwechselrichter statisch gesperrt."
+            ('Die dynamische Freigabe ist an und verwendet aktuelle Netz- und Lastwerte mit 600 s Mindestabstand zwischen Schaltungen; die Lastschwelle allein garantiert keine vollständige Vermeidung von Einspeisung. Im Config-Editor unter „Tarif & Strompreise“ das Feld „Dynamische Last-Freigabe“ nur für diesen bewusst gewünschten Betrieb eingeschaltet lassen.' if dm_aux_shelly_dynamic_unblock else 'Sicherer Standard: Bei Negativpreis bleibt der Zusatzwechselrichter statisch gesperrt.') if ('warning' if dm_aux_shelly_override and dm_aux_shelly_dynamic_unblock else 'ok') in ("warning", "error") else ('Dynamische Freigabe ist bewusst aktiviert. Sie nutzt gültige Netz-/Lastwerte und eine 600-s-Schaltsperre; der gewählte Lastwert garantiert allein keinen exportfreien Betrieb.' if dm_aux_shelly_dynamic_unblock else 'Sicherer Standard: Bei Negativpreis bleibt der Zusatzwechselrichter statisch gesperrt.')
         ),
     )
     price["direct_marketing_aux_inverter_shelly_unblock_threshold_w"] = _entry(
         key="direct_marketing_aux_inverter_shelly_unblock_threshold_w",
-        label="DV-Zusatz-WR Last-Freigabeschwelle",
+        label='Last-Freigabe ab',
         unit="W",
         configured=dm_aux_shelly_unblock_threshold_w,
         live_value=None,
@@ -4428,9 +4125,7 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
         source=str(dm_aux_migration.get("source") or "default"),
         severity="warning" if dm_aux_shelly_dynamic_unblock and not (100.0 <= dm_aux_shelly_unblock_threshold_w <= 100000.0) else "ok",
         message=(
-            "Last-Freigabeschwelle muss zwischen 100 W und 100.000 W liegen; wirksam werden mindestens 100 W angesetzt."
-            if dm_aux_shelly_dynamic_unblock and not (100.0 <= dm_aux_shelly_unblock_threshold_w <= 100000.0)
-            else "Last-Freigabeschwelle ist plausibel; sie muss zur Leistung des Zusatzwechselrichters und der schaltbaren Last passen."
+            (f'Die Lastschwelle von {dm_aux_shelly_unblock_threshold_w:g} W liegt außerhalb 100 bis 100000 W; verwendet werden mindestens 100 W. Im Config-Editor unter „Tarif & Strompreise“ das Feld „Last-Freigabe ab“ prüfen.' if dm_aux_shelly_dynamic_unblock and (not 100.0 <= dm_aux_shelly_unblock_threshold_w <= 100000.0) else 'Last-Freigabeschwelle ist plausibel; sie muss zur Leistung des Zusatzwechselrichters und der schaltbaren Last passen.') if ('warning' if dm_aux_shelly_dynamic_unblock and (not 100.0 <= dm_aux_shelly_unblock_threshold_w <= 100000.0) else 'ok') in ("warning", "error") else ('Last-Freigabeschwelle muss zwischen 100 W und 100.000 W liegen; wirksam werden mindestens 100 W angesetzt.' if dm_aux_shelly_dynamic_unblock and (not 100.0 <= dm_aux_shelly_unblock_threshold_w <= 100000.0) else 'Last-Freigabeschwelle ist plausibel; sie muss zur Leistung des Zusatzwechselrichters und der schaltbaren Last passen.')
         ),
     )
 
@@ -4447,7 +4142,7 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
     )
     price["direct_marketing_variable_fee_basis"] = _entry(
         key="direct_marketing_variable_fee_basis",
-        label="DV-Basis variable Gebühr",
+        label='Basis variable Gebühr',
         unit="-",
         configured=dm_variable_fee_basis if _has_user_value(cfg, "direct_marketing_variable_fee_basis") else None,
         live_value=None,
@@ -4456,14 +4151,12 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
         source="user" if _has_user_value(cfg, "direct_marketing_variable_fee_basis") else "default",
         severity="warning" if dm_fee_pct > 0.0 and (not variable_fee_basis_known or not variable_fee_basis_ready) else "ok",
         message=(
-            "Die variable Gebühr ist aktiv, aber ihre Abrechnungsbasis ist unbekannt oder unvollständig."
-            if dm_fee_pct > 0.0 and (not variable_fee_basis_known or not variable_fee_basis_ready)
-            else "Die variable Gebühr wird auf die konfigurierte Abrechnungsbasis gerechnet."
+            ('Die variable Gebühr ist an, aber ihre Abrechnungsbasis fehlt oder ist unbekannt; die Kostenbewertung ist unvollständig. Im Config-Editor unter „Tarif & Strompreise“ das Feld „Basis variable Gebühr“ prüfen.' if dm_fee_pct > 0.0 and (not variable_fee_basis_known or not variable_fee_basis_ready) else 'Die variable Gebühr wird auf die konfigurierte Abrechnungsbasis gerechnet.') if ('warning' if dm_fee_pct > 0.0 and (not variable_fee_basis_known or not variable_fee_basis_ready) else 'ok') in ("warning", "error") else ('Die variable Gebühr ist aktiv, aber ihre Abrechnungsbasis ist unbekannt oder unvollständig.' if dm_fee_pct > 0.0 and (not variable_fee_basis_known or not variable_fee_basis_ready) else 'Die variable Gebühr wird auf die konfigurierte Abrechnungsbasis gerechnet.')
         ),
     )
     price["direct_marketing_input_vat_recoverable"] = _entry(
         key="direct_marketing_input_vat_recoverable",
-        label="DV-Vorsteuerabzug",
+        label='Vorsteuer abziehbar',
         unit="-",
         configured=cfg.get("direct_marketing_input_vat_recoverable") if _has_user_value(cfg, "direct_marketing_input_vat_recoverable") else None,
         live_value=None,
@@ -4472,9 +4165,7 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
         source="user" if _has_user_value(cfg, "direct_marketing_input_vat_recoverable") else "default",
         severity="warning" if dm_enabled and (dm_fee_pct > 0.0 or dm_monthly_fee > 0.0 or dm_balancing_cost_estimate > 0.0) and not _has_user_value(cfg, "direct_marketing_input_vat_recoverable") else "ok",
         message=(
-            "Bitte steuerlich klären, ob die Umsatzsteuer auf Vermarktungskosten als Vorsteuer abziehbar ist."
-            if dm_enabled and (dm_fee_pct > 0.0 or dm_monthly_fee > 0.0 or dm_balancing_cost_estimate > 0.0) and not _has_user_value(cfg, "direct_marketing_input_vat_recoverable")
-            else ("Vorsteuer wird kostenmindernd berücksichtigt." if dm_input_vat_recoverable else "Umsatzsteuer wird als Kostenbestandteil berücksichtigt.")
+            ('Die Vorsteuerbehandlung ist nicht festgelegt; dadurch ist die Kostenbewertung steuerlich ungeklärt. Im Config-Editor unter „Tarif & Strompreise“ das Feld „Vorsteuer abziehbar“ prüfen.' if dm_enabled and (dm_fee_pct > 0.0 or dm_monthly_fee > 0.0 or dm_balancing_cost_estimate > 0.0) and (not _has_user_value(cfg, 'direct_marketing_input_vat_recoverable')) else 'Vorsteuer wird kostenmindernd berücksichtigt.' if dm_input_vat_recoverable else 'Umsatzsteuer wird als Kostenbestandteil berücksichtigt.') if ('warning' if dm_enabled and (dm_fee_pct > 0.0 or dm_monthly_fee > 0.0 or dm_balancing_cost_estimate > 0.0) and (not _has_user_value(cfg, 'direct_marketing_input_vat_recoverable')) else 'ok') in ("warning", "error") else ('Bitte steuerlich klären, ob die Umsatzsteuer auf Vermarktungskosten als Vorsteuer abziehbar ist.' if dm_enabled and (dm_fee_pct > 0.0 or dm_monthly_fee > 0.0 or dm_balancing_cost_estimate > 0.0) and (not _has_user_value(cfg, 'direct_marketing_input_vat_recoverable')) else 'Vorsteuer wird kostenmindernd berücksichtigt.' if dm_input_vat_recoverable else 'Umsatzsteuer wird als Kostenbestandteil berücksichtigt.')
         ),
     )
 
@@ -4487,7 +4178,7 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
     )
     price["direct_marketing_aux_inverter_ac_protected_target_soc_pct"] = _entry(
         key="direct_marketing_aux_inverter_ac_protected_target_soc_pct",
-        label="DV-AC geschütztes SoC-Ziel",
+        label='Geschütztes Reserve-Ziel',
         unit="%",
         configured=(
             cfg.get("direct_marketing_aux_inverter_ac_protected_target_soc_pct")
@@ -4509,67 +4200,61 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
         ),
         severity="ok" if protected_target_valid else "warning",
         message=(
-            "Leer bedeutet automatisch: wirksame Notstrom-/Haus-/Nachtreserve."
-            if dm_aux_ac_protected_target_raw is None
-            else (
-                "Geschütztes SoC-Ziel ist plausibel."
-                if protected_target_valid
-                else "Geschütztes SoC-Ziel muss zwischen 0 und 100 Prozent liegen."
-            )
+            ('Leer bedeutet automatisch: wirksame Notstrom-/Haus-/Nachtreserve.' if dm_aux_ac_protected_target_raw is None else 'Geschütztes SoC-Ziel ist plausibel.' if protected_target_valid else 'Das geschützte Speicherziel liegt außerhalb 0 bis 100 % und ist ungültig. Im Config-Editor unter „Tarif & Strompreise“ das Feld „Geschütztes Reserve-Ziel“ prüfen.') if ('ok' if protected_target_valid else 'warning') in ("warning", "error") else ('Leer bedeutet automatisch: wirksame Notstrom-/Haus-/Nachtreserve.' if dm_aux_ac_protected_target_raw is None else 'Geschütztes SoC-Ziel ist plausibel.' if protected_target_valid else 'Geschütztes SoC-Ziel muss zwischen 0 und 100 Prozent liegen.')
         ),
     )
     dm_numeric_checks = (
-        ("direct_marketing_fee_ct_per_kwh", "DV-Gebühr fix", dm_fee_ct, "ct/kWh", 0.0, None),
-        ("direct_marketing_fee_pct", "DV-Gebühr variabel", dm_fee_pct, "%", 0.0, 100.0),
-        ("direct_marketing_monthly_fee_eur", "DV-Grundgebühr", dm_monthly_fee, "EUR/Monat", 0.0, None),
-        ("direct_marketing_variable_fee_basis_ct_per_kwh", "DV-Manuelle Gebührenbasis", dm_variable_fee_basis_ct, "ct/kWh", 0.0, None),
-        ("direct_marketing_service_vat_pct", "DV-Umsatzsteuer Dienstleistung", dm_service_vat_pct, "%", 0.0, 100.0),
-        ("direct_marketing_installed_kwp", "DV-Abrechnungsleistung", dm_installed_kwp, "kWp", 0.0, None),
-        ("direct_marketing_balancing_cost_eur_per_kwp_month", "DV-Ausgleichskosten Abschlag", dm_balancing_cost_estimate, "EUR/kWp/Monat", 0.0, None),
-        ("direct_marketing_balancing_cost_actual_eur_per_kwp_month", "DV-Ausgleichskosten tatsächlich", dm_balancing_cost_actual, "EUR/kWp/Monat", 0.0, None),
-        ("direct_marketing_revenue_offset_ct", "DV-Erlös-Korrektur", dm_revenue_offset, "ct/kWh", None, None),
-        ("direct_marketing_min_margin_pct", "DV-Mindestmarge", dm_min_margin, "%", 0.0, None),
-        ("direct_marketing_min_profit_ct_per_kwh", "DV-Mindestgewinn", dm_min_profit, "ct/kWh", 0.0, None),
-        ("direct_marketing_min_window_profit_eur", "DV-Mindestfenstergewinn", dm_min_window_profit_eur, "EUR", 0.0, None),
-        ("direct_marketing_min_export_energy_kwh", "DV-Mindestexportenergie", dm_min_export_energy_kwh, "kWh", 0.0, None),
-        ("direct_marketing_min_export_window_min", "DV-Mindestexportdauer", dm_min_export_window_min, "min", 15.0, 1440.0),
-        ("direct_marketing_preferred_export_plateau_min", "DV-Bevorzugte Plateaudauer", dm_preferred_export_plateau_min, "min", 15.0, 1440.0),
-        ("direct_marketing_price_plateau_tolerance_ct", "DV-Preisplateau-Toleranz", dm_price_plateau_tolerance_ct, "ct/kWh", 0.0, 20.0),
-        ("direct_marketing_max_daily_export_kwh", "DV-Tagesexportlimit", dm_max_daily_export_kwh, "kWh/Tag", 0.0, None),
-        ("direct_marketing_deep_cycle_threshold_pct", "DV-Tiefzyklus-Schwelle", dm_deep_cycle_threshold_pct, "%", 0.0, 100.0),
-        ("direct_marketing_deep_cycle_lcos_factor", "DV-Tiefzyklus-LCOS-Faktor", dm_deep_cycle_lcos_factor, "Faktor", 0.0, 5.0),
-        ("direct_marketing_profit_hold_ct_per_kwh", "DV-Gewinn-Halteband", dm_profit_hold, "ct/kWh", 0.0, None),
-        ("direct_marketing_margin_hold_pct", "DV-Margen-Halteband", dm_margin_hold, "%", 0.0, 50.0),
-        ("direct_marketing_degradation_ct_per_kwh", "DV-Degeneration", dm_degradation, "ct/kWh", 0.0, None),
-        ("direct_marketing_roundtrip_efficiency_pct", "DV-Wirkungsgrad", dm_efficiency, "%", 50.0, 100.0),
-        ("direct_marketing_safety_margin_ct_per_kwh", "DV-Sicherheitskorrektur", dm_safety_margin, "ct/kWh", -10.0, 50.0),
-        ("direct_marketing_max_export_w", "DV-Basis-Entladung", dm_max_export_w, "W", 0.0, None),
-        ("direct_marketing_min_grid_export_w", "DV-Mindest-Netzexport", dm_min_grid_export_w, "W", 0.0, None),
-        ("direct_marketing_max_grid_charge_w", "DV-Max-Netzladen", dm_max_grid_charge_w, "W", 0.0, None),
-        ("direct_marketing_pv_store_threshold_ct", "DV-PV-Speicher-Schwelle", dm_pv_store_threshold, "ct/kWh", -50.0, 200.0),
-        ("direct_marketing_pv_store_max_w", "DV-Max-PV-Speichern", dm_pv_store_max_w, "W", 0.0, None),
-        ("direct_marketing_pv_store_min_surplus_w", "DV-PV-Mindestüberschuss", dm_pv_store_min_surplus_w, "W", 0.0, None),
-        ("direct_marketing_pv_store_import_guard_w", "DV-PV-Importwächter", dm_pv_store_import_guard_w, "W", 0.0, None),
-        ("direct_marketing_pv_store_min_hold_s", "DV-PV-Mindesthaltezeit", dm_pv_store_min_hold_s, "s", 0.0, 3600.0),
-        ("direct_marketing_pv_store_ramp_step_w", "DV-PV-Laderampe", dm_pv_store_ramp_step_w, "W/Zyklus", 100.0, 5000.0),
-        ("direct_marketing_aux_inverter_ac_deadband_wh", "DV-AC-Energietotband", dm_aux_ac_deadband_wh, "Wh", 0.0, None),
-        ("direct_marketing_aux_inverter_ac_min_margin_ct_per_kwh", "DV-AC-Mindestmarge", dm_aux_ac_min_margin_ct, "ct/kWh", 0.0, None),
+        ("direct_marketing_fee_ct_per_kwh", 'Gebühr fix', dm_fee_ct, "ct/kWh", 0.0, None),
+        ("direct_marketing_fee_pct", 'Gebühr variabel', dm_fee_pct, "%", 0.0, 100.0),
+        ("direct_marketing_monthly_fee_eur", 'Grundgebühr', dm_monthly_fee, "EUR/Monat", 0.0, None),
+        ("direct_marketing_variable_fee_basis_ct_per_kwh", 'Manuelle Gebührenbasis', dm_variable_fee_basis_ct, "ct/kWh", 0.0, None),
+        ("direct_marketing_service_vat_pct", 'USt. auf Kosten', dm_service_vat_pct, "%", 0.0, 100.0),
+        ("direct_marketing_installed_kwp", 'Abrechnungsleistung', dm_installed_kwp, "kWp", 0.0, None),
+        ("direct_marketing_balancing_cost_eur_per_kwp_month", 'Ausgleichskosten Abschlag', dm_balancing_cost_estimate, "EUR/kWp/Monat", 0.0, None),
+        ("direct_marketing_balancing_cost_actual_eur_per_kwp_month", 'Ausgleichskosten tatsächlich', dm_balancing_cost_actual, "EUR/kWp/Monat", 0.0, None),
+        ("direct_marketing_revenue_offset_ct", 'Erlös-Korrektur', dm_revenue_offset, "ct/kWh", None, None),
+        ("direct_marketing_min_margin_pct", 'Mindestmarge', dm_min_margin, "%", 0.0, None),
+        ("direct_marketing_min_profit_ct_per_kwh", 'Mindestgewinn', dm_min_profit, "ct/kWh", 0.0, None),
+        ("direct_marketing_min_window_profit_eur", 'Mindestgewinn/Fenster', dm_min_window_profit_eur, "EUR", 0.0, None),
+        ("direct_marketing_min_export_energy_kwh", 'Mindestenergie/Fenster', dm_min_export_energy_kwh, "kWh", 0.0, None),
+        ("direct_marketing_min_export_window_min", 'Mindestdauer/Fenster', dm_min_export_window_min, "min", 15.0, 1440.0),
+        ("direct_marketing_preferred_export_plateau_min", 'Bevorzugtes Plateau', dm_preferred_export_plateau_min, "min", 15.0, 1440.0),
+        ("direct_marketing_price_plateau_tolerance_ct", 'Plateau-Toleranz', dm_price_plateau_tolerance_ct, "ct/kWh", 0.0, 20.0),
+        ("direct_marketing_max_daily_export_kwh", 'Tagesexportlimit', dm_max_daily_export_kwh, "kWh/Tag", 0.0, None),
+        ("direct_marketing_deep_cycle_threshold_pct", 'Tiefzyklus ab', dm_deep_cycle_threshold_pct, "%", 0.0, 100.0),
+        ("direct_marketing_deep_cycle_lcos_factor", 'Tiefzyklus-LCOS', dm_deep_cycle_lcos_factor, "Faktor", 0.0, 5.0),
+        ("direct_marketing_profit_hold_ct_per_kwh", 'Gewinn-Halteband', dm_profit_hold, "ct/kWh", 0.0, None),
+        ("direct_marketing_margin_hold_pct", 'Margen-Halteband', dm_margin_hold, "%", 0.0, 50.0),
+        ("direct_marketing_degradation_ct_per_kwh", 'Degeneration', dm_degradation, "ct/kWh", 0.0, None),
+        ("direct_marketing_roundtrip_efficiency_pct", 'Wirkungsgrad', dm_efficiency, "%", 50.0, 100.0),
+        ("direct_marketing_safety_margin_ct_per_kwh", 'Sicherheitskorrektur', dm_safety_margin, "ct/kWh", -10.0, 50.0),
+        ("direct_marketing_max_export_w", 'Basis-Entladung', dm_max_export_w, "W", 0.0, None),
+        ("direct_marketing_min_grid_export_w", 'Mindest-Netzexport', dm_min_grid_export_w, "W", 0.0, None),
+        ("direct_marketing_max_grid_charge_w", 'Max. Netzladen', dm_max_grid_charge_w, "W", 0.0, None),
+        ("direct_marketing_pv_store_threshold_ct", 'PV-Speicher-Schwelle', dm_pv_store_threshold, "ct/kWh", -50.0, 200.0),
+        ("direct_marketing_pv_store_max_w", 'Max. PV-Speichern', dm_pv_store_max_w, "W", 0.0, None),
+        ("direct_marketing_pv_store_min_surplus_w", 'PV-Mindestüberschuss', dm_pv_store_min_surplus_w, "W", 0.0, None),
+        ("direct_marketing_pv_store_import_guard_w", 'PV-Importwächter', dm_pv_store_import_guard_w, "W", 0.0, None),
+        ("direct_marketing_pv_store_min_hold_s", 'PV-Mindesthaltezeit', dm_pv_store_min_hold_s, "s", 0.0, 3600.0),
+        ("direct_marketing_pv_store_ramp_step_w", 'PV-Laderampe', dm_pv_store_ramp_step_w, "W/Zyklus", 100.0, 5000.0),
+        ("direct_marketing_aux_inverter_ac_deadband_wh", 'Defizit-Totbereich', dm_aux_ac_deadband_wh, "Wh", 0.0, None),
+        ("direct_marketing_aux_inverter_ac_min_margin_ct_per_kwh", 'Zusätzliche Mindestmarge', dm_aux_ac_min_margin_ct, "ct/kWh", 0.0, None),
         ("direct_marketing_aux_inverter_ac_grid_import_guard_w", "DV-AC-Netzbezugsgrenze", dm_aux_ac_grid_import_guard_w, "W", 0.0, 300.0),
-        ("direct_marketing_pv_store_dc_charge_efficiency_pct", "DV-DC-Ladewirkungsgrad", dm_pv_store_dc_charge_efficiency_pct, "%", 50.0, 100.0),
-        ("direct_marketing_pv_store_aux_ac_charge_efficiency_pct", "DV-AC-Ladewirkungsgrad", dm_pv_store_aux_ac_charge_efficiency_pct, "%", 50.0, 100.0),
-        ("direct_marketing_pv_store_discharge_efficiency_pct", "DV-Entladewirkungsgrad", dm_pv_store_discharge_efficiency_pct, "%", 50.0, 100.0),
-        ("direct_marketing_pv_store_external_ac_guard_w", "DV-PV-AC-Zusatz-Wächter", dm_pv_store_external_ac_guard_w, "W", 0.0, None),
-        ("direct_marketing_pv_store_export_limit_guard_w", "DV-PV-Exportlimit-Toleranz", dm_pv_store_export_limit_guard_w, "W", 0.0, None),
-        ("direct_marketing_pv_store_export_limit_ramp_bypass_w", "DV-PV-Exportlimit-Rampenbypass", dm_pv_store_export_limit_ramp_bypass_w, "W", 0.0, 5000.0),
-        ("direct_marketing_price_max_age_s", "DV-Preis-Maxalter", dm_price_max_age_s, "s", 0.0, None),
-        ("direct_marketing_max_cycles_per_day", "DV-Zyklenlimit", dm_cycles, "Zyklen/Tag", 0.0, 3.0),
-        ("direct_marketing_keep_headroom_pct", "DV-Headroom", dm_headroom, "%", 0.0, 100.0),
-        ("direct_marketing_negative_headroom_lookahead_min", "DV-Preisfenster-Headroom-Vorlauf", dm_negative_headroom_lookahead_min, "min", 0.0, 1440.0),
-        ("direct_marketing_negative_headroom_min_window_min", "DV-Preisfenster-Mindestfenster", dm_negative_headroom_min_window_min, "min", 0.0, 720.0),
-        ("direct_marketing_negative_headroom_min_surplus_wh", "DV-Preisfenster-Mindestüberschuss", dm_negative_headroom_min_surplus_wh, "Wh", 0.0, None),
-        ("direct_marketing_negative_headroom_buffer_pct", "DV-Preisfenster-Headroom-Puffer", dm_negative_headroom_buffer_pct, "%", 0.0, 50.0),
-        ("direct_marketing_low_price_curtail_limit_w", "DV-Billigpreis-Restexport", dm_curtail_limit_w, "W", 0.0, None),
-        ("direct_marketing_eeg_support_years", "DV-EEG-Förderjahre", dm_eeg_support_years, "Jahre", 0.0, 30.0),
+        ("direct_marketing_pv_store_dc_charge_efficiency_pct", 'E3DC-DC Laden', dm_pv_store_dc_charge_efficiency_pct, "%", 50.0, 100.0),
+        ("direct_marketing_pv_store_aux_ac_charge_efficiency_pct", 'Zusatz-WR-AC Laden', dm_pv_store_aux_ac_charge_efficiency_pct, "%", 50.0, 100.0),
+        ("direct_marketing_pv_store_discharge_efficiency_pct", 'Speicher entladen', dm_pv_store_discharge_efficiency_pct, "%", 50.0, 100.0),
+        ("direct_marketing_pv_store_external_ac_guard_w", 'AC-Zusatz-Wächter', dm_pv_store_external_ac_guard_w, "W", 0.0, None),
+        ("direct_marketing_pv_store_export_limit_guard_w", 'Exportlimit-Toleranz', dm_pv_store_export_limit_guard_w, "W", 0.0, None),
+        ("direct_marketing_pv_store_export_limit_ramp_bypass_w", 'Exportlimit-Bypass', dm_pv_store_export_limit_ramp_bypass_w, "W", 0.0, 5000.0),
+        ("direct_marketing_price_max_age_s", 'Preis-Maxalter', dm_price_max_age_s, "s", 0.0, None),
+        ("direct_marketing_max_cycles_per_day", 'Zyklen/Tag', dm_cycles, "Zyklen/Tag", 0.0, 3.0),
+        ("direct_marketing_keep_headroom_pct", 'Headroom', dm_headroom, "%", 0.0, 100.0),
+        ("direct_marketing_negative_headroom_lookahead_min", 'Preisfenster-Vorlauf', dm_negative_headroom_lookahead_min, "min", 0.0, 1440.0),
+        ("direct_marketing_negative_headroom_min_window_min", 'Preisfenster-Mindestfenster', dm_negative_headroom_min_window_min, "min", 0.0, 720.0),
+        ("direct_marketing_negative_headroom_min_surplus_wh", 'Preisfenster-Mindestüberschuss', dm_negative_headroom_min_surplus_wh, "Wh", 0.0, None),
+        ("direct_marketing_negative_headroom_buffer_pct", 'Preisfenster-Puffer', dm_negative_headroom_buffer_pct, "%", 0.0, 50.0),
+        ("direct_marketing_low_price_curtail_limit_w", 'Restexport-Limit', dm_curtail_limit_w, "W", 0.0, None),
+        ("direct_marketing_eeg_support_years", 'Förderjahre', dm_eeg_support_years, "Jahre", 0.0, 30.0),
     )
     for key, label, value, unit, minimum, maximum in dm_numeric_checks:
         severity = "ok"
@@ -4578,69 +4263,69 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
         if check_active:
             if minimum is not None and value < minimum:
                 severity = "warning"
-                message = "Wert darf nicht negativ oder unter der Mindestgrenze liegen."
+                message = (f'Der Wert von {value:g} {unit} liegt unter der Mindestgrenze von {minimum:g} {unit}. Kein eigenes Feld im Config-Editor; die Konfiguration durch den Fachbetrieb prüfen lassen.') if key == "direct_marketing_aux_inverter_ac_grid_import_guard_w" else (f'Der Wert von {value:g} {unit} liegt unter der Mindestgrenze von {minimum:g} {unit}. Im Config-Editor unter „Tarif & Strompreise“ das Feld „{label}“ prüfen.')
             elif maximum is not None and value > maximum:
                 severity = "warning"
-                message = "Der Wert liegt über der plausiblen Obergrenze."
+                message = (f'Der Wert von {value:g} {unit} liegt über der Obergrenze von {maximum:g} {unit}. Kein eigenes Feld im Config-Editor; die Konfiguration durch den Fachbetrieb prüfen lassen.') if key == "direct_marketing_aux_inverter_ac_grid_import_guard_w" else (f'Der Wert von {value:g} {unit} liegt über der Obergrenze von {maximum:g} {unit}. Im Config-Editor unter „Tarif & Strompreise“ das Feld „{label}“ prüfen.')
             elif key == "direct_marketing_safety_margin_ct_per_kwh" and value < 0.0:
                 severity = "warning"
-                message = "Negative Korrektur macht die Regelung aggressiver; Mindestmarge bleibt als Schutz aktiv."
+                message = f'Die negative Preiskorrektur von {value:g} ct/kWh lässt kleinere Preisvorteile genügen; die Mindestmarge bleibt wirksam. Im Config-Editor unter „Tarif & Strompreise“ das Feld „{label}“ prüfen.'
             elif key == "direct_marketing_min_margin_pct" and value < 10.0:
                 severity = "warning"
-                message = "Mindestmarge unter 10 Prozent; Wirtschaftlichkeit wird zu aggressiv."
+                message = f'Die Mindestmarge von {value:g} % liegt unter 10 %; kleinere erwartete Gewinne reichen für eine Speicheraktion. Im Config-Editor unter „Tarif & Strompreise“ das Feld „{label}“ prüfen.'
             elif key == "direct_marketing_max_export_w" and dm_export_enabled and value <= 0.0:
                 severity = "warning"
-                message = "Export ist freigegeben, aber die Basis-Entladung steht auf 0 W."
+                message = f'Batterieeinspeisung ist freigegeben, aber 0 W Basisentladung erlauben keine Entladeleistung. Im Config-Editor unter „Tarif & Strompreise“ das Feld „{label}“ prüfen.'
             elif key == "direct_marketing_max_grid_charge_w" and dm_grid_charge_enabled and value <= 0.0:
                 severity = "warning"
-                message = "Netzladen ist freigegeben, aber die maximale Netzladeleistung steht auf 0 W."
+                message = f'Netzladen ist freigegeben, aber 0 W maximale Netzladeleistung erlauben keine Ladung. Im Config-Editor unter „Tarif & Strompreise“ das Feld „{label}“ prüfen.'
             elif key == "direct_marketing_pv_store_min_surplus_w" and dm_pv_store_enabled and value < 300.0:
                 severity = "warning"
-                message = "PV-Speichern unter 300 W kann takten und Messrauschen folgen."
+                message = f'Der Mindestüberschuss von {value:g} W liegt unter 300 W; PV-Speichern kann dadurch häufig ein- und ausschalten oder Messrauschen folgen. Im Config-Editor unter „Tarif & Strompreise“ das Feld „{label}“ prüfen.'
             elif key == "direct_marketing_pv_store_import_guard_w" and dm_pv_store_enabled and value > 300.0:
                 severity = "warning"
-                message = "Hohe Importwächter-Grenze kann Netzbezug beim PV-Speichern zulassen."
+                message = f'Die zulässige Bezugsgrenze von {value:g} W ist hoch; beim PV-Speichern kann Netzstrom bezogen werden. Im Config-Editor unter „Tarif & Strompreise“ das Feld „{label}“ prüfen.'
             elif key == "direct_marketing_pv_store_max_w" and dm_pv_store_enabled and value <= 0.0:
                 message = "0 W bedeutet Automatik: der Storage Manager nutzt das System-Ladelimit und den realen PV-Überschuss."
             elif key == "direct_marketing_pv_store_min_hold_s" and dm_pv_store_enabled and value < 300.0:
                 severity = "warning"
-                message = "Mindesthaltezeit unter 5 Minuten kann PV-Speichern nervös takten lassen."
+                message = f'Die Mindesthaltezeit von {value:g} s liegt unter 5 Minuten; PV-Speichern kann häufig ein- und ausschalten. Im Config-Editor unter „Tarif & Strompreise“ das Feld „{label}“ prüfen.'
             elif key == "direct_marketing_pv_store_ramp_step_w" and dm_pv_store_enabled and value > 3000.0:
                 severity = "warning"
-                message = "Sehr große Laderampen können die DV-PV-Ladeleistung trotz Preisfenster sprunghaft machen."
+                message = f'Die Leistungsänderung von {value:g} W je Zyklus ist groß; die PV-Ladeleistung kann sprunghaft wechseln. Im Config-Editor unter „Tarif & Strompreise“ das Feld „{label}“ prüfen.'
             elif key == "direct_marketing_aux_inverter_ac_deadband_wh" and value == 0.0:
                 message = "0 bedeutet Automatik: mindestens 500 Wh, 2 Prozent Kapazität und eine Mindestleistungs-Slotenergie."
             elif key == "direct_marketing_aux_inverter_ac_min_margin_ct_per_kwh" and value == 0.0:
                 message = "0 bedeutet: nur strikt positive Routenmarge; eine höhere Nutzergrenze bleibt zusätzlich bindend."
             elif key == "direct_marketing_aux_inverter_ac_grid_import_guard_w" and value > 0.0:
                 severity = "warning"
-                message = "Eine positive Grenze toleriert messbaren Netzbezug; 0 W hält Zusatz-WR-AC strikt PV-only."
+                message = (f'Die Bezugsgrenze von {value:g} W erlaubt messbaren Netzbezug beim Laden aus dem Zusatzwechselrichter. Kein eigenes Feld im Config-Editor; die Konfiguration durch den Fachbetrieb prüfen lassen.') if key == "direct_marketing_aux_inverter_ac_grid_import_guard_w" else (f'Die Bezugsgrenze von {value:g} W erlaubt messbaren Netzbezug beim Laden aus dem Zusatzwechselrichter. Im Config-Editor unter „Tarif & Strompreise“ das Feld „{label}“ prüfen.')
             elif (
                 key == "direct_marketing_pv_store_aux_ac_charge_efficiency_pct"
                 and value >= dm_pv_store_dc_charge_efficiency_pct
             ):
                 severity = "warning"
-                message = "Der AC-Ladewirkungsgrad sollte technisch unter dem direkten DC-Ladewirkungsgrad liegen."
+                message = f'Der Ladewirkungsgrad aus dem Zusatzwechselrichter von {value:g} % liegt nicht unter den {dm_pv_store_dc_charge_efficiency_pct:g} % bei direkter PV-Ladung und ist damit technisch fragwürdig. Im Config-Editor unter „Tarif & Strompreise“ das Feld „{label}“ prüfen.'
             elif key == "direct_marketing_pv_store_export_limit_guard_w" and dm_pv_store_enabled and value > 500.0:
                 severity = "warning"
-                message = "Hohe Exportlimit-Toleranz kann bei Negativpreisfenstern unnötigen Restexport zulassen."
+                message = f'Die Einspeisetoleranz von {value:g} W ist hoch; bei Negativpreisen kann unnötige Resteinspeisung bleiben. Im Config-Editor unter „Tarif & Strompreise“ das Feld „{label}“ prüfen.'
             elif key == "direct_marketing_pv_store_export_limit_ramp_bypass_w" and dm_pv_store_enabled and value > 1000.0:
                 severity = "warning"
-                message = "Hoher Rampenbypass reagiert spät auf Exportlimit-0-Fenster."
+                message = f'Die Schwelle von {value:g} W für sofortige Leistungsänderungen ist hoch; auf ein Einspeiselimit von 0 W wird spät reagiert. Im Config-Editor unter „Tarif & Strompreise“ das Feld „{label}“ prüfen.'
             elif key == "direct_marketing_negative_headroom_lookahead_min" and dm_negative_headroom_enabled and value < 30.0:
                 severity = "warning"
-                message = "Sehr kurzer Vorlauf kann die Ladekurve vor Negativpreisfenstern zu spät beruhigen."
+                message = f'Der Vorlauf von {value:g} min ist kurz; die Ladekurve kann vor Negativpreisen zu spät beruhigt werden. Im Config-Editor unter „Tarif & Strompreise“ das Feld „{label}“ prüfen.'
             elif key == "direct_marketing_negative_headroom_min_window_min" and dm_negative_headroom_enabled and value < 15.0:
                 severity = "warning"
-                message = "Sehr kurze Negativpreisfenster sind oft Prognose- und Rampenrauschen; mindestens 15 Minuten sind empfohlen."
+                message = f'Die Preisfensterdauer von {value:g} min liegt unter 15 Minuten; kurze Prognoseschwankungen können als nutzbares Fenster gelten. Im Config-Editor unter „Tarif & Strompreise“ das Feld „{label}“ prüfen.'
             elif key == "direct_marketing_negative_headroom_min_surplus_wh" and dm_negative_headroom_enabled and value < 300.0:
                 severity = "warning"
-                message = "Sehr kleiner Mindestüberschuss kann Headroom-Holds aus Messrauschen erzeugen."
+                message = f'Der Mindestüberschuss von {value:g} Wh ist klein; Messrauschen kann unnötig freie Speicherkapazität auslösen. Im Config-Editor unter „Tarif & Strompreise“ das Feld „{label}“ prüfen.'
             elif key == "direct_marketing_price_max_age_s" and dm_enabled and value == 0.0:
                 message = "0 bedeutet: Preisalter wird nicht pauschal begrenzt; explizite Stale-Flags blockieren weiterhin aktiv."
         price[key] = _entry(
             key=key,
-            label=label,
+            label={'direct_marketing_aux_inverter_ac_grid_import_guard_w': 'Netzbezugsgrenze der Zusatzwechselrichterladung', 'direct_marketing_keep_headroom_pct': 'Freie Speicherkapazität', 'direct_marketing_pv_store_export_limit_ramp_bypass_w': 'Sofortige Anpassung an das Einspeiselimit', 'direct_marketing_deep_cycle_lcos_factor': 'Verschleißkosten bei tiefer Entladung'}.get(key, label),
             unit=unit,
             configured=value if _has_user_value(cfg, key) else None,
             live_value=None,
@@ -4656,7 +4341,7 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
     )
     price["direct_marketing_aux_inverter_ac_forecast_confidence_pct"] = _entry(
         key="direct_marketing_aux_inverter_ac_forecast_confidence_pct",
-        label="DV-AC-Punktprognosewert (nur Diagnose)",
+        label='Gespeicherter Prognosepunktwert',
         unit="%",
         configured=(
             dm_aux_ac_forecast_confidence_pct
@@ -4676,26 +4361,13 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
             else "info"
         ),
         message=(
-            "Der gespeicherte Punktwert ist ungültig, besitzt aber ohnehin "
-            "keine Steuerwirkung."
-            if not dm_point_confidence_valid
-            else (
-                "Nur Diagnose, keine Steuerwirkung: Der gespeicherte Punktwert "
-                "ist weder ein kalibriertes Quantil noch die Risikoschwelle für "
-                "eine Zusatz-AC-Freigabe. Die Route bleibt EVIDENCE_LIMIT."
-                if dm_aux_ac_storage_requested
-                else (
-                    "Nur Diagnose, keine Steuerwirkung: Der gespeicherte "
-                    "Punktwert ist weder ein kalibriertes Quantil noch eine "
-                    "Risikoschwelle."
-                )
-            )
+            ('Der gespeicherte Prognosepunktwert liegt außerhalb 0 bis 100 %; er besitzt keine Steuerwirkung und ersetzt keinen belastbaren Prognosenachweis. Im Config-Editor unter „Tarif & Strompreise“ das Feld „Legacy-Punktwert nur Diagnose“ prüfen.' if not dm_point_confidence_valid else 'Der gespeicherte Prognosepunktwert ist nur eine Diagnoseangabe und erlaubt keine Ladung aus dem Zusatzwechselrichter; der belastbare Prognosenachweis fehlt weiterhin. Im Config-Editor unter „Tarif & Strompreise“ das Feld „Legacy-Punktwert nur Diagnose“ nur als Diagnoseangabe verwenden.' if dm_aux_ac_storage_requested else 'Nur Diagnose, keine Steuerwirkung: Der gespeicherte Punktwert ist weder ein kalibriertes Quantil noch eine Risikoschwelle.') if ('warning' if dm_aux_ac_storage_requested or not dm_point_confidence_valid else 'info') in ("warning", "error") else ('Der gespeicherte Punktwert ist ungültig, besitzt aber ohnehin keine Steuerwirkung.' if not dm_point_confidence_valid else 'Nur Diagnose, keine Steuerwirkung: Der gespeicherte Punktwert ist weder ein kalibriertes Quantil noch die Risikoschwelle für eine Zusatz-AC-Freigabe. Die Route bleibt EVIDENCE_LIMIT.' if dm_aux_ac_storage_requested else 'Nur Diagnose, keine Steuerwirkung: Der gespeicherte Punktwert ist weder ein kalibriertes Quantil noch eine Risikoschwelle.')
         ),
     )
 
     price["direct_marketing_arbitrage_enable"] = _entry(
         key="direct_marketing_arbitrage_enable",
-        label="DV-Arbitrage",
+        label='Alte Freigabe für Stromhandel mit der Batterie',
         unit="-",
         configured=(
             cfg.get("direct_marketing_arbitrage_enable")
@@ -4710,9 +4382,7 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
         source="user" if dm_arbitrage_requested else "default",
         severity="warning" if dm_arbitrage_requested else "ok",
         message=(
-            "Arbitrage ist derzeit nicht freigegeben; vorhandene Altwerte bleiben erhalten, aber wirkungslos."
-            if dm_arbitrage_requested
-            else "Arbitrage ist derzeit nicht freigegeben."
+            ('Der gespeicherte Stromhandel zwischen Netz und Batterie ist nicht freigegeben; die alten Werte bleiben ohne Wirkung. Keine Aktion nötig; diese Einstellung wird nicht mehr verwendet.' if dm_arbitrage_requested else 'Arbitrage ist derzeit nicht freigegeben.') if ('warning' if dm_arbitrage_requested else 'ok') in ("warning", "error") else ('Arbitrage ist derzeit nicht freigegeben; vorhandene Altwerte bleiben erhalten, aber wirkungslos.' if dm_arbitrage_requested else 'Arbitrage ist derzeit nicht freigegeben.')
         ),
     )
     price["direct_marketing_export_enable"] = _entry(
@@ -4740,14 +4410,14 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
         message="Netzladen ist separat freigegeben." if dm_grid_charge_enabled else "Netzladen ist gesperrt.",
     )
     for key, label, value in (
-        ("direct_marketing_negative_price_no_export", "DV-kein Verkauf bei Negativpreis", dm_negative_no_export),
-        ("direct_marketing_negative_headroom_enable", "DV-Headroom vor Preisfenstern", dm_negative_headroom_enabled),
-        ("direct_marketing_low_price_headroom_enable", "DV-Headroom vor Billigpreis", dm_low_price_headroom_enabled),
-        ("direct_marketing_low_price_no_export", "DV-kein Verkauf bei Billigpreis", dm_low_no_export),
+        ("direct_marketing_negative_price_no_export", 'Kein Verkauf bei Negativpreis', dm_negative_no_export),
+        ("direct_marketing_negative_headroom_enable", 'Headroom vor Negativpreis', dm_negative_headroom_enabled),
+        ("direct_marketing_low_price_headroom_enable", 'Headroom vor Billigpreis', dm_low_price_headroom_enabled),
+        ("direct_marketing_low_price_no_export", 'Kein Verkauf bei Billigpreis', dm_low_no_export),
     ):
         price[key] = _entry(
             key=key,
-            label=label,
+            label={'direct_marketing_negative_headroom_enable': 'Freie Speicherkapazität vor Negativpreisen', 'direct_marketing_low_price_headroom_enable': 'Freie Speicherkapazität vor günstigen Preisen'}.get(key, label),
             unit="-",
             configured=cfg.get(key) if _has_user_value(cfg, key) else None,
             live_value=None,
@@ -4755,7 +4425,7 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
             effective=value,
             source="user" if _has_user_value(cfg, key) else "default",
             severity="warning" if dm_enabled and not value else "ok",
-            message="Schutz ist aktiv." if value else "Schutz ist aus; ein Verkauf in ungünstigen Preisfenstern wäre später möglich.",
+            message=('Schutz ist aktiv.' if value else f'Die Vermeidung von Einspeisung bei ungünstigen Preisen ist aus; ein späterer Verkauf zu solchen Preisen wäre möglich. Im Config-Editor unter „Tarif & Strompreise“ das Feld „{label}“ nur bei bewusst gewünschtem Betrieb ausgeschaltet lassen.') if ('warning' if dm_enabled and (not value) else 'ok') in ("warning", "error") else ('Schutz ist aktiv.' if value else 'Schutz ist aus; ein Verkauf in ungünstigen Preisfenstern wäre später möglich.'),
         )
     price["direct_marketing_low_price_curtail_enable"] = _entry(
         key="direct_marketing_low_price_curtail_enable",
@@ -4768,8 +4438,7 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
         source="user" if _has_user_value(cfg, "direct_marketing_low_price_curtail_enable") else "default",
         severity="ok",
         message=(
-            "Harte Gesamt-Einspeisebegrenzung ist ausschließlich für Negativpreise freigegeben; positive EEG-/Billigpreisfenster bleiben weich."
-            if dm_curtail_enabled else "Zusätzliche harte Negativpreis-Einspeisebegrenzung ist aus."
+            ('Die zusätzliche Einspeisebegrenzung ist an und wirkt nur bei Negativpreisen; günstige positive Preise lösen keine harte Begrenzung aus. Im Config-Editor unter „Tarif & Strompreise“ das Feld „Negativpreis-Export begrenzen“ nur für diesen gewünschten Betrieb eingeschaltet lassen.' if dm_curtail_enabled else 'Zusätzliche harte Negativpreis-Einspeisebegrenzung ist aus.') if ('ok') in ("warning", "error") else ('Harte Gesamt-Einspeisebegrenzung ist ausschließlich für Negativpreise freigegeben; positive EEG-/Billigpreisfenster bleiben weich.' if dm_curtail_enabled else 'Zusätzliche harte Negativpreis-Einspeisebegrenzung ist aus.')
         ),
     )
 
@@ -4785,7 +4454,7 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
     )
     wallbox["bluelink_user"] = _entry(
         key="bluelink_user",
-        label="Bluelink Benutzer",
+        label='Benutzer (E-Mail)',
         unit="-",
         configured="gesetzt" if bluelink_user_set else None,
         live_value=None,
@@ -4794,14 +4463,12 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
         source="user" if bluelink_user_set else "default",
         severity="warning" if (bluelink_active and not bluelink_user_set) else ("ok" if bluelink_user_set else "info"),
         message=(
-            "Bluelink: Benutzer (E-Mail des Hyundai/Kia-Kontos) fehlt; der Fahrzeugdienst bleibt ohne Zugangsdaten deaktiviert."
-            if (bluelink_active and not bluelink_user_set)
-            else ("Benutzer ist gesetzt." if bluelink_user_set else "Bluelink ist nicht konfiguriert.")
+            ('Die E-Mail-Adresse des Herstellerkontos fehlt; der Fahrzeugdienst bleibt ohne Zugangsdaten aus. Im Config-Editor unter „Wallbox & Fahrzeug“ im Abschnitt „Fahrzeug Integration (Bluelink)“ das Feld „Benutzer (E-Mail)“ prüfen.' if bluelink_active and (not bluelink_user_set) else 'Benutzer ist gesetzt.' if bluelink_user_set else 'Bluelink ist nicht konfiguriert.') if ('warning' if bluelink_active and (not bluelink_user_set) else 'ok' if bluelink_user_set else 'info') in ("warning", "error") else ('Bluelink: Benutzer (E-Mail des Hyundai/Kia-Kontos) fehlt; der Fahrzeugdienst bleibt ohne Zugangsdaten deaktiviert.' if bluelink_active and (not bluelink_user_set) else 'Benutzer ist gesetzt.' if bluelink_user_set else 'Bluelink ist nicht konfiguriert.')
         ),
     )
     wallbox["bluelink_password"] = _entry(
         key="bluelink_password",
-        label="Bluelink Passwort",
+        label='Passwort',
         unit="-",
         configured="gesetzt" if bluelink_password_set else None,
         live_value=None,
@@ -4810,15 +4477,13 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
         source="user" if bluelink_password_set else "default",
         severity="warning" if (bluelink_active and not bluelink_password_set) else ("ok" if bluelink_password_set else "info"),
         message=(
-            "Bluelink: Passwort fehlt; die Anmeldung am Hyundai/Kia-Konto ist nicht möglich."
-            if (bluelink_active and not bluelink_password_set)
-            else ("Passwort ist gesetzt." if bluelink_password_set else "Bluelink ist nicht konfiguriert.")
+            ('Das Passwort des Herstellerkontos fehlt; der Fahrzeugdienst kann sich nicht anmelden. Im Config-Editor unter „Wallbox & Fahrzeug“ im Abschnitt „Fahrzeug Integration (Bluelink)“ das Feld „Passwort“ prüfen.' if bluelink_active and (not bluelink_password_set) else 'Passwort ist gesetzt.' if bluelink_password_set else 'Bluelink ist nicht konfiguriert.') if ('warning' if bluelink_active and (not bluelink_password_set) else 'ok' if bluelink_password_set else 'info') in ("warning", "error") else ('Bluelink: Passwort fehlt; die Anmeldung am Hyundai/Kia-Konto ist nicht möglich.' if bluelink_active and (not bluelink_password_set) else 'Passwort ist gesetzt.' if bluelink_password_set else 'Bluelink ist nicht konfiguriert.')
         ),
     )
     bluelink_pin_valid = bluelink_pin_raw == "" or bluelink_pin_raw.isdigit()
     wallbox["bluelink_pin"] = _entry(
         key="bluelink_pin",
-        label="Bluelink PIN",
+        label='PIN',
         unit="-",
         configured="gesetzt" if bluelink_pin_raw else None,
         live_value=None,
@@ -4827,15 +4492,13 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
         source="user" if bluelink_pin_raw else "default",
         severity="warning" if not bluelink_pin_valid else "ok",
         message=(
-            "Bluelink: Die PIN darf nur Ziffern enthalten; sie wird ignoriert."
-            if not bluelink_pin_valid
-            else ("PIN ist gesetzt." if bluelink_pin_raw else "PIN ist optional (nur für Konten mit PIN-Pflicht).")
+            ('Die PIN enthält andere Zeichen als Ziffern und wird ignoriert. Im Config-Editor unter „Wallbox & Fahrzeug“ im Abschnitt „Fahrzeug Integration (Bluelink)“ das Feld „PIN“ prüfen.' if not bluelink_pin_valid else 'PIN ist gesetzt.' if bluelink_pin_raw else 'PIN ist optional (nur für Konten mit PIN-Pflicht).') if ('warning' if not bluelink_pin_valid else 'ok') in ("warning", "error") else ('Bluelink: Die PIN darf nur Ziffern enthalten; sie wird ignoriert.' if not bluelink_pin_valid else 'PIN ist gesetzt.' if bluelink_pin_raw else 'PIN ist optional (nur für Konten mit PIN-Pflicht).')
         ),
     )
     bluelink_brand_valid = bluelink_brand_raw in {"", "hyundai", "kia"}
     wallbox["bluelink_brand"] = _entry(
         key="bluelink_brand",
-        label="Bluelink Marke",
+        label='Marke',
         unit="-",
         configured=bluelink_brand_raw if bluelink_brand_raw else None,
         live_value=None,
@@ -4844,9 +4507,7 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
         source="user" if (bluelink_brand_raw and bluelink_brand_valid) else "default",
         severity="warning" if not bluelink_brand_valid else "ok",
         message=(
-            "Bluelink: Marke muss hyundai oder kia sein; wirksam ist hyundai."
-            if not bluelink_brand_valid
-            else "Marke des Herstellerkontos (Hyundai Bluelink oder Kia Connect)."
+            ('Die Fahrzeugmarke ist unbekannt; verwendet wird Hyundai. Im Config-Editor unter „Wallbox & Fahrzeug“ im Abschnitt „Fahrzeug Integration (Bluelink)“ das Feld „Marke“ prüfen.' if not bluelink_brand_valid else 'Marke des Herstellerkontos (Hyundai Bluelink oder Kia Connect).') if ('warning' if not bluelink_brand_valid else 'ok') in ("warning", "error") else ('Bluelink: Marke muss hyundai oder kia sein; wirksam ist hyundai.' if not bluelink_brand_valid else 'Marke des Herstellerkontos (Hyundai Bluelink oder Kia Connect).')
         ),
     )
 
@@ -4867,13 +4528,13 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
         repeat_warning = not repeat_valid or 0 < repeat_value < 10 or repeat_value > 3600
         repeat_message = "0 = aus; Wiederholung nur bei gültigen Live-Daten."
         if not repeat_valid:
-            repeat_message = "Ganze, nicht negative Sekunden erforderlich; Wiederholung ist aus."
+            repeat_message = f'Der Wiederholabstand ist keine nichtnegative ganze Sekundenzahl; die Wiederholung bleibt aus. Im Config-Editor unter „Schnittstellen & MQTT“ das Feld „Werte zyklisch wiederholen (s)“ prüfen.'
         elif 0 < repeat_value < 10:
-            repeat_message = "Mindestabstand 10 s; wirksam sind 10 s."
+            repeat_message = f'Der Wiederholabstand liegt unter 10 s; verwendet werden 10 s. Im Config-Editor unter „Schnittstellen & MQTT“ das Feld „Werte zyklisch wiederholen (s)“ prüfen.'
         elif repeat_value > 3600:
-            repeat_message = "Höchstabstand 3600 s; wirksam sind 3600 s."
+            repeat_message = f'Der Wiederholabstand liegt über 3600 s; verwendet werden 3600 s. Im Config-Editor unter „Schnittstellen & MQTT“ das Feld „Werte zyklisch wiederholen (s)“ prüfen.'
         consumer["mqtt_hub_repeat_interval_s"] = _entry(
-            key="mqtt_hub_repeat_interval_s", label="MQTT-Werte zyklisch wiederholen", unit="s",
+            key="mqtt_hub_repeat_interval_s", label='Werte zyklisch wiederholen (s)', unit="s",
             configured=repeat_raw, live_value=None, live_key=None, effective=repeat_effective,
             source="user" if _has_user_value(cfg, "mqtt_hub_repeat_interval_s") else "default",
             severity="warning" if repeat_warning else "ok", message=repeat_message,
@@ -4881,12 +4542,11 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
 
     names, valid = parse_mqtt_vehicle_allowlist(cfg.get("mqtt_vehicle_allowlist"))
     consumer["mqtt_vehicle_allowlist"] = _entry(
-        key="mqtt_vehicle_allowlist", label="MQTT-Fahrzeug-Freigabeliste", unit="-",
+        key="mqtt_vehicle_allowlist", label='MQTT-Fahrzeug-Freigabeliste (optional)', unit="-",
         configured="[maskiert]" if names is not None else "", live_value=None, live_key=None,
         effective="offen" if names is None else "begrenzt" if valid else "gesperrt",
         source="default" if names is None else "user", severity="ok" if valid else "warning",
-        message=("Exakte kommagetrennte NAME-Segmente ohne Wildcards; nur generische MQTT-Fahrzeuge."
-                 if valid else "Ungültige Freigabeliste: generische MQTT-Fahrzeuge sind gesperrt."),
+        message=(('Exakte kommagetrennte NAME-Segmente ohne Wildcards; nur generische MQTT-Fahrzeuge.' if valid else 'Die Fahrzeugfreigabeliste ist ungültig; allgemeine MQTT-Fahrzeuge bleiben gesperrt. Im Config-Editor unter „Schnittstellen & MQTT“ das Feld „MQTT-Fahrzeug-Freigabeliste (optional)“ auf exakte, kommagetrennte Namen ohne Platzhalter prüfen.') if ('ok' if valid else 'warning') in ("warning", "error") else ('Exakte kommagetrennte NAME-Segmente ohne Wildcards; nur generische MQTT-Fahrzeuge.' if valid else 'Ungültige Freigabeliste: generische MQTT-Fahrzeuge sind gesperrt.')),
     )
     wp_topic = str(cfg.get("wp_power_topic") or "").strip()
     base = str(cfg.get("mqtt_hub_topic") or "e3dc").strip().strip('/') or 'e3dc'
@@ -4907,12 +4567,10 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
         or wp_topic == f"{base}/live"))
     invalid = any(char in wp_topic for char in ('#', '+', '\x00')) or len(wp_topic.encode('utf-8')) > 65535
     consumer["wp_power_topic"] = _entry(
-        key="wp_power_topic", label="WP-Leistungs-Topic", unit="-", configured=wp_topic,
+        key="wp_power_topic", label='MQTT-Leistungsthema der Wärmepumpe', unit="-", configured=wp_topic,
         live_value=None, live_key=None, effective=wp_topic or "Feste WP-Leistungseingänge",
         source="user" if wp_topic else "default", severity="warning" if invalid or conflict else "ok",
-        message=("Exaktes MQTT-Topic ohne Wildcards erforderlich; keine automatische Ersatzquelle." if invalid
-            else "Topic kollidiert mit einem anderen Funktionstopic; bitte ein eigenes Leistungs-Topic wählen." if conflict
-            else "Rohe endliche Zahl in W am zentralen Broker; Dienstneustart über den Einrichtungsplan. Eine HA-Entity-ID ist kein MQTT-Topic."),
+        message=(('Das MQTT-Leistungsthema enthält Platzhalter oder ist ungültig; es wird keine automatische Ersatzquelle verwendet. Im Config-Editor unter „Schnittstellen & MQTT“ das Feld „WP-Leistungs-Topic (optional)“ auf ein exaktes Thema prüfen.' if invalid else 'Das MQTT-Leistungsthema wird schon für eine andere Funktion verwendet; die Zuordnung ist widersprüchlich. Im Config-Editor unter „Schnittstellen & MQTT“ im Feld „WP-Leistungs-Topic (optional)“ ein eigenes Thema wählen.' if conflict else 'Rohe endliche Zahl in W am zentralen Broker; Dienstneustart über den Einrichtungsplan. Eine HA-Entity-ID ist kein MQTT-Topic.') if ('warning' if invalid or conflict else 'ok') in ("warning", "error") else ('Exaktes MQTT-Topic ohne Wildcards erforderlich; keine automatische Ersatzquelle.' if invalid else 'Topic kollidiert mit einem anderen Funktionstopic; bitte ein eigenes Leistungs-Topic wählen.' if conflict else 'Rohe endliche Zahl in W am zentralen Broker; Dienstneustart über den Einrichtungsplan. Eine HA-Entity-ID ist kein MQTT-Topic.')),
     )
 
     warnings = _warning_count(storage, wallbox, consumer, price, forecast)
@@ -4960,8 +4618,9 @@ def write_config_validation(
     cfg: Optional[Dict[str, Any]],
     live: Optional[Dict[str, Any]],
     path: str = CONFIG_VALIDATION_F,
+    *, reserve_sample_fresh: Optional[bool] = None,
 ) -> Dict[str, Any]:
-    payload = validate_storage_config(cfg, live)
+    payload = validate_storage_config(cfg, live, reserve_sample_fresh=reserve_sample_fresh)
     _atomic_write_on_change(
         path,
         payload,

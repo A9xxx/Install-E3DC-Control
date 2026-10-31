@@ -1760,8 +1760,6 @@ class EnsemblePVForecaster:
         """Liefert eine nach TTL und Provenienz belegte Modellfrische."""
 
         import time as _t
-        if self._pv_topology_contract_or_unbound().get("split_usable") is not True:
-            return {"fresh": False, "source": f"{model_id}_topology_split_unusable"}
         cached = self._model_cache.get(model_id, {})
         ttl = MODEL_TTL.get(model_id, 3600)
         if model_id == "m3":
@@ -3052,7 +3050,10 @@ class EnsemblePVForecaster:
                 projection_status=projection_status,
                 projection_reason=projection_reason,
             )
-            if topology_slot.get("status") != "bound":
+            if topology_slot.get("status") != "bound" and not (
+                topology_slot.get("reason") == "RESOURCE_COUPLING_MISSING"
+                and projection_status == "complete"
+            ):
                 slot["pv_forecast_fresh"] = False
                 slot["forecast_fresh"] = False
                 slot["pv_forecast_freshness_source"] = (

@@ -115,7 +115,7 @@ def auto_discover_modules():
     # Legacy-Setup-Skripte ignorieren wir; normale Einrichtung läuft über
     # Installation/Update und danach über WebUI bzw. Config-Editor.
     IGNORE_MODULES = (
-        "core", "__init__", "e3dc_mqtt_hub", "e3dc_websocket",
+        "core", "__init__", "e3dc_mqtt_hub",
         "bluelink_client", "sqlite_archiver", "notification_manager", "ha_manager",
         "ml_predictor", "generate_vapid", "wallbox_manager", "energy_manager", "idm_live",
         "heizstab_manager", "climate_live", "climate_control", "stiebel", "e3dc_live",

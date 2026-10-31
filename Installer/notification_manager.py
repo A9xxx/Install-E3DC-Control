@@ -42,8 +42,6 @@ def safe_execute(cmd_list, silent=False):
     try:
         script_path = cmd_list[1] if len(cmd_list) > 1 else cmd_list[0]
         if os.path.exists(script_path):
-            if not silent:
-                print(f"[{datetime.now().strftime('%H:%M:%S')}] Führe aus: {' '.join(cmd_list)}", flush=True)
             
             res = subprocess.run(cmd_list, capture_output=True, text=True, check=False)
             
@@ -51,15 +49,14 @@ def safe_execute(cmd_list, silent=False):
                 print(f"[{datetime.now().strftime('%H:%M:%S')}] Fehler bei {' '.join(cmd_list)}:\n{res.stderr.strip()}", flush=True)
             elif res.stderr.strip() and not silent:
                 print(f"[{datetime.now().strftime('%H:%M:%S')}] Hinweis von {' '.join(cmd_list)}:\n{res.stderr.strip()}", flush=True)
-            if not silent and res.stdout.strip():
+            if res.returncode != 0 and res.stdout.strip():
                 print(f"[{datetime.now().strftime('%H:%M:%S')}] Ausgabe:\n{res.stdout.strip()}", flush=True)
             if res.returncode != 0:
                 print(f"[{datetime.now().strftime('%H:%M:%S')}] Befehl fehlgeschlagen (Rückgabecode {res.returncode}): {' '.join(cmd_list)}", flush=True)
                 return False
             return True
         else:
-            if not silent:
-                print(f"[{datetime.now().strftime('%H:%M:%S')}] Überspringe (Datei fehlt): {script_path}", flush=True)
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] Überspringe (Datei fehlt): {script_path}", flush=True)
             return False
     except Exception as e:
         print(f"Fehler bei der Ausführung von {cmd_list}: {e}", flush=True)
@@ -228,6 +225,12 @@ def main():
         if c_time == "00:00" and last_run.get('backup') != backup_id and not is_standby:
             if safe_execute(["/usr/bin/php", "/var/www/html/backup_history.php"]):
                 last_run['backup'] = backup_id
+
+        # Stündliche Minutensicherung vor der Berechnung der Tageszeile.
+        history_id = f"{c_date}_{now.strftime('%H')}"
+        if c_minute == "55" and last_run.get('history_backup') != history_id and not is_standby:
+            if safe_execute(["/usr/bin/php", "/var/www/html/backup_history.php", "--heute"]):
+                last_run['history_backup'] = history_id
 
         # 6. SQLite Archiver (Immer um Minute 55, ersetzt Cron)
         archiver_id = f"{c_date}_{now.strftime('%H')}"

@@ -1792,7 +1792,6 @@ def _install_forecast_evidence_service_compat(
 
 def install_epex_service(
     start_services=True,
-    include_websocket=False,
     expected_recovery_dropins=None,
     allow_optional_not_found_compat=False,
 ):
@@ -1805,7 +1804,6 @@ def install_epex_service(
         capture_systemd_service_bundle,
         install_e3dc_live_service,
         rollback_systemd_service_bundle,
-        setup_websocket_service,
     )
     installer_dir = os.path.join(INSTALL_DIR, "Installer")
 
@@ -1816,8 +1814,6 @@ def install_epex_service(
         ("Storage Simulator", "storage_simulator.py"),
         ("Storage Manager", "storage_manager.py"),
     ]
-    if include_websocket:
-        required_scripts.append(("WebSocket Service", "e3dc_websocket.py"))
     missing_scripts = [
         (label, os.path.join(installer_dir, relative_path))
         for label, relative_path in required_scripts
@@ -1846,8 +1842,6 @@ def install_epex_service(
     ]
     if evidence_present:
         service_names.append("e3dc-forecast-evidence")
-    if include_websocket:
-        service_names.append("e3dc-websocket")
     expected_recovery_dropins = {
         unit: contract
         for unit, contract in dict(expected_recovery_dropins or {}).items()
@@ -1888,7 +1882,7 @@ def install_epex_service(
             raise RuntimeError(f"{label} konnte nicht transaktional vorbereitet werden")
 
     try:
-        total_steps = 7 if include_websocket else 6
+        total_steps = 6
 
         # 1. E3DC Live Daten Service (RSCP Python) - Basis für alle Kerndienste
         print(f"\n[1/{total_steps}] E3DC Live Daten Service...")
@@ -1987,18 +1981,6 @@ def install_epex_service(
                 "e3dc-forecast-evidence",
             )
 
-        if include_websocket:
-            print(f"\n[7/{total_steps}] WebSocket Service...")
-            _require_prepared(
-                setup_websocket_service(
-                    start_service=False,
-                    defer_activation=True,
-                    bundle_snapshot=service_snapshot,
-                ),
-                "WebSocket Service",
-                "e3dc-websocket",
-            )
-
         enabled_services = [
             "e3dc-live",
             "e3dc-epex-manager",
@@ -2017,9 +1999,6 @@ def install_epex_service(
         if evidence_present and evidence_enabled:
             enabled_services.append("e3dc-forecast-evidence")
             start_order.append("e3dc-forecast-evidence")
-        if include_websocket:
-            enabled_services.append("e3dc-websocket")
-            start_order.append("e3dc-websocket")
         start_order.append("e3dc-storage-manager")
 
         if activate_systemd_service_bundle(

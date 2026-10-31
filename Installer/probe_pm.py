@@ -139,6 +139,9 @@ def probe_pm_index(idx: int, timeout_s: float = 5.0) -> dict:
 
 
 def main():
+    from runtime_logging import configure_service_logger
+    from Wallbox.config import LOG_DIR
+    configure_service_logger("WallboxManager", log_path=os.path.join(LOG_DIR, "probe_pm.log"))
     parser = argparse.ArgumentParser(description="E3DC PM-Index Plausibilitätsprüfung")
     parser.add_argument("--index", type=int, default=1, help="PM-Index (0..7)")
     parser.add_argument("--json", action="store_true", help="Ausgabe im JSON-Format")

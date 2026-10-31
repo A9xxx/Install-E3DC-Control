@@ -123,7 +123,6 @@ def _configure_wallbox_logging():
         root_logger.addHandler(console_handler)
 
 
-_configure_wallbox_logging()
 logger = logging.getLogger("WallboxManager")
 install_quiet_info_filter(
     logger,
@@ -488,7 +487,11 @@ def _smooth_native_wb_status(state_dict):
 def write_status(state_dict):
     """Schreibt den aktuellen Manager-Status in die Ramdisk."""
     try:
-        state_dict = _smooth_native_wb_status(_sanitize_native_wb_power(dict(state_dict)))
+        state_dict = dict(state_dict)
+        # Der Not-Aus-Zweig liefert bereits Messwertgültigkeit und Nullsollwerte.
+        # Anzeigeharmonisierung und Glättung dürfen diese Aussage nicht ersetzen.
+        if state_dict.get("emergency_stop_active") is not True:
+            state_dict = _smooth_native_wb_status(_sanitize_native_wb_power(state_dict))
         state_dict["ts"] = int(time.time())
         atomic_write_on_change(
             STATUS_OUTPUT_FILE,

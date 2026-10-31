@@ -309,7 +309,7 @@ $defaults = [
     "einspeiselimit" => "7.0",
     "maximumladeleistung" => "12500",
     "maximaleentladeleistung" => "11000",
-    "ep_reserve_pct" => "8.0",
+    "ep_reserve_pct" => "",
     "storage_curve_target_mode" => "anchored",
     "storage_curve_sliding_horizon_enable" => "0",
     // Prognose-100 später Vollstand nur mit Grund, Kurvenende-Puffer (Standardwerte wie im Simulator).
@@ -541,13 +541,11 @@ $defaults = [
     "storage_central_pv_split_enable" => "0",
     "storage_central_pv_split_gate_hold_s" => "60",
     "storage_home_wp_split" => "auto", // Wärmepumpe im Hauswert (auto/include/separate), Alias-Tabelle in storage_manager.py
-    "wb_restart_delay_s" => "60", "wb_min_charge_time_s" => "300", "wb_cloud_stop_delay_s" => "180", "wb_phase_change_hold_s" => "180",
-    "wb_phase_down_delay_s" => "480", "wb_phase_up_forecast_hold_s" => "60", "wb_phase_up_symmetry_enable" => "0", // Vorlauf 60 s (die 480 s sind die Sperre nach dem Wechsel), Symmetrie-Klausel aus
-    "wb_phase_up_export_wh" => "120", // Export-Wh-Konto 1p→3p (vorher 250 Wh), schaltet alternativ zur Uhr
+    "wb_restart_delay_s" => "60", "wb_min_charge_time_s" => "300", "wb_cloud_stop_delay_s" => "180",
     "wb_pv_only_release_hold_s" => "120", "wb_pv_only_hold_stale_guard_s" => "45",
     "wb_grid_import_settle_s" => "10",
-    "wb1_restart_delay_s" => "", "wb1_min_charge_time_s" => "", "wb1_cloud_stop_delay_s" => "", "wb1_phase_change_hold_s" => "",
-    "wb2_restart_delay_s" => "", "wb2_min_charge_time_s" => "", "wb2_cloud_stop_delay_s" => "", "wb2_phase_change_hold_s" => "", "wb_openwb_zero_budget_hold_s" => "300",
+    "wb1_restart_delay_s" => "", "wb1_min_charge_time_s" => "", "wb1_cloud_stop_delay_s" => "",
+    "wb2_restart_delay_s" => "", "wb2_min_charge_time_s" => "", "wb2_cloud_stop_delay_s" => "", "wb_openwb_zero_budget_hold_s" => "300",
     "openwb_pro_phase_wait_s" => "480", "openwb_pro_phase_cp_interrupt_duration_s" => "5", "openwb_pro_phase_restart_delay_s" => "0", "openwb_pro_start_wakeup_delay_s" => "5",
     "openwb_pro_automatic_start_cp_enable" => "auto", "openwb_pro_start_cp_grace_s" => "60",
     "openwb_pro_start_hold_s" => "180", "openwb_pro_start_retry_cycle_s" => "300",
@@ -622,6 +620,7 @@ $tooltips = [
     "ui_wp_bridge_preset" => "Voreinstellung für die Überbrückung bei kurzzeitig fehlendem PV-Überschuss. „Eigene Werte aus der Feinabstimmung“ verwendet die individuell eingestellten Werte. Änderungen werden erst nach dem Speichern wirksam.",
     "ui_battery_target_soc" => "Ziel-Ladezustand für den manuellen Batterieauftrag in Prozent. Ohne aktiven Auftrag zeigt der Regler 100 %. Einstellbar sind 5 bis 100 %; leer oder 0 ist über diesen Schieberegler nicht wählbar. Erst Laden oder Entladen startet den Auftrag.",
     "ui_wallbox_budget" => "Anzeige der Hausabsicherung abzüglich Reserve in Ampere je Phase, mindestens 0 A. Ohne Eingaben rechnet diese Anzeige mit 35 A und 2 A Reserve. Dieser berechnete Wert ist kein eigenes Eingabefeld.",
+    "ui_market_day_basis" => "Datenbasis für die reine Beispielrechnung wählen: einen typischen trüben Wintertag oder die nächsten 24 Stunden der vorhandenen Prognose. Die Auswahl wird nicht gespeichert.",
     "ui_extra_parameter" => "Zusätzlicher Parameter ohne hinterlegte Feldbeschreibung. Wirkung, Einheit, Standardwert sowie die Bedeutung von leer oder 0 sind dem Editor nicht bekannt und hängen vom auswertenden Dienst ab.",
     "ui_new_key" => "Name des neuen Zusatzparameters: höchstens 128 Zeichen, beginnend mit einem Buchstaben; danach Kleinbuchstaben, Ziffern, Punkt, Bindestrich oder Unterstrich. Bekannte Schlüssel und geschützte Parameter sind hier gesperrt.",
     "ui_new_value" => "Wert des neuen Zusatzparameters. Beim Hinzufügen ist ein nicht leerer Text- oder Zahlenwert mit höchstens 65 535 Zeichen erforderlich.",
@@ -645,13 +644,13 @@ $tooltips = [
     "aes_password"           => "RSCP AES-Passwort – direkt am E3DC-Display unter Einstellungen vergeben.",
     "e3dc_user"              => "Benutzername für das E3DC-Myreserve-Portal (benötigt für RSCP-Authentifizierung).",
     "e3dc_password"          => "Passwort für das E3DC-Myreserve-Portal.",
-    "wurzelzaehler"          => "Legacy/optional: PM-Index für die reine Phasendiagnose. 0 sucht automatisch nach einem PM mit Phasenwerten. Die Regelung nutzt den EMS-Netzpunkt direkt per RSCP und benötigt keinen Wurzelzähler.",
-    "wurzelzaehler_invertiert" => "Legacy/optional: invertiert nur die PM-Phasendiagnose. Der führende EMS-Netzpunkt wird nicht invertiert.",
-    "live_grid_pm_delta_debounce_enable" => "Entprellt kurze Differenzen zwischen EMS-Netzpunkt und PM-Phasensumme. Einzelne Soft-Treffer bleiben Diagnose, harte oder wiederholte Treffer bleiben regelwirksam.",
-    "live_grid_pm_delta_soft_threshold_w" => "Abweichung in Watt, ab der ein Grid-PM-Delta diagnostisch als auffällig gilt.",
-    "live_grid_pm_delta_hard_threshold_w" => "Abweichung in Watt, ab der ein Grid-PM-Delta sofort regelwirksam bleibt.",
-    "live_grid_pm_delta_persist_count" => "Anzahl auffälliger Grid-PM-Delta-Samples im Zeitfenster, bevor der Grund regelwirksam wird.",
-    "live_grid_pm_delta_persist_window_s" => "Zeitfenster in Sekunden für wiederholte Grid-PM-Delta-Samples.",
+    "wurzelzaehler"          => "PM-Index des Wurzelzählers für die Phasenwerte des Hausanschlusses. 0 sucht automatisch nach einem PM mit Phasenwerten. Ohne gültige Phasenwerte warten Wallboxstarts; laufende Ladungen nutzen die vorhandene Datenfrist.",
+    "wurzelzaehler_invertiert" => "Invertiert die Phasenwerte des Wurzelzählers. Die Zuordnung und das Vorzeichen müssen zum Hausanschluss passen; der EMS-Netzwert bleibt unverändert.",
+    "live_grid_pm_delta_debounce_enable" => "Entprellt kurze Differenzen zwischen E3DC-Netzwert und Phasensumme des Leistungsmessers. Harte oder bestätigte Treffer erscheinen als Diagnose und Kartenhinweis. Die Probe bleibt gültig; Netzladen und Netzanteile des Speichers warten.",
+    "live_grid_pm_delta_soft_threshold_w" => "Weicher Schwellwert der Abweichung in Watt zwischen E3DC-Netzwert und Phasensumme des Leistungsmessers. Wiederholte Treffer erscheinen nach Bestätigung als Diagnose und Kartenhinweis. Die Phasenwerte bestimmen weiterhin den Wallboxrahmen. Netzladen und Netzanteile des Speichers warten bei bestätigtem Widerspruch.",
+    "live_grid_pm_delta_hard_threshold_w" => "Abweichung in Watt für einen sofortigen Diagnose- und Kartenhinweis. Die Probe bleibt gültig; Netzladen und Netzanteile des Speichers warten. Der Wallboxrahmen folgt weiterhin den Phasenwerten.",
+    "live_grid_pm_delta_persist_count" => "Anzahl auffälliger Proben im Zeitfenster bis zur Bestätigung des Widerspruchs. Danach erscheinen Diagnose und Kartenhinweis; Netzladen und Netzanteile des Speichers warten. Die Probe bleibt gültig.",
+    "live_grid_pm_delta_persist_window_s" => "Zeitfenster in Sekunden für die Bestätigung wiederholter Abweichungen. Bestätigte Treffer erscheinen als Diagnose und Kartenhinweis; Netzladen und Netzanteile des Speichers warten. Die Probe bleibt gültig.",
     "ext_inverter_type" => "Zusatzwechselrichter: none = keine Direktlesung (Standard), sungrow_modbus = Sungrow-String-Wechselrichter (SG-Serie) per Modbus TCP nur lesend abfragen. Nur setzen, wenn ein zweiter Wechselrichter über LAN erreichbar ist; die Regelung nutzt weiterhin den E3DC-Messwert des externen Leistungsmessers, die Direktlesung liefert Phasen-/String-Daten und Diagnose in live_data_py.json (Block ext_inverter).",
     "ext_inverter_ip" => "IPv4-Adresse des Zusatzwechselrichters bzw. seines Kommunikationsmoduls (Modbus TCP). Ohne gültige Adresse bleibt die Direktlesung deaktiviert.",
     "ext_inverter_port" => "Modbus-TCP-Port des Zusatzwechselrichters (Standard 502).",
@@ -675,7 +674,7 @@ $tooltips = [
     "speichergroesse"        => "Nutzbare Kapazität des Batteriespeichers in kWh (z.B. 15). Wird als Fallback genutzt wenn RSCP keinen Wert liefert.",
     "maximumladeleistung"    => "Maximale Ladeleistung in Watt. Liegt die Eingabe über der gültigen Gerätegrenze oder ist sie leer, 0 oder kleiner als 300 W, wird die Gerätegrenze mit Hinweis verwendet. Eine bewusste Drosselung ab 300 W bleibt erhalten; eine E3DC-Mindestempfehlung ist nur ein Hinweis.",
     "maximaleentladeleistung" => "Maximale Entladeleistung in Watt. Liegt die Eingabe über der gültigen Gerätegrenze oder ist sie leer, 0 oder kleiner als 300 W, wird die Gerätegrenze mit Hinweis verwendet. Eine bewusste Drosselung ab 300 W bleibt erhalten. Notstromsperre und dynamische Grenzen gelten weiterhin.",
-    "ep_reserve_pct"         => "Fallback-Notstromreserve in %. Wenn E3DC die Reserve in Wh liefert, wird sie auf die gesamte Speicherkapazität normalisiert. Dieser Wert greift nur, wenn RSCP keine Reserve liefert oder als zusätzlicher konservativer Boden.",
+    "ep_reserve_pct"         => "Leer oder 0: Der E3DC hält seine eigene Reserve; E3DC-Control sperrt dann nur eigene Entladebefehle. Leer bedeutet Rückfall 8 %, falls die Gerätereserve fehlt oder niedriger liegt. Für den Freilauf das Feld leeren oder 0 eintragen. Eine eingetragene Reserve bleibt als zusätzlicher Boden wirksam; der höhere Wert gilt. Wh werden auf die Gesamtspeicherkapazität umgerechnet.",
     "einspeiselimit"         => "Einspeisebegrenzung in kW (z.B. 7.0). Der Abregelschutz nutzt diesen Wert als Ziel-Netzpunkt, sofern er unter dem per RSCP gemeldeten E3DC-Derating liegt.",
     "storage_curve_target_mode" => "Zielkurven-Modus. Ankerkurve nutzt Morgen-Puffer, Zwischenziele und Tagesziel wie bisher. Prognose auf 100% berechnet die Speicher-Zielkurve allein aus PV- und Verbrauchsprognose bis zum Tagesziel am Freilauf. Normal sind 100%; bei aktivem PV + Akku und unzureichender gemeinsamer PV-Deckung kann die heutige PV-Kurve bei wbminSoC enden. Bedarf 0 senkt nichts, unbekannter Bedarf zählt nach bestätigter Ladung weiter, nur am selben Kurventag und in derselben Steck-Episode; nach 60 Minuten unter 300 W bei ausreichendem PV- und Stromangebot endet dieser Beleg. Für alle Wallboxen gelten mögliche bzw. konfigurierte Phasen und mindestens der konfigurierte Mindeststrom (mindestens 6 A), bei gemeldetem Gerätewert der höhere. Der Ladebeleg schaltet ab 500 W ein, nach 45 s unter 300 W aus. Folgetage und Netzladeziele bleiben normal; Schutzpfade, Pre-Dump und Abregelreserve bleiben aktiv.",
     "storage_curve_sliding_horizon_enable" => "Optionaler erweiterter Modus: erlaubt dem 100%-Prognosepfad, die Ladung über einen gleitenden Prognosehorizont zu entspannen, wenn Vertrauen, Zielerreichbarkeit und Abregeldruck sicher sind. Nur bei Zielkurven-Modus 'Prognose auf 100%' aktivierbar.",
@@ -727,11 +726,6 @@ $tooltips = [
     "wb_restart_delay_s" => "Pause nach einem Wallbox-Stopp, bevor bei PV-Betrieb wieder gestartet wird (Sekunden). Schützt das Schütz vor Flattern bei wechselnder Sonne. Geplante Ladefenster starten sofort.",
     "wb_min_charge_time_s" => "So lange läuft eine gestartete Ladung mindestens (Sekunden), auch wenn der Überschuss kurz einbricht. Harte Stopps – Nutzer-Aus, Ladefenster-Ende, Schutzgrenzen – haben Vorrang.",
     "wb_cloud_stop_delay_s" => "Wolken-Halt: So lange darf eine laufende Ladung bei 0 W PV-Budget am Mindeststrom weiterlaufen (Sekunden), bevor gestoppt wird. Überbrückt Wolkenlücken ohne Schützwechsel.",
-    "wb_phase_change_hold_s" => "Nach einem Phasenwechsel wird der Strom so lange nicht weiter angehoben (Sekunden), damit das Fahrzeug den Wechsel sicher übernimmt. Der erste Hochlauf je Stecksession darf sofort erfolgen.",
-    "wb_phase_down_delay_s" => "Beharrung 3p→1p (Sekunden, Standard 480 = openWB-Referenz, mindestens 60): So lange muss der Überschuss dauerhaft unter dem 3p-Minimum liegen, bevor auf eine Phase geschaltet wird. Bei erreichbarem Speicherziel verlängert der bestehende Prognosepfad die Beobachtung auf mindestens 600 s. Die zentrale Defizitsequenz läuft getrennt. Schutzfunktionen – Netzbezug über der Schwelle, wbminSoC-Untergrenze, unerlaubter Akkubezug – verkürzen auf 60 s.",
-    "wb_phase_up_forecast_hold_s" => "Vorlauf 1p→3p (Sekunden, Standard 60, mindestens 30): So lange muss die Hochschaltbedingung gelten – der Überschuss (Einspeisung plus Wallbox oder das frische Budget des Speicherreglers, Akku-Entladung zählt als Defizit) liegt im 30-s-Mittel über dem 3p-Minimum plus Puffer (4140 W + 300 W an der openWB Pro) und die eine Phase ist ausgereizt: bei phasenschaltfähigem Paar (Fahrzeugprofil 3-phasig, Wallbox schaltfähig) steht der gemessene Strom bis auf 2 A am Referenzstrom – dem kleineren Wert aus 1p-Deckel und aufgerundetem (3p-Minimum + Puffer)/230 V, an der openWB Pro 20 A – oder der Zielstrom liegt darüber; sonst gilt der wirksame 1p-Deckel (Zielstrom darüber, gemessener Strom bis auf 1 A daran oder – nur mit Symmetrie-Klausel – der Schieflastwert). Eine 16-A-Wallbox (1p höchstens 3,68 kW) schaltet also hoch, sobald der Überschuss das 3p-Minimum trägt. Die Uhr leckt: Wolkenlücken zählen sie zurück statt sie zu löschen, erst 15 s durchgehend ohne Bedingung setzen sie auf 0. Alternativ schaltet ein volles Export-Wh-Konto (Export-Wh 1p→3p) auch vor Ablauf des Vorlaufs. Kurze Netzbezugs-Blips unter 30 s setzen die Uhr nicht zurück. Die 480 s sind nicht der Vorlauf, sondern die Sperre nach jedem Phasenwechsel (Pro Phasen-Cooldown).",
-    "wb_phase_up_export_wh" => "Export-Wh 1p→3p (Wattstunden, Standard 120, mindestens 50): Energiekonto der Hochschaltung. Es füllt sich mit dem Überschuss oberhalb des Referenzstroms (verschenkte Einspeisung bzw. Budget über dem 1p-Angebot), solange die Hochschaltbedingung gilt; unter dem 3p-Minimum plus Puffer zieht es das 3p-Defizit ab, sonst hält es; es sättigt bei der doppelten Schwelle. Ist das Konto voll, wird auf drei Phasen geschaltet, auch wenn der Vorlauf 1p→3p noch läuft (Uhr ODER Konto). Kleinere Werte schalten schneller, größere Werte verlangen mehr nachgewiesenen Überschuss.",
-    "wb_phase_up_symmetry_enable" => "Symmetrie-Klausel 1p→3p (Standard aus): Ein = eine einphasige Ladung gilt schon ab dem Schieflastwert (Schieflast-Wächter am Netzpunkt, Standard 20 A ≈ 4,6 kVA) als ausgereizt und darf mit ausreichend Überschuss (3p-Minimum plus Puffer) auf drei Phasen wechseln, damit die Einspeisung nicht einseitig auf einer Netzphase reduziert wird. Aus = nur Überschuss und wirksamer 1p-Deckel zählen. Vor dem Einschalten klären, ob die Unsymmetriegrenze des Netzbetreibers auch für die Einspeiseseite gilt.",
     // Schlüssel gilt zusätzlich für den Wiederanlauf nach einem Kaskaden-Stop des Gruppen-Defizitreglers.
     "wb_pv_only_release_hold_s" => "PV-only Halt-Freigabe (Sekunden, Standard 120, mindestens 30): Hat die Mehrfach-Wallbox-Zuteilung eine laufende Wallbox in der PV-only-Klasse auf den Mindeststrom gesetzt (Slot 0), wird eine Slot-Erhöhung erst übernommen, wenn der Slot so lange ununterbrochen über dem Mindeststrom stand; Slot 0 hält sofort wieder. Verhindert das Pendeln zwischen Mindeststrom und vollem Slot, wenn das Budget um das 3p-Minimum der anderen Wallbox liegt. Gilt ebenso für den Wiederanlauf nach einem Kaskaden-Stop des Gruppen-Defizitreglers (Netz- oder Akku-Wh-Konto): Der Start erfolgt erst, wenn das PV-Budget die Mindestleistung der erwarteten Phasenzahl (1p 1380 W, 3p 4140 W) so lange durchgehend deckt – eine einzelne Wolkenlücke startet nicht.",
     "wb_pv_only_hold_stale_guard_s" => "PV-only Halt-Gnadenfrist (Sekunden, Standard 45, 10 bis 300): So lange trägt ein einzelner Poll-Aussetzer der Wallbox (kein frischer Status) oder eine kurz nicht bereite Gruppenzuteilung den Halt-Zustand weiter, ohne einen neuen Halt zu erteilen. Ohne Gnadenfrist setzt ein Aussetzer die Halt-Freigabe zurück und der nächste Zyklus gibt den vollen Slotstrom auf den Draht. Dauert der Aussetzer länger, endet die Halt-Episode.",
@@ -739,11 +733,9 @@ $tooltips = [
     "wb1_restart_delay_s" => "Abweichende Wiedereinschalt-Pause nur für Wallbox 1 (Sekunden). Leer = globaler Wert.",
     "wb1_min_charge_time_s" => "Abweichende Mindestladezeit nur für Wallbox 1 (Sekunden). Leer = globaler Wert.",
     "wb1_cloud_stop_delay_s" => "Abweichender Wolken-Halt nur für Wallbox 1 (Sekunden). Leer = globaler Wert.",
-    "wb1_phase_change_hold_s" => "Abweichender Phasen-Halt nur für Wallbox 1 (Sekunden). Leer = globaler Wert.",
     "wb2_restart_delay_s" => "Abweichende Wiedereinschalt-Pause nur für Wallbox 2 (Sekunden). Leer = globaler Wert.",
     "wb2_min_charge_time_s" => "Abweichende Mindestladezeit nur für Wallbox 2 (Sekunden). Leer = globaler Wert.",
     "wb2_cloud_stop_delay_s" => "Abweichender Wolken-Halt nur für Wallbox 2 (Sekunden). Leer = globaler Wert.",
-    "wb2_phase_change_hold_s" => "Abweichender Phasen-Halt nur für Wallbox 2 (Sekunden). Leer = globaler Wert.",
     "wb_openwb_zero_budget_hold_s" => "Legacy-Fallback für openWB Pro 0W-Haltezeit; neue Installationen nutzen die Wallbox-Zeitparameter oben.",
     "openwb_pro_phase_wait_s" => "Sperre nach einer bestätigten Phasenumschaltung der openWB Pro (Sekunden, Standard 480 = openWB-Referenz): so lange gibt es keinen weiteren Phasenwechsel, egal was das Budget sagt. Das ist nicht die Dauer der CP-Unterbrechung.",
     "openwb_pro_phase_cp_interrupt_duration_s" => "Kurze Unterbrechung des Steuersignals (CP) beim Phasenwechsel, 2 bis 30 Sekunden – nur so lange, wie das Gerät braucht. Ein alter Wert 480 wird auf 5 migriert; die 480-Sekunden-Sperre ist ein eigener Wert (Pro Phasen-Cooldown).",
@@ -789,11 +781,11 @@ $tooltips = [
     "solcast_api_slot_fc2"   => "Solcast-Konto für FC2. Leer erhält das bisherige Verhalten (Konto 2, wenn dessen Schlüssel gesetzt ist, sonst Konto 1).",
     "solcast_api_slot_fc3"   => "Solcast-Konto für FC3. Leer erhält das bisherige Verhalten (Konto 2, wenn dessen Schlüssel gesetzt ist, sonst Konto 1).",
     "solcast_api_slot_fc4"   => "Solcast-Konto für FC4. Leer erhält das bisherige Verhalten (Konto 2, wenn dessen Schlüssel gesetzt ist, sonst Konto 1).",
-    "pv_forecast_coupling_fc1" => "Physische Kopplung von FC1: E3DC-DC-String oder externer AC-Wechselrichter. Ohne vollständige Zuordnung bleibt die DC-/AC-Aufteilung bewusst inaktiv.",
-    "pv_forecast_coupling_fc2" => "Physische Kopplung von FC2: E3DC-DC-String oder externer AC-Wechselrichter.",
-    "pv_forecast_coupling_fc3" => "Physische Kopplung von FC3: E3DC-DC-String oder externer AC-Wechselrichter.",
-    "pv_forecast_coupling_fc4" => "Physische Kopplung von FC4: E3DC-DC-String oder externer AC-Wechselrichter.",
-    "pv_external_ac_inverter_limit_w" => "AC-Nennleistung bzw. wirksames Ausgangslimit aller als EXTERNAL_AC zugeordneten Zusatzwechselrichter in Watt. Kein anlagenspezifischer Standard.",
+    "pv_forecast_coupling_fc1" => "Physische Kopplung von FC1: Auswahl „Topologie offen“, „E3DC DC“ oder „Externer AC-WR“. Ist ein externer AC-Wechselrichter bekannt (über „Externer AC-WR“ in der Kopplungsauswahl der Flächen, den Kasten „PV-Flächen und Wechselrichtergruppen“, „Externe AC-WR-Leistung (W)“, AC-Speicherroute, Shelly-IP oder zentrale Steuerung des Zusatz-WR eingetragen), hält die Notstrom-Vorhaltung die volle Energie, bis alle Flächen eingetragen sind. Ohne bekannten externen AC-Wechselrichter gilt eine offene Fläche wie eine E3DC-Fläche; die Vorhaltung nutzt die Gesamtprognose wie bei einer E3DC-Anlage. Bei „Speicherladung auf E3DC-DC begrenzen“ oder aktivem Sicherheitsveto „ausschließlich E3DC-DC-PV“ der Direktvermarktung bleibt ohne gebundene Aufteilung die volle Energie stehen. Ohne Aufteilung bleiben zusätzlicher DC-Headroom und die Zusatzladung aus dem AC-Überschuss in der Direktvermarktung aus.",
+    "pv_forecast_coupling_fc2" => "Physische Kopplung von FC2: Auswahl „Topologie offen“, „E3DC DC“ oder „Externer AC-WR“. Ist ein externer AC-Wechselrichter bekannt (über „Externer AC-WR“ in der Kopplungsauswahl der Flächen, den Kasten „PV-Flächen und Wechselrichtergruppen“, „Externe AC-WR-Leistung (W)“, AC-Speicherroute, Shelly-IP oder zentrale Steuerung des Zusatz-WR eingetragen), hält die Notstrom-Vorhaltung die volle Energie, bis alle Flächen eingetragen sind. Ohne bekannten externen AC-Wechselrichter gilt eine offene Fläche wie eine E3DC-Fläche; die Vorhaltung nutzt die Gesamtprognose wie bei einer E3DC-Anlage. Bei „Speicherladung auf E3DC-DC begrenzen“ oder aktivem Sicherheitsveto „ausschließlich E3DC-DC-PV“ der Direktvermarktung bleibt ohne gebundene Aufteilung die volle Energie stehen. Ohne Aufteilung bleiben zusätzlicher DC-Headroom und die Zusatzladung aus dem AC-Überschuss in der Direktvermarktung aus.",
+    "pv_forecast_coupling_fc3" => "Physische Kopplung von FC3: Auswahl „Topologie offen“, „E3DC DC“ oder „Externer AC-WR“. Ist ein externer AC-Wechselrichter bekannt (über „Externer AC-WR“ in der Kopplungsauswahl der Flächen, den Kasten „PV-Flächen und Wechselrichtergruppen“, „Externe AC-WR-Leistung (W)“, AC-Speicherroute, Shelly-IP oder zentrale Steuerung des Zusatz-WR eingetragen), hält die Notstrom-Vorhaltung die volle Energie, bis alle Flächen eingetragen sind. Ohne bekannten externen AC-Wechselrichter gilt eine offene Fläche wie eine E3DC-Fläche; die Vorhaltung nutzt die Gesamtprognose wie bei einer E3DC-Anlage. Bei „Speicherladung auf E3DC-DC begrenzen“ oder aktivem Sicherheitsveto „ausschließlich E3DC-DC-PV“ der Direktvermarktung bleibt ohne gebundene Aufteilung die volle Energie stehen. Ohne Aufteilung bleiben zusätzlicher DC-Headroom und die Zusatzladung aus dem AC-Überschuss in der Direktvermarktung aus.",
+    "pv_forecast_coupling_fc4" => "Physische Kopplung von FC4: Auswahl „Topologie offen“, „E3DC DC“ oder „Externer AC-WR“. Ist ein externer AC-Wechselrichter bekannt (über „Externer AC-WR“ in der Kopplungsauswahl der Flächen, den Kasten „PV-Flächen und Wechselrichtergruppen“, „Externe AC-WR-Leistung (W)“, AC-Speicherroute, Shelly-IP oder zentrale Steuerung des Zusatz-WR eingetragen), hält die Notstrom-Vorhaltung die volle Energie, bis alle Flächen eingetragen sind. Ohne bekannten externen AC-Wechselrichter gilt eine offene Fläche wie eine E3DC-Fläche; die Vorhaltung nutzt die Gesamtprognose wie bei einer E3DC-Anlage. Bei „Speicherladung auf E3DC-DC begrenzen“ oder aktivem Sicherheitsveto „ausschließlich E3DC-DC-PV“ der Direktvermarktung bleibt ohne gebundene Aufteilung die volle Energie stehen. Ohne Aufteilung bleiben zusätzlicher DC-Headroom und die Zusatzladung aus dem AC-Überschuss in der Direktvermarktung aus.",
+    "pv_external_ac_inverter_limit_w" => "AC-Nennleistung bzw. wirksames Ausgangslimit aller als „Externer AC-WR“ zugeordneten Zusatzwechselrichter in Watt. Eine positive oder unlesbare Eingabe macht den Zusatz-WR bekannt; solange dann eine PV-Fläche offen ist, hält die Notstrom-Vorhaltung die volle Energie. Leer und 0 gelten als nicht eingetragen. Kein anlagenspezifischer Standard.",
     "pv_e3dc_dc_inverter_limit_w" => "Optionales E3DC-DC-/Wechselrichterlimit in Watt, nur als Fallback wenn kein frischer PVI_DC_MAX_POWER-Readback verfügbar ist.",
     "pv_forecast_topology_config" => "Versionierter Vertrag für beliebig viele Generatorgruppen, physische PV-Flächen und Solcast-Providerbindungen. Ungültige oder unvollständige Topologien bleiben bewusst nicht bindbar.",
     "forecast_diagnostics_enable" => "Schaltet ausschließlich die lokale, read-only PV-Prognosediagnose ein. Sie vergleicht die E3/DC-DC-Punktprognose insgesamt und nach Erfassungs-Vorlauf mit gültigen Messwerten, behauptet kein P50 und ändert weder Regelentscheidungen noch Modelle oder Konfigurationswerte.",
@@ -1150,18 +1142,18 @@ $tooltips = [
     "grid_max_amps_l1"       => "Optionales abweichendes Betriebslimit für Netzphase L1. Leer verwendet die globale Hausabsicherung. Nur einen tatsächlich bekannten Wert eintragen.",
     "grid_max_amps_l2"       => "Optionales abweichendes Betriebslimit für Netzphase L2. Leer verwendet die globale Hausabsicherung. Nur einen tatsächlich bekannten Wert eintragen.",
     "grid_max_amps_l3"       => "Optionales abweichendes Betriebslimit für Netzphase L3. Leer verwendet die globale Hausabsicherung. Nur einen tatsächlich bekannten Wert eintragen.",
-    "grid_wallbox_reserve_amps" => "Betriebsreserve für übrige Hausverbraucher unterhalb der Hausabsicherung je Phase. Der Wallbox-Regler begrenzt das gemeinsame Wallbox-Budget auf Hausabsicherung minus Reserve (z. B. bei 50 A SLS und 10 A Reserve auf 40 A je Phase). Für den einphasigen Deckel der openWB Pro gilt dasselbe Betriebslimit; die Reserve deckt zusammen mit der Leistungsfaktor-Reserve Messverzug (RSCP 2–3 s, Rampe 1 A je Regelschritt) und den Spannungs-Fallback ab – unter 2 A nicht empfohlen.",
+    "grid_wallbox_reserve_amps" => "Die Summe aller Wallboxströme je Netzphase bleibt höchstens bei Hausanschluss minus Reserve: 50 A und 10 A Reserve ergeben 40 A. Die Hauslast wird über die Netzphasenmessung berücksichtigt; nach Abzug der gemessenen Boxleistungen erhält die verbleibende Hauslast die Leistungsfaktor-Marge. Bei unbekannter Netzphase einer ein- oder zweiphasigen Box gilt der Sicherheitsabstand zusätzlich für deren Strom; mit Zuordnung und eigener Phasenstrommessung werden Sicherung und Hausanschluss voll genutzt.",
     "grid_wallbox_reserve_amps_l1" => "Optionale zusätzliche Reserve für Netzphase L1. Leer verwendet die globale Wallbox-Reserve.",
     "grid_wallbox_reserve_amps_l2" => "Optionale zusätzliche Reserve für Netzphase L2. Leer verwendet die globale Wallbox-Reserve.",
     "grid_wallbox_reserve_amps_l3" => "Optionale zusätzliche Reserve für Netzphase L3. Leer verwendet die globale Wallbox-Reserve.",
-    "wb1_grid_phase"         => "Auf welcher Netzphase (L1, L2 oder L3) liegt die lokale Phase L1 von Wallbox 1? Eintragen, was der Elektriker angeschlossen hat; E3DC-Control prüft die Zuordnung beim einphasigen Laden ab 8 A automatisch (Last und Stromsprünge müssen auf dieser Netzphase erscheinen). Stimmt sie nicht, zeigt das Dashboard „Phasenzuordnung WB1 stimmt nicht: Last auf Lx statt Ly“ und es bleibt bei 20 A. Eine Änderung setzt den Nachweis zurück.",
-    "wb2_grid_phase"         => "Auf welcher Netzphase (L1, L2 oder L3) liegt die lokale Phase L1 von Wallbox 2? Eintragen, was der Elektriker angeschlossen hat; E3DC-Control prüft die Zuordnung beim einphasigen Laden ab 8 A automatisch (Last und Stromsprünge müssen auf dieser Netzphase erscheinen). Stimmt sie nicht, zeigt das Dashboard „Phasenzuordnung WB2 stimmt nicht: Last auf Lx statt Ly“ und es bleibt bei 20 A. Eine Änderung setzt den Nachweis zurück.",
+    "wb1_grid_phase"         => "Auf welcher Netzphase (L1, L2 oder L3) liegt die lokale Phase L1 von Wallbox 1? Eintragen, was der Elektriker angeschlossen hat. Ohne Eintrag rechnet E3DC-Control eine ein- oder zweiphasig ladende Wallbox mit Sicherheitsabstand auf allen möglichen Netzphasen; bei einseitig hoher Hauslast lädt sie dann mit weniger Strom oder startet nicht. Mit Eintrag gilt die Phase wie eingetragen. An einer openWB Pro prüft E3DC-Control die Zuordnung beim einphasigen Laden ab 8 A zusätzlich anhand der Messwerte (Last und Stromsprünge müssen auf dieser Netzphase erscheinen); passt sie nicht, erscheint der Hinweis „Eingetragene Netzphase passt nicht zur Messung – Zuordnung prüfen“. Den Strom begrenzt diese Prüfung nicht. Eine Änderung setzt den Nachweis zurück.",
+    "wb2_grid_phase"         => "Auf welcher Netzphase (L1, L2 oder L3) liegt die lokale Phase L1 von Wallbox 2? Eintragen, was der Elektriker angeschlossen hat. Ohne Eintrag rechnet E3DC-Control eine ein- oder zweiphasig ladende Wallbox mit Sicherheitsabstand auf allen möglichen Netzphasen; bei einseitig hoher Hauslast lädt sie dann mit weniger Strom oder startet nicht. Mit Eintrag gilt die Phase wie eingetragen. An einer openWB Pro prüft E3DC-Control die Zuordnung beim einphasigen Laden ab 8 A zusätzlich anhand der Messwerte (Last und Stromsprünge müssen auf dieser Netzphase erscheinen); passt sie nicht, erscheint der Hinweis „Eingetragene Netzphase passt nicht zur Messung – Zuordnung prüfen“. Den Strom begrenzt diese Prüfung nicht. Eine Änderung setzt den Nachweis zurück.",
     "wb1_openwb_pro_1p_max_amp" => "Obergrenze für einphasiges Laden an openWB Pro 1 (A). Mehr als 20 A werden dynamisch freigegeben aus Hausabsicherung − Reserve − gemessenem Bezug der zugeordneten Netzphase (E3DC-Wurzelzähler ÷ Wechselrichter-Spannung), begrenzt durch den Schieflast-Wächter; Anhebung 1 A je Regelschritt, Absenkung sofort; nur bei bestätigter Zuordnung und frischen Messwerten, sonst 20 A.",
     "wb2_openwb_pro_1p_max_amp" => "Obergrenze für einphasiges Laden an openWB Pro 2 (A). Mehr als 20 A werden dynamisch freigegeben aus Hausabsicherung − Reserve − gemessenem Bezug der zugeordneten Netzphase (E3DC-Wurzelzähler ÷ Wechselrichter-Spannung), begrenzt durch den Schieflast-Wächter; Anhebung 1 A je Regelschritt, Absenkung sofort; nur bei bestätigter Zuordnung und frischen Messwerten, sonst 20 A.",
-    "wb1_openwb_pro_unplug_offer" => "Verhalten der openWB Pro 1 nach dem Abstecken. Die Box behält sonst ihren letzten Sollstrom, und ein Auto lädt beim nächsten Anstecken sofort los, bevor die Regelung entscheidet. Sicherheitsvariante (Standard): Nach dem bestätigten Abstecken sendet E3DC-Control einmalig 0 A; beim Anstecken startet nichts, bis die Regelung freigibt. Schneller Start: einmalig 6 A; das Auto startet beim Anstecken sofort (auch aus Akku oder Netz) und zunächst ohne Zuteilung – Hausanschluss und eine zweite ladende Wallbox berücksichtigt erst die Regelung, sobald sie übernimmt. In „Aus“, bei Sperre oder unklaren Messwerten wird nichts gesendet; der Auftrag wartet, solange die Box getrennt bleibt. Eine manuelle Pause endet bereits beim Abstecken.",
-    "wb2_openwb_pro_unplug_offer" => "Verhalten der openWB Pro 2 nach dem Abstecken. Die Box behält sonst ihren letzten Sollstrom, und ein Auto lädt beim nächsten Anstecken sofort los, bevor die Regelung entscheidet. Sicherheitsvariante (Standard): Nach dem bestätigten Abstecken sendet E3DC-Control einmalig 0 A; beim Anstecken startet nichts, bis die Regelung freigibt. Schneller Start: einmalig 6 A; das Auto startet beim Anstecken sofort (auch aus Akku oder Netz) und zunächst ohne Zuteilung – Hausanschluss und eine zweite ladende Wallbox berücksichtigt erst die Regelung, sobald sie übernimmt. In „Aus“, bei Sperre oder unklaren Messwerten wird nichts gesendet; der Auftrag wartet, solange die Box getrennt bleibt. Eine manuelle Pause endet bereits beim Abstecken.",
-    "wb_pcc_phase_basis"     => "Messbasis 1p-Deckel openWB Pro: Woraus der einphasige Stromdeckel der openWB Pro oberhalb von 20 A berechnet wird. Standard: Netzbezug je Phase vom E3DC-Wurzelzähler geteilt durch die vom Wechselrichter gemessene Phasenspannung (sonst 230 V) plus gemessener Wallbox-Strom. „Aus“ hält fest 20 A. Für mehr als 20 A müssen eine einphasige Obergrenze über 20 A („openWB Pro 1p Max.“ der Wallbox) und die Hausabsicherung ausdrücklich eingetragen, die Netzphase der Wallbox zugeordnet und diese Zuordnung von E3DC-Control beim Laden automatisch bestätigt sein („Zuordnung bestätigt“ im Dashboard). Fehlen frische Messwerte (10 s), gilt sofort wieder 20 A.",
-    "wb_pcc_power_factor_margin" => "Leistungsfaktor-Reserve Fremdlast: Sicherheitsfaktor für den Anteil des Netzbezugs, der nicht von der Wallbox stammt (Haus, Wärmepumpe, zweite Wallbox): dessen Strom wird durch diesen Faktor geteilt, weil aus Wirkleistung und Spannung kein Blindstrom sichtbar ist. 0,9 = 11 % Aufschlag; 1,0 nur bei rein ohmschen Lasten. Der Wallbox-Anteil wird als echter Strom von der openWB Pro gemessen und braucht keinen Aufschlag.",
+    "wb1_openwb_pro_unplug_offer" => "Verhalten nach dem bestätigten Abstecken. Sicherheitsvariante: immer 0 A. Schneller Start hält 6 A bereit, solange der gewählte Modus gerade einen Start erlaubt: qualifiziertes Budget oder freigegebenes Netzladen, ausreichend Hausanschluss je Phase und gültige Daten. Sonst 0 A; das Angebot kann über den Tag wechseln. Aus, Pause, Sperre und Reserve nehmen die Freigabe sofort zurück. Bei anliegenden 6 A übernimmt die Regelung nach dem Anstecken ohne zweite Startqualifizierung.",
+    "wb2_openwb_pro_unplug_offer" => "Verhalten nach dem bestätigten Abstecken. Sicherheitsvariante: immer 0 A. Schneller Start hält 6 A bereit, solange der gewählte Modus gerade einen Start erlaubt: qualifiziertes Budget oder freigegebenes Netzladen, ausreichend Hausanschluss je Phase und gültige Daten. Sonst 0 A; das Angebot kann über den Tag wechseln. Aus, Pause, Sperre und Reserve nehmen die Freigabe sofort zurück. Bei anliegenden 6 A übernimmt die Regelung nach dem Anstecken ohne zweite Startqualifizierung.",
+    "wb_pcc_phase_basis"     => "Messbasis 1p-Deckel openWB Pro: Woraus der einphasige Stromdeckel der openWB Pro oberhalb von 20 A berechnet wird. Standard: Netzbezug je Phase vom E3DC-Wurzelzähler geteilt durch die vom Wechselrichter gemessene Phasenspannung (sonst 230 V) plus gemessener Wallbox-Strom. „Aus“ hält fest 20 A. Für mehr als 20 A müssen eine einphasige Obergrenze über 20 A („openWB Pro 1p Max.“ der Wallbox) und die Hausabsicherung ausdrücklich eingetragen und die Netzphase der Wallbox zugeordnet sein. Die automatische Prüfung der Zuordnung beim Laden („Zuordnung bestätigt“ im Dashboard) ist ein Hinweis und keine Voraussetzung. Fehlen frische Messwerte (10 s), gilt sofort wieder 20 A.",
+    "wb_pcc_power_factor_margin" => "Leistungsfaktor-Reserve Hauslast: Vom Netzpunktwert werden zuerst die gemessenen Wirkleistungen aller frischen Wallboxen abgezogen. Nur die verbleibende Hauslast einschließlich weiterer Verbraucher wird durch diesen Faktor geteilt, weil Wirkleistung und Spannung den Blindstrom nicht zeigen. 0,9 = rund 11 % Aufschlag. Mit bekannter Netzphase und eigener Phasenstrommessung erhält der Boxanteil keinen Aufschlag. Wallboxen ohne eigene Phasenstrommessung behalten auch mit eingetragener Netzphase diesen Abstand. Die Stromschätzung gilt für U·cos φ ≥ 207 V (Spannung mal Leistungsfaktor, bei Marge 0,9). Ohne Zuordnung wird der Strom einer ein- oder zweiphasigen Box auf allen möglichen Phasen durch den Faktor geteilt reserviert. Der einphasige Pro-Deckel liest denselben Rest ohne zweite Marge.",
     "grid_pcc_imbalance_max_a" => "Schieflast-Wächter am Netzpunkt (A), nur openWB Pro: Höchste zulässige Differenz der Bezugsströme zwischen der Wallbox-Phase und der am wenigsten belasteten Phase am Hausanschluss; Einspeisung zählt als 0 A (20 A ≙ 4,6 kVA, übliche Netzbetreiber-Vorgabe). Das E3DC entlädt und speist in der Regel gleichmäßig über alle drei Phasen: Dann sinkt der Bezug der Wallbox-Phase, und der Deckel steigt nachts auf etwa 28–29 A, tagsüber je nach Einspeisung bis zur eingestellten 1p-Obergrenze. Ohne jeden Ausgleich (leerer Akku, keine PV) bleibt er bei 20 A; unter 20 A senkt der Wächter nie. Wer einphasig strikt 20 A einhalten muss, lässt die 1p-Obergrenze der openWB Pro leer. Nur nach Rücksprache mit dem Netzbetreiber erhöhen.",
     "wbcostpowers"           => "Typische Wallbox-Ladeleistungen in kW für Kostenberechnung, z.B. '7.2, 11.0, 22.0'.",
     "smart_wbhour_enable"    => "Dynamische Ladeplanung: 1=Auto (SoC-basiert), 0=Manuell (wbhour aus UI).",
@@ -1219,12 +1211,12 @@ $tooltips = [
     "mqtt_hub_sub_soc_name"  => "Anzeigename für Fahrzeug 1 SoC aus MQTT.",
     "mqtt_hub_sub_soc_topic_2" => "Zweites MQTT-SoC-Topic (zweites Fahrzeug).",
     "mqtt_hub_sub_soc_name_2" => "Anzeigename für Fahrzeug 2 SoC aus MQTT.",
-    "wb_ip" => "MQTT-Broker für direkte externe Wallbox-Leistung. Kann identisch mit dem Hauptbroker sein, z.B. 192.0.2.20:1883.",
-    "wb_topic" => "MQTT-Topic für die Wirkleistung von Wallbox 1 in Watt, z.B. evcc/loadpoints/1/chargePower. Nicht für Fahrzeug-SoC verwenden.",
+    "wb_ip" => "MQTT-Broker für direkte externe Wallbox-Leistung. Kann identisch mit dem Hauptbroker sein, z.B. 192.0.2.20:1883. Bei deaktiviertem Wallbox-Modell nur Messung: Broker und Leistungs-Topic müssen gesetzt sein; keine Steuerung. Als Thema der Messwallbox nicht das Ausgabethema der eigenen Wallboxregelung eintragen.",
+    "wb_topic" => "MQTT-Topic für die Wirkleistung von Wallbox 1 in Watt, z.B. evcc/loadpoints/1/chargePower. Nicht für Fahrzeug-SoC verwenden. Bei deaktiviertem Wallbox-Modell nur Messung: Broker und Leistungs-Topic müssen gesetzt sein; keine Steuerung. Als Thema der Messwallbox nicht das Ausgabethema der eigenen Wallboxregelung eintragen.",
     "wb_user" => "Optionaler Benutzer für den direkten Wallbox-Leistungsbroker und openWB-simpleAPI-HTTP-Zugriff (Basic Auth), falls die openWB Benutzerverwaltung dies verlangt.",
     "wb_pass" => "Optionales Passwort für den direkten Wallbox-Leistungsbroker und openWB-simpleAPI-HTTP-Zugriff.",
-    "wb2_ip" => "MQTT-Broker für direkte externe Wallbox-2-Leistung. Leer lassen, wenn nur eine Wallbox genutzt wird.",
-    "wb2_topic" => "MQTT-Topic für die Wirkleistung von Wallbox 2 in Watt, z.B. evcc/loadpoints/2/chargePower. Leer lassen bei nur einer Wallbox.",
+    "wb2_ip" => "MQTT-Broker für direkte externe Wallbox-2-Leistung. Leer lassen, wenn nur eine Wallbox genutzt wird. Bei deaktiviertem Wallbox-Modell nur Messung: Broker und Leistungs-Topic müssen gesetzt sein; keine Steuerung. Als Thema der Messwallbox nicht das Ausgabethema der eigenen Wallboxregelung eintragen.",
+    "wb2_topic" => "MQTT-Topic für die Wirkleistung von Wallbox 2 in Watt, z.B. evcc/loadpoints/2/chargePower. Leer lassen bei nur einer Wallbox. Bei deaktiviertem Wallbox-Modell nur Messung: Broker und Leistungs-Topic müssen gesetzt sein; keine Steuerung. Als Thema der Messwallbox nicht das Ausgabethema der eigenen Wallboxregelung eintragen.",
     "wb2_user" => "Optionaler Benutzer für Wallbox 2, MQTT-Leistungsbroker oder openWB-simpleAPI-HTTP-Zugriff.",
     "wb2_pass" => "Optionales Passwort für Wallbox 2, MQTT-Leistungsbroker oder openWB-simpleAPI-HTTP-Zugriff.",
     "mqtt_ha_inbound_enable" => "Erlaubt kontrollierte MQTT-Eingangsdaten von Home Assistant/ioBroker unter e3dc/in/... Nur Messwerte aus einer festen Allowlist, keine Steuerbefehle.",
@@ -4771,13 +4763,9 @@ $groups = [
         "wb_surplus_target_grid_w", "wb_surplus_noise_w", "phase_transition_safety_margin_w", "heatpump_start_settle_s",
         "wb_curve_pv_only_house_reserve_w",
         "storage_home_wp_split",
-        "wb_restart_delay_s", "wb_min_charge_time_s", "wb_cloud_stop_delay_s", "wb_phase_change_hold_s",
-        "wb_phase_down_delay_s", "wb_phase_up_forecast_hold_s", "wb_phase_up_symmetry_enable", "wb_phase_up_export_wh",
-        "wb_pv_only_release_hold_s", "wb_pv_only_hold_stale_guard_s",
+        "wb_restart_delay_s", "wb_min_charge_time_s", "wb_cloud_stop_delay_s", "wb_pv_only_release_hold_s", "wb_pv_only_hold_stale_guard_s",
         "wb_grid_import_settle_s",
-        "wb1_restart_delay_s", "wb1_min_charge_time_s", "wb1_cloud_stop_delay_s", "wb1_phase_change_hold_s",
-        "wb2_restart_delay_s", "wb2_min_charge_time_s", "wb2_cloud_stop_delay_s", "wb2_phase_change_hold_s",
-        "smart_wbhour_enable", "car_capacity", "car_target_unit", "car_target_kwh", "car_target_soc", "car_max_soc_si", "car_charge_power",
+        "wb1_restart_delay_s", "wb1_min_charge_time_s", "wb1_cloud_stop_delay_s", "wb2_restart_delay_s", "wb2_min_charge_time_s", "wb2_cloud_stop_delay_s", "smart_wbhour_enable", "car_capacity", "car_target_unit", "car_target_kwh", "car_target_soc", "car_max_soc_si", "car_charge_power",
         "bluelink_user", "bluelink_password", "bluelink_pin", "bluelink_brand", "bluelink_vin", "bluelink_car_name", "bluelink_interval", "bluelink_ignore_plug_status",
         "v2h_enable", "v2h_min_soc", "v2h_bat_soc_limit"
     ],
@@ -4923,6 +4911,12 @@ $groups = [
     "Sonstiges" => []
 ];
 $frontendHiddenKeys = [
+    'wb_phase_down_delay_s', 'wb1_phase_down_delay_s', 'wb2_phase_down_delay_s',
+    'wb_phase_up_forecast_hold_s', 'wb1_phase_up_forecast_hold_s', 'wb2_phase_up_forecast_hold_s',
+    'wb_phase_up_export_wh', 'wb1_phase_up_export_wh', 'wb2_phase_up_export_wh',
+    'wb_phase_up_symmetry_enable', 'wb1_phase_up_symmetry_enable', 'wb2_phase_up_symmetry_enable',
+    'wb_phase_change_hold_s', 'wb1_phase_change_hold_s', 'wb2_phase_change_hold_s',
+
     'e3dc_device_family',
     "direct_marketing_e3dc_export_execution_owner",
     "storage_absorb_pct", "storage_release_pct", "storage_hysteresis_cycles",
@@ -5194,6 +5188,8 @@ function renderHeatpumpPvReservationStatus($entry, $runtime = null): string {
             <p class="small mb-1">Konservative Sperrfrist abgelaufen; Zeitbestätigung im Container nicht belegt.</p>
             <?php elseif ($recoveryReason === 'clock_implausible'): ?>
             <p class="small mb-1">WP-Energiekonto: Wartet auf plausible Zeitbestätigung (widersprüchliche Zeitprobe).</p>
+            <?php elseif ($recoveryReason === 'checkpoint_gap_consumed_clock_unconfirmed' && ($runtime['state']['uncertain_state'] ?? false) !== true): ?>
+            <p class="small mb-1">WP-Energiekonto nach Neustart fortgeführt; Ausfallzeit ohne Zeitnachweis als verbraucht gebucht.</p>
             <?php elseif ($recoveryReason === 'checkpoint_wall_clock_resumed' && ($runtime['state']['uncertain_state'] ?? false) !== true): ?>
             <p class="small mb-1">WP-Energiekonto nach Neustart fortgeführt.</p>
             <?php elseif (!is_bool($recoveryEnd) && is_numeric($recoveryEnd) && is_finite((float)$recoveryEnd)): ?>
@@ -5739,6 +5735,18 @@ async function readConfirmedConfigJson(response) {
             grid-template-columns: minmax(0, 1fr);
             align-items: start;
         }
+    }
+    .market-day { min-width: 0; margin-top: 8px; overflow-wrap: anywhere; }
+    .market-day canvas { display: block; width: 100%; max-width: 100%; height: 190px; }
+    .market-day canvas[data-market-day-soc] { height: 110px; }
+    .market-day canvas[hidden] { display: none; }
+    .market-day-cost { padding: 4px 5px; border: 1px solid transparent; font-size: .7rem; }
+    .market-day-cost.is-selected { border-color: var(--bs-info); border-radius: 4px; font-weight: 600; }
+    .market-path-decision-list { flex: 0 0 auto; }
+    @media (max-width: 575px) {
+        .market-path-preview-title { grid-template-columns: minmax(0, 1fr); }
+        .market-path-decision-row { padding: 3px 4px; gap: 4px; }
+        .market-path-decision-label { white-space: normal; }
     }
     .market-path-inline-note {
         padding-top: 2px;
@@ -6411,7 +6419,7 @@ async function readConfirmedConfigJson(response) {
                         </div>
                         <div class="col-md-6">
                             <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['ep_reserve_pct'] ?? '') ?>">Hausreserve (%)</label>
-                            <input type="number" min="0" max="80" step="0.5" name="values[ep_reserve_pct]" class="form-control config-input" data-simple-config-field value="<?= $simpleVal('ep_reserve_pct') ?>">
+                            <input type="number" min="0" max="80" step="0.5" name="values[ep_reserve_pct]" class="form-control config-input" data-simple-config-field value="<?= $simpleVal('ep_reserve_pct') ?>" placeholder="8">
                         </div>
                         <div class="col-md-6">
                             <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['maximumladeleistung'] ?? '') ?>">Max. Laden (W)</label>
@@ -8804,7 +8812,7 @@ async function readConfirmedConfigJson(response) {
                                 <?= $flowStep('amber', '&#8722;', 'Reserve ' . $flowVal('grid_wallbox_reserve_amps', '2') . ' A bleibt frei', 'für Haus, Wärmepumpe und Herd; die Wallboxen bekommen nur den Rest.') ?>
                                 <?= $flowStep('green', '&#10003;', 'Wallbox-Budget <span class="config-flow-value" data-flow-computed="wallbox_budget">' . htmlspecialchars((string)$curBudgetAmps) . '</span> A je Phase', 'mehr bekommen WB1 und WB2 auch zusammen nie – bei zwei Wallboxen wird es aufgeteilt.') ?>
                                 <?= $flowStep('sky', '&#128065;', 'Modus „Beobachten / autonom“', 'E3DC-Control sendet keine Stromvorgabe; dann muss die Wallbox oder ihr Ladeprofil die Hausgrenze selbst kennen.') ?>
-                                <?= $flowStep('sky', '&#9889;', '1p-Deckel openWB Pro', 'Sicherung − Reserve − Fremdlast der Wallbox-Phase (E3DC-Wurzelzähler), begrenzt vom Schieflast-Wächter; mehr als 20 A erst nach Software-Nachweis der Phasenzuordnung.', true) ?>
+                                <?= $flowStep('sky', '&#9889;', '1p-Deckel openWB Pro', 'Sicherung − Reserve − Fremdlast der Wallbox-Phase (E3DC-Wurzelzähler), begrenzt vom Schieflast-Wächter; mehr als 20 A nur mit eingetragener Netzphase und frischen Messwerten.', true) ?>
                             </div>
                         </div>
                     </div>
@@ -8825,7 +8833,7 @@ async function readConfirmedConfigJson(response) {
                             <?php endforeach; ?>
                             <div class="col-12">
                                 <small class="text-muted">
-                                    Eine höhere einphasige Freigabe an einer openWB Pro braucht eine ausdrücklich eingetragene Hausabsicherung, die Zuordnung „Wallbox-Phase → Netzphase“ (unten bei den Ladepunkten) und den automatischen Software-Nachweis dieser Zuordnung beim Laden; ohne das bleibt es bei 20 A.
+                                    Eine höhere einphasige Freigabe an einer openWB Pro braucht eine ausdrücklich eingetragene Hausabsicherung, die Zuordnung „Wallbox-Phase → Netzphase“ (unten bei den Ladepunkten) und frische Messwerte; ohne das bleibt es bei 20 A. Die automatische Prüfung der Zuordnung beim Laden ist nur ein Hinweis.
                                 </small>
                             </div>
                         </div>
@@ -8849,7 +8857,7 @@ async function readConfirmedConfigJson(response) {
                     <details class="col-12 mt-2">
                         <summary class="small fw-bold text-muted">Einphasiger Deckel openWB Pro (Messbasis)</summary>
                         <div class="row g-2 mt-1">
-                            <div class="col-12"><small class="text-muted">Nur für openWB Pro mit einphasigem Laden über 20 A. Der Deckel wird aus Hausabsicherung − Reserve − gemessenem Fremdbezug der zugeordneten Netzphase berechnet, +1 A je Regelschritt angehoben und sofort abgesenkt; ohne frische Messwerte oder ohne bestätigte Zuordnung gilt 20 A.</small></div>
+                            <div class="col-12"><small class="text-muted">Nur für openWB Pro mit einphasigem Laden über 20 A. Der Deckel wird aus Hausabsicherung − Reserve − gemessenem Fremdbezug der zugeordneten Netzphase berechnet, +1 A je Regelschritt angehoben und sofort abgesenkt; ohne frische Messwerte oder ohne eingetragene Netzphase gilt 20 A.</small></div>
                             <div class="col-6 col-lg-4">
                                 <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['wb_pcc_phase_basis'] ?? '') ?>">Messbasis 1p-Deckel openWB Pro</label>
                                 <select class="form-select config-input" name="values[wb_pcc_phase_basis]">
@@ -9108,23 +9116,6 @@ async function readConfirmedConfigJson(response) {
                     <details class="col-12 mt-2" data-wallbox-common>
                         <summary class="small fw-bold text-muted">Phasenwechsel (openWB Pro und E3DC-Direktvertrag)</summary>
                         <div class="row g-2 mt-2">
-                            <div class="col-6 col-lg-3">
-                                <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['wb_phase_down_delay_s'] ?? '') ?>">Beharrung 3p→1p (s)</label>
-                                <input type="number" min="60" max="3600" step="30" name="values[wb_phase_down_delay_s]" class="form-control config-input" value="<?= $val('wb_phase_down_delay_s') ?>" placeholder="480">
-                            </div>
-                            <div class="col-6 col-lg-3">
-                                <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['wb_phase_up_forecast_hold_s'] ?? '') ?>">Vorlauf 1p→3p (s)</label>
-                                <input type="number" min="30" max="3600" step="30" name="values[wb_phase_up_forecast_hold_s]" class="form-control config-input" value="<?= $val('wb_phase_up_forecast_hold_s') ?>" placeholder="60">
-                                <?= $configValidationMarker('wb_phase_up_forecast_hold_s') ?>
-                            </div>
-                            <div class="col-6 col-lg-3">
-                                <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['wb_phase_up_symmetry_enable'] ?? '') ?>">Symmetrie-Klausel 1p→3p</label>
-                                <select name="values[wb_phase_up_symmetry_enable]" class="form-select config-input">
-                                    <option value="0" <?= !$isTrue('wb_phase_up_symmetry_enable') ? 'selected' : '' ?>>Aus</option>
-                                    <option value="1" <?= $isTrue('wb_phase_up_symmetry_enable') ? 'selected' : '' ?>>Ein (ab Schieflastwert)</option>
-                                </select>
-                                <?= $configValidationMarker('wb_phase_up_symmetry_enable') ?>
-                            </div>
                             <?php /* Experimenteller E3DC-Direktvertrag, Standard aus; nur Sichtbarkeit. */ ?>
                             <div class="col-6 col-lg-3">
                                 <label class="config-label text-danger" data-tooltip="<?= htmlspecialchars($tooltipMap['wb_e3dc_direct_phase_control_enable'] ?? '') ?>">E3DC-Direktvertrag (experimentell)</label>
@@ -9133,10 +9124,6 @@ async function readConfirmedConfigJson(response) {
                                     <option value="1" <?= $isTrue('wb_e3dc_direct_phase_control_enable') ? 'selected' : '' ?>>Ein (schreibt Geräteeinstellungen)</option>
                                 </select>
                                 <?= $configValidationMarker('wb_e3dc_direct_phase_control_enable') ?>
-                            </div>
-                            <div class="col-6 col-lg-3">
-                                <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['wb_phase_up_export_wh'] ?? '') ?>">Export-Wh 1p→3p (Wh)</label>
-                                <input type="number" min="50" max="2000" step="10" name="values[wb_phase_up_export_wh]" class="form-control config-input" value="<?= $val('wb_phase_up_export_wh') ?>" placeholder="120">
                             </div>
                             <div class="col-6 col-lg-3">
                                 <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['openwb_pro_phase_wait_s'] ?? '') ?>">Pro Phasen-Cooldown (s)</label>
@@ -9152,34 +9139,20 @@ async function readConfirmedConfigJson(response) {
                                 <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['openwb_pro_phase_restart_delay_s'] ?? '') ?>">Pro CP-Nachlauf (s)</label>
                                 <input type="number" min="0" max="1800" name="values[openwb_pro_phase_restart_delay_s]" class="form-control config-input" value="<?= $val('openwb_pro_phase_restart_delay_s') ?>" placeholder="0">
                             </div>
-                            <div class="col-6 col-lg-3">
-                                <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['wb_phase_change_hold_s'] ?? '') ?>">Phasen-Halt (s)</label>
-                                <input type="number" min="0" max="1800" name="values[wb_phase_change_hold_s]" class="form-control config-input" value="<?= $val('wb_phase_change_hold_s') ?>" placeholder="<?= $defaults['wb_phase_change_hold_s'] ?>">
-                            </div>
                             <div class="col-12">
                                 <div class="config-flow-help rounded-3 p-3">
                                     <div class="config-flow-title fw-bold mb-3"><i class="fas fa-route me-1"></i>Wann schaltet E3DC-Control die Phasen um?</div>
                                     <div class="config-flow">
-                                        <?= $flowStep('sky', '&#9201;', 'Der Überschuss reicht ' . $flowVal('wb_phase_down_delay_s', '480') . ' s lang nicht mehr für drei Phasen', 'dann erst wird auf eine Phase geschaltet. Hält die Speicherprognose das Ziel für erreichbar, verlängert sich dieser Vorlauf im bestehenden Prognosepfad auf mindestens 600 s. Die zentrale Defizitsequenz läuft getrennt. Kurze Wolkenlücken lösen nichts aus. Netzbezug über der Schwelle, die wbminSoC-Untergrenze und unerlaubter Akkubezug verkürzen die Wartezeit auf 60 s.') ?>
-                                        <?= $flowStep('green', '&#9650;', 'Der Überschuss (gemessen oder frisches Budget) trägt im 30-s-Mittel drei Phasen (4140 W + Puffer) und die eine Phase ist ausgereizt (schaltfähiges Paar: bis auf 2 A am Referenzstrom, an der openWB Pro 20 A) – ' . $flowVal('wb_phase_up_forecast_hold_s', '60') . ' s auf der leckenden Uhr', 'oder das Export-Wh-Konto ist voll (' . $flowVal('wb_phase_up_export_wh', '120') . ' Wh Überschuss über dem Referenzstrom; Wolken ziehen nur das 3p-Defizit ab) – dann wird auf drei Phasen geschaltet. Wolkenlücken zählen die Uhr zurück, erst 15 s ohne Bedingung löschen sie; Netzbezugs-Blips unter 30 s zählen nicht. Eine 16-A-Wallbox gilt ab dem 3p-Minimum als ausgereizt.') ?>
+                                        <?= $flowStep('sky', '&#9201;', 'Gemeinsame Phasenwahl für alle Ladepunkte', 'Aufstieg nach 60 s, Abstieg nach 60 s; Phasenraum und Energieanteile werden gemeinsam berücksichtigt.') ?>
                                         <?= $flowStep('amber', '&#8646;', 'Die Umschaltung selbst', 'openWB Pro trennt kurz den CP (' . $flowVal('openwb_pro_phase_cp_interrupt_duration_s', '5') . ' s), danach ' . $flowVal('openwb_pro_phase_restart_delay_s', '0') . ' s Nachlauf, bevor wieder Strom fließt. E3DC-Wallboxen schalten nur mit aktivem Direktvertrag.') ?>
-                                        <?= $flowStep('violet', '&#9203;', 'Das Fahrzeug lädt nach dem Wechsel wieder', 'für ' . $flowVal('wb_phase_change_hold_s', '180') . ' s wird der Strom nicht weiter angehoben, bis das Fahrzeug den Wechsel verdaut hat. Der erste Hochlauf je Stecksession darf sofort erfolgen.') ?>
-                                        <?= $flowStep('red', '&#128274;', 'Nach einer bestätigten Umschaltung', $flowVal('openwb_pro_phase_wait_s', '480') . ' s Sperre: kein weiterer Phasenwechsel, egal was das Budget sagt. Erst danach beginnt die nächste Beharrung – zwei Schützwechsel binnen acht Minuten gibt es nie.', true) ?>
+                                        <?= $flowStep('red', '&#128274;', 'Nach einer bestätigten Umschaltung', $flowVal('openwb_pro_phase_wait_s', '480') . ' s Sperre: kein weiterer Phasenwechsel, egal was das Budget sagt. Erst danach beginnt die nächste 60-Sekunden-Qualifizierung – zwei Schützwechsel binnen acht Minuten gibt es nie.', true) ?>
                                     </div>
                                 </div>
                             </div>
                             <div class="col-12">
                                 <small class="text-muted" style="font-size: 0.75rem;">
-                                    <i class="fas fa-info-circle me-1"></i> Der Phasen-Halt gilt global für alle nativen Wallboxen; leer gelassene WB1/WB2-Felder verwenden den globalen Wert.
+                                    <i class="fas fa-info-circle me-1"></i> Die gemeinsame Phasenwahl qualifiziert Aufstiege 60 s und Abstiege 60 s; nach jedem Wechsel gelten mindestens 480 s Sperre.
                                 </small>
-                            </div>
-                            <div class="col-6 col-lg-3" data-wallbox-column="1">
-                                <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['wb1_phase_change_hold_s'] ?? '') ?>">WB1 Phasen-Halt (s)</label>
-                                <input type="number" min="0" max="1800" name="values[wb1_phase_change_hold_s]" class="form-control config-input" value="<?= $val('wb1_phase_change_hold_s') ?>" placeholder="global">
-                            </div>
-                            <div class="col-6 col-lg-3" data-wallbox-column="2" <?= $hasSecondWallbox ? '' : 'hidden' ?>>
-                                <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['wb2_phase_change_hold_s'] ?? '') ?>">WB2 Phasen-Halt (s)</label>
-                                <input type="number" min="0" max="1800" name="values[wb2_phase_change_hold_s]" class="form-control config-input" value="<?= $val('wb2_phase_change_hold_s') ?>" placeholder="global">
                             </div>
                         </div>
                     </details>
@@ -9516,14 +9489,6 @@ async function readConfirmedConfigJson(response) {
                             <option value="special" <?= ($tariffUiType === 'special') ? 'selected' : '' ?>>Spezialtarif</option>
                         </select>
                     </div>
-                    <div class="col-md-3" id="opt_price_basis" style="display: <?= $showBasisPrice ? 'block' : 'none' ?>;">
-                        <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['strompreis_basis'] ?? '') ?>">Arbeitspreis <span class="text-muted text-nowrap">(ct/kWh)</span></label>
-                        <div class="input-group">
-                            <input type="number" step="0.01" name="values[strompreis_basis]" class="form-control config-input" value="<?= $val('strompreis_basis') ?>">
-                            <span class="input-group-text bg-body-tertiary">ct</span>
-                        </div>
-                        <?= $configValidationMarker('strompreis_basis') ?>
-                    </div>
                     <div class="col-md-3" id="opt_price_cheap" style="display: <?= $showOctopusPrices ? 'block' : 'none' ?>;">
                         <label class="config-label text-success" data-tooltip="<?= htmlspecialchars($tooltipMap['strompreis_cheap'] ?? '') ?>">Günstig <span class="text-muted text-nowrap">(LT)</span></label>
                         <div class="input-group">
@@ -9532,8 +9497,16 @@ async function readConfirmedConfigJson(response) {
                         </div>
                         <?= $configValidationMarker('strompreis_cheap') ?>
                     </div>
+                    <div class="col-md-3" id="opt_price_basis" style="display: <?= $showBasisPrice ? 'block' : 'none' ?>;">
+                        <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['strompreis_basis'] ?? '') ?>"><span data-tariff-basis-label><?= $tariffUiType === 'octopus_heat' ? 'Normal (HT)' : 'Arbeitspreis' ?></span> <span class="text-muted text-nowrap" data-tariff-basis-unit style="display: <?= $tariffUiType === 'octopus_heat' ? 'none' : 'inline' ?>;">(ct/kWh)</span></label>
+                        <div class="input-group">
+                            <input type="number" step="0.01" name="values[strompreis_basis]" class="form-control config-input" value="<?= $val('strompreis_basis') ?>">
+                            <span class="input-group-text bg-body-tertiary">ct</span>
+                        </div>
+                        <?= $configValidationMarker('strompreis_basis') ?>
+                    </div>
                     <div class="col-md-3" id="opt_price_uht" style="display: <?= $showOctopusPrices ? 'block' : 'none' ?>;">
-                        <label class="config-label text-danger" data-tooltip="<?= htmlspecialchars($tooltipMap['strompreis_uht'] ?? '') ?>">Extrem Teuer <span class="text-muted text-nowrap">(UHT)</span></label>
+                        <label class="config-label text-danger" data-tooltip="<?= htmlspecialchars($tooltipMap['strompreis_uht'] ?? '') ?>">Teuer <span class="text-muted text-nowrap">(UHT)</span></label>
                         <div class="input-group">
                             <input type="number" step="0.01" name="values[strompreis_uht]" class="form-control config-input" value="<?= $val('strompreis_uht') ?>">
                             <span class="input-group-text bg-body-tertiary border-danger">ct</span>
@@ -9878,25 +9851,40 @@ async function readConfirmedConfigJson(response) {
                             <div class="market-path-decision-list">
                                 <div class="market-path-decision-row market-path-decision-low">
                                     <div>
-                                        <span class="market-path-decision-label" data-market-low-label>LT / günstig</span>
+                                        <span class="market-path-decision-label" data-market-low-label>Günstig (LT)</span>
                                         <strong data-market-low-action>Laden bei Defizit</strong>
                                     </div>
                                     <div class="market-path-decision-text" data-market-low-detail>Nur wenn späterer Bedarf nicht sicher aus PV/Speicher gedeckt ist.</div>
                                 </div>
                                 <div class="market-path-decision-row market-path-decision-normal">
                                     <div>
-                                        <span class="market-path-decision-label" data-market-normal-label>Normalpreis</span>
+                                        <span class="market-path-decision-label" data-market-normal-label>Normal (HT)</span>
                                         <strong data-market-normal-action>Halten</strong>
                                     </div>
                                     <div class="market-path-decision-text" data-market-normal-detail>Halten stoppt Entladung bei späterem Bedarf; Netzladen braucht Defizit und Ladeschwelle.</div>
                                 </div>
                                 <div class="market-path-decision-row market-path-decision-high">
                                     <div>
-                                        <span class="market-path-decision-label" data-market-high-label>Teuer / später</span>
+                                        <span class="market-path-decision-label" data-market-high-label>Teuer (UHT)</span>
                                         <strong data-market-high-action>kein Einkauf</strong>
                                     </div>
                                     <div class="market-path-decision-text" data-market-high-detail>Hier wird Bedarf bewertet; Einkauf passiert vorher nur bei Prognosedefizit.</div>
                                 </div>
+                            </div>
+                            <div class="market-day" data-market-day>
+                                <label class="small" for="market-day-basis" data-tooltip="<?= htmlspecialchars($tooltipMap['ui_market_day_basis'] ?? '') ?>">Datenbasis</label>
+                                <select id="market-day-basis" class="form-select form-select-sm" data-market-day-basis>
+                                    <option value="winter">Typischer trüber Wintertag</option>
+                                    <option value="forecast">Eigene Prognose (nächste 24 h)</option>
+                                </select>
+                                <p class="small text-muted my-1" data-market-day-note></p>
+                                <strong class="small" data-market-day-title>nur PV</strong>
+                                <div class="small">Leistung in kW · PV grün · Verbrauch rot · Netz blau gestrichelt · Batterie violett (+ laden / − entladen)</div>
+                                <canvas data-market-day-power role="img" aria-label="Leistung am zweiten Rechentag"></canvas>
+                                <div class="small">Speicherfüllstand · Günstige Fenster grün, teure Fenster orange</div>
+                                <canvas data-market-day-soc role="img" aria-label="SoC am zweiten Rechentag"></canvas>
+                                <div data-market-day-costs aria-live="polite"></div>
+                                <div class="small text-muted">Beispielrechnung, kein Speicherplan</div>
                             </div>
                             <div class="market-path-preview-formula">
                                 <span data-market-formula-note>Halten: Preis + Sicherheit. Netzladen: Preis / Wirkungsgrad + Akku + Sicherheit + Marge.</span>
@@ -11861,7 +11849,7 @@ async function readConfirmedConfigJson(response) {
                     <div class="mt-3 rounded-3 p-3 config-wizard-section">
                         <div class="fw-bold text-info mb-3"><i class="fas fa-charging-station me-2"></i>Wallbox-Leistung per MQTT</div>
                         <div class="small text-muted mb-3">
-                            Direkter Messwert-Eingang für evcc/openWB ohne Home Assistant. Der MQTT-Hub abonniert diese Topics selbst und schreibt die Leistung nach <code>external_wb.json</code>, damit sie im Dashboard und in der Hausverbrauchsbereinigung wirkt.
+                            Direkter Messwert-Eingang ohne Home Assistant. Mit „Deaktiviert / Keine Wallbox 1“ bzw. „Deaktiviert / keine Wallbox 2“ werden frische Werte bei gesetztem Broker und Leistungs-Topic in Übersicht, Verlauf und Statistik als Wallbox angezeigt. E3DC-Control steuert diese Box nicht. Die Prognose und Regelung verwenden weiterhin den Hausverbrauch einschließlich dieser Wallbox.
                         </div>
                         <div class="row g-2">
                             <div class="col-12 col-md-4">
@@ -12032,7 +12020,7 @@ async function readConfirmedConfigJson(response) {
                         </div>
                         <div class="col-6 col-md-3">
                             <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['ep_reserve_pct'] ?? '') ?>">Fallback-Reserve (%)</label>
-                            <input type="number" min="0" max="80" step="0.5" name="values[ep_reserve_pct]" class="form-control config-input" value="<?= $sv('ep_reserve_pct') ?>" placeholder="8.0">
+                            <input type="number" min="0" max="80" step="0.5" name="values[ep_reserve_pct]" class="form-control config-input" value="<?= $sv('ep_reserve_pct') ?>" placeholder="8">
                             <?= $configValidationMarker('ep_reserve_pct') ?>
                             <div class="text-muted" style="font-size:0.72rem;">Fallback/zusätzlicher Boden</div>
                         </div>
@@ -13244,7 +13232,7 @@ async function readConfirmedConfigJson(response) {
                             <div class="d-flex flex-wrap align-items-start justify-content-between gap-2 mb-2">
                                 <div>
                                     <div class="fw-bold text-info"><i class="fas fa-diagram-project me-2"></i>PV-Flächen und Wechselrichtergruppen</div>
-                                    <div class="small text-muted mt-1">Hier kannst Du auch eine vierte oder weitere Dachfläche anlegen und eindeutig E3DC-DC oder einem externen AC-Wechselrichter zuordnen. Bestehende IDs bleiben unverändert.</div>
+                                    <div class="small text-muted mt-1">Eine vierte oder weitere Dachfläche anlegen und eindeutig E3DC-DC oder einem externen AC-Wechselrichter zuordnen. Bestehende IDs bleiben unverändert.</div>
                                 </div>
                                 <span class="badge rounded-pill bg-secondary-subtle text-secondary-emphasis">Topologie v1</span>
                             </div>
@@ -13644,7 +13632,15 @@ async function readConfirmedConfigJson(response) {
                     const model = pvTopologyModelFromDom();
                     const errors = pvTopologyValidate(model);
                     pvTopologyRenderSummary(model);
-                    if (errors.length) return false;
+                    if (errors.length) {
+                        alert('PV-Topologie kann nicht gespeichert werden:\n' + errors.join('\n'));
+                        if (errors.includes('Für EXTERNAL_AC fehlt die externe WR-Leistung.')) {
+                            const field = document.getElementById('pv_external_ac_inverter_limit_w');
+                            const group = field?.closest('.config-group-el');
+                            if (group) openAdvancedConfigGroup(group.id, field.id);
+                        }
+                        return false;
+                    }
                     const input = document.getElementById('pv-topology-json-input');
                     if (input) input.value = JSON.stringify(model);
                     return true;
@@ -13776,6 +13772,9 @@ async function readConfirmedConfigJson(response) {
                             status.textContent = 'Bestehende Flächen konnten nicht vollständig übernommen werden: ' + automaticProposal.errors.join(' ');
                         }
                     }
+                    document.getElementById('pv_external_ac_inverter_limit_w')?.addEventListener('input', () => {
+                        pvTopologyRenderSummary(pvTopologyModelFromDom());
+                    });
                     editor.addEventListener('input', event => {
                         pvTopologyLegacyAutofillActive = false;
                         const allocations = event.target.closest('[data-pv-allocations]');
@@ -14729,7 +14728,7 @@ function submitConfigEditorForm(form, nativeSubmit) {
 }
 
 function updateTariffEditorFields(tariffType) {
-    const tariff = String(tariffType || '').toLowerCase();
+    const tariff = String(tariffType || '').trim().toLowerCase();
     const isTibber = tariff === 'tibber';
     const isEpex = ['epex', 'dynamic', 'awattar'].includes(tariff);
     const isDynamicPrice = isEpex || isTibber;
@@ -14760,6 +14759,10 @@ function updateTariffEditorFields(tariffType) {
         || providerFields[0]
         || null;
 
+    const basisLabel = document.querySelector('[data-tariff-basis-label]');
+    if (basisLabel) basisLabel.textContent = isOctopus ? 'Normal (HT)' : 'Arbeitspreis';
+    const basisUnit = document.querySelector('[data-tariff-basis-unit]');
+    if (basisUnit) basisUnit.style.display = isOctopus ? 'none' : 'inline';
     setDisplay('opt_price_basis', (isFixed || isOctopus) ? 'block' : 'none');
     setDisplay('opt_price_cheap', isOctopus ? 'block' : 'none');
     setDisplay('opt_price_uht', isOctopus ? 'block' : 'none');
@@ -15647,7 +15650,10 @@ const MARKET_PATH_PREVIEW_KEYS = [
     'market_roundtrip_efficiency_pct', 'market_degradation_ct_per_kwh',
     'market_grid_charge_min_job_wh', 'market_grid_charge_min_job_pct',
     'direct_marketing_roundtrip_efficiency_pct', 'direct_marketing_degradation_ct_per_kwh',
-    'stromtarif_typ', 'strompreis_basis', 'strompreis_cheap', 'strompreis_uht', 'strompreis_spezial'
+    'stromtarif_typ', 'strompreis_basis', 'strompreis_cheap', 'strompreis_uht', 'strompreis_spezial',
+    'market_battery_hold_enable', 'market_battery_grid_charge_enable', 'grid_friendly_mode',
+    'speichergroesse', 'ep_reserve_pct', 'maximumladeleistung', 'maximaleentladeleistung',
+    'market_profit_hold_ct_per_kwh'
 ];
 const DIRECT_MARKETING_EEG_CURRENT_TABLE = {
     source: 'Bundesnetzagentur EEG-Fördersätze',
@@ -15795,11 +15801,10 @@ function initDirectMarketingEegRateUi() {
         commissioning.addEventListener('change', () => applyDirectMarketingEegCurrentTable(false));
         commissioning.addEventListener('input', updateDirectMarketingEegSupportEnd);
     }
-    const supportYears = storageCurvePreviewInput('direct_marketing_eeg_support_years');
-    if (supportYears) {
+    document.querySelectorAll('[name="values[direct_marketing_eeg_support_years]"]').forEach(supportYears => {
         supportYears.addEventListener('input', updateDirectMarketingEegSupportEnd);
         supportYears.addEventListener('change', updateDirectMarketingEegSupportEnd);
-    }
+    });
     source.addEventListener('change', () => applyDirectMarketingEegCurrentTable(false));
     const applyButton = document.getElementById('directMarketingEegApplyCurrentTable');
     if (applyButton) {
@@ -15812,10 +15817,13 @@ function initDirectMarketingEegRateUi() {
 function storageCurvePreviewInput(key) {
     const fields = Array.from(document.querySelectorAll(`[name="values[${key}]"]`));
     if (!fields.length) return null;
-    const checked = fields.find(field => (field.type === 'checkbox' || field.type === 'radio') && field.checked);
+    // Die inaktive Editoransicht sperrt ihre doppelten Felder; maßgeblich ist das Feld, das gespeichert wird.
+    const enabled = fields.filter(field => !field.disabled);
+    const candidates = enabled.length ? enabled : fields;
+    const checked = candidates.find(field => (field.type === 'checkbox' || field.type === 'radio') && field.checked);
     if (checked) return checked;
-    const visibleControl = fields.find(field => field.type !== 'hidden');
-    return visibleControl || fields[0];
+    const visibleControl = candidates.find(field => field.type !== 'hidden');
+    return visibleControl || candidates[0];
 }
 
 function storageCurvePreviewNumber(key, fallback) {
@@ -16049,7 +16057,7 @@ function applyMarketChargeProfile(profileRaw) {
     });
     const comfortMax = document.querySelector('[data-market-comfort-max-soc]');
     if (comfortMax) comfortMax.textContent = marketPathPreviewFormat(storageCurvePreviewClamp(storageCurvePreviewNumber('cheap_grid_battery_max_soc', 80), 0, 100), 1);
-    updateMarketPathPreview();
+    scheduleMarketPathPreview();
 }
 
 function initMarketChargeProfile() {
@@ -16071,216 +16079,562 @@ function initMarketChargeProfile() {
     applyMarketChargeProfile(select.value);
 }
 
-function updateMarketPathPreview() {
-    const formulaNote = document.querySelector('[data-market-formula-note]');
-    const previewInfo = document.querySelector('[data-market-preview-info]');
-    const tariffBadge = document.querySelector('[data-market-preview-tariff]');
-    const lowLabel = document.querySelector('[data-market-low-label]');
-    const normalLabel = document.querySelector('[data-market-normal-label]');
-    const highLabel = document.querySelector('[data-market-high-label]');
-    const lowAction = document.querySelector('[data-market-low-action]');
-    const lowDetail = document.querySelector('[data-market-low-detail]');
-    const normalAction = document.querySelector('[data-market-normal-action]');
-    const normalDetail = document.querySelector('[data-market-normal-detail]');
-    const highAction = document.querySelector('[data-market-high-action]');
-    const highDetail = document.querySelector('[data-market-high-detail]');
-    if (
-        !formulaNote && !previewInfo && !tariffBadge && !lowLabel && !normalLabel && !highLabel
-        && !lowAction && !normalAction && !highAction
-    ) return;
+// Tarif-Tagesbild: reine Rechnung, ohne Speicherplan oder Gerätezugriff.
+function marketDaySettings() {
+    const n = marketPathPreviewNumber;
+    const profile = marketChargeProfileValue(), preset = MARKET_CHARGE_PROFILE_PRESETS[profile];
+    const clamp = storageCurvePreviewClamp;
+    const charge = Math.max(0, n('maximumladeleistung', 5000));
+    return {
+        tariff: String(storageCurvePreviewFieldValue('stromtarif_typ', 'static')).trim().toLowerCase(), profile,
+        efficiency: clamp(n('market_roundtrip_efficiency_pct', n('direct_marketing_roundtrip_efficiency_pct', 85)), 1, 100) / 100,
+        degradation: Math.max(0, n('market_degradation_ct_per_kwh', n('direct_marketing_degradation_ct_per_kwh', 4))),
+        margin: preset.margin ?? Math.max(0, n('market_min_margin_pct', 10)),
+        safety: preset.safety ?? clamp(n('market_safety_correction_ct_per_kwh', 0), -10, 50),
+        spread: ['balanced', 'comfort'].includes(profile) ? 0 : Math.max(0, n('market_profit_hold_ct_per_kwh', 0.5)),
+        holdMargin: 5, lateBufferPct: 3,
+        capacity: Math.max(1, n('speichergroesse', 10)) * 1000,
+        reserve: clamp(n('ep_reserve_pct', 8), 0, 100), charge,
+        discharge: Math.max(0, n('maximaleentladeleistung', charge)),
+        target: profile === 'comfort' ? Math.min(95, clamp(n('cheap_grid_battery_max_soc', 80), 0, 100)) : 95,
+        limit: n('market_price_limit_ct', 0),
+        buffer: Math.max(0, n('market_autarky_horizon_buffer_wh', 500)),
+        lowSoc: clamp(n('market_autarky_low_soc_pct', 20), 0, 100),
+        minJobWh: Math.max(0, n('market_grid_charge_min_job_wh', 0)),
+        minJobPct: clamp(n('market_grid_charge_min_job_pct', 5), 0, 100),
+        enabled: storageCurvePreviewBool('grid_friendly_mode', true),
+        grid: storageCurvePreviewBool('market_battery_grid_charge_enable', false),
+        hold: storageCurvePreviewBool('market_battery_hold_enable', false),
+        prices: [n('strompreis_cheap', null), n('strompreis_basis', null), n('strompreis_uht', null)],
+        stages: marketSpecialTariffStages()
+    };
+}
 
-    const directEfficiency = marketPathPreviewNumber('direct_marketing_roundtrip_efficiency_pct', 85);
-    const efficiency = storageCurvePreviewClamp(
-        marketPathPreviewNumber('market_roundtrip_efficiency_pct', directEfficiency),
-        1,
-        100
-    );
-    const directDegradation = marketPathPreviewNumber('direct_marketing_degradation_ct_per_kwh', 4);
-    const degradation = Math.max(0, marketPathPreviewNumber('market_degradation_ct_per_kwh', directDegradation));
-    // Marge/Sicherheit aus der Preset-Tabelle (nicht aus den Feldern, außer custom).
-    const chargeProfile = marketChargeProfileValue();
-    const chargePreset = MARKET_CHARGE_PROFILE_PRESETS[chargeProfile];
-    const safety = chargePreset.safety === null
-        ? storageCurvePreviewClamp(marketPathPreviewNumber('market_safety_correction_ct_per_kwh', 0), -10, 50)
-        : chargePreset.safety;
-    const margin = chargePreset.margin === null
-        ? Math.max(0, marketPathPreviewNumber('market_min_margin_pct', 10))
-        : chargePreset.margin;
-    const isComfortProfile = chargeProfile === 'comfort';
-    const autarkyFirst = !isComfortProfile;
-    const comfortMaxSoc = storageCurvePreviewClamp(marketPathPreviewNumber('cheap_grid_battery_max_soc', 80), 0, 100);
-    const configuredPriceLimit = marketPathPreviewNumber('market_price_limit_ct', 0);
-    const tariffMeanPrice = marketTariffMeanPriceCt();
-    const comfortPriceLimit = configuredPriceLimit > 0 ? configuredPriceLimit : tariffMeanPrice;
-    const autarkyLowSoc = storageCurvePreviewClamp(marketPathPreviewNumber('market_autarky_low_soc_pct', 20), 0, 100);
-    const autarkyBufferWh = Math.max(0, marketPathPreviewNumber('market_autarky_horizon_buffer_wh', 500));
-    const safetyPrefix = safety > 0 ? '+ ' : (safety < 0 ? '- ' : '± ');
-    const tariffInput = document.querySelector('[name="values[stromtarif_typ]"]');
-    const tariff = String(tariffInput ? tariffInput.value : 'static').trim().toLowerCase();
-    const specialTariff = ['special', 'spezial', 'special_tariff'].includes(tariff);
-    const stages = specialTariff ? marketSpecialTariffStages() : null;
-    const stagePrices = stages ? Array.from(new Set(stages.map(entry => entry[1]))).sort((a, b) => a - b) : [];
-    const basis = specialTariff ? (stagePrices[1] ?? stagePrices[0] ?? null) : marketPathPreviewNumber('strompreis_basis', null);
-    const cheap = specialTariff ? (stagePrices[0] ?? null) : marketPathPreviewNumber('strompreis_cheap', null);
-    const uht = specialTariff ? (stagePrices[stagePrices.length - 1] ?? null) : marketPathPreviewNumber('strompreis_uht', null);
-    const lowPrice = cheap;
-    const factor = 100 / efficiency;
-    const spreadMin = ['balanced', 'comfort'].includes(chargeProfile) ? 0 : Math.max(0, marketPathPreviewNumber('market_profit_hold_ct_per_kwh', marketPathPreviewNumber('direct_marketing_profit_hold_ct_per_kwh', 0.5)));
-    const lowCost = lowPrice === null ? null : (lowPrice * factor) + degradation + safety;
-    const lowThreshold = lowCost === null ? null : lowCost + Math.max(spreadMin, Math.max(1, Math.abs(lowCost)) * margin / 100);
-    const normalCost = basis === null ? null : (basis * factor) + degradation + safety;
-    const normalThreshold = normalCost === null ? null : normalCost + Math.max(spreadMin, Math.max(1, Math.abs(normalCost)) * margin / 100);
-    const lowHoldThreshold = Math.max(0, lowPrice + safety);
-    const normalHoldThreshold = Math.max(0, basis + safety);
-    const pricesKnown = [lowPrice, basis, uht].every(value => value !== null);
-    const laterFixedReference = pricesKnown ? Math.max(lowPrice, basis, uht) : null;
-    const lowCanGridChargeAtHigh = pricesKnown && laterFixedReference >= lowThreshold;
-    const normalCanBuyAtHigh = pricesKnown && laterFixedReference >= normalThreshold;
+function marketDayThresholds(c, price) {
+    const cost = price / c.efficiency + c.degradation + c.safety;
+    const holdCost = price + c.safety;
+    return {
+        cost,
+        grid: cost + Math.max(c.spread, Math.max(1, Math.abs(cost)) * c.margin / 100),
+        hold: Math.max(price, holdCost + c.spread,
+            holdCost + Math.max(1, Math.abs(holdCost)) * c.holdMargin / 100)
+    };
+}
 
-    const autarkyText = autarkyFirst
-        ? `PV-autark zuerst blockiert den normalen Marktpfad, solange Speicher plus erwartete PV den Horizont mit ${marketPathPreviewFormat(autarkyBufferWh, 0)} Wh Puffer decken; Ausnahme ab ${marketPathPreviewFormat(autarkyLowSoc, 1)} % SOC. `
-        : 'Komfort-Profil: PV-autark zuerst ist durch das Zeitziel ersetzt (PV zuerst, Netz nur für den Rest bis zum Fensterende). ';
-    const profileLabel = chargePreset.label;
-    const formulaText = isComfortProfile
-        ? `Rechenbasis Profil ${profileLabel}: ${autarkyText}Preislimit ${comfortPriceLimit === null ? 'Mittelpreis des Preishorizonts' : marketPathPreviewFormat(comfortPriceLimit, 1) + ' ct'}${configuredPriceLimit > 0 ? '' : ' (Tarif-Mittel)'}, Ziel min(Ladeziel, ${marketPathPreviewFormat(comfortMaxSoc, 0)} %), ×${marketPathPreviewFormat(factor, 2)} Wirkungsgrad nur für die Ladedauer.`
-        : `Rechenbasis Profil ${profileLabel}: ${autarkyText}Halten ohne Akku-Zyklus; Netzladen inkl. ×${marketPathPreviewFormat(factor, 2)} Wirkungsgrad, ${marketPathPreviewFormat(degradation, 1)} ct Akku, ${safetyPrefix}${marketPathPreviewFormat(Math.abs(safety), 2)} ct Sicherheit, ${marketPathPreviewFormat(margin, 1)} % Marge.`;
-    const fixedTooltip = `${autarkyText}Halten: Entladung sperren, wenn die Prognose späteren Bezug sieht und dieser spätere Bezug teurer ist als das aktuelle Fenster plus Sicherheitskorrektur. Netzladen: erst wenn der spätere Bezugspreis auch die Lade-Schwelle inkl. Wirkungsgrad, Akku-Kosten, Sicherheitskorrektur und Mindestmarge übersteigt. Verbraucherfreigabe und Prognosedefizit bleiben Pflicht.`;
-    const dynamicTooltip = `${autarkyText}EPEX wird je Börsenslot bewertet. Halten vergleicht den aktuellen Arbeitspreis plus Sicherheitskorrektur mit einem späteren Bezugspreis. Netzladen nutzt zusätzlich Wirkungsgrad, Akku-Kosten und Mindestmarge und startet nur bei Prognosebedarf sowie freigegebenem Verbraucher.`;
-
-    if (formulaNote) formulaNote.textContent = formulaText;
-    if (previewInfo) previewInfo.setAttribute('data-tooltip', fixedTooltip);
-    if (lowLabel) lowLabel.textContent = 'LT / günstig';
-    if (normalLabel) normalLabel.textContent = 'Normalpreis';
-    if (highLabel) highLabel.textContent = 'Teuer / später';
-    if (highAction) highAction.textContent = 'kein Einkauf';
-    if (highDetail) highDetail.textContent = `Kein Einkauf: dieses spätere Bezugsfenster liefert nur den Vergleichspreis.`;
-
-    const isFixed = ['static', 'fix', 'fixed', 'flat'].includes(tariff);
-    const isOctopus = tariff === 'octopus_heat';
-    const isSpecial = ['special', 'spezial', 'special_tariff'].includes(tariff);
-    const isDynamic = ['tibber', 'awattar', 'dynamic', 'epex'].includes(tariff);
-    if (isFixed) {
-        if (tariffBadge) tariffBadge.textContent = 'Fixpreis: Marktpfad aus';
-        if (lowLabel) lowLabel.textContent = 'Fixpreis';
-        if (normalLabel) normalLabel.textContent = 'Ladekurve';
-        if (highLabel) highLabel.textContent = 'Später';
-        if (lowAction) lowAction.textContent = 'kein Netzladen';
-        if (lowDetail) lowDetail.textContent = 'Ohne Preisfenster gibt es keinen normalen Marktpfad-Einkauf.';
-        if (normalAction) normalAction.textContent = 'halten';
-        if (normalDetail) normalDetail.textContent = 'Ladekurve und PV-Regelung bleiben führend; Verbraucherfreigaben ändern daran nichts.';
-        if (formulaNote) formulaNote.textContent = 'Fixer Arbeitspreis: kein normaler Marktpfad. PV-Kurve, Reserve und Direktvermarktung bleiben getrennt.';
-        return;
+function marketDayPrice(c, timestamp) {
+    const d = new Date(timestamp), minute = d.getHours() * 60 + d.getMinutes();
+    if (c.tariff === 'octopus_heat') return (minute >= 120 && minute < 360) || (minute >= 720 && minute < 960)
+        ? c.prices[0] : minute >= 1080 && minute < 1260 ? c.prices[2] : c.prices[1];
+    if (['special', 'spezial', 'special_tariff'].includes(c.tariff)) {
+        if (!c.stages?.length) return null;
+        let price = c.stages[c.stages.length - 1][1];
+        for (const row of c.stages) if (row[0] <= minute) price = row[1];
+        return price;
     }
-    if (isOctopus || isSpecial) {
-        if (tariffBadge) tariffBadge.textContent = (isOctopus ? 'Octopus Heat' : 'Spezialtarif') + ' · Profil ' + profileLabel;
-        if (lowLabel) lowLabel.textContent = isOctopus ? 'LT / günstig' : 'Spezial / günstig';
-        if (normalLabel) normalLabel.textContent = isOctopus ? 'Normalpreis' : 'Normalfenster';
-        if (highLabel) highLabel.textContent = isOctopus ? 'Teuer / später' : 'Vergleich später';
-        if (!pricesKnown || lowPrice === laterFixedReference) {
-            const detail = !pricesKnown
-                ? 'Tarifpreise nicht gesetzt oder Tagesplan ungültig: kein Netzladen.'
-                : 'Einheitlicher Tarifpreis: kein günstiges Preisfenster.';
-            if (lowAction) lowAction.textContent = 'kein Netzladen';
-            if (normalAction) normalAction.textContent = 'kein Netzladen';
-            if (lowDetail) lowDetail.textContent = detail;
-            if (normalDetail) normalDetail.textContent = detail;
-            if (highDetail) highDetail.textContent = pricesKnown ? `Tarifpreis ${marketPathPreviewFormat(lowPrice, 1)} ct/kWh.` : 'Späterer Bezug nicht gesetzt.';
-            return;
-        }
-        if (highDetail) highDetail.textContent = `Späterer Bezug: höchste Tarifstufe ${marketPathPreviewFormat(laterFixedReference, 1)} ct/kWh im wiederkehrenden Tagesplan.`;
-        if (isSpecial && normalLabel) normalLabel.textContent = stagePrices.length > 2 ? 'Zwischenstufe' : 'Teure Stufe';
-        // Jede Zwischenstufe wird gegen die höchste spätere Stufe bewertet.
-        if (isSpecial && stagePrices.length > 3) {
-            if (normalLabel) normalLabel.textContent = 'Zwischenstufen';
-            const intermediateDetails = stagePrices.slice(1, -1).map(price => {
-                const cost = price * factor + degradation + safety;
-                const threshold = cost + Math.max(spreadMin, Math.max(1, Math.abs(cost)) * margin / 100);
-                const canCharge = isComfortProfile
-                    ? comfortPriceLimit !== null && price <= comfortPriceLimit + 0.001
-                    : laterFixedReference >= threshold;
-                const detail = isComfortProfile
-                    ? `Preislimit ${comfortPriceLimit === null ? '?' : marketPathPreviewFormat(comfortPriceLimit, 1)} ct/kWh`
-                    : `Schwelle ${marketPathPreviewFormat(threshold, 1)} ct/kWh`;
-                return `${marketPathPreviewFormat(price, 1)} ct/kWh: ${canCharge ? 'Netzladen möglich' : 'kein Netzladen'} (${detail})`;
+    return ['static', 'fix', 'fixed', 'flat'].includes(c.tariff) ? c.prices[1] : null;
+}
+
+function marketDayData(c, basis, data, now = Date.now()) {
+    const step = 900000, dynamic = ['epex', 'dynamic', 'awattar', 'tibber'].includes(c.tariff);
+    if (!dynamic && !['octopus_heat', 'special', 'spezial', 'special_tariff', 'static', 'fix', 'fixed', 'flat'].includes(c.tariff)) {
+        return {rows: [], initialSoc: null, basis, unsupported: true,
+            note: 'Tarifart wird vom Marktpfad nicht unterstützt; keine Vorschau.'};
+    }
+    let start = new Date(now); start.setHours(0, 0, 0, 0); start = start.getTime();
+    let initialSoc = Math.min(100, c.reserve + 5), note = '', selectedBasis = basis;
+    let own = null, quotes = null;
+    if (basis === 'forecast') {
+        start = (Math.floor(now / step) + 1) * step;
+        const times = Array.isArray(data?.timestamps) ? data.timestamps : [];
+        const stamps = times.map(v => Number(v) * (Number(v) < 1e11 ? 1000 : 1));
+        const marketDaySample = (key, idx) => {
+            if (!Array.isArray(data?.[key])) return null;
+            const value = data[key][idx];
+            if (typeof value !== 'number' && (typeof value !== 'string' || !value.trim())) return null;
+            return storageCurvePreviewOptionalNumber(value);
+        };
+        const at = ts => {
+            let idx = -1;
+            for (let j = 0; j < stamps.length; j++) if (stamps[j] <= ts) idx = j;
+            const duration = idx + 1 < stamps.length ? stamps[idx + 1] - stamps[idx] : idx > 0 ? stamps[idx] - stamps[idx - 1] : 0;
+            if (idx < 0 || duration < 300000 || duration > 3600000 || ts >= stamps[idx] + duration) return null;
+            const number = key => marketDaySample(key, idx);
+            const pv = number('pv') ?? number('pv_ensemble'), home = number('home');
+            // Die getrennten Verbraucherreihen gehören zum Prognosevertrag; Lücken nicht als 0 deuten.
+            const extras = ['wp', 'wb', 'wb2', 'climate'].map(key => number(key));
+            if (pv === null || home === null || extras.some(v => v === null) || [pv, home, ...extras].some(v => v < 0)) return null;
+            return {pv, load: home + extras.reduce((a, b) => a + b, 0), price: number('price'), soc: number('soc')};
+        };
+        own = Array.from({length: 96}, (_, i) => at(start + i * step));
+        if (own.some(v => v === null)) {
+            own = null; selectedBasis = 'winter';
+            note = 'Prognose fehlt oder ist unvollständig. Typischen trüben Wintertag verwenden.';
+            const day = new Date(now); day.setHours(0, 0, 0, 0); start = day.getTime();
+        } else {
+            initialSoc = own[0].soc ?? initialSoc;
+            note = 'Eigene Prognose: Tag 2 wiederholt die nächsten 24 h; Viertelstunden als Stufenfunktion.';
+            if (dynamic) quotes = Array.from({length: 192}, (_, i) => {
+                const ts = start + i * step;
+                let idx = -1;
+                for (let j = 0; j < stamps.length; j++) if (stamps[j] <= ts) idx = j;
+                const duration = idx + 1 < stamps.length ? stamps[idx + 1] - stamps[idx] : idx > 0 ? stamps[idx] - stamps[idx - 1] : 0;
+                return idx >= 0 && duration >= 300000 && duration <= 3600000 && ts < stamps[idx] + duration
+                    ? marketDaySample('price', idx) : null;
             });
-            if (normalAction) normalAction.textContent = 'je Tarifsegment';
-            if (normalDetail) normalDetail.textContent = intermediateDetails.join('; ') + '. Freigaben bleiben maßgeblich. Wirtschaftlich und ausgeglichen benötigen Prognosebedarf; Komfort lädt bis zum Ziel am Segmentende.';
         }
-        if (isComfortProfile) {
-            // Komfort: Laden im Preisfenster (Slots <= Limit) bis zum Ziel am Fensterende, kein Defizit nötig.
-            const limitKnown = comfortPriceLimit !== null;
-            const lowInWindow = limitKnown && lowPrice <= comfortPriceLimit + 0.001;
-            const normalInWindow = limitKnown && basis <= comfortPriceLimit + 0.001;
-            if (lowAction) lowAction.textContent = lowInWindow ? 'laden bis Ziel' : 'kein Laden';
-            if (lowDetail) {
-                lowDetail.textContent = lowInWindow
-                    ? `Laden im Preisfenster ≤ ${marketPathPreviewFormat(comfortPriceLimit, 1)} ct/kWh bis min(Ladeziel, Speicher max. ${marketPathPreviewFormat(comfortMaxSoc, 0)} %) zum Fensterende; PV zuerst, kein Prognosedefizit nötig.`
-                    : (limitKnown ? `${marketPathPreviewFormat(lowPrice, 1)} > ${marketPathPreviewFormat(comfortPriceLimit, 1)} ct/kWh: kein Laden – Limit liegt unter dem günstigsten Tarifpreis.` : 'Preislimit unbekannt: kein Laden.');
-            }
-            if (!(isSpecial && stagePrices.length > 3) && normalAction) normalAction.textContent = normalInWindow ? 'laden bis Ziel' : 'halten';
-            if (!(isSpecial && stagePrices.length > 3) && normalDetail) {
-                normalDetail.textContent = normalInWindow
-                    ? `${marketPathPreviewFormat(basis, 1)} ≤ ${marketPathPreviewFormat(comfortPriceLimit, 1)} ct/kWh: Laden auch zu Normalpreis-Stunden (Limit prüfen).`
-                    : `${marketPathPreviewFormat(basis, 1)} > ${limitKnown ? marketPathPreviewFormat(comfortPriceLimit, 1) : '?'} ct/kWh: kein Laden. Halten, wenn späterer Bezug > ${marketPathPreviewFormat(normalHoldThreshold, 1)} ct/kWh.`;
-            }
-            return;
-        }
-        if (lowAction) lowAction.textContent = 'halten / laden';
-        if (lowDetail) {
-            lowDetail.textContent = lowCanGridChargeAtHigh
-                ? `Halten, wenn späterer Bezug > ${marketPathPreviewFormat(lowHoldThreshold, 1)} ct/kWh. Netzladen, wenn späterer Bezug > ${marketPathPreviewFormat(lowThreshold, 1)} ct/kWh und Prognosedefizit.`
-                : `Halten, wenn späterer Bezug > ${marketPathPreviewFormat(lowHoldThreshold, 1)} ct/kWh. Kein Netzladen: max. späterer Bezug ${marketPathPreviewFormat(laterFixedReference, 1)} ct/kWh < Schwelle ${marketPathPreviewFormat(lowThreshold, 1)} ct/kWh.`;
-        }
-        if (!(isSpecial && stagePrices.length > 3) && normalAction) normalAction.textContent = normalCanBuyAtHigh ? 'halten / laden' : 'halten';
-        if (!(isSpecial && stagePrices.length > 3) && normalDetail) {
-            normalDetail.textContent = normalCanBuyAtHigh
-                ? `Halten, wenn späterer Bezug > ${marketPathPreviewFormat(normalHoldThreshold, 1)} ct/kWh. Netzladen, wenn späterer Bezug > ${marketPathPreviewFormat(normalThreshold, 1)} ct/kWh.`
-                : `Halten, wenn späterer Bezug > ${marketPathPreviewFormat(normalHoldThreshold, 1)} ct/kWh. Kein Netzladen: späterer Bezug ${marketPathPreviewFormat(laterFixedReference, 1)} ct/kWh < Schwelle ${marketPathPreviewFormat(normalThreshold, 1)} ct/kWh.`;
-        }
-        return;
     }
-    if (isDynamic) {
-        if (tariffBadge) tariffBadge.textContent = 'EPEX / dynamisch · Profil ' + profileLabel;
-        if (previewInfo) previewInfo.setAttribute('data-tooltip', dynamicTooltip);
-        if (lowLabel) lowLabel.textContent = 'Günstiger Slot';
-        if (normalLabel) normalLabel.textContent = 'Normaler Slot';
-        if (highLabel) highLabel.textContent = 'Später teuer';
-        if (isComfortProfile) {
-            if (lowAction) lowAction.textContent = 'laden bis Ziel';
-            if (lowDetail) lowDetail.textContent = configuredPriceLimit > 0
-                ? `Slots ≤ ${marketPathPreviewFormat(configuredPriceLimit, 1)} ct/kWh laden bis min(Ladeziel, Speicher max. ${marketPathPreviewFormat(comfortMaxSoc, 0)} %) zum Fensterende; PV zuerst, kein Prognosedefizit nötig.`
-                : `Ohne Limit gilt der Mittelpreis des gebundenen Preishorizonts je Plan; Slots darunter laden bis min(Ladeziel, Speicher max. ${marketPathPreviewFormat(comfortMaxSoc, 0)} %) zum Fensterende. Bei flacher Preiskurve lädt fast jeder Slot – eigenes Limit empfohlen.`;
-            if (normalAction) normalAction.textContent = 'je Slot';
-            if (normalDetail) normalDetail.textContent = 'Slots über dem Limit: kein Laden; Halten bleibt preisabhängig möglich.';
-            if (formulaNote) formulaNote.textContent = `${formulaText} EPEX: Fenster laufen mit jedem Börsenslot.`;
-            return;
-        }
-        if (lowAction) lowAction.textContent = 'Spread prüfen';
-        if (lowDetail) {
-            lowDetail.textContent = 'Halten und Netzladen werden je Slot aus aktuellem Börsenpreis und späterem Bezugspreis berechnet.';
-        }
-        if (normalAction) normalAction.textContent = 'je Slot';
-        if (normalDetail) {
-            normalDetail.textContent = 'Keine feste Normal-Schwelle; gültige Preisdaten, Verbraucherfreigabe und Prognosedefizit entscheiden.';
-        }
-        if (formulaNote) formulaNote.textContent = `${formulaText} EPEX: Schwellen laufen mit jedem Börsenslot.`;
-        return;
+    if (dynamic && (!own || !quotes || quotes.some(v => v === null))) {
+        return {rows: [], initialSoc, basis: selectedBasis,
+            note: note + ' Börsentarif: Eigene Prognose und vollständige Preise für beide Tage erforderlich.'};
     }
-    if (tariffBadge) tariffBadge.textContent = 'Marktpfad';
-    if (lowAction) lowAction.textContent = 'prüft Preisfenster';
-    if (lowDetail) lowDetail.textContent = 'Netzladen braucht gültige Preisdaten, Verbraucherfreigabe und Prognosebedarf.';
-    if (normalAction) normalAction.textContent = 'halten';
-    if (normalDetail) normalDetail.textContent = `Halten, wenn späterer Bezug > ${marketPathPreviewFormat(normalHoldThreshold, 1)} ct/kWh; Netzladen, wenn späterer Bezug > ${marketPathPreviewFormat(normalThreshold, 1)} ct/kWh.`;
+    const rows = [];
+    const gaussian = (t, m, s) => Math.exp(-((t - m) ** 2) / (2 * s * s));
+    for (let i = 0; i < 384; i++) {
+        const ts = start + i * step, t = (i % 96) / 4 + 0.125;
+        const pv = own ? own[i % 96].pv : t > 8 && t < 16 ? 2100 * Math.sin(Math.PI * (t - 8) / 8) ** 1.3 : 0;
+        const load = own ? own[i % 96].load : 850 + 600 * gaussian(t, 7.2, .9) + 900 * gaussian(t, 19, 1.6) + 150 * gaussian(t, 12.5, 1);
+        const price = dynamic ? quotes[i % 192] : marketDayPrice(c, ts);
+        if (price === null || !Number.isFinite(price)) return {rows: [], initialSoc, basis: selectedBasis, note: 'Tarifpreise fehlen oder Tagesplan ungültig.'};
+        rows.push({ts, end: ts + step, pv, load, price, deficit: Math.max(0, load - pv) / 4, surplus: Math.max(0, pv - load) / 4});
+    }
+    return {rows, initialSoc: storageCurvePreviewClamp(initialSoc, 0, 100), basis: selectedBasis,
+        note: note || 'Typischer trüber Wintertag: feste PV- und Verbrauchsform als Beispiel.'};
+}
+
+function marketDayCharge(c, soc, target, seconds, deliver = false) {
+    const bands = [[0, 90, .73], [90, 95, .58], [95, 97, .33], [97, 100, .33]];
+    const duration = rate => bands.reduce((sum, [lo, hi, factor]) => sum + Math.max(0, Math.min(target, hi) - Math.max(soc, lo)) * c.capacity / 100 / Math.max(1, Math.min(rate, c.charge * factor)) * 3600, 0);
+    if (deliver) {
+        let amount = 0;
+        for (const [lo, hi, factor] of bands) {
+            const power = c.charge * factor;
+            const energy = Math.min(Math.max(0, Math.min(target, hi) - Math.max(soc, lo)) * c.capacity / 100, Math.max(0, seconds) * power / 3600);
+            amount += energy; seconds -= energy / Math.max(1, power) * 3600;
+        }
+        return amount;
+    }
+    if (target <= soc || c.charge <= 0) return 0;
+    let lo = 0, hi = c.charge;
+    for (let i = 0; i < 32; i++) {
+        const mid = (lo + hi) / 2;
+        if (duration(mid) > seconds) lo = mid; else hi = mid;
+    }
+    return Math.min(c.charge, Math.max(300, Math.ceil(hi / 100) * 100));
+}
+
+function marketDayAnnotate(c, all, index) {
+    const rows = all.slice(index, index + 192).map(row => ({...row}));
+    const prices = rows.map(r => r.price).sort((a, b) => a - b);
+    const fixed = ['octopus_heat', 'special', 'spezial', 'special_tariff'].includes(c.tariff);
+    const min = prices[0], max = prices[prices.length - 1], cut = prices[Math.floor((prices.length - 1) * .25)];
+    const limit = c.limit > 0 ? c.limit : Math.round(rows.slice(0, fixed ? 96 : 192).reduce((a, r) => a + r.price, 0) / Math.min(rows.length, fixed ? 96 : 192) * 10) / 10;
+    const annotate = r => {
+        r.fixed = fixed;
+        r.low = c.profile === 'comfort' ? (!fixed || max > min) && r.price <= limit + .001
+            : fixed ? max > min && r.price < max - .001 && (r.price <= min + .001 || max >= marketDayThresholds(c, r.price).grid)
+                : r.price <= cut + .001 || (max > min && (max - r.price) / (max - min) * 100 >= 75);
+        return r;
+    };
+    rows.forEach(annotate);
+    rows.past = fixed ? [] : all.slice(0, index).map(r => annotate({...r}));
+    return rows;
+}
+
+function marketDayWindow(rows, index, cap = Infinity) {
+    if (!rows[index]?.low || rows[index].price < 0 || rows[index].price > cap + .001) return null;
+    let end = index + 1;
+    while (end < rows.length && rows[end].low && rows[end].price >= 0 && rows[end].price <= cap + .001
+        && (!rows[index].fixed || Math.abs(rows[end].price - rows[index].price) <= .001)) end++;
+    let begin = index;
+    while (begin > 0 && rows[begin - 1].low && rows[begin - 1].price >= 0 && rows[begin - 1].price <= cap + .001
+        && (!rows[index].fixed || Math.abs(rows[begin - 1].price - rows[index].price) <= .001)) begin--;
+    return {start: index, end, endTs: rows[end - 1].end,
+        ref: rows.slice(begin, end).reduce((s, r) => s + r.price, 0) / (end - begin)};
+}
+
+function marketDayNeed(c, rows, stock, cut, cost, credit = null) {
+    const usable = c.capacity * (100 - c.reserve) / 100;
+    let energy = stock, horizon = Math.max(0, stock), shortage = 0, required = 0;
+    let stockEnd = null, requiredTotal = 0, requiredEcon = 0, checked = cut, proofs = [];
+    let futureDeficit = 0, futureSurplus = 0;
+    const served = [], credits = new Map();
+    const buffer = c.buffer + c.capacity * c.lateBufferPct / 100;
+    if (!cut) energy = Math.min(usable, energy - Math.min(Math.max(0, energy), rows[0].deficit) + rows[0].surplus * c.efficiency);
+    else energy = Math.min(usable, energy + rows[0].surplus * c.efficiency);
+    const startStock = energy;
+    for (let i = 1; i < rows.length; i++) {
+        const r = rows[i], inWindow = i < cut;
+        futureDeficit += r.deficit; futureSurplus += r.surplus;
+        shortage += Math.max(0, r.deficit - horizon);
+        horizon = Math.min(usable, Math.max(0, horizon - r.deficit) + r.surplus * c.efficiency);
+        if (!inWindow && stockEnd === null) stockEnd = energy;
+        if (credit && !inWindow && i >= checked) {
+            const w = marketDayWindow(rows, i, credit.cap);
+            checked = w ? w.end : i + 1;
+            if (w && w.ref <= credit.ref * (1 + c.margin / 100) + .001 && c.grid && c.enabled && c.charge * .73 >= 300) {
+                const project = initial => {
+                    const sub = rows.slice(i);
+                    const need = marketDayNeed(c, sub, initial, w.end - i, marketDayThresholds(c, w.ref).cost);
+                    return marketDayJob(c, sub, initial, {...w, start: 0, end: w.end - i}, need, w.ref);
+                };
+                const proof = project(energy);
+                if (proof.active && (c.profile === 'comfort' || proof.benefit !== null && proof.benefit >= marketDayThresholds(c, w.ref).grid)) {
+                    const projection = project(required);
+                    let left = proof.gridWh * c.efficiency;
+                    let projected = projection.active ? projection.gridWh * c.efficiency : 0;
+                    const entry = {...proof, ...w, deliveryEnd: w.endTs - 900000};
+                    proofs.push(entry);
+                    for (let j = i; j < w.end; j++) {
+                        const hours = Math.max(0, Math.min(rows[j].end, entry.deliveryEnd) - rows[j].ts) / 3600000;
+                        const amount = Math.min(left, c.charge * .73 * hours * c.efficiency);
+                        const amountRequired = Math.min(projected, c.charge * .73 * hours * c.efficiency);
+                        credits.set(j, [amount, amountRequired]); left -= amount; projected -= amountRequired;
+                    }
+                }
+            }
+        }
+        const cheap = credits.has(i);
+        const uncovered = cheap || inWindow ? 0 : Math.max(0, r.deficit - Math.max(0, energy));
+        if (!cheap && !inWindow) energy -= Math.min(Math.max(0, energy), r.deficit);
+        energy = Math.min(usable, energy + r.surplus * c.efficiency);
+        if (uncovered > .001 && r.price + .001 >= cost) served.push({wh: Math.round(uncovered * 1000) / 1000, price: r.price});
+        if (!inWindow) {
+            const missing = cheap ? 0 : Math.max(0, r.deficit - required);
+            if (!cheap) required = Math.max(0, required - r.deficit);
+            required = Math.min(usable, required + r.surplus * c.efficiency);
+            requiredTotal += missing;
+            if (r.price + .001 >= cost) requiredEcon += missing;
+        }
+        if (cheap) {
+            energy = Math.min(usable, energy + credits.get(i)[0]);
+            if (!inWindow) required = Math.min(usable, required + credits.get(i)[1]);
+        }
+    }
+    if (stockEnd === null) stockEnd = energy;
+    const requiredStock = Math.min(usable, requiredEcon + buffer);
+    const reference = cut ? stockEnd : startStock;
+    const needAbove = Math.min(Math.max(0, requiredStock - Math.max(0, reference)), shortage + buffer + Math.max(0, -stock));
+    return {stockEnd: Math.round(Math.max(0, stockEnd)), floorGap: Math.round(Math.max(0, -stockEnd)),
+        need: Math.round(needAbove + (needAbove > .001 ? Math.max(0, -stockEnd) : 0)),
+        requiredStock: Math.round(requiredStock), capped: requiredEcon + buffer > usable + .001,
+        requiredTotal: Math.round(requiredTotal), requiredEcon: Math.round(requiredEcon),
+        shortage: Math.round(shortage), futureDeficit: Math.round(futureDeficit), futureSurplus: Math.round(futureSurplus), served, proofs};
+}
+
+function marketDayJob(c, rows, stock, w, need, ref) {
+    const inactive = {active: false, gridWh: 0, rate: 0, benefit: null};
+    if (!w || c.charge * .73 < 300) return inactive;
+    const targetWh = Math.max(0, (c.target - c.reserve) / 100 * c.capacity);
+    const room = Math.max(0, targetWh - (need.stockEnd - need.floorGap));
+    const minimum = Math.max(c.minJobWh, c.capacity * c.minJobPct / 100);
+    let gridWh = c.profile === 'comfort' ? room / c.efficiency : Math.min(room, need.need) / c.efficiency;
+    if (c.profile !== 'comfort' && need.need - need.floorGap <= .001) return inactive;
+    if (gridWh <= .001 || gridWh + .001 < minimum) return inactive;
+    const seconds = (w.endTs - rows[0].ts - 900000) / 1000;
+    if (seconds <= 0) return inactive;
+    const soc = c.reserve + stock / c.capacity * 100;
+    gridWh = Math.min(gridWh, marketDayCharge(c, soc, c.target, seconds, true) / c.efficiency);
+    if (gridWh <= .001 || gridWh + .001 < minimum) return inactive;
+    const targetTs = w.endTs - Math.min(1800000, (w.endTs - rows[0].ts) / 2);
+    const rate = marketDayCharge(c, soc, Math.min(c.target, soc + gridWh * c.efficiency / c.capacity * 100), Math.max(1, targetTs - rows[0].ts) / 1000);
+    const roundedJob = Math.round(gridWh);
+    let left = roundedJob * c.efficiency, served = 0, value = 0;
+    for (const s of need.served) {const amount = Math.min(left, s.wh); served += amount; value += amount * s.price; left -= amount;}
+    return {active: true, gridWh: roundedJob, rate, benefit: served > .001 ? value / served : null, ref};
+}
+
+// Eine austauschbare Stelle für Halteprüfung und Ersatz-Gate.
+function marketDayHold(c, rows, stock, proofs) {
+    const usable = c.capacity * (100 - c.reserve) / 100;
+    const replacements = new Map();
+    for (const proof of proofs) {
+        if (rows[0].price < marketDayThresholds(c, proof.ref).grid) continue;
+        const buffer = c.profile === 'comfort' ? 0 : c.buffer + c.capacity * c.lateBufferPct / 100;
+        let left = Math.max(0, proof.gridWh * c.efficiency - buffer);
+        for (let i = proof.start; i < proof.end; i++) {
+            const r = rows[i], hours = Math.max(0, Math.min(r.end, proof.deliveryEnd) - r.ts) / 3600000;
+            const pv = Math.min(r.surplus * c.efficiency, c.charge * .25 * c.efficiency);
+            const amount = Math.min(left, c.charge * .73 * hours * c.efficiency,
+                Math.max(0, c.charge * .25 * c.efficiency - pv));
+            if (amount > .001) {replacements.set(i, {amount, cost: marketDayThresholds(c, proof.ref).cost}); left -= amount;}
+        }
+    }
+    // Gleichpreisige Lastslots ohne Quelle zusammenfassen: identisches Flussnetz,
+    // da zwischen ihnen weder Einspeisung noch Preiswechsel liegt. Slot 0 bleibt einzeln.
+    const totalLoad = rows.reduce((sum, r) => sum + r.deficit, 0);
+    const compact = [], compactReplacement = new Map();
+    rows.forEach((row, i) => {
+        const previous = compact[compact.length - 1];
+        const replacement = replacements.get(i);
+        const load = Math.min(row.deficit, c.discharge / 4);
+        if (i > 1 && previous && previous.price === row.price && !previous.surplus && !row.surplus
+            && !replacement && !compactReplacement.has(compact.length - 1)) previous.demand += load;
+        else {
+            if (replacement) compactReplacement.set(compact.length, replacement);
+            compact.push({...row, demand: load});
+        }
+    });
+    const buffer = c.profile === 'comfort' ? 0 : proofs.reduce((sum, proof) =>
+        sum + (rows[0].price >= marketDayThresholds(c, proof.ref).grid
+            ? Math.min(proof.gridWh * c.efficiency, c.buffer + c.capacity * c.lateBufferPct / 100) : 0), 0);
+    const available = Math.max(0, Math.min(usable, stock));
+    rows = compact;
+    const count = rows.length;
+    const loads = rows.map(r => r.demand);
+    function allocate(initial, demand) {
+        const source = count, sink = count + 1, graph = Array.from({length: count + 2}, () => []), sinks = [];
+        const edge = (u, v, cap, cost) => {
+            const forward = {v, rev: graph[v].length, cap: Math.max(0, cap), cost};
+            graph[u].push(forward); graph[v].push({v: u, rev: graph[u].length - 1, cap: 0, cost: -cost});
+            return forward;
+        };
+        edge(source, 0, initial, 0);
+        for (let i = 0; i < count; i++) {
+            edge(source, i, Math.min(rows[i].surplus, c.charge / 4) * c.efficiency, 0);
+            const replacement = compactReplacement.get(i);
+            if (i > 0 && replacement) edge(source, i, replacement.amount, replacement.cost);
+            sinks.push(edge(i, sink, demand[i], -rows[i].price));
+            if (i + 1 < count) edge(i, i + 1, usable, 0);
+        }
+        for (let iteration = 0; iteration <= 4 * count * count; iteration++) {
+            const distances = new Float64Array(count + 2).fill(Infinity), parentNode = new Int32Array(count + 2).fill(-1), parentEdge = new Int32Array(count + 2);
+            const queued = new Uint8Array(count + 2), queue = [source]; let head = 0, relax = 0;
+            distances[source] = 0; queued[source] = 1;
+            while (head < queue.length) {
+                const u = queue[head++]; queued[u] = 0;
+                for (let j = 0; j < graph[u].length; j++) {
+                    const e = graph[u][j];
+                    if (e.cap > 1e-6 && distances[e.v] > distances[u] + e.cost + 1e-6) {
+                        if (++relax > 8 * (count + 2) ** 3) throw new Error('Halteverteilung nicht berechenbar');
+                        distances[e.v] = distances[u] + e.cost; parentNode[e.v] = u; parentEdge[e.v] = j;
+                        if (!queued[e.v]) {queue.push(e.v); queued[e.v] = 1;}
+                    }
+                }
+            }
+            if (parentNode[sink] < 0) return demand.map((wh, i) => Math.max(0, wh - sinks[i].cap));
+            let amount = Infinity;
+            for (let v = sink; v !== source; v = parentNode[v]) amount = Math.min(amount, graph[parentNode[v]][parentEdge[v]].cap);
+            for (let v = sink; v !== source; v = parentNode[v]) {const e = graph[parentNode[v]][parentEdge[v]]; e.cap -= amount; graph[v][e.rev].cap += amount;}
+        }
+        throw new Error('Halteverteilung nicht berechenbar');
+    }
+    if (count < 2 || !loads[0] || stock <= .001) return {active: false, fraction: 0, holdWh: 0, buffer};
+    const supplied = allocate(available, loads), automatic = Math.min(available, loads[0]);
+    const forcedLoads = loads.slice(); forcedLoads[0] -= automatic;
+    const forced = allocate(available - automatic, forcedLoads); forced[0] += automatic;
+    const holdWh = Math.max(0, automatic - supplied[0]);
+    const saving = rows.reduce((s, r, i) => s + (supplied[i] - forced[i]) * r.price / 1000, 0);
+    const benefit = holdWh > 1e-6 ? rows[0].price + saving * 1000 / holdWh : rows[0].price;
+    const active = holdWh > .001 && saving > .000001 && benefit > rows[0].price
+        && benefit >= marketDayThresholds(c, rows[0].price).hold;
+    return {active, fraction: active ? Math.min(1, holdWh / loads[0]) : 0, holdWh, benefit, buffer,
+        baselineMissing: Math.max(0, totalLoad - forced.reduce((sum, wh) => sum + wh, 0))};
+}
+
+function marketDayDecision(c, all, index, soc) {
+    const none = {action: 'auto', fraction: 0, rate: 0, benefit: null};
+    if (!c.enabled || !['octopus_heat', 'special', 'spezial', 'special_tariff', 'epex', 'dynamic', 'awattar', 'tibber'].includes(c.tariff) || !(c.hold || c.grid)) return none;
+    const rows = marketDayAnnotate(c, all, index), current = rows[0];
+    const stock = (soc - c.reserve) / 100 * c.capacity;
+    const base = marketDayNeed(c, rows, stock, 0, -Infinity);
+    const autarky = c.profile !== 'comfort' && soc > c.lowSoc + .001 && base.shortage <= .001
+        && Math.round(Math.max(0, stock)) + base.futureSurplus * c.efficiency - base.futureDeficit >= c.buffer;
+    const fixed = ['octopus_heat', 'special', 'spezial', 'special_tariff'].includes(c.tariff);
+    let cap = Infinity;
+    if (fixed && c.profile !== 'comfort') {
+        const highestDeficit = Math.max(...rows.filter(r => r.deficit > 0).map(r => r.price));
+        let high = rows.findIndex(r => r.deficit > 0 && r.price === highestDeficit);
+        if (high < 0) high = 0;
+        const candidates = rows.slice(0, high + 1).sort((a, b) => a.price - b.price || a.ts - b.ts);
+        let covered = 0; cap = candidates[0].price;
+        if (base.shortage / c.efficiency > 100 && c.charge >= 300) {
+            for (const r of candidates) {cap = r.price; covered += c.charge / 4; if (covered >= base.shortage / c.efficiency) break;}
+        }
+    }
+    const w = marketDayWindow(rows, 0, cap);
+    // Vollständiges Fenster einschließlich vergangener Slots bindet seinen Mittelpreis.
+    if (w) {
+        let from = index;
+        const first = rows[0].price;
+        const previous = fixed ? all : rows.past;
+        while (from > 0 && previous[from - 1].price >= 0 && previous[from - 1].price <= cap + .001
+            && (fixed ? previous[from - 1].price === first : previous[from - 1].low)) from--;
+        w.ref = (previous.slice(from, index).reduce((s, r) => s + r.price, 0) + rows.slice(0, w.end).reduce((s, r) => s + r.price, 0)) / (index - from + w.end);
+    }
+    const ref = w ? w.ref : current.price;
+    const need = !c.grid ? {proofs: []} : marketDayNeed(c, rows, stock, w ? w.end : 0, marketDayThresholds(c, ref).cost, {cap, ref});
+    const job = c.grid ? marketDayJob(c, rows, stock, w, need, ref) : {active: false, benefit: null};
+    const gridProfit = c.profile === 'comfort' || job.benefit !== null && job.benefit >= marketDayThresholds(c, current.price).grid;
+    if (c.grid && job.active && !autarky && (c.profile === 'comfort' || base.shortage > .001) && gridProfit) {
+        return {action: 'grid_charge', fraction: 0, rate: job.rate, benefit: job.benefit, job, need};
+    }
+    const hold = marketDayHold(c, rows, stock, need.proofs);
+    if ((c.hold || c.grid) && hold.active && (!autarky || hold.baselineMissing > .001)) return {action: 'hold_discharge', fraction: hold.fraction, rate: 0, benefit: hold.benefit, hold};
+    return {...none, job, need};
+}
+
+function marketDayExecute(c, row, soc, decision) {
+    const net = row.load - row.pv, available = Math.max(0, (soc - c.reserve) / 100 * c.capacity);
+    const room = Math.max(0, (100 - soc) / 100 * c.capacity);
+    let battery = net < 0 ? Math.min(-net, c.charge, room / c.efficiency * 4)
+        : -Math.min(net, c.discharge, available * 4) * (1 - decision.fraction);
+    if (decision.action === 'grid_charge') battery = Math.max(battery, Math.min(c.charge, decision.rate, room / c.efficiency * 4));
+    return {soc: storageCurvePreviewClamp(soc + (battery > 0 ? battery * c.efficiency : battery) / 4 / c.capacity * 100, 0, 100),
+        grid: net + battery, battery, pv: row.pv, load: row.load, price: row.price, ts: row.ts, action: decision.action};
+}
+
+function marketDayCompute(c, input) {
+    if (!input.rows.length) return {...input, cases: [], selected: ''};
+    const modes = [
+        {name: 'nur PV', hold: false, grid: false},
+        {name: 'nur halten', hold: true, grid: false},
+        {name: 'halten und nachladen', hold: true, grid: true}
+    ];
+    const cases = modes.map(mode => {
+        const cfg = {...c, hold: mode.hold, grid: mode.grid};
+        let soc = input.initialSoc, electricityCost = 0, batteryCost = 0; const rows = [];
+        for (let i = 0; i < 192; i++) {
+            const decision = marketDayDecision(cfg, input.rows, i, soc);
+            const row = marketDayExecute(cfg, input.rows[i], soc, decision); soc = row.soc;
+            if (i >= 96) {
+                rows.push(row);
+                electricityCost += Math.max(0, row.grid) / 4 * row.price / 100000;
+                // Nur der Netzanteil der im Akku ankommenden Ladeenergie trägt Akkukosten.
+                batteryCost += Math.min(Math.max(0, row.battery), Math.max(0, row.grid))
+                    / 4 * c.efficiency * c.degradation / 100000;
+            }
+        }
+        return {name: mode.name, electricityCost, batteryCost, cost: electricityCost + batteryCost, endSoc: soc, rows};
+    });
+    const candidate = c.grid ? cases[2] : c.hold ? cases[1] : cases[0];
+    const selected = candidate.rows.some(r => r.action === 'grid_charge') ? 'halten und nachladen'
+        : candidate.rows.some(r => r.action === 'hold_discharge') ? 'nur halten' : 'nur PV';
+    cases.forEach(result => {result.delta = result.cost - cases[0].cost;});
+    const cheapest = cases.reduce((best, item) => item.cost < best.cost ? item : best).name;
+    return {...input, cases, selected, cheapest, active: candidate};
+}
+
+function marketDayDraw(canvas, result, socOnly) {
+    if (!canvas || !result?.rows?.length) return;
+    const width = Math.max(240, canvas.clientWidth || 600), height = socOnly ? 110 : 190;
+    const ratio = window.devicePixelRatio || 1;
+    canvas.width = width * ratio; canvas.height = height * ratio;
+    const ctx = canvas.getContext('2d'); ctx.scale(ratio, ratio);
+    const color = getComputedStyle(canvas).getPropertyValue('--bs-body-color').trim() || '#64748b';
+    const left = 38, right = width - 9, top = 12, bottom = height - 24;
+    const rows = result.rows, prices = rows.map(r => r.price), min = Math.min(...prices), max = Math.max(...prices);
+    const extent = socOnly ? 100 : Math.max(1000, ...rows.flatMap(r => [r.pv, r.load, Math.abs(r.grid), Math.abs(r.battery)])) / 1000 * 1.12;
+    const x = i => left + i / 96 * (right - left);
+    const y = value => socOnly ? bottom - value / 100 * (bottom - top) : top + (extent - value) / (extent * 2) * (bottom - top);
+    rows.forEach((r, i) => {
+        if (max > min && (r.price <= min + .001 || r.price >= max - .001)) {
+            ctx.fillStyle = r.price <= min + .001 ? 'rgba(34,197,94,.10)' : 'rgba(245,158,11,.12)';
+            ctx.fillRect(x(i), top, x(i + 1) - x(i), bottom - top);
+        }
+    });
+    ctx.font = '10px system-ui'; ctx.fillStyle = color; ctx.strokeStyle = color; ctx.globalAlpha = .35;
+    const levels = socOnly ? [0, 50, 100] : [-extent, 0, extent];
+    levels.forEach(value => {ctx.beginPath(); ctx.moveTo(left, y(value)); ctx.lineTo(right, y(value)); ctx.stroke();});
+    ctx.globalAlpha = 1;
+    levels.forEach(value => ctx.fillText(socOnly ? value + '%' : marketPathPreviewFormat(value, 1), 0, y(value) + 3));
+    const labelStep = width < 480 ? 32 : 16;
+    for (let i = 0; i <= 96; i += labelStep) {
+        const stamp = i === 96 ? rows[95].ts + 900000 : rows[i].ts;
+        ctx.fillText(new Date(stamp).toLocaleTimeString('de-DE', {hour: '2-digit', minute: '2-digit'}), Math.min(right - 27, x(i) - 12), height - 6);
+    }
+    const series = socOnly ? [['soc', '#8b5cf6', false]]
+        : [['pv', '#16a34a', false], ['load', '#dc2626', false], ['grid', '#0284c7', true], ['battery', '#8b5cf6', false]];
+    series.forEach(([key, stroke, dashed]) => {
+        ctx.strokeStyle = stroke; ctx.lineWidth = 1.8; ctx.setLineDash(dashed ? [5, 3] : []); ctx.beginPath();
+        rows.forEach((r, i) => {const value = socOnly ? r[key] : r[key] / 1000; if (i) ctx.lineTo(x(i), y(value)); else ctx.moveTo(x(i), y(value));});
+        ctx.stroke();
+    });
+    ctx.setLineDash([]);
+}
+
+function marketDayRender(result) {
+    const wrapper = document.querySelector('[data-market-day]');
+    if (!wrapper) return;
+    const put = (selector, text) => {const el = document.querySelector(selector); if (el) el.textContent = text;};
+    put('[data-market-day-note]', [result.note, result.rows.some(row => row.price < 0)
+        ? 'Negative Börsenpreise im Vorschauzeitraum: Halten und Netzladen können hier von der Regelung abweichen.' : ''].filter(Boolean).join(' '));
+    put('[data-market-day-title]', result.selected);
+    const show = result.cases.length > 0;
+    document.querySelectorAll('[data-market-day-power], [data-market-day-soc], [data-market-day-costs]').forEach(el => {el.hidden = !show;});
+    const list = document.querySelector('[data-market-day-costs]');
+    if (list) {
+        list.replaceChildren();
+        result.cases.forEach(item => {
+            const row = document.createElement('div'); row.className = 'market-day-cost';
+            if (item.name === result.cheapest) row.classList.add('is-selected');
+            row.textContent = `${item.name}: ${marketPathPreviewFormat(item.electricityCost, 2)} € Strom + ${marketPathPreviewFormat(item.batteryCost, 2)} € Akku = ${marketPathPreviewFormat(item.cost, 2)} €/Tag · ${item.delta <= 0 ? 'Vorteil' : 'Nachteil'} ${marketPathPreviewFormat(Math.abs(item.delta), 2)} € gegenüber nur PV · Ende ${marketPathPreviewFormat(item.endSoc, 1)} % SoC`;
+            list.appendChild(row);
+        });
+    }
+    if (!show) return;
+    marketDayDraw(document.querySelector('[data-market-day-power]'), result.active, false);
+    marketDayDraw(document.querySelector('[data-market-day-soc]'), result.active, true);
+}
+
+function updateMarketPathPreview() {
+    const put = (selector, text) => {const el = document.querySelector(selector); if (el) el.textContent = text;};
+    const c = marketDaySettings();
+    const basis = document.querySelector('[data-market-day-basis]')?.value || 'winter';
+    const input = marketDayData(c, basis, storageCurvePreviewData);
+    if (input.unsupported) {
+        const block = document.getElementById('opt_market_economics');
+        if (block) block.style.display = 'flex';
+    }
+    const result = marketDayCompute(c, input);
+    const fixed = ['static', 'fix', 'fixed', 'flat'].includes(c.tariff);
+    const octopus = c.tariff === 'octopus_heat';
+    const special = ['special', 'spezial', 'special_tariff'].includes(c.tariff);
+    const suffix = octopus ? ['LT', 'HT', 'UHT'] : special ? ['Stufe', 'Stufe', 'Stufe'] : ['Slot', 'Slot', 'Slot'];
+    ['low', 'normal', 'high'].forEach((key, i) => put(`[data-market-${key}-label]`,
+        special && i === 1 && new Set(c.stages?.map(r => r[1])).size > 3 ? 'Zwischenstufen' : `${['Günstig', 'Normal', 'Teuer'][i]} (${suffix[i]})`));
+    put('[data-market-preview-tariff]', !input.rows.length ? input.note : (fixed ? 'Fixpreis: Marktpfad aus' : octopus ? 'Octopus Heat' : special ? 'Spezialtarif' : 'EPEX / dynamisch') + ' · Profil ' + MARKET_CHARGE_PROFILE_PRESETS[c.profile].label);
+    const note = c.profile === 'comfort'
+        ? `Komfort: Preislimit ${c.limit > 0 ? marketPathPreviewFormat(c.limit, 1) + ' ct/kWh' : 'Tarif-Mittelpreis'}, Ziel ${marketPathPreviewFormat(c.target, 0)} %. PV zuerst, Netz für den Rest bis zum Fensterende. Halten bis zum nächsten Komfortfenster, ohne Pufferabzug.`
+        : `Halten mit Mindestabstand und 5 % Haltemarge. Der Pufferanteil jedes Netzladeauftrags zählt nicht als Nachladen. Netzladen: ×${marketPathPreviewFormat(1 / c.efficiency, 2)} Wirkungsgrad, ${marketPathPreviewFormat(c.degradation, 1)} ct Akku, ${marketPathPreviewFormat(c.safety, 2)} ct Sicherheit, ${marketPathPreviewFormat(c.margin, 1)} % Marge. PV-autark zuerst blockiert bei ausreichender Deckung.`;
+    put('[data-market-formula-note]', !input.rows.length ? input.note : fixed ? 'Fixer Arbeitspreis: kein normaler Marktpfad.' : note);
+    const info = document.querySelector('[data-market-preview-info]');
+    if (info) info.setAttribute('data-tooltip', 'Halten nach zeitlicher Verteilung von Bestand, PV und nachweisbar günstigerem Nachladen. Der Pufferanteil zählt nicht als Nachladen; Komfort ohne Pufferabzug. Netzladen gegen den mengengewichteten Nutzen der versorgten Defizit-Slots prüfen. Freigaben, Reserve und Prognosedeckung berücksichtigen. Beispiel: Bei 85 % Wirkungsgrad, 4 ct/kWh Akkukosten und 24,91 ct/kWh im günstigen Fenster kostet nachgeladene Energie rund 33,3 ct/kWh. Liegt der aktuelle Bezugspreis darunter, zählt sie nicht als Ersatz. Eine negative Sicherheitskorrektur senkt diese Ersatzkosten rechnerisch und kann tatsächlich teureres Umladen auslösen. Bei negativen Börsenpreisen kann die Vorschau von der Regelung abweichen; der gesonderte Negativpreis-Boost ist nicht enthalten.');
+    const prices = input.rows.length ? [...new Set(input.rows.slice(96, 192).map(r => r.price))].sort((a, b) => a - b) : [];
+    const groups = !octopus && !special
+        ? [prices.slice(0, 1), prices.length ? [prices[Math.floor(prices.length / 2)]] : [], prices.slice(-1)]
+        : [prices.slice(0, 1), prices.slice(1, -1), prices.slice(-1)];
+    ['low', 'normal', 'high'].forEach((key, i) => {
+        const entries = groups[i].length ? groups[i] : prices.length === 1 ? prices : [];
+        const details = entries.map(price => {
+            const threshold = marketDayThresholds(c, price);
+            const rows = result.active?.rows.filter(r => Math.abs(r.price - price) < .001) || [];
+            const grid = rows.some(r => r.action === 'grid_charge'), hold = rows.some(r => r.action === 'hold_discharge');
+            return {text: `${marketPathPreviewFormat(price, 1)} ct/kWh: Halten ab späterem Nutzen ${marketPathPreviewFormat(threshold.hold, 1)} ct/kWh; ${c.profile === 'comfort' ? 'Laden bis Ziel im Preislimit' : 'Netzladen ab versorgtem Nutzen ' + marketPathPreviewFormat(threshold.grid, 1) + ' ct/kWh'}.`, grid, hold};
+        });
+        put(`[data-market-${key}-action]`, details.some(r => r.grid) ? 'halten / laden' : details.some(r => r.hold) ? 'halten' : input.rows.length ? 'kein Netzladen' : '—');
+        put(`[data-market-${key}-detail]`, details.length ? details.map(r => r.text).join(' ') : input.note);
+    });
+    marketDayRender(result);
+    return result;
+}
+
+let marketDayTimer = null;
+function scheduleMarketPathPreview() {
+    clearTimeout(marketDayTimer);
+    marketDayTimer = setTimeout(updateMarketPathPreview, 250);
 }
 
 function initMarketPathPreview() {
     updateMarketPathPreview();
     MARKET_PATH_PREVIEW_KEYS.forEach(key => {
         document.querySelectorAll(`[name="values[${key}]"]`).forEach(el => {
-            el.addEventListener('input', updateMarketPathPreview);
-            el.addEventListener('change', updateMarketPathPreview);
+            el.addEventListener('input', scheduleMarketPathPreview);
+            el.addEventListener('change', scheduleMarketPathPreview);
         });
     });
+    document.querySelector('[data-market-day-basis]')?.addEventListener('change', scheduleMarketPathPreview);
+    window.addEventListener('resize', scheduleMarketPathPreview);
+    new MutationObserver(scheduleMarketPathPreview).observe(document.documentElement, {attributes: true, attributeFilter: ['data-bs-theme', 'class']});
 }
 
 function storageCurvePreviewSmooth(ratio) {
@@ -18063,9 +18417,12 @@ function initStorageCurveConfigPreview() {
         .then(response => response.json())
         .then(data => {
             storageCurvePreviewData = data || {};
+            scheduleMarketPathPreview();
             renderStorageCurveConfigPreview();
         })
         .catch(() => {
+            storageCurvePreviewData = null;
+            scheduleMarketPathPreview();
             document.querySelectorAll('[data-storage-curve-warning]').forEach(warning => {
                 warning.classList.add('is-risk');
                 warning.innerHTML = '<i class="fas fa-exclamation-triangle text-warning me-1"></i>Prognosedaten für die Vorschau konnten nicht geladen werden.';
@@ -18076,12 +18433,12 @@ function initStorageCurveConfigPreview() {
             });
         });
     [...new Set([...STORAGE_CURVE_PREVIEW_KEYS, ...DIRECT_MARKETING_PREVIEW_KEYS])].forEach(key => {
-        const el = storageCurvePreviewInput(key);
-        if (!el) return;
-        el.addEventListener('input', scheduleStorageCurveConfigPreview);
-        el.addEventListener('change', scheduleStorageCurveConfigPreview);
-        el.addEventListener('input', refreshDirectMarketingPowerValidationMarkers);
-        el.addEventListener('change', refreshDirectMarketingPowerValidationMarkers);
+        document.querySelectorAll(`[name="values[${key}]"]`).forEach(el => {
+            el.addEventListener('input', scheduleStorageCurveConfigPreview);
+            el.addEventListener('change', scheduleStorageCurveConfigPreview);
+            el.addEventListener('input', refreshDirectMarketingPowerValidationMarkers);
+            el.addEventListener('change', refreshDirectMarketingPowerValidationMarkers);
+        });
     });
     const directMarketingToggle = document.getElementById('conf_direct_marketing_enable');
     if (directMarketingToggle) toggleDirectMarketingDetails(directMarketingToggle.checked);

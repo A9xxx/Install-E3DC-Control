@@ -669,6 +669,15 @@ def read_runtime_live_snapshot(
             max_bytes=16 * 1024 * 1024,
             copy_data=False,
         )
+        if web_meta.get("valid"):
+            web = dict(web)
+            for prefix in ("wb", "wb2"):
+                if web.get(prefix + "_measure_only") is True:
+                    web["home"] = web.get("home_without_measure_only", projected.get("home"))
+                    web[prefix] = 0.0
+                    web[prefix + "_configured"] = False
+                    web[prefix + "_source"] = ""
+                    web["is_external_wb2" if prefix == "wb2" else "is_external_wb"] = False
         merged = dict(web) if web_meta.get("valid") else {}
         merged.update(projected)
         clean_home, clean_home_binding = _bound_web_clean_home(
@@ -871,8 +880,58 @@ def _watchdog_hash() -> Optional[str]:
     return "_".join(str(int(round(float(value)))) for value in values)
 
 
+WATCHDOG_LIMITS_MAX_AGE_S = 120.0
+
+
+def watchdog_limits_text(
+    path: str = LIVE_DATA_PATH,
+    *,
+    max_age_s: float = WATCHDOG_LIMITS_MAX_AGE_S,
+) -> str:
+    """Kurztext der Akkugrenzen (POWER_SETTINGS) für den Watchdog-Hinweis.
+
+    Quelle ist der Readback von ``e3dc-live``. Fehlende, veraltete oder ungültige
+    Werte ergeben „unbekannt“, nie „keine aktiv“. Der Text enthält weder
+    Anführungszeichen noch Prozentzeichen, weil der Watchdog ihn in eine
+    JSON-Zeile einsetzt.
+    """
+    payload, metadata = read_bound_json_object(
+        path,
+        max_age_s=max_age_s,
+        max_bytes=4 * 1024 * 1024,
+    )
+    if not metadata.get("valid") or payload.get("ems_power_settings_valid") is not True:
+        return "Akkugrenzen: unbekannt"
+    active = payload.get("power_limits_active")
+    if active is False:
+        return "Akkugrenzen: keine aktiv"
+    if active is not True:
+        return "Akkugrenzen: unbekannt"
+    parts = []
+    for label, key in (
+        ("Laden", "ems_max_charge_power_w"),
+        ("Entladen", "ems_max_discharge_power_w"),
+    ):
+        raw = payload.get(key)
+        value = None if isinstance(raw, bool) else _finite_number(raw)
+        if value is None or value < 0:
+            parts.append(f"{label} unbekannt")
+        else:
+            parts.append(f"{label} höchstens {int(round(value))} W")
+    return "Akkugrenzen aktiv: " + ", ".join(parts)
+
+
 def _main(argv: Any = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
+    if args[:1] == ["--watchdog-limits"]:
+        rest = args[1:]
+        path = LIVE_DATA_PATH
+        if rest:
+            if len(rest) != 2 or rest[0] != "--live-path":
+                return 2
+            path = rest[1]
+        sys.stdout.write(watchdog_limits_text(path) + "\n")
+        return 0
     if args != ["--watchdog-hash"]:
         return 2
     current_hash = _watchdog_hash()
@@ -890,6 +949,7 @@ __all__ = [
     "read_bound_json_object",
     "read_bound_json_value",
     "read_runtime_live_snapshot",
+    "watchdog_limits_text",
 ]
 
 

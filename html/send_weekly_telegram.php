@@ -64,7 +64,12 @@ $query = "SELECT
 	            SUM(bat_out) as bat_out,
 	            SUM(wb_consumption) as wb,
 	            SUM(wp_consumption) as wp,
-	            SUM(COALESCE(climate_consumption, 0)) as climate
+	            SUM(climate_consumption) as climate,
+                COUNT(*) as days,
+                COUNT(pv_yield) as pv_days, COUNT(home_consumption) as home_days,
+                COUNT(grid_in) as grid_in_days, COUNT(grid_out) as grid_out_days,
+                COUNT(bat_out) as bat_out_days, COUNT(wb_consumption) as wb_days,
+                COUNT(wp_consumption) as wp_days, COUNT(climate_consumption) as climate_days
 		          FROM daily_stats
           WHERE date >= ? AND date <= ?";
           
@@ -72,11 +77,11 @@ $stmt = $db->prepare($query);
 $stmt->execute([$startDateStr, $endDateStr]);
 $row = $stmt->fetch(PDO::FETCH_ASSOC);
 
-if (!$row || $row['pv_yield'] === null) {
+if (!$row || (int)$row['days'] === 0) {
     exit(0);
 }
 
-$climateConsumption = (float)($row['climate'] ?? 0);
+$climateConsumption = $row['climate'];
 $total_cons = $row['home'] + $row['wb'] + $row['wp'] + $climateConsumption;
 $autarky = $total_cons > 0 ? max(0, min(100, (($total_cons - $row['grid_in']) / $total_cons) * 100)) : 100;
 $selfcon = $row['pv_yield'] > 0 ? max(0, min(100, (($row['pv_yield'] - $row['grid_out']) / $row['pv_yield']) * 100)) : 100;
@@ -86,20 +91,31 @@ $showClimate = telegramConfigTruthy($config['climate_enable'] ?? '0') || $climat
 $startDateFmt = date('d.m.', strtotime('-6 days')); 
 $endDateFmt = date('d.m.Y');
 
+function telegramWeeklyNumber($value, $digits = 2) {
+    return $value === null ? 'unbekannt' : number_format($value, $digits, ',', '.');
+}
+$missingLabels = ['pv' => 'PV', 'home' => 'Haus', 'grid_in' => 'Netzbezug', 'grid_out' => 'Einspeisung',
+    'bat_out' => 'Batterie', 'wb' => 'Wallbox', 'wp' => 'Wärmepumpe', 'climate' => 'Klima'];
+$missingNotes = [];
+foreach ($missingLabels as $key => $label) {
+    $missing = (int)$row['days'] - (int)$row[$key . '_days'];
+    if ($missing > 0) $missingNotes[] = $label . ': ' . $missing . ' Tage ohne Wert';
+}
 $msg = "📅 *$deviceName Wochenrückblick ($startDateFmt - $endDateFmt)*\n\n";
-$msg .= "☀️ *PV Ertrag:* " . number_format($row['pv_yield'], 2, ',', '.') . " kWh\n";
-$msg .= "🔌 *Netzbezug:* " . number_format($row['grid_in'], 2, ',', '.') . " kWh\n";
-$msg .= "🔋 *Batterie (Out):* " . number_format($row['bat_out'], 2, ',', '.') . " kWh\n\n";
-$msg .= "🏠 *Hausverbrauch:* " . number_format($row['home'], 2, ',', '.') . " kWh\n";
+if ($missingNotes) $msg .= "Unvollständig: " . implode("; ", $missingNotes) . "\n\n";
+$msg .= "☀️ *PV Ertrag:* " . telegramWeeklyNumber($row['pv_yield'], 2) . " kWh\n";
+$msg .= "🔌 *Netzbezug:* " . telegramWeeklyNumber($row['grid_in'], 2) . " kWh\n";
+$msg .= "🔋 *Batterie (Out):* " . telegramWeeklyNumber($row['bat_out'], 2) . " kWh\n\n";
+$msg .= "🏠 *Hausverbrauch:* " . telegramWeeklyNumber($row['home'], 2) . " kWh\n";
 
 if ($showWp) {
-    $msg .= "🚗 *Wallbox:* " . number_format($row['wb'], 2, ',', '.') . " kWh\n";
-    $msg .= "♨️ *Wärmepumpe:* " . number_format($row['wp'], 2, ',', '.') . " kWh\n";
+    $msg .= "🚗 *Wallbox:* " . telegramWeeklyNumber($row['wb'], 2) . " kWh\n";
+    $msg .= "♨️ *Wärmepumpe:* " . telegramWeeklyNumber($row['wp'], 2) . " kWh\n";
 } else {
-    $msg .= "🚗 *Wallbox:* " . number_format($row['wb'], 2, ',', '.') . " kWh\n";
+    $msg .= "🚗 *Wallbox:* " . telegramWeeklyNumber($row['wb'], 2) . " kWh\n";
 }
 if ($showClimate) {
-    $msg .= "❄️ *Klima:* " . number_format($climateConsumption, 2, ',', '.') . " kWh\n";
+    $msg .= "❄️ *Klima:* " . telegramWeeklyNumber($climateConsumption, 2) . " kWh\n";
 }
 $msg .= "\n";
 

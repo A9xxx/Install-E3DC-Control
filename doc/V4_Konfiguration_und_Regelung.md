@@ -55,6 +55,8 @@ hängt, ist er genannt; die Detailabläufe stehen in `doc/Native_Wallbox.md`,
 
 ### Oberste Regelziele
 
+E3DC-Control regelt auf die Messwerte des E3DC. Messgrößen werden nicht gegeneinander geprüft; Abweichungen erscheinen als Hinweis.
+
 Geregelt wird so, wie es eingestellt ist; Einstellungen haben Vorrang in der
 Regelung, Schutzfunktionen gehen vor. Die Verbraucherpriorität
 (`consumer_priority_order`) gilt auch beim Start: Ein frisch qualifizierter
@@ -107,28 +109,16 @@ Schranken gilt die folgende Rangfolge:
      einer bestätigten Umschaltung sperrt eine feste, nicht konfigurierbare
      Hardware-Sperre von mindestens 480 s ausschließlich einen weiteren
      Phasenwechsel. Sie blockiert weder den bestätigten Wiederanlauf noch die
-     laufende Ladung. Davon getrennt sind die Beharrungszeiten vor einem
-     Wechsel: abwärts `wb_phase_down_delay_s` (an der openWB Pro Standard
-     480 s, Untergrenze 60 s), aufwärts `wb_phase_up_forecast_hold_s`
-     (Beharrung 1p→3p Standard 60 s, Untergrenze 30 s) auf einem
-     30-s-Mittel des verfügbaren Überschusses (Einspeisung plus Wallbox oder
-     frisches Budget des Speicherreglers, Speicher-Entladung zählt als
-     Defizit) als leckende Uhr – Wolkenlücken zählen sie zurück statt sie zu
-     löschen – oder alternativ das Export-Wh-Konto (Standard 120 Wh). Für ein
-     phasenschaltfähiges Paar aus Fahrzeug und Wallbox gilt als „1p
-     ausgereizt“ der Referenzstrom aus 3p-Minimum plus Puffer (etwa 20 A),
-     nicht der dynamische 1p-Deckel. Sie filtern Wolkenlücken und kurze
-     Lastspitzen vor einem Schützwechsel aus; die Beruhigung nach dem Schalten
-     ist allein die Hardware-Sperre. Während dieser Sperre zählen weder die
-     Uhr noch das Energiekonto: beide werden danach neu verdient, damit auf
-     einen Abstieg kein sofortiger Wiederaufstieg folgt. Das gilt für jeden
-     Wallbox-Typ gleich: Am E3DC-Direktvertrag ist die Haltezeit nach jedem
-     Wechsel diese Sperre, und das experimentelle 10-min-Fenster beginnt in
-     ihr ebenfalls neu.
+     laufende Ladung. Der Regelkern steigt nach 60 Sekunden ausreichender
+     Deckung des dreiphasigen Mindeststroms durch den zugeteilten Leistungsanteil
+     auf und nach 60 Sekunden geeigneter Unterdeckung ab. Fahrzeug, Wallbox, Hausanschluss
+     und Phasenfreigabe müssen den Wechsel erlauben; nach jedem Wechsel gilt
+     die feste Phasensperre von 480 Sekunden.
+     Auch ein 16-A-Ladepunkt kann bei ausreichendem gemeinsam zugeteiltem Anteil auf drei Phasen wechseln; maßgeblich ist die Deckung des dreiphasigen Mindeststroms.
    - *Anti-Flattern.* Hysterese, Deadband, Zeitbedingungen und Energiewächter
      werden gemeinsam aus Messrauschen, realen Leistungsstufen und dem Verhalten
      der Aktorik ausgelegt. Jede Kante bekommt ihre eigene, passende Schwelle
-     (etwa das Export-Wh-Konto für die Hochschaltung 1p→3p); es gibt keine
+     (etwa die 60 Sekunden Deckung für die Hochschaltung 1p→3p); es gibt keine
      pauschale Leistungsdifferenz für alle Ein- und Ausschaltschwellen.
 
 ### Regelungstechnik und Hardware-Schutz
@@ -137,9 +127,9 @@ Schranken gilt die folgende Rangfolge:
   Jede Schwelle hat eine passende Hysterese, ein Deadband, eine Mindestlaufzeit,
   eine Wiedereinschaltverzögerung oder eine Entprellung. Beispiele:
   `wb_soc_hysterese_pct` an `wbminsoc`, die Beharrungszeiten des
-  Phasenwechsels, die 120-s-Freigabe und 45-s-Gnadenfrist des Mindesthalts
-  sowie die 120-s-Budgetstabilität für den Wiederanlauf nach einem
-  Kaskaden-Stop (`wb_pv_only_release_hold_s`, `wb_pv_only_hold_stale_guard_s`).
+  Phasenwechsels mit je 60 Sekunden für Auf- und Abstieg, 60 Sekunden
+  PV-Startqualifizierung, drei Minuten Unterdeckung bis zum Stopp und fünf Minuten Mindestladezeit. Bei freigegebener Netzquelle
+  entfällt die PV-Startqualifizierung; die harten Schranken bleiben wirksam.
 - Zustandsautomaten haben saubere Übergänge. `Aus` heißt `Aus`: Deaktivierte
   Systeme werden beobachtet, aber nicht aktiv angesteuert.
 - Fehlende oder unplausible Messwerte werden nie als echte `0` geschrieben,
@@ -147,7 +137,7 @@ Schranken gilt die folgende Rangfolge:
   plus Gültigkeit und Quelle (`*_valid`, `*_source`). Fehlende Daten sind keine
   Freigabe: Ohne frische, gültige Live-Werte bleiben Budgets geschlossen,
   Konten eingefroren und Aktoren im sicheren Zustand.
-- Notstromschutz: An der Notstromreserve wird die Entladung sofort gesperrt.
+- Notstromschutz: An der Notstromreserve wird die Entladung sofort gesperrt. Ab 5.5.6 entfällt nur die zusätzliche EMS-Entladegrenze, wenn das Reservefeld leer oder 0 ist, die Gerätereserve frisch und gültig gelesen wird und sie den wirksamen Boden bildet: Der E3DC hält die Reserve selbst; eigene Entlade-, Verkaufs- und Exportbefehle bleiben bis zur bestehenden SoC-Erholung gesperrt. Leer bedeutet weiterhin 8 % Rückfallreserve; liegt diese über der Gerätereserve, bleibt die 0-W-Grenze aktiv. Ein gespeicherter Wert, auch 8,0, zählt als eigene Reserve. Für den Freilauf das Feld leeren oder 0 eintragen. Nach ungültigen oder veralteten Daten bleibt die 0-W-Grenze bis Reserve + 1,5 Prozentpunkte und 30 Sekunden stabilen Messwerten bestehen. Erlaubtes Netzladen bleibt möglich.
   Ein Export- oder Verkaufsbefehl (`FORCE_EXPORT`) endet an dieser Grenze
   beziehungsweise am Reserveboden der Direktvermarktung; der Speicher fällt in
   den normalen Betrieb zurück, unabhängig davon, was Preis- oder
@@ -164,12 +154,21 @@ Schranken gilt die folgende Rangfolge:
   spätere Wolkenlücken, Ladeleistung und Speichersättigung. Fehlt eine frische
   vollständige Prognose oder der Plan, bleibt die volle konfigurierte Energie,
   mindestens die Gerätereserve, auch über die eingestellte Uhrzeit hinaus stehen.
+  Ist ein externer AC-Wechselrichter bekannt (über „Externer AC-WR“ in der Kopplungsauswahl der Flächen, den Kasten „PV-Flächen und Wechselrichtergruppen“, „Externe AC-WR-Leistung (W)“, AC-Speicherroute, Shelly-IP oder zentrale Steuerung des Zusatz-WR eingetragen), hält die Notstrom-Vorhaltung die volle Energie, bis alle Flächen eingetragen sind. Ohne bekannten externen AC-Wechselrichter gilt eine offene Fläche
+  wie eine E3DC-Fläche; die Vorhaltung nutzt die Gesamtprognose wie bei einer E3DC-Anlage.
+  Bei „Speicherladung auf E3DC-DC begrenzen“ oder aktivem Sicherheitsveto
+  „ausschließlich E3DC-DC-PV“ der Direktvermarktung bleibt ohne gebundene Aufteilung
+  die volle Energie stehen.
+  Ist ein externer AC-Wechselrichter nicht eingetragen und läuft er im Inselbetrieb nicht,
+  kann die Gesamtprognose die morgendliche Deckung rechnerisch zu früh anzeigen.
   Freigabe nach prognostizierter Übernahme verlangt zusätzlich 120 s lückenlose
   gemessene PV-Deckung des Hauses. Ein Wh-Puffer aus 1 % Kapazitätsauflösung
   und 35 s maximaler Entladung sowie ein eigener Wh-Abstand beruhigen Übergänge.
   Diese Reaktionszeit ist eine konservative Regelannahme, kein Feldnachweis.
   Der bestehende Speicherregler begrenzt flüchtig die Entladung und erhält den
-  bereits zulässigen PV-Laderahmen. Verbraucher und wirtschaftlicher Verkauf,
+  bereits zulässigen PV-Laderahmen. Bei veralteten Livedaten zieht die freiwillige
+  Notstrom-Vorhaltung ihre eigene Entladegrenze zurück. Die Notstromreserve hält
+  der E3DC weiterhin selbst ein. Verbraucher und wirtschaftlicher Verkauf,
   Export, Headroom und Pre-Dump nutzen nur Energie oberhalb der wirksamen Böden.
   Hausverbrauch und darin enthaltene Verbraucher zählen weiterhin genau einmal.
   Harte Anschlussgrenzen haben Vorrang; gewöhnliche Netzbezugsvermeidung öffnet
@@ -233,27 +232,12 @@ Schranken gilt die folgende Rangfolge:
 - Diagnose-Reihenfolge bei unerklärlichem Verhalten: zuerst Messwertqualität,
   physikalische Glitches, Netzwerk-/API-Latenz, veraltete Daten, Phasenmessung
   und Hardwaregrenzen prüfen, bevor Einstellungen oder Regeln geändert werden.
-- **Reaktionszeit des Speichers.** Der Hausspeicher gleicht eine Laständerung
-  am Netzpunkt erst nach einigen Sekunden aus (am E3DC 5–8 s bis zum Umschwung
-  des Akkus, sichtbar im 3-s-Takt der Livewerte). Die Wallbox-Regelung regelt
-  nicht dagegen: Nach neuem Netzbezug – nach einer eigenen Anhebung oder bei
-  einer kurzen Lastspitze wie einem Induktionskochfeld – senkt der Defizitregler
-  erst ab, wenn der Bezug die Einschwingfrist `wb_grid_import_settle_s`
-  (Standard 10 s, 0 = aus) überdauert. Angehoben wird erst nach Beruhigung und
-  in Schritten von höchstens 2 A je Wallbox; in einer Gruppe kann jede
-  Wallbox im selben Zyklus eine Stufe anheben. Harte Grenzen wirken sofort:
-  Hausanschluss je Phase
-  (`grid_max_amps_l1..3` abzüglich `grid_wallbox_reserve_amps_l1..3`),
-  Phasen- und Schieflastdeckel, Nutzer-`Aus` und Netzbezug über der Reichweite
-  des Speichers (aktuelle Ladeleistung plus der noch freie Teil der wirksamen
-  Entladegrenze; diese ist der kleinste Wert aus `maximaleentladeleistung`,
-  gesetzter und vom E3DC genutzter Entladegrenze). In der PV-only-Klasse, an
-  der Notstromreserve und ohne gültigen Leistungseinstellungsbereich der
-  Livewerte (Reichweite unbekannt) gilt keine Frist. Der Keepalive der openWB
-  Pro wiederholt nur den
-  zuletzt ausgegebenen Sollstrom und ist kein zweiter Entscheider. Details und
-  Energiebetrachtung: `doc/Native_Wallbox.md`, Abschnitt „Netzbezug beim Laden:
-  Einschwingfrist, Anhebung und Grid-Wächter“.
+- **Reaktionszeit des Speichers.** Der Kern setzt den Budgetanteil direkt
+  mit 1-A-Totband um. Die Netzbremse zählt zwei Takte über 300 W; nach eigener
+  Anhebung und nach Start, Anhebung oder Phasenwechsel einer Netzbox zählen
+  20 Sekunden nicht mit. Nur frische gemessene Netzboxleistung wird einmal
+  vom Netzpunkt abgezogen. Nach einer Korrektur braucht eine Anhebung 30 s
+  unter 300 W. Elektrische Grenzen und Nutzer-Aus wirken sofort.
 - **Ungültige Liveprobe.** Eine einzelne ungültige Probe stoppt keine laufende
   Ladung: Bei allen geregelten Wallbox-Typen bleibt der zuletzt ausgeführte
   Strom höchstens 10 s nach der letzten gültigen Probe (ihrem Zeitstempel)
@@ -327,11 +311,12 @@ Schranken gilt die folgende Rangfolge:
      Wallbox nur den batterieneutralen PV-Rahmen (Akkustützung, Punkt 5).
      Unterhalb von `wbminsoc` verhält sich der Modus wie `PV-Kurve ruhig`; an
      der Untergrenze senkt beziehungsweise stoppt der Wallbox Manager die
-     Ladung. Bei ausgeschalteter zentraler PV-Aufteilung gilt weiterhin der
-     Wallbox-Automatikbetrieb des Speichers (`parallel_wb_auto`); darin
-     setzt der Speicher in diesem Modus keine Entladegrenze: Eine geregelte
-     Wallbox wird zuerst abgesenkt, und das Akku-Wh-Konto (Akkustützung,
-     Punkt 4) schaltet sie bei Überschreiten seines Budgets ab.
+     Ladung. Bei Akkustützung bleibt die Ladegrenze der Ladekurve auch bei
+     ausgeschalteter zentraler PV-Aufteilung erhalten; nur die Entladeseite
+     wird im zulässigen Rahmen freigegeben. Nötige Ladung zur Vermeidung von
+     Abregelung hat weiterhin Vorrang. Eine geregelte Wallbox wird zuerst
+     abgesenkt, und das Akku-Wh-Konto (Akkustützung, Punkt 4) schaltet sie bei
+     Überschreiten seines Budgets ab. Die Notstromreserve bleibt vorrangig.
 
 ### Zentrale PV-Aufteilung Akku/Wallbox (experimentell)
 
@@ -368,37 +353,9 @@ höchstens 60 Sekunden gilt nur dieser konservative Rest:
 Fehlt die Batteriemessung, bleibt der konservative Rest unbekannt; daraus
 entsteht keine Anhebung. Harte Schutzgrenzen behalten Vorrang.
 
-Der bisherige Wallbox-Führungszustand `parallel_wb_auto` entfällt auf diesem
-Pfad; die Anzeige lautet „Kurve zuerst: Akku x W, Wallbox y W“. Die
-Verteilung auf mehrere geregelte Wallboxen bleibt beim Verbrauchervertrag.
-Strom, Phasen und Stop entscheidet weiter der Wallbox Manager. Fällt der
-Rahmen unter das Wallboxminimum, hält eine bereits real ladende Box ihren
-bestätigten Mindeststrom nur bis zur Grenze des Kontos „Kurvenrückstand“.
-Dieses Konto gehört zu jedem Ladepunkt und jeder Stecksession. Es bucht
-`max(0, min(Eigenleistung, Mindestleistung der bestätigten Ist-Phasen) − Einzelrahmen)`
-in Wh. Ein bloßes Stromangebot zählt nicht. Die Grenze entspricht dem
-Wolken-Kontingent (automatisch 0,5 % der Speicherkapazität, mindestens 50 Wh).
-Netz- und Akkukonto bleiben vorrangig; je Zyklus wächst nur eine Komponente.
-Endet das Wolken-Kontingent zuerst, gilt dessen Entscheidung und das
-Rückstandskonto beginnt neu.
-
-An der Grenze folgt 1p ausschließlich bei ausführbarer Phasensequenz, freier
-Phasensperre und einem Einzelrahmen, der den 1p-Wiederanlauf samt der bestehenden
-Reserve trägt. Andernfalls folgt direkt Stop (`curve_backlog_stop`). Die
-1p-Stufe beginnt erst nach bestätigtem Phasenwechsel und realem Wiederanlauf
-bei null; an ihrer erneuten Kontogrenze folgt Stop. Während einer eigenen
-Phasensequenz endet die Episode nicht und es gibt keine neue Endentscheidung.
-Nach 60 Sekunden gültig belegtem Ende der Anwendbarkeit oder Ladung wird das
-Konto zurückgesetzt. Bei `frame_w: null` bleiben Stand und Rücksetzuhr stehen;
-die Lücke wird nicht nachgebucht und erzeugt weder Start, Anhebung, Phasenwechsel
-noch Stop. Nach Dienstneustart bleibt ein erschöpftes Konto erschöpft.
-
-Nach bestätigtem Stop muss der Einzelrahmen das Startminimum plus
-`max(230 W, 10 % des Startminimums)` über die vorhandene Stabilitätszeit tragen
-(Standard 120 Sekunden). Profilpause, Startsequenz, CP-Wiederanlauf und
-bestehende ausdrückliche Freigaben behalten ihre Regeln. Der Zentralrahmen ist
-die einzige reguläre Quelle auch bei Einspeisung; der Mindesthalt erlaubt
-keinen neuen Start und keine Anhebung.
+Das Budget ist der Rahmen für die Wallboxen; Strom, Phasen und Stopp
+entscheidet der Wallbox Manager. Schutzstopps, Unterdeckungsregel, Datenfrist
+und Wiederanlauf wirken auch bei zentraler PV-Aufteilung wie ohne sie.
 Die Kurvenleistung ist daher ein Laderahmen und keine garantierte physische
 Akkuladeleistung. Im E3DC-Sonnenmodus begrenzt auch dieser Rahmen den
 Stromdeckel; Mindeststrom und Geräteverzögerungen bleiben wirksam.
@@ -409,12 +366,6 @@ gemessene Leistungen beobachten. Eine Wolke muss den Rahmen sofort senken;
 nach Sonne steigt er schrittweise. Bei unerwartetem Netzbezug, fehlender
 Bestätigung oder unruhigen Ausgängen ausschalten und die Diagnose sichern.
 Das Feld `central_pv_split` steht im Speicherzustand und Wallboxbudget.
-Im Status und Diagnose-Export je Ladepunkt nennt `curve_backlog` den Stand
-`used_wh`, die Grenze `limit_wh`, die Stufe `stage` (3p/1p), die letzte Aktion
-`last_action` und den Grund `reason`. `central_frame.frame_w` zeigt den einmal
-zugeteilten Einzelrahmen. Zum Prüfen Mindeststrom, Eigenleistung, Ist-Phasen,
-Rahmen und Wh-Stand gemeinsam beobachten; nach Stop die stabile Deckung des
-Startminimums samt Reserve prüfen.
 
 ### Beobachtete Wallboxen
 
@@ -464,9 +415,11 @@ Datenwächter behalten Vorrang.
   einphasig, Mindeststrom, Weckverhalten oder fehlende Steuerfähigkeit sind
   Fähigkeits-Eingaben der zentralen Policy, keine eigenen Regelwelten.
   Messprotokoll und Steuerautorität sind zwei verschiedene Dinge.
+- Pause, Not-Aus und Ladepunktsperre beenden eine laufende Ladung sofort mit quittiertem Stopp, auch in „Beobachten“. Anti-Flattern und Mindestladezeit verzögern diesen Stopp nicht. Das Abbruchbit der Box zeigt, ob die Box eine Ladung freigibt oder gesperrt hat. Native E3DC-Wallboxen erhalten einen Stoppimpuls nur, wenn sie frisch „nicht abgebrochen“ melden, auch ohne Leistungsbezug. „Abgebrochen“ quittiert den Stopp ohne weitere Flanke. Fehlt die Abbruchmeldung der Box über mehrere Proben, ist genau ein Stopp mit frischem Ladebeleg zulässig; die Anzeige meldet „Zustand der Box nicht lesbar“. Andere Typen nehmen auch ein stehendes Angebot zurück. Bleibt nach einer nativen Stoppflanke der Bitwechsel 30 Sekunden aus, entsteht ein Fehler. Im Fehlerzustand „Box reagiert nicht auf den Stopp“ erhalten Pause, Ladepunktsperre, Not-Aus, Notstromreserve und Hausanschluss gemeinsam genau eine zusätzliche Stoppflanke: frühestens 60 Sekunden nach dem letzten Stoppversuch, bei frischer Probe mit „nicht abgebrochen“ oder unbekanntem Bit und nur mit frischem Ladebeleg. Die Fehleranzeige erscheint ab Fehlerbeginn. Die zusätzliche Einmalflanke ist höchstens einmal je Stecksession und Dienstlauf zulässig; ist sie verbraucht oder für den Stoppgrund nicht berechtigt, bittet die Oberfläche, den Ladepunkt zu prüfen. Nach einem Neustart des Dienstes steht sie einmal neu zur Verfügung. Eine Stecksession endet erst mit bestätigtem Abstecken: mindestens drei aufeinanderfolgende frische Proben ohne gestecktes Fahrzeug über mindestens zehn Sekunden. Insgesamt sind höchstens drei Versuche je Ereignis zulässig; eine bereits verbrauchte Einmalflanke wird durch einen späteren Nutzer-Stopp nicht erneuert. Ein beobachteter externer Neustart wird bei Nutzer-Aus, Schutzgründen, Ladefensterende, Ziel erreicht, Abfahrt oder Budget-Zeitlimit erneut gestoppt, frühestens 30 Sekunden nach der letzten Flanke. Bei Unterdeckung übernimmt der Regelkern die externe Ladung und beendet sie nach seinen normalen Sitzungsregeln. Sperre, Pause und Not-Aus bleiben nach Dienst- und Host-Neustart sowie Containerstart bestehen. Die Ladepunktsperre gilt als Nutzer-Aus. Sperre und Not-Aus lassen sich nur über den Schalter mit dem Power-Symbol des jeweiligen Ladepunkts in der erweiterten Ansicht auf der Seite „Wallbox“ aufheben. Moduswahl, Abstecken und Speichern in der einfachen Ansicht heben die Sperre nicht auf. Fortsetzen, ein bewusster Moduswechsel, Sofortstart, Abstecken oder externes Fortsetzen an einer openWB Primary heben nur die Pause auf. In den PV-Modi kehrt eine Primary nach Freigabe eines eigenen Stopp- oder Sofortauftrags, bewusstem Moduswechsel oder aufgehobener importierter Fremdpause genau einmal auf PV zurück; dies gilt auch nach Abstecken und Wiederanstecken. Während Pause, Not-Aus oder Ladepunktsperre gibt es keine PV-Rückgabe. Eine Nutzerwahl an der openWB ohne solche Aktion bleibt bestehen. Bleibt „Beobachten“ eingestellt, wird beim Fortsetzen oder Freigeben einmalig die Grundeinstellung freigegeben und anschließend wieder beobachtet. Bei nativen Boxen hebt Fortsetzen in „Beobachten“ nur die eigene Pause oder Ladepunktsperre derselben Stecksession genau einmal auf, wenn die Box frisch „abgebrochen“ meldet. Diese Übergabe benötigt kein Regelbudget. Eine App-Sperre wird nicht aufgehoben. Nach Not-Aus erfolgt in „Beobachten“ keine automatische Freigabe; die Box bleibt bis zur App-Freigabe gesperrt. Endet eine Pause in „Beobachten“ durch bestätigtes Abstecken, bleibt eine native Box gesperrt, bis sie in der E3DC-App freigegeben oder ein Regelmodus gewählt wird. Die bewusste Freigabe über den Schalter der Ladepunktsperre gibt die Box genau einmal frei, auch ohne gestecktes Fahrzeug, solange seit der Sperre weder eine Pause noch ein neues Anstecken dazwischenlag.
 - `Aus` ist der bewusste Beobachtungsmodus: keine Regelbefehle, keine
   Auto-Erkennung. Nur beim bewussten Wechsel auf `Aus` in der WebUI wird einmalig
-  die Wallbox-Grundeinstellung freigegeben, nicht bei Reconnect oder Neustart.
+  die Wallbox-Grundeinstellung freigegeben; zusätzlich einmal beim Fortsetzen
+  einer Pause in diesem Modus, nicht bei Reconnect oder Neustart.
   Deaktivierte Wallboxen werden weder erkannt noch gesteuert.
 
 ### Akkustützung der Wallbox in `PV-Kurve ruhig` nach Korridorlage
@@ -476,313 +429,47 @@ Datenwächter behalten Vorrang.
    im Rahmen eines kleinen, benannten Wolken-Kontingents stützen; ob und wie
    viel, entscheidet die Speicher-Ladekurve, nicht ein fester SoC-Wert.
    Akkuladen des Fahrzeugs bis zu einer Untergrenze gibt es ausschließlich in
-   `PV + Akku bis Untergrenze` (Untergrenze `wbminsoc`).
+   `PV + Akku bis Untergrenze` (Untergrenze `wbminsoc`). Auch bei dieser
+   Akkustützung bleibt die Ladegrenze der Ladekurve bestehen; freigegeben
+   wird nur die Entladeseite im zulässigen Rahmen.
 2. **Bezugsgröße.** Die Lage des Speicher-SoC zum Kurvenkorridor zwischen
    Untergrenze (`soc_min_curve`) und Obergrenze (`soc_ceiling_curve`) des
    Speicherplans: `above_ceiling`, `inside_band`, `below_floor` oder `no_curve`
    (Feld `adaptive_curve_relation` im Storage-Zustand).
-3. **Regel je Korridorlage.**
-   - Über dem Korridor: Der Storage Manager autorisiert Stützung (Grund
-     `curve_above_target`), begrenzt auf den Anteil über dem Kurvenziel. Das
-     Wallbox-Budget bleibt PV-basiert; Akkuenergie, die im Automatikbetrieb des
-     E3DC dennoch in die Wallbox fließt, zählt in das Akku-Wh-Konto
-     (Punkt 4).
-   - Im Korridor: Laden fortsetzen (Grund `curve_within_corridor`); der Strom
-     wird so geführt, dass möglichst lange ohne Schützwechsel geladen wird, mit
-     Reduktion bis zum Mindeststrom vor jedem Stop. Stützung nur im Rahmen
-     dieser Haltung und ebenfalls nur bis zum Akku-Wh-Konto (Punkt 4).
-   - Unter dem Korridor: Bei ausgeschalteter zentraler PV-Aufteilung ist das
-     Wallbox-Budget der reine PV-Überschuss; eingeschaltet wird zuerst der
-     Akkuanteil nach `iFc` abgezogen (siehe experimentelle PV-Aufteilung).
-     Der bisherige PV-only-Vertrag
-     (`wallbox_curve_pv_only_budget_w`) bleibt als zusätzliche Schutzgrenze erhalten. Solange eine Wallbox tatsächlich lädt,
-     begrenzt der Storage Manager die Entladung, damit der Automatikbetrieb des
-     E3DC die Wallbox nicht aus dem Speicher speist: auf die Hausgrundlast laut
-     Wallbox-Manager plus 200 W, mindestens `wb_curve_house_baseline_min_w`
-     (Standard 1500 W, Untergrenze 300 W), in `PV-Kurve ruhig` zusätzlich auf
-     Hausverbrauch plus Wärmepumpe minus PV zuzüglich der Reserve
-     `wb_curve_pv_only_house_reserve_w` (Standard und Mindestwert 300 W). Das
-     gilt in `PV-Kurve ruhig` und in den Speicherzuständen mit EMS-Grenze;
-     im bisherigen Wallbox-Automatikbetrieb von `PV + Akku bis Untergrenze`
-     (`parallel_wb_auto`, zentrale PV-Aufteilung aus) setzt der Speicher keine Entladegrenze, dort
-     begrenzen die Absenkung durch den Wallbox Manager und das Akku-Wh-Konto
-     (Punkt 4). Nachgeführt wird die Grenze erst ab 200 W Änderung (Totband);
-     eine Senkung durch eine harte Grenze wirkt sofort.
-     Die Grenze schaltet ein, sobald eine Wallbox ab 500 W lädt oder ihre
-     Messung ungültig, veraltet, unvollständig oder für ein laut Wallbox
-     Manager gestecktes Fahrzeug nicht vorhanden ist. Sie schaltet erst wieder
-     aus, wenn jeder gesteckte Ladepunkt 45 s ohne Unterbrechung gültig und
-     frisch unter 300 W misst; eine einzelne 0-W-Probe hebt sie nicht auf.
-     Unter 500 W darf der Speicher das Fahrzeug weiter mitversorgen (etwa
-     beim Ausklingen der Ladung); die Zeitbedingung verhindert, dass die
-     Grenze an der Schwelle flattert. Ist das Fahrzeug nur gesteckt und lädt
-     nicht, bleibt die Entladung frei.
-     Der Laderahmen des Speichers folgt dabei der Kurvenführung über `iFc`.
-   - Wh-Kontingent an der Untergrenze: Unter dem Korridor darf der Speicher die
-     Wallbox nur mit einem kleinen Energiekontingent stützen, um Wolkenlücken am
-     Mindeststrom zu überbrücken. Das Kontingent ist `wb_curve_floor_support_wh`
-     (0 oder leer = automatisch 0,5 % der Speicherkapazität `speichergroesse`,
-     mindestens 50 Wh; ein Handwert gilt absolut, nie unter 50 Wh).
-     Diese Kontingentregel gilt nur in `PV-Kurve ruhig` unter dem Korridor.
-     Die Modi mit Akkuladen bis zur Untergrenze behalten den Pfad aus Punkt 5.
-     Unter dem Korridor steuert genau dieses Kontingent die Speicherklasse,
-     die Wallboxaktion und die Anzeige. An seinem Ende folgt im selben Zyklus
-     genau eine Entscheidung je Kontingent, unabhängig vom bisherigen Ladestrom
-     (Aktionsgrund `curve_floor_contingent_end`):
-     - Trägt das batterieneutrale PV-Budget die Mindestleistung der aktuellen
-       Phasenzahl (konfigurierter Mindeststrom, Standard 6 A, · 230 V · Phasen), lädt die Wallbox weiter aus PV;
-       ein höherer Strom wird auf das PV-Budget abgesenkt.
-     - Andernfalls folgt ein Abstieg von 3p auf 1p nur bei verfügbarem
-       Phasenausgang, freier Phasensperre und genügend PV für den Wiederanlauf samt Messreserve
-       (an der openWB Pro bei 6 A und 0,1-A-Schritten 1530 W).
-     - In allen anderen Fällen, auch bei unbekanntem, ungültigem oder
-       veraltetem PV-Budget, folgt Stop. Der Wiederanlauf folgt Punkt 4.
-     Maßgeblich ist das batterieneutrale Gruppen-PV abzüglich der realen
-     Leistung anderer Wallboxen, ohne Klemme durch die Slot-Zuteilung.
-     Bei frischem Status wird die reale Leistung jeder anderen Wallbox abgezogen.
-     Ohne frischen Status macht eine zuletzt ladende Box (mindestens 500 W
-     oder Status „charging“, letzte gültige Probe höchstens zehn Minuten alt)
-     den Rahmen unbekannt. Eine zuletzt nicht ladende, seit Dienststart nie
-     gesehene oder seit mehr als zehn Minuten ohne gültigen Status gebliebene
-     Fremdbox zählt für dieses Budget mit 0 W; die PV-only-Grenze und
-     das Netzkonto bleiben wirksam. Die eigene letzte gültige Probe darf bis
-     zu 15 s alt sein. Ein Stop bei unbekanntem Budget nennt den Statusgrund
-     im Journal.
-     Während der Brücke wird die gewählte Aktion fortgeschrieben, nicht neu
-     entschieden. Danach gelten wieder Netz- und Budgetkonto, Einschwingfrist,
-     Fast-Grid und Wh-Wächter. Ein erschöpftes Kontingent löst keine weitere
-     Absenkung, keinen weiteren Phasenwechsel und keinen weiteren Stop aus.
-     Die Speicherstützung bleibt bis zur frischen Bestätigung unter 500 W
-     erhalten; dies bestätigt auch den 0-A-Schritt eines Phasenabstiegs.
-     Spätestens 30 s nach dem Kontingent-Ende gilt dennoch die PV-only-Grenze,
-     falls die Wallbox nicht folgt. Trägt PV die aktuelle Mindestladung,
-     gilt PV-only sofort. Harte Schutzgrenzen behalten Vorrang.
-     Das Kontingent zählt nicht bei ausdrücklich erlaubter Stützung:
-     offenem wbminSoC-Tor in den Modi mit Akkuladen bis zur Untergrenze,
-     Grundladung, Netz-, Preis-, Pre-Dump-, Direktvermarktungs- oder
-     Prognosefreigabe sowie einer gebundenen Startreservierung des Speichers
-     für eine real ladende Wallbox. Diese Ausnahmen ändern nur Zählung und
-     Anzeige, nicht die bestehende Stützungsfreigabe, Klasse oder deren Grund.
-     Es beginnt nach 60 s ohne geltende Korridorregel oder ohne Ladung wieder
-     bei null. Das gilt auch nach 60 s ausdrücklich erlaubter Stützung.
-4. **Akku-Wh-Konto im laufenden Mindesthalt.** Der gemeinsame
-   Defizitregler, der eine laufende Wallbox bis zum Mindeststrom reduziert und
-   dort hält, führt für die marginale Wallbox in `PV-Kurve ruhig` ein drittes
-   Energiekonto. Es zählt den Anteil der Speicherentladung, der tatsächlich in
-   die Wallbox fließt: min(Entladung, Wallbox-Ist − PV-Rest) abzüglich 100 W
-   Toleranz, mit dem Leck `wb_min_current_import_release_w` (Standard 80 W).
-   Schwelle ist dasselbe Kontingent wie unter Punkt 3. In und über dem
-   Korridor bleibt dieses Konto unverändert. Unter dem Korridor gilt allein
-   der Kontingentstand aus Punkt 3, ohne zweite Zählung mit Toleranz und Leck;
-   nur seine einmalige Aktionswahl am Ende ersetzt dort die Stufenfolge
-   Strom, Phase, Stop. Mit der Endentscheidung beginnt das Akkukonto wieder
-   bei null. Nach Ende der Brücke zählt es wieder mit 100 W Toleranz und
-   80 W Leck als zeitlicher Rückhalt gegen weitere Akkuentladung.
-   Netz- und Budgetkonto bleiben wirksam; die Endentscheidung bleibt einmalig.
-   Es gilt nur ohne Netz-, Preis-, Pre-Dump-,
-   Direktvermarktungs- oder Prognose-Akkufreigabe und ohne Startreservierung
-   der Speicherseite; in `Grundladung stabil` und den Modi mit Akkuladen bis
-   zur Untergrenze ist die Stützung ausdrücklich gewollt und wird nicht
-   gezählt. Je Zyklus zählt genau eine Komponente in der Rangfolge
-   **Netz > Akku > Budgetüberziehung**: Das Netzkonto
-   (`wb_min_current_import_stop_wh`, Standard 40 Wh, Toleranz
-   `wb_min_current_import_tolerance_w` 200 W) zählt, wenn es seine
-   Netzschwelle mindestens so schnell erreicht wie das Akkukonto sein
-   Kontingent; sonst zählt der Akku und das Netzkonto pausiert. Das Akkukonto
-   zählt, sobald der Speicher die Wallbox speist. Bei ausgeschalteter zentraler
-   PV-Aufteilung bleibt die Budgetüberziehung sonst Diagnose. Bei eingeschalteter
-   Aufteilung ersetzt das oben beschriebene Rückstandskonto diesen nachrangigen
-   Pfad; der einmal zugeteilte Einzelrahmen enthält die Eigenleistung bereits. Speist der Netzpunkt dagegen ein (mindestens die Toleranz,
-   stabil 30 s) und lädt oder ruht der Speicher dabei, ruht das Budgetkonto:
-   es fehlt physikalisch nichts, die Kachel bleibt leer. Netz- und Akkukonto
-   bleiben vorrangig; fehlen frische Live- oder Batteriedaten, zählt es weiter
-   wie bisher, und nach einer Datenlücke muss die Ruhe neu verdient werden.
-   Ist die Schwelle
-   erreicht, senkt die Kaskade zuerst den Strom, schaltet dann die Phasen
-   herunter und stoppt zuletzt (Aktionsgrund `battery_support_threshold`,
-   Journal „Akku-Wh-Zähler x/y Wh … → Stop“). Der Phasenabstieg läuft als
-   vollständige Sequenz (0 A, Phasenziel, Wiederanlauf auf der Zielphase).
-   Ein Abstieg reserviert nur die Wiederanlaufleistung der Zielphase samt
-   Reserve; beim Aufstieg bleibt auch die bisherige Last reserviert.
-   Beginnt ein angeforderter Kaskadenabstieg binnen 30 s keinen Ausgang,
-   folgt nur bei fortbestehendem Defizit ein Stop: Netzbezug über der
-   Toleranz oder eine gezählte Akku-Komponente mit erreichter Akkuschwelle.
-   Ein PV-Rahmen unter dem
-   aktuellen Minimum zählt dafür nur ohne erlaubte Akkustützung: nach dem
-   Kontingent unter dem Korridor in `PV-Kurve ruhig` oder bei geschlossenem
-   wbminSoC-Tor. Bei erlaubter Stützung ist Netzbezug innerhalb der Toleranz
-   kein Stopgrund. Eine reine Budgetüberziehung ohne diesen Stopgrund lässt
-   den unbegonnenen Abstieg nach 30 s verfallen. Die Reservierung wird frei,
-   das Konto beginnt bei null; erst nach erneutem Kontodurchlauf kann derselbe
-   Abstieg wieder angefordert werden. Nach einem Kaskadenabstieg auf eine
-   Phase startet die openWB Pro mit dem konfigurierten Mindeststrom der
-   jeweiligen Wallbox. Derselbe Strom liegt der gebundenen
-   Wiederanlaufreservierung zugrunde. Werte unter dem Geräteminimum werden auf
-   das Geräteminimum angehoben, Werte über der Gerätehöchstgrenze begrenzt.
-   Aktuelle Stromgrenzen, Budget, Hausanschluss und Reservierung müssen diesen
-   Strom vollständig tragen; andernfalls wartet der Wiederanlauf und startet
-   nicht mit einem niedrigeren Ersatzwert. Fehlt der Konfigurationswert oder
-   ist er ungültig, gilt der bisherige Rückfall auf 6 A. Der Status der
-   Phasenreservierung nennt den Wiederanlaufstrom (`restart_amp`), seine
-   Quelle (`restart_amp_source`: `configured_min`, `device_min` oder
-   `fallback_6a`) und den Grund (`restart_amp_reason`). Nach bestätigtem
-   Wiederanlauf folgt die normale Stromrampe. Startfenster und Re-Emit, Stop-
-   und Aus-Vetos sowie das Schnellstart-Angebot nach dem Abstecken behalten
-   ihre bestehenden Regeln.
-   Für eine
-   begonnene Sequenz gilt weiterhin die Bestätigungsfrist von standardmäßig
-   240 s (`wb_phase_confirm_timeout_s`).
-   Ist das Ende der Defizitepisode bestätigt (Einspeisung bei ladendem oder
-   ruhendem Speicher, stabil 30 s), auch nach Ablauf der Ausgangsfrist,
-   verfällt der noch nicht angelaufene Auftrag, das Konto beginnt neu,
-   und eine schon zugesagte Phasenreservierung wird ohne Ausgang freigegeben.
-   Schaltet der Nutzer vor dem Phasenziel auf `Aus`, endet die Sequenz
-   ebenso ohne weiteren Ausgang; nach der Rückkehr gilt keine alte
-   Phasenentscheidung.
-   Das Konto ist ausgesetzt, solange
-   eine andere Wallbox mit autorisierter Speicherstützung (`PV + Akku bis
-   Untergrenze`, `Sofort bis Preislimit`, `Akku bis Abfahrt`, Grundladung oder
-   Startreservierung) real lädt, weil Entladung und PV-Rest Gruppengrößen sind.
-   Das gilt nur mit frischem, gültigem Status dieser Wallbox: Fehlt ihr Status
-   oder ist er veraltet, gilt sie als nicht vorhanden und das Konto zählt
-   weiter; fällt der Blocker weg, zählt das Konto ohne Sprung weiter.
-   Fehlen Batterie-, PV- oder Leistungsdaten, bleibt das Konto eingefroren; es
-   stoppt nie aus geschätzten Größen.
-   Nach einem Stop der Kaskade startet die Wallbox in derselben Stecksession
-   erst wieder, wenn das batterieneutrale PV-Budget die Mindestleistung der
-   erwarteten Phasenzahl (6 A · 230 V · Phasen, also 1p 1380 W und 3p 4140 W)
-   ununterbrochen `wb_pv_only_release_hold_s` (Standard 120 s) lang deckt;
-   ungültige Live-Daten setzen die Zeit zurück, eine einzelne Wolkenlücke
-   startet nicht. Netz-/Preisfenster, Nutzer-`Aus` oder ein ausdrücklicher
-   Start heben die Wartezeit auf. Ein bewusster Wechsel auf „PV + Akku bis
-   Untergrenze“ oder „Akku bis Abfahrt“ löst sie ebenfalls einmalig;
-   „Sofort bis Preislimit“ nur mit tatsächlicher Akku-/Netzfreigabe.
-   „PV-Kurve ruhig“ und „Grundladung stabil“ lösen sie nicht. Das gilt für
-   jeden Kaskaden-Stop einschließlich Kontingent-Ende und gescheitertem
-   Phasenabstieg. Wh-Konten und harte Schutzgrenzen bleiben wirksam;
-   ein neuer Stop eröffnet eine neue Episode. Der erste Start nach dem Anstecken bleibt
-   unverändert. Solange dieses Wiederanlauftor bewaffnet und blockiert ist,
-   legt die Policy für eine stehende Wallbox keine neue Phasenreservierung an.
-   Erst nach Freigabe beginnt eine erforderliche Phasenvorbereitung; deren
-   Sequenz und Wiedereinschaltverzögerung kommen zur Wartezeit hinzu.
-5. **`wbminsoc`.** `wbminsoc` begrenzt die Akkustützung, nie das PV-Laden.
-   Bei knapper PV dient es in `PV + Akku bis Untergrenze` außerdem als
-   Abendziel der normalen Ladekurve (siehe Wallbox-Grundregeln). Liegt der SoC morgens unter `wbminsoc` und es wird eingespeist,
-   lädt die Wallbox aus PV-Überschuss; im Korridor wird geladen wie unter
-   Punkt 3. Ist `wbminsoc` gesetzt, wirkt es als zusätzliche Untergrenze der
-   Stützung (mit Hysterese `wb_soc_hysterese_pct`); ist es aus, gilt allein die
-   Kurvenregel. „Aus“ bedeutet nie „unbegrenzt bis zur E3DC-Grenze“. Eine
-   Anhebung von `wbminsoc` im laufenden Betrieb sperrt die Stützung sofort
-   (`wbminsoc_runtime_raise`).
-   In den Modi mit Akkuladen bis zur Untergrenze (`PV + Akku bis
-   Untergrenze`, `Sofort bis Preislimit`, `Akku bis Abfahrt`) gilt die
-   Korridorregel aus Punkt 3 nur, solange das wbminSoC-Tor geschlossen ist.
-   Ist es offen, stützt der Speicher die Wallbox unabhängig von der
-   Korridorlage (Grund `wbminsoc_floor_open`); die bisherige Freigabe bleibt
-   auch bei eingeschalteter zentraler PV-Aufteilung erhalten. Unterhalb von
-   `wbminsoc` verhalten sich diese Modi wie
-   `PV-Kurve ruhig`, jedoch ohne das Wolken-Kontingent aus Punkt 3.
-   **Haltezone.** Zwischen `wbminsoc` und `wbminsoc` plus dem
-   Neustart-Abstand (der größere Wert aus `wb_soc_hysterese_pct` und
-   `wb_target_restart_above_wbminsoc_pct`, Standard 2 Prozentpunkte) hält
-   der Speicher den SoC, statt zu pumpen – ohne Netz-, Preis-, Boost- oder
-   Pre-Dump-Fenster und unabhängig davon, ob das wbminSoC-Tor gerade offen
-   oder geschlossen ist. Sie gilt in `PV + Akku bis Untergrenze` und in
-   `Sofort bis Preislimit` ohne Preis- oder Netzfenster, nicht in `Akku bis
-   Abfahrt` (eigener Stop an der Untergrenze). Die Wallbox bekommt dort nur den batterieneutralen
-   PV-Rahmen: PV minus Haus, Wärmepumpe und Heizstab. Der Speicher stützt
-   nicht und lädt nicht vorrangig nach der Kurve; er lädt nur, was die
-   Wallbox nicht abnimmt (Vertrag `wallbox_wbminsoc_hold_zone` im
-   Wallbox-Rahmen). Eine
-   vorher gestützte höhere Wallboxleistung wird beim Eintritt nicht gehalten.
-   Kurze Schwankungen – eine Lastspitze etwa eines Induktionskochfelds oder
-   eine Wolke – fängt der Speicher ab, ohne dass die Wallbox nachregelt:
-   War die Wallbox zuvor vom PV-Rahmen gedeckt, bleibt ihre laufende Leistung
-   gehalten, solange die dabei aus dem Akku in die Wallbox fließende Energie
-   (abzüglich 100 W Messtoleranz) das Wolken-Kontingent
-   `wb_curve_floor_support_wh` nicht erreicht; das Kontingent beginnt wieder
-   bei null, wenn 60 s lang keine Akkustützung der Wallbox anlag, die
-   Haltezone verlassen war oder keine Wallbox lud. Begrenzt die PV-only-
-   Entladegrenze aus Punkt 3 den Speicher auf das Haus, gilt nur der
-   aktuelle PV-Rahmen. Unter der Haltezone gilt die Kurvenregel, darüber die
-   Stützung bis `wbminsoc`. Weil der E3DC den SoC in ganzen Prozent meldet,
-   verlässt der Speicher die Haltezone nach oben erst ab Neustart-Abstand
-   plus `wb_soc_hysterese_pct` (Standard 2,7 Prozentpunkte über `wbminsoc`);
-   dorthin kommt er nur mit PV-Überschuss, den die Wallbox nicht abnimmt.
-   Diese Hysterese hängt nur am SoC; ein einzelner Zyklus ohne gültigen
-   Wallbox-Intent setzt sie nicht zurück. Der Vertrag nennt das PV-Budget der
-   Wallboxgruppe im Band (`budget_w`, gleich `hold_frame_w`); es gilt,
-   solange der Vertrag aktiv und höchstens 15 s alt ist. Wallboxwert und
-   E3DC-Rest des Rahmens stammen aus demselben Probenpaar („Eine Stellgröße
-   je Regelkreis“, Punkt 3).
-   Strom, Phasen und Stop der Wallbox entscheidet weiter der Wallbox Manager.
-   Er nutzt im Band einschließlich der Untergrenze den veröffentlichten
-   Haltezonen-Rahmen als PV-Budget und rechnet dort kein eigenes Budget:
-   Sinkt der Rahmen, folgt der Sollstrom direkt; schließt das wbminSoC-Tor
-   an der Untergrenze, bleibt der Rahmen das Budget. Trägt der Rahmen die
-   Mindestleistung der genutzten Phasenzahl nicht, gilt auch bei offenem Tor
-   der Direktabsenk- und Stop-Pfad der Untergrenze (siehe unten). Der
-   Akkuwächter an der Untergrenze senkt im Band nicht gegen eine
-   Überbrückung aus dem Wolken-Kontingent ab.
-   In `PV + Akku bis Untergrenze` – und in `Sofort bis Preislimit`, das ohne
-   Preis- oder Netzfenster denselben Regelpfad bis zur Untergrenze nutzt –
-   gilt an der erreichten Untergrenze: Das wbminSoC-Tor ist geschlossen, der
-   Wallbox-Intent meldet `battery_support_authorized` false mit Grund
-   `wbminsoc_floor_closed`. Maßgeblich ist der Modus der Wallbox, die gerade
-   geregelt wird – auch wenn eine andere gesteckte Wallbox einen anderen Modus
-   hat – und ihr eigenes batterieneutrales PV-Budget (der kleinere Wert aus
-   Gruppen-PV und ihrer Zuteilung; in der Haltezone ist das Gruppen-PV der
-   Haltezonen-Rahmen). Trägt es die Mindestleistung der aktuell
-   genutzten Phasenzahl nicht (1p 1380 W, 3p 4140 W), setzt die Kaskade die
-   laufende Wallbox bei dieser Phasenzahl auf den Mindeststrom und lässt das
-   vorhandene Wh-Konto genau einmal bis zu seiner Schwelle
-   (`wb_min_current_import_stop_wh`, Standard 40 Wh) weiterlaufen – die
-   Absenkung setzt es nicht zurück. Danach wechselt eine dreiphasig ladende,
-   phasenumschaltbare Wallbox auf 1p, wenn ihr PV-Budget das 1p-Minimum trägt
-   und der Regler an ihr die Phasen umschalten kann (openWB Pro); in allen
-   anderen Fällen stoppt die Kaskade ohne Phasenwechsel. Bleibt die
-   Bestätigung dieses Phasenwechsels aus, stoppt sie ebenfalls.
-   Laden mehrere Wallboxen, wird eine Wallbox in dieser Lage ohne Netzbezug
-   zuerst geregelt, auch wenn eine andere Wallbox mehr über ihrer Zuteilung
-   lädt – sofern sie selbst, gemessen an ihrer tatsächlichen Leistung, mehr
-   als das Leck des Kontos (`wb_min_current_import_release_w`, Standard 80 W)
-   über ihrer eigenen Zuteilung lädt. Deckt ihre Zuteilung die tatsächliche
-   Ladeleistung, etwa beim Mindeststrom, der real oft unter 1380 W liegt,
-   lädt sie weiter und wird nicht wegen der Überziehung einer anderen Wallbox
-   gestoppt. Mehrere solche Wallboxen werden nacheinander auf den Mindeststrom
-   gesetzt, bevor das Konto durchläuft. Besteht Netzbezug, baut die Kaskade
-   zuerst diesen ab. Läuft an einer anderen Wallbox gerade ein Phasenwechsel
-   oder Stop der Kaskade, wartet die Absenkung dessen Ende ab (höchstens
-   `wb_phase_confirm_timeout_s`, Standard 240 s für eine begonnene Sequenz;
-   ohne begonnenen Ausgang bei fortbestehendem Defizit höchstens 30 s).
-   Die Absenkung geschieht sofort, wenn für diese Wallbox kein PV anliegt
-   (nachts oder eigene Zuteilung 0 W) oder das Gruppen-PV-Budget unbekannt
-   ist. Liegt noch Gruppen-PV an (Dämmerung, Wolke) – auch wenn die eigene
-   Zuteilung fehlt –, muss die Unterdeckung erst
-   `wb_floor_pv_only_phase_down_hold_s` (Standard 20 s, dieselbe Haltezeit wie
-   für den Phasenabstieg an der Untergrenze) ununterbrochen anstehen; bis
-   dahin warten die vom Budgetkonto ausgelösten Strom- und Phasenstufen, das
-   Konto zählt weiter. Diese Bestätigung läuft je Wallbox, unabhängig davon,
-   welche Wallbox die Kaskade gerade regelt; ein Wechsel startet sie nicht
-   neu. Netzbezug regelt die Kaskade dabei wie immer vorrangig
-   ab (sofort proportional, bei vollem Netzkonto die nächste Stufe). Ein
-   kurzer PV-Einbruch senkt also nicht ab. Der eine
-   Kontodurchlauf ist die Bestätigung gegen Flattern; die Energie unter der
-   Grenze bleibt damit im Bereich eines Kontodurchlaufs (in einer Gruppe
-   zuzüglich der genannten Wartezeiten). Weil das Konto bei
-   der Absenkung nicht neu beginnt, kann der Stop nach einer
-   Eintrittsbestätigung bei vollem Strom schon kurz nach Erreichen des
-   Mindeststroms folgen. Folgt die Wallbox der Absenkung nicht, zählt das
-   Konto mit der gemessenen Leistung weiter und die Kaskade stoppt sie an der
-   Schwelle, frühestens 30 s nach der Absenkung – auch wenn zwischendurch eine
-   andere Wallbox geregelt wird. Trägt das PV-Budget die Mindestleistung,
-   bleibt es bei der stufenweisen Kaskade. `Akku bis Abfahrt` behält seinen eigenen Stop an der
-   Untergrenze. Nach dem Stop startet die Wallbox in derselben Stecksession
-   nur über das Wiederanlauftor nach einem Kaskaden-Stop (Punkt 4) neu. Das
-   wbminSoC-Tor gibt die Akkustützung in diesen Modi erst wieder frei, wenn
-   der SoC die Untergrenze um den größeren Wert aus `wb_soc_hysterese_pct` und
-   `wb_target_restart_above_wbminsoc_pct` (Standard 2 Prozentpunkte)
-   übersteigt; das startet die Ladung aber nicht allein.
+3. **PV-Anteil und Wolkenstützung.** Der Speicher veröffentlicht
+   `budget_pv_w` nach festen Lasten und seinem eigenen Ladeanspruch sowie
+   `budget_battery_w` als Rest des Gesamtbudgets. In AUTO-Freilauf beträgt
+   dieser Ladeanspruch 0 W. Keine Momentanbilanz der Akkuleistung vergrößert
+   den PV-Anteil. Eine PV-Box erhält nur den verbleibenden PV-Anteil nach
+   den Akkuboxen. Die Korridorlage gibt ihr keine Akkuquelle für Anhebungen.
+4. **Kurzes Halten.** Das vorhandene Wolken-Kontingent
+   `wb_curve_floor_support_wh` beträgt automatisch 0,5 % der Kapazität,
+   mindestens 50 Wh; ein Handwert gilt absolut, ebenfalls mindestens 50 Wh.
+   Es zählt nur den tatsächlich aus dem Akku gestützten Anteil der PV-Boxen.
+   Die Akkuquelle einer anderen Box hebt die Kontingentgrenze nicht auf.
+   Bei geeigneter Unterdeckung erfolgt nach 60 Sekunden der Abstieg auf
+   eine Phase. Das verbrauchte Kontingent bleibt auch über eine längere
+   Nullpause der Phasensequenz erhalten und steht danach mit seinem Rest
+   für weitere Wolken bereit. Unterdeckung hält höchstens den Mindeststrom; nach drei Minuten und
+   mindestens fünf Minuten Ladung folgt der reguläre Stopp. Fehlt die
+   Stützungsfreigabe, gilt dieselbe Unterdeckungsregel. Nach Ende des
+   Wolken-Kontingents kann der Akku deshalb bis zu 180 Sekunden weiter stützen.
+   Nach einem Phasenwechsel hält die Box bei Unterdeckung in den ersten
+   480 Sekunden der bestehenden Phasensperre Mindeststrom; Schutzstopps wirken
+   sofort. Die Wiederherstellung der Sperre erhält auch diese Haltezeit.
+   Ohne gesetzte Phasensperre erzeugt ein selbst ausgeführter Wechsel keinen
+   zusätzlichen Halt.
+5. **`wbminsoc`.** Die Untergrenze begrenzt nur Akkustützung. Ein ausreichender
+   veröffentlichter PV-Anteil erlaubt weiterhin Laden. Die bestehende
+   SoC-Hysterese und Speicher-Haltezone bleiben erhalten. Das Reserve-Tor
+   begrenzt Netzstarts und laufende Netzsitzungen; es sperrt keinen ausreichenden
+   PV-Anteil. Ein geschlossenes Tor bleibt beim Dienstneustart geschlossen und
+   öffnet erst ab Reserve plus 2 Prozentpunkten (Standardwerte). „PV + Akku bis
+   Untergrenze“, „Sofort bis Preislimit“ ohne Netzfenster und „Akku bis Abfahrt“
+   im Abfahrtsfenster nutzen oberhalb der offenen Untergrenze das Gesamtbudget;
+   darunter nur den PV-Anteil. „Grundladung stabil“ hält Mindeststrom nur,
+   solange seine bestehende Grundladungsbedingung gilt. Keine fehlende
+   SoC-Messung öffnet eine Akkuquelle.
 6. **Ein Entscheider.** Ob und wie viel Stützung erlaubt ist, entscheidet der
    Storage Manager je Zyklus auf Basis des Wallbox-Intents. Der Wallbox-Intent
    meldet die Kurvenklasse der Wallbox (`battery_support_authorized`,
@@ -804,21 +491,18 @@ Datenwächter behalten Vorrang.
    Strom, Phasen und Stop der Wallbox.
 7. **Harte Schranken unberührt.** Nutzer-`Aus`, Notstromreserve, Hausanschluss,
    Pre-Dump, Preisfenster und `Sofort bis Preislimit` behalten ihre Regeln.
-8. **Anzeige.** Das Dashboard zeigt im Wallbox-Slot das Kontingent als
-   „Akku x/y Wh“ (Stützung an der Korridor-Untergrenze) beziehungsweise
-   „PV-only x/y Wh“ (Kontingent aufgebraucht, Wallbox nur aus PV-Überschuss).
-   Die Kachel erscheint nur, solange die Korridorregel tatsächlich gilt und
-   geladen wird; bei ausdrücklich erlaubter Stützung bleibt sie verborgen.
-   Während der höchstens 30 s langen Stützung bis zur Wirkung bleibt die
-   Akku-Klasse sichtbar, auch wenn das Kontingent bereits verbraucht ist;
-   der Zustand des Defizitreglers steht in `wb_deficit_counter` und je Wallbox
-   in `group_deficit_battery_support` der Entscheidungsdatei.
+8. **Anzeige.** Der Entscheidungssatz je Ladepunkt nennt Anteil, Strom,
+   Phasen und Grund. Das Wolken-Kontingent und die gemessene Wirkung bleiben
+   von einer bloßen Freigabe unterscheidbar. Fehlende Quellen erscheinen als
+   `null` mit Gültigkeit und Quelle. Fehlt nur der gültige PV-Teil, erhalten
+   PV-Boxen weder Start noch Anhebung; ein gültiges Gesamtbudget bleibt für
+   Akkuboxen nutzbar.
 
 ### Wallbox-Grundregeln
 
-- Bei eingeschalteter experimenteller zentraler PV-Aufteilung gelten der
-  Einzelrahmen, das Rückstandskonto und das Wiederanlauftor aus dem Abschnitt
-  „Zentrale PV-Aufteilung Akku/Wallbox“. Harte Schranken bleiben vorrangig.
+- Auch bei eingeschalteter zentraler PV-Aufteilung liest der Kern den
+  veröffentlichten Rahmen über denselben Budgetvertrag. Harte Schranken
+  bleiben vorrangig.
 
 - Bei klassischer openWB wird die tatsächliche Rolle unterschieden: Secondary
   mit Sollstrom und Heartbeat, Primary-PV mit eigener PV-/Ladepunktlogik oder
@@ -1096,12 +780,12 @@ Hysterese. Die sichtbaren Nutzer-Modi sind bewusst klein gehalten:
 
 | UI-Modus | Bedeutung |
 |---|---|
-| `Aus` | NGNA: keine aktive E3DC-Control-Ladung und keine laufenden Steuerbefehle. Nur beim bewussten Wechsel auf `Aus` in der WebUI wird einmalig die Wallbox-Grundeinstellung freigegeben. Geplantes Netzladen bleibt gesperrt. |
+| `Beobachten` (intern `Aus`) | E3DC-Control beobachtet, die Wallbox bzw. der E3DC regelt selbst. Beim bewussten Wechsel und beim Fortsetzen einer Pause in diesem Modus wird einmalig die Grundeinstellung freigegeben. Pause und Not-Aus stoppen weiterhin sofort. Geplantes Netzladen bleibt gesperrt. |
 | `PV-Kurve ruhig` | Laden aus PV-Überschuss entlang der Speicher-Ladekurve mit Hysterese; über oder im Kurvenkorridor stützt der Hausspeicher nur im Rahmen des Wolken-Kontingents. Unter dem Korridor erhält die Wallbox bei ausgeschalteter zentraler PV-Aufteilung den reinen PV-Überschuss. Mit experimenteller zentraler PV-Aufteilung wird der Kurvenbedarf zuerst vom absoluten Wallboxrahmen abgezogen (Abschnitt „Akkustützung der Wallbox in `PV-Kurve ruhig` nach Korridorlage“). |
 | `Grundladung stabil` | Wie PV-Kurve ruhig, aber mit stabiler 1p/3p-Grundladung, solange `wbminSoc` laut Planung erreichbar bleibt. |
-| `PV + Akku bis Untergrenze` | Das Auto darf PV plus Hausspeicher oberhalb der Hausakku-Untergrenze nutzen; oberhalb der Haltezone bleibt die bisherige Speicherfreigabe. Mit experimenteller zentraler PV-Aufteilung führt unterhalb der Haltezone bei geschlossenem Tor der Kurvenbedarf den Akkuanteil. Unterhalb der Grenze lädt das Auto wie in `PV-Kurve ruhig` nur aus PV-Überschuss, der Speicher stützt nur Hausverbrauch und Wärmepumpe, Netz bleibt außen vor. |
-| `Sofort bis Preislimit` | Sofortiges Netzladen, solange der aktuelle Preis das Wallbox-Preislimit erfüllt. |
-| `Akku bis Abfahrt` | Lädt im Freigabefenster vor der Abfahrtszeit aus PV und Hausspeicher bis zur Hausakku-Untergrenze `wbminsoc`; Netzladen bleibt gesperrt. Gestoppt wird bei erreichter Abfahrtszeit, vollem Fahrzeug oder erreichter Untergrenze (`wb<n>_battery_departure_time`, `wb<n>_battery_departure_window_h`). |
+| `PV + Akku bis Untergrenze` | Das Auto darf PV plus Hausspeicher oberhalb der Hausakku-Untergrenze nutzen. Oberhalb der Haltezone ist die Entladestützung freigegeben; die Ladegrenze folgt weiter der Ladekurve, einschließlich nötiger Ladung zur Vermeidung von Abregelung. Mit experimenteller zentraler PV-Aufteilung führt unterhalb der Haltezone bei geschlossenem Tor der Kurvenbedarf den Akkuanteil. Unterhalb der Grenze lädt das Auto wie in `PV-Kurve ruhig` nur aus PV-Überschuss, der Speicher stützt nur Hausverbrauch und Wärmepumpe, Netz bleibt außen vor. |
+| `Sofort bis Preislimit` | Netzladen im freigegebenen Preisfenster mit zulässigem Höchststrom, Start ohne Wartezeit; außerhalb des Fensters wie „PV + Akku bis Untergrenze“. Das Fenster endet mit Stopp; ein späterer Start aus PV oder Akku benötigt erneut 60 Sekunden ausreichenden Anteil. |
+| `Akku bis Abfahrt` | Lädt im Freigabefenster vor der Abfahrtszeit aus PV und Hausspeicher bis zur Hausakku-Untergrenze `wbminsoc`; Netzladen bleibt gesperrt. Außerhalb des Fensters, zur Abfahrtszeit und bei erreichtem Fahrzeugziel wird gestoppt; an der Untergrenze kann mit ausreichendem PV-Anteil weitergeladen werden (`wb<n>_battery_departure_time`, `wb<n>_battery_departure_window_h`). |
 
 Geplantes Netzladen per Zeitfenster/Slot darf in allen aktiven Modi laden und
 ignoriert bewusst das globale Wallbox-Preislimit, weil die Preislogik bereits
@@ -1110,22 +794,13 @@ bei der Slot-Auswahl steckt.
 Wichtige Schutzlogik:
 
 - Schwellen wie `wbminsoc` arbeiten mit Hysterese.
-- Grid-Wächter (letzte Schutzstufe gegen anhaltenden Netzbezug): Liegt der
-  Netzbezug länger als 45 s über 500 W, senkt der Wächter jede Wallbox, die laut
-  Messung tatsächlich lädt und über 6 A steht, auf 6 A ab. Er hebt nie an,
-  startet nie und setzt keinen Ladezustand. Gestoppte, pausierte, abgesteckte
-  oder gesteckte, aber nicht ladende Wallboxen, Wallboxen im Modus `Aus` und
-  Wallboxen, die der Manager gerade stoppt, bleiben außen vor. Ist Netzbezug
-  gewollt (Preisoptimierung oder freigegebenes Netzladen), ist der Wächter für
-  alle Wallboxen aus. Eine Wallbox, die der Defizitregler im selben Zyklus
-  führt, überlässt er diesem; erreicht dessen Absenkung die Wallbox nicht,
-  senkt der Wächter sie selbst ab. Weist ein nachgelagertes Gate seinen
-  Befehl ab, versucht er es in den folgenden Zyklen erneut, höchstens dreimal
-  in Folge; danach beginnt die 45-s-Frist neu. Meldet der Treiber nur noch den
-  letzten guten Stand (Status gedrosselt, höchstens 45 s alt), senkt der
-  Wächter ab, wenn dieser Stand „lädt“ zeigt; maßgeblich ist dann der eigene
-  Sollstrom. Details: `doc/Native_Wallbox.md`, Abschnitt „Netzbezug beim Laden:
-  Einschwingfrist, Anhebung und Grid-Wächter“.
+- Die Netzbremse prüft Netzpunkt minus frisch gemessene Netzboxleistung.
+  Zwei Regeltakte über 300 W senken den Strom bis zum Mindeststrom.
+  Nach Start, Anhebung oder Phasenwechsel gilt die bestehende 20-s-Frist;
+  Netzboxen haben keine Netzbremse. Hausanschlussgrenzen wirken sofort.
+  Details: `doc/Native_Wallbox.md`, „Netzbezug beim Laden: direkte Regelung
+  und Netzbremse“.
+
 - Liegt der Speicher in `PV-Kurve ruhig` unter seinem Zielkorridor und ist das
   Wh-Stützkontingent der Wallbox-Ladung verbraucht (Akkustützung nach Korridorlage,
   PV-only), begrenzt der Speicher-Manager, solange eine Wallbox tatsächlich
@@ -1156,8 +831,8 @@ Wichtige Schutzlogik:
   4,6 kVA) stehen im Config-Editor unter Wallbox → „Hausanschluss & gemeinsame
   Grenzen“ → „Einphasiger Deckel openWB Pro (Messbasis)“. Voraussetzungen: eine einphasige Obergrenze über 20 A in `wb<n>_openwb_pro_1p_max_amp` (leer = 20 A), eine
   ausdrücklich eingetragene Hausabsicherung `grid_max_amps` (der stille
-  Standard 35 A zählt nicht), die Zuordnung `wb<n>_grid_phase` und der
-  automatische Software-Nachweis dieser Zuordnung beim Laden (Dashboard:
+  Standard 35 A zählt nicht) und die Zuordnung `wb<n>_grid_phase`; der
+  automatische Software-Nachweis dieser Zuordnung beim Laden ist nur ein Hinweis (Dashboard:
   „Zuordnung bestätigt“); ohne frische Messwerte (10 s) gilt sofort wieder
   20 A. Anhebung +1 A je Regelschritt, Absenkung sofort. Details:
   `doc/Native_Wallbox.md`, Abschnitt „Einphasiger Stromdeckel aus
@@ -1201,71 +876,19 @@ Wichtige Schutzlogik:
   Ohne Fahrzeug-Ladeende-Evidenz kehrt ein Kaskadenstopp über das normale
   Startfenster zurück. Details: `doc/Native_Wallbox.md`, „Budgetabhängige
   Bereitschaft“.
-- openWB Pro Startfenster: Nach dem Anstecken bietet der
-  Manager 6 A an, übernimmt ein stehendes Angebot der Box und hält das
-  Angebot `openwb_pro_start_hold_s` (Standard 180 s) ohne 0 A und ohne
-  Anhebung, auch bei kurzen Budget-Einbrüchen, bis das Auto Leistung
-  aufnimmt. Eine Absenkung ab 6 A unter das frisch zurückgemeldete
-  Box-Angebot setzt er dagegen sofort um, etwa wenn die Box nach einem
-  eigenen Neustart mit höherem Strom lädt. Nimmt das Auto nicht an, wird alle `openwb_pro_start_retry_cycle_s`
-  (Standard 300 s) ein neuer Zyklus mit höchstens einem Weckimpuls gezählt,
-  nach drei Zyklen bleibt das Angebot mit Meldung stehen; „Ladung beendet“ nur
-  bei erreichtem Ziel-SoC. Die CP-Karenz `openwb_pro_start_cp_grace_s` liegt nie
-  unter 60 s. Einen Phasenabstieg gibt das Fenster erst frei, wenn der
-  Hausspeicher die dreiphasige Mindestladung nachweislich nicht mehr stützen
-  kann (keine Stützung autorisiert, Haltezone, Notstromreserve,
-  PV-only-Klasse oder `wbminsoc` erreicht, wirksame Entladegrenze unter dem
-  Bedarf max(0, 3p-Mindestleistung + Haus − PV), Hausanschluss je Phase,
-  Bezug über der Speicherreichweite oder Bezug in jeder gültigen Probe über
-  die Einschwingfrist hinaus, gezählt nach Liveproben, nicht nach
-  Regelzyklen); solange er es kann, bleibt die Ladung
-  dreiphasig. Unbekannte Reichweite, Entladegrenze oder unbekannter Bedarf
-  geben nicht frei. Ist der Abstieg freigegeben, erfolgt er im Fenster
-  tatsächlich: 0 A, Phasenziel 1p und Wiederanlauf mit dem Mindeststrom, ohne
-  weiteren Stopp. Editor: Wallbox → „Fahrzeug-Weckruf und Wiederanlauf“ („Pro
-  Startfenster (s)“, „Pro Start-Wiederholzyklus (s)“). Details:
-  `doc/Native_Wallbox.md`, Abschnitt „Startfenster, Wiederholzyklus und
-  Weckimpuls“.
-- openWB Pro, Hochschaltung 1p→3p: Die Regelung reserviert beim
-  Speicherregler die bisher laufende Leistung beziehungsweise den
-  Wiederanlauf mit 6 A je Phase, nicht den einphasigen Strom je Zielphase.
-  Solange der Auftrag auf die Freigabe wartet, rechnet die Zuteilung schon
-  mit drei Phasen; belegt der frische Status eine einphasige Ladung, behält
-  diese ihren Strom im Rahmen des Budgets. Die vorläufige Variante (b)
-  bindet bei einer Einzelbox Mindestbudget und Stromumrechnung an diese
-  eine Phase, auch im Zyklus eines Abbruchs ohne Ausgang. Bei mehreren
-  Wallboxen bleibt die Stromzuteilung zum Schutz des Hausanschlusses
-  dreiphasig; die dadurch mögliche Begrenzung auf etwa ein Drittel der
-  Leistung ist eine bekannte Einschränkung, kein Regelungsziel.
-  Ohne ausreichende Freigabe endet der Auftrag nach 90 s ohne Geräteausgang,
-  eine erteilte, aber ungenutzte Freigabe spätestens 90 s nach ihrem Eingang,
-  und fordert die Regelung die Hochschaltung zwei Zyklen lang nicht mehr an
-  (etwa in einer Ladepause), endet er sofort. Der nächste Versuch folgt
-  frühestens nach `wb_phase_retry_block_s` (Standard 900 s); Vorlauf,
-  Export-Wh-Konto und 10-min-Fenster werden danach neu verdient. Nach dem
-  Wechsel läuft die Box mit 6 A je Phase wieder an; bis der Wiederanlauf
-  unter Last bestätigt ist (drei Messungen über 500 W, stabil über 10 s,
-  gleich mit wie vielen Phasen das Fahrzeug lädt), begrenzt die Regelung
-  jeden Strom auf die freigegebene Reservierung. Danach folgt der Strom
-  wieder dem Wattbudget, jedoch bis zum Ende der Reservierung weiter auf
-  drei Phasen umgerechnet. Ein zwei- oder einphasig ladendes Fahrzeug
-  erreicht deshalb in dieser Zeit höchstens etwa zwei Drittel beziehungsweise
-  ein Drittel des Budgets. Diese bekannte Grenze wird hier nicht aufgehoben.
-  Details: `doc/Native_Wallbox.md`, Abschnitt „Hochschaltung ausgeben:
-  Freigabe, Wartegrenze und Wiederanlauf“.
-- Experimentelles 10-min-Fenster 1p→3p (`wb_phase_up_window_enable`,
-  Standard aus): Nur mit eingeschalteter Energie-Phasenpolitik an der openWB
-  Pro und am E3DC-Direktvertrag. Das Fenster ist ein zusätzlicher Auslöser:
-  Trägt der verfügbare Überschuss im 10-Minuten-Mittel das 3p-Minimum plus
-  15 % ohne Einbruch in den letzten 2 Minuten, schaltet die Regelung auf drei
-  Phasen; für diesen Auslöser entfallen Vorlauf, Export-Wh-Konto und die
-  Bedingung „eine Phase ausgereizt“. Der bisherige Weg über Vorlauf oder
-  Export-Wh-Konto bleibt daneben wirksam. Eine neue Ladung startet nur mit
-  einem Fahrzeugprofil mit drei Phasen direkt dreiphasig. Fehlende Messwerte
-  zählen nie als Überschuss. Sperre nach jedem Wechsel, Netzbezugssperre,
-  einphasige Fahrzeuge und die Freigabe durch den Speicherregler gelten
-  unverändert. Details und Testanleitung: `doc/Native_Wallbox.md`,
-  Abschnitt „Experimentelles 10-min-Fenster 1p→3p“.
+- Start und Phasen folgen dem gemeinsamen Regelkern. Ein gültiger Anteil
+  über der Mindestleistung qualifiziert den Start nach 60 Sekunden; eine freigegebene Netzquelle startet ohne diese Wartezeit. Bleibt
+  das Fahrzeug im Standby oder folgt seinem eigenen Ladeplan, wird der
+  Start nicht wiederholt; nach spätestens 30 Sekunden nennt der
+  Entscheidungssatz den fehlenden Ladebeginn. Ein später selbst ladendes
+  Fahrzeug wird ohne neue Startflanke übernommen.
+- Die Phasenentscheidung nutzt den eigenen Quellenanteil: aufwärts nach
+  60 Sekunden, abwärts nach 60 Sekunden geeigneter Unterdeckung. Elektrische Reservierung,
+  Speicherfreigabe, bestätigter Phasenreadback und die vorhandene
+  Gerätesequenz bleiben nötig. Die mindestens 480 Sekunden nach einem
+  Wechsel sperren weitere Phasenwechsel, nicht den bestätigten
+  Wiederanlauf. Ein Export-Wh-Konto und ein zusätzlicher Vorlauf entfallen.
+
 - openWB Pro mit einphasig hinterlegtem Fahrzeug: Die Phasen der Box werden
   nicht umgeschaltet; Mindestleistung und Budget folgen dem Fahrzeug
   (1,38 kW), der einphasige Stromdeckel den gemessenen aktiven Phasen.
@@ -1767,49 +1390,154 @@ Bei reduzierter Bewegung bleibt die Hervorhebung ohne Animation sichtbar.
 Externe Lasten können im Config-Editor unter **Tarif & Strompreise → Geplante
 Lastfenster** abgesichert werden.
 
-### Stromauflösung, bestätigte Anhebung und gedeckter 1p-Wiederanlauf
+### Wallbox-Regelkern
 
-Die aktive Regelung erhält die vom Treiber unterstützte, mit
-`wb1_current_step_amp` beziehungsweise `wb2_current_step_amp` gewählte
-Schrittweite (0,1, 0,5 oder 1 A) bis zum Strombefehl. Sicherheitsdeckel werden
-immer abwärts auf die Gerätestufe gerundet. Ganze Ampere bleiben für Geräte
-mit 1-A-Fähigkeit verbindlich.
+Jeder konfigurierte, nicht deaktivierte Ladepunkt verwendet denselben
+Regelkern. Die Betriebsart bleibt je Ladepunkt eingestellt; eine zusätzliche
+Reglerauswahl gibt es nicht. Der Rückweg nach einem Update ist das Backup.
 
-Eine gemeinsame Anhebungsentscheidung gilt für den direkten und den allgemeinen
-Regelpfad. Ziele innerhalb eines 100-W-Bands teilen dieselbe Bestätigung;
-mehrere Aufrufe mit derselben Messung zählen nicht als zusätzliche Messframes. Eine laufende Ladung erhält nach mindestens 45 s kohärenter Deckung
-und verschiedenen frischen Messframes den freigegebenen Zielstrom ohne weitere
-2-A-Treppe. Der Netzpunkt muss den zusätzlichen Strom tragen; Akkuladung allein
-ist kein Beleg für sofort verfügbare Leistung. Ungültige Daten, Bezug über der
-Toleranz, ein offenes Defizitkonto oder ein gesunkener Rahmen setzen die
-Bestätigung zurück. Watt-, Hausanschluss-, Phasen- und Startfenstergrenzen sowie
-Option B bleiben bindend. Absenkungen warten nicht auf diese Bestätigung.
+Der Speicher veröffentlicht das absolute Gruppenbudget in zwei Teilen:
+`budget_pv_w` aus PV nach festen Lasten und seinem eigenen Ladeanspruch sowie
+`budget_battery_w` als Rest von `budget_w`. Laufende Akkuladung und die eigene
+Wallboxleistung werden davon nicht erneut abgezogen. Externe Wallboxen stecken
+im Hauswert, native E3DC-Wallboxen haben einen eigenen Messpunkt.
 
-Reicht der individuelle Anteil nicht für das dreiphasige Mindestangebot, wird
-im selben Verbrauchervertrag die einphasige Fortsetzung geprüft. Benötigt
-werden der konfigurierte Mindeststrom mal 230 V und die bestehende Reserve
-`max(150 W, 2 × Schrittweite × 230 W/A)`. Bei 6 A ergibt das 1530, 1610 oder
-1840 W. Diese Reserve ist eine Deckungsbedingung und kein zusätzlicher
-Verbraucherabzug. Eine Transitionsgeneration bleibt über Lease und Retry
-gebunden; sie darf weder ein ungedecktes 3p-Angebot noch einen verfrühten
-Phasenwechsel erzeugen. Ein echter Nullvertrag, fehlende Quellen und Nutzer-Aus
-geben weder Reserve noch Start oder Phasenwechsel frei.
+Je Ladepunkt und Zyklus gilt eine Anteilsquelle: Netz bei ausdrücklicher
+Netzfreigabe; Akku in „PV + Akku bis Untergrenze“, außerhalb des Netzfensters
+in „Sofort bis Preislimit“ und im Abfahrtsfenster in „Akku bis Abfahrt“, jeweils
+mit gültigem SoC, offener Untergrenze und Speicherautorisierung; sonst PV.
+Netzboxen erhalten ihren zulässigen Höchststrom ohne Verbrauch des
+Speicherbudgets. Die frisch gemessene Netzboxleistung wird genau einmal vom Gesamtbudget
+abgezogen. Bei unbekannter oder mehr als 15 Sekunden alter Netzboxmessung
+erhalten Akkuboxen höchstens den PV-Teil. Der PV-Rahmen bleibt unverändert.
+Akkuboxen teilen zuerst das so bereinigte Gesamtbudget; PV-Boxen bekommen
+den PV-Rest nach diesen Anteilen. Innerhalb einer Quelle gilt die eingestellte
+Verteilpriorität. Reicht der Anteil nur für eine bereits ladende Box, behält
+die Vorrangbox, sonst die länger ladende Sitzung ihren Anteil. Ein Rest unter
+der Mindestleistung geht an den nächsten geeigneten Ladepunkt.
 
-Gemessene Phasen gelten auch dann, wenn das Schaltziel noch unbekannt ist.
-Ein ungültiger Ladepunkt erhält keine Phasenfreigabe; gültige andere Punkte
-werden weiterhin einzeln gegen ihren Anteil geprüft. Eine neue Stecksession
-beginnt mit einer eigenen Startlease. Die Fortführung einer Umschaltung und
-die Freigabe ihrer alten Last bleiben an dieselbe Session und Transaktion gebunden.
+Der elektrische Zuteiler prüft danach Geräte- und Fahrzeuggrenzen,
+Phasenlage und Hausanschluss je Phase. Im 10-Sekunden-Takt folgt der Strom
+direkt dem Anteil, abwärts auf das Geräteraster gerundet. Ein Totband von 1 A
+verhindert Änderungen bei kleinen Budgetschwankungen; es gibt keine
+Anhebungstreppe und keine zusätzliche Bestätigungszeit.
 
-Die bestehende 600-s-Prognosebeobachtung vor dem Abstieg und die mindestens
-480-s-Sperre nach einem Pro-Phasenwechsel bleiben getrennte Schutzzeiten.
-Der Nutzen ist der gedeckte Wiederanlauf nach dem regulären Wechsel; ein
-früherer Abstieg wird daraus nicht abgeleitet. CP-Folge und frischer Zielreadback
-bleiben Voraussetzung, auch nach einem Neustart.
+Ein PV- oder Akkustart braucht 60 Sekunden ausreichenden Anteil; eine freigegebene Netzquelle startet ohne diese Wartezeit. Kurze Unterdeckung führt
+zum Mindeststrom, solange Stützung autorisiert ist: bei „PV-Kurve ruhig“ nur
+aus dem Wolken-Kontingent, bei „Grundladung stabil“ nur solange die bestehende
+Grundladungsbedingung gilt, bei Akkubetriebsarten nur oberhalb der Untergrenze.
+Haltestützung erlaubt keinen Start aus fehlender Quelle. Nach drei Minuten
+Unterdeckung und mindestens fünf Minuten Ladung endet die Sitzung regulär;
+danach benötigt ein neuer PV- oder Akkustart erneut 60 Sekunden ausreichenden Anteil. Diese Unterdeckungsregel gilt
+auch ohne Stützungsfreigabe. Nutzer-Aus und Schutzstopps wirken sofort.
 
-Je Ladepunkt enthält die vorhandene RAM-Diagnose `fine_regulation`: Dauer und
-Export-Wh bei 3p/0 A mit gedeckter 1p-Fortsetzung, individuellen Anteil,
-Mindestangebot, Freigabegrund, Phasenbeleg mit Frist und Herkunft des letzten
-Stromausgangs. `openwb_pro_curve_direct_active` zeigt die Policyfreigabe;
-`direct_path_entered` und der Ausgangsbeleg zeigen den tatsächlich genutzten
-Pfad. Fehlende Quellen stehen als `null` mit Grund in der Diagnose.
+Die Netzbremse zählt nur unerlaubten Bezug: Netzpunkt minus frisch gemessene
+Leistung der Netzboxen. Fehlt eine Messung oder ist sie älter als 15 Sekunden,
+gilt der rohe Netzwert. Zwei Regeltakte über 300 W senken den Strom ab.
+Die ersten 20 Sekunden nach Start, Anhebung oder Phasenwechsel einer Netzbox
+zählen für die anderen Boxen nicht als Bezugstakt; nach eigener Anhebung gilt
+dieselbe Frist. Netzboxen selbst haben keine Netzbremse. Nach einer Korrektur
+braucht eine erneute Anhebung 30 Sekunden Beruhigung unter 300 W.
+
+Die Regelung wählt die Phasen aller Ladepunkte gemeinsam. Je Netzphase darf
+die Summe der Wallboxströme höchstens Hausanschluss minus Wallbox-Reserve
+betragen: 50 A mit 10 A Reserve ergeben 40 A. Die Hauslast wird zusätzlich
+am Netzpunkt berücksichtigt: Erst werden die gemessenen Boxleistungen
+abgezogen, danach erhält ausschließlich die verbleibende Hauslast die
+Marge über den Leistungsfaktor. Für den Hausanschluss zählen ausschließlich die drei frischen, gültigen Phasenwerte des E3DC-Leistungsmessers. Darin sind Haus, Akku, Wärmepumpe und Wallboxen bereits enthalten. Die eigenen gemessenen Wallboxanteile werden genau einmal abgezogen; auf die verbleibende Last wirkt die Leistungsfaktormarge. Die Reserve begrenzt nur die Wallboxsumme: Der Rahmen ist der kleinere Wert aus Anschluss minus Reserve minus unbekannten Boxanteilen und Anschluss minus positiver gehaltener Hauslast. Die eingetragene Netzphase gilt wie eingetragen; eine abweichende Messung erscheint als Hinweis. Netzwert und Phasensumme werden für diesen Rahmen nicht gegeneinander geprüft.
+
+Ohne gültige Phasenwerte warten neue Starts, Sofortladen, Fortsetzen und Phasenwechsel. Eine laufende Ladung nutzt während der vorhandenen Datenfrist den letzten gemessenen Hauswert unverändert und hält sofort Mindeststrom; nach 300 Sekunden endet sie. Nach dem Nullsetzen einer Phasenfolge bleibt die Box ohne gültige Phasenwerte auf 0 A. Elektrische Grenzen und Nutzerstopps wirken weiterhin sofort. Falsche, aber frische und gültige Zählerwerte oder eine falsch eingetragene Netzphase können zu einer dauerhaften Überschreitung führen. Ein fremder Lastsprung in der Datenlücke bleibt bis zum Fristende unbemerkt.
+
+Meldet eine Wallbox keine Phasenströme, rechnet E3DC-Control ihren Strom aus der gemessenen Leistung mit derselben Sicherheitsmarge wie die übrige Hauslast. Die Stromschätzung gilt für U·cos φ ≥ 207 V (Spannung mal Leistungsfaktor, bei Marge 0,9). Wallboxen ohne eigene Phasenstrommessung behalten auch mit eingetragener Netzphase diesen Abstand. Derselbe Abstand gilt bereits bei der Verteilung des Zielstroms, damit der verfügbare Raum beim Start gleich bleibt. Steigt eine andere Last im Haus sprunghaft,
+regelt E3DC-Control die Wallbox im nächsten Regeltakt herunter; für diesen
+einen Takt kann der Netzstrom über dem eingestellten Hausanschluss liegen.
+Mit `f` als Leistungsfaktor-Marge gilt je Phase:
+`Haus = (Netzwirkleistung − eigene Boxwirkleistung) / (230 V × f)` und
+`Rahmen = min(Hausanschluss − Reserve − U, Hausanschluss − max(0, Haus))`.
+`U` ist der Hardwarehöchststrom veralteter Boxen, deren Leistung im Hauswert
+bleibt. Bis zur Stromquittung bleibt der höhere Hauswert erhalten.
+Ist die Netzphase einer ein- oder zweiphasig ladenden Wallbox nicht
+eingetragen, rechnet E3DC-Control ihren Strom mit Sicherheitsabstand:
+Die elektrische Belegung beträgt Zielstrom geteilt durch `f` auf allen
+möglichen Phasen. Sobald eine Phase die Grenze erreicht, wird die Box
+abgesenkt. Mit eingetragener Netzphase wird nur die Wallbox auf der
+betroffenen Phase abgesenkt; mit eigener Phasenstrommessung werden Sicherung und Hausanschluss voll genutzt.
+Bei 40 A zulässiger Boxsumme bleiben für eine unbekannte Box mit `f = 0,9`
+höchstens 36 A. Auf dem Dashboard und auf der Seite „Wallbox“
+erscheint bei fehlender Netzphase ein Hinweis mit dem Feldnamen im
+Config-Editor. Der Hinweis verschwindet, sobald die Zuordnung eingetragen
+ist oder die Box nicht mehr ein- oder zweiphasig lädt.
+Ein neues Aufstiegsziel muss 60 Sekunden, ein Abstiegsziel 60 Sekunden
+bestehen; nach einem Wechsel gelten mindestens 480 Sekunden Sperre.
+Laden zwei Boxen einphasig auf derselben oder einer unbekannten Netzphase,
+teilen sie deren Leistung entsprechend dem eingestellten Vorrang. Bei
+bekannter gleicher Netzphase beschreibt die Meldung diese Aufteilung.
+
+Auch eine auf 16 A begrenzte Wallbox kann bei ausreichendem dreiphasigem
+Anteil aufsteigen. Die vorhandenen Gerätesequenzen, Reservierungen und
+frischen Rücklesebelege bleiben verbindlich. Nutzer-Aus, Notstromreserve,
+Hausanschluss, Datenvalidität und sichere Hardwarekommandos haben Vorrang.
+Eine native Stoppflanke braucht den frischen Zustand „nicht abgebrochen“. Fehlt das Bit, gilt der einmalige Rückfall mit frischem Ladebeleg. Im Fehlerzustand „Box reagiert nicht auf den Stopp“ erhalten Pause, Ladepunktsperre, Not-Aus, Notstromreserve und Hausanschluss gemeinsam genau eine zusätzliche Stoppflanke: frühestens 60 Sekunden nach dem letzten Stoppversuch, bei frischer Probe mit „nicht abgebrochen“ oder unbekanntem Bit und nur mit frischem Ladebeleg. Die Fehleranzeige erscheint ab Fehlerbeginn. Die zusätzliche Einmalflanke ist höchstens einmal je Stecksession und Dienstlauf zulässig; ist sie verbraucht oder für den Stoppgrund nicht berechtigt, bittet die Oberfläche, den Ladepunkt zu prüfen. Nach einem Neustart des Dienstes steht sie einmal neu zur Verfügung. Eine Stecksession endet erst mit bestätigtem Abstecken: mindestens drei aufeinanderfolgende frische Proben ohne gestecktes Fahrzeug über mindestens zehn Sekunden. Insgesamt sind höchstens drei Versuche je Ereignis zulässig; eine bereits verbrauchte Einmalflanke wird durch einen späteren Nutzer-Stopp nicht erneuert.
+
+„Beobachten“, reine Messquellen und extern geführte openWB-Primary-PV-Rollen
+erhalten keine Start- oder Strombefehle. Pause, Sperre und Not-Aus bleiben
+auch dort wirksam. Die Primary-Direktregelung verwendet denselben Kern.
+
+Fehlt nur der gültige PV-Teil, halten PV-Boxen höchstens den Mindeststrom,
+ohne Start oder Anhebung; Akkuboxen nutzen das gültige Gesamtbudget weiter.
+Veraltetes Gesamtbudget führt zum Mindeststrom, nach 45 Sekunden zum Stopp.
+Bei ungültigen Livewerten gelten zunächst zehn Sekunden Halt, danach
+Mindeststrom und nach fünf Minuten ein Stopp über den bestehenden Befehlsweg.
+
+„Sofort bis Preislimit“ startet im freigegebenen Netzfenster ohne Wartezeit. Das Ende des
+Netzfensters stoppt im ersten Zyklus. Ein späterer Start mit anderer freigegebener Quelle benötigt erneut 60 Sekunden ausreichenden Anteil.
+„Akku bis Abfahrt“ startet nur im Abfahrtsfenster, stoppt am Fensterende,
+zur Abfahrtszeit und bei erreichtem Fahrzeugziel. An der Hausakku-Untergrenze
+kann es mit ausreichendem PV-Anteil weiterladen. Die Speicherentscheidung bei
+Netzladung bleibt bestehen: Ein freigegebener Preis-/Slot-Halt kann die
+Entladung sperren; AUTO-Freilauf allein garantiert keine Entladesperre.
+
+Auf der Seite „Wallbox“, auch in der mobilen Ansicht, steht je Ladepunkt der Entscheidungssatz
+mit Anteil, Strom, Phasen und Wartegrund. Bleibt nach einem Start das Fahrzeug
+aus, nennt der Satz dies spätestens nach 30 Sekunden; es wird kein weiterer
+Start allein wegen des ausbleibenden Ladebeginns gesendet. Beginnt das Fahrzeug
+später selbst zu laden, übernimmt der Kern die laufende Sitzung.
+Die Diagnosefelder `simple_core_grid_corrections_1h` und
+`simple_core_grid_import_wh_1h` zeigen die letzte Stunde seit Managerstart.
+Ungültige Messungen und Lücken über 15 Sekunden werden ausgelassen.
+Simulationen ersetzen keinen Feldnachweis der konkreten Geräte und Fahrzeuge.
+
+Der Kaltstart im freien AUTO-Betrieb nimmt Überschuss während der
+60-Sekunden-Startqualifizierung im Speicher auf. Im Kurvenladezustand bleibt
+die gewollte Kurven-Ladegrenze wirksam: Bei 5 kW Überschuss wurden bis zum
+Ladebeginn rund 89 Wh Export gemessen. Die Grenze von 20 Wh gilt für freien
+AUTO-Betrieb; sie ist für Kurvenladung keine Zusage.
+
+
+### Speicherentladung während des Wallbox-Netzladens
+
+Unterhalb der Hausakku-Untergrenze der Wallbox bleibt die Entladung für das
+Fahrzeug begrenzt. Der Speicher darf weiterhin das gemessene Haus- und
+Wärmepumpendefizit decken. Externe Wallboxen sind bereits im Hausverbrauch
+enthalten; ihre Leistung wird für diese Grenze genau einmal herausgerechnet.
+Bei fehlender Wallbox-Messung und zuletzt eingestecktem oder ladendem Fahrzeug
+gilt die vorhandene Messlückenregel: Die Grenze
+beträgt höchstens die zuletzt belegte Haus-/WP-Grenze oder die konfigurierte
+Hausgrundlast plus Wärmepumpe, je nachdem, welcher Wert größer ist. Der letzte
+Beleg gilt dabei 600 Sekunden; danach bleibt die Grundlast mit Wärmepumpe.
+Die konfigurierte maximale Entladeleistung begrenzt auch diesen Ersatzwert.
+In Budgets und Bilanzen bleibt der gemessene Hausverbrauch einschließlich
+unbekannter Verbraucher erhalten.
+
+Während eine Wallbox unterhalb der Hausakku-Untergrenze aus dem Netz lädt,
+bleibt die Wallbox-Entladegrenze vor einem Markt-Netzladeauftrag wirksam.
+
+Ohne Fahrzeug beeinflusst eine ausgefallene Wallbox die Speicherregelung nicht.
+Bei der openWB Pro belegt der fortschreitende Quellenzeitstempel die Frische.
+Fehlt er bei älterer Firmware, gilt der erfolgreiche Abruf als Frischebeleg.
+Jeder Leser behält seine engere Altersgrenze; im Speicherpfad sind es 30 Sekunden.
+Ein Uhrversatz zur Steuerung entwertet die Messung nicht. Bleibt die Box-Uhr
+über die vorhandene Datenfrist stehen oder läuft sie rückwärts, erscheint
+die Messung als ungültig. Angezeigter Angebotsstrom ist die Rücklesung der
+Wallbox; ein gesendeter Sollstrom bestätigt weder seine Übernahme noch die
+physische Ladeleistung des Fahrzeugs.

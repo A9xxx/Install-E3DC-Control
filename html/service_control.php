@@ -54,7 +54,6 @@ $fallback_allowed_services = [
     "e3dc-weather-manager.service" => ["name" => "PV-Prognose und ML", "group" => "core", "desc" => "Bezieht tagesaktuelle Solardaten und berechnet den Vorhersage-Algorithmus inkl. ML-Modell."],
     "e3dc-storage-simulator.service" => ["name" => "Storage Simulator", "group" => "core", "desc" => "Plant vorausschauend Speicher-Entladungen basierend auf Preisen und dynamischen Prognosen."],
     "e3dc-storage-manager.service" => ["name" => "Storage Manager", "group" => "core", "desc" => "Erzwingt Lade/Entlade-Korridore auf E3DC-Ebene (V4 Brain Limiter)."],
-    "e3dc-websocket.service" => ["name" => "WebUI Live-Animationen", "group" => "core", "desc" => "WebSocket-Pflichtdienst; die Weboberfläche nutzt derzeit HTTP-Abfragen und verwendet ihn noch nicht."],
 
     "e3dc-wallbox-manager.service" => ["name" => "Wallbox Manager", "group" => "consumers", "desc" => "Native Ladungssteuerung für externe Wallboxen inkl. Phasenanschluss-Regelung."],
     "energy_manager.service" => ["name" => "Wärmepumpe Manager", "group" => "consumers", "desc" => "PV-Boost und smarte Überschuss-Verschiebung für SG-Ready Wärmepumpen."],
@@ -81,7 +80,6 @@ $fallback_core_locked = [
     "e3dc-storage-simulator.service",
     "e3dc-storage-manager.service",
     "e3dc-notifier.service",
-    "e3dc-websocket.service",
 ];
 foreach ($fallback_allowed_services as $fallback_unit => &$fallback_info) {
     $fallback_info['optional'] = !in_array($fallback_unit, $fallback_core_locked, true);
@@ -133,12 +131,11 @@ if (!empty($catalog_control['alive'])) {
 
 // Mapping: Service-Name -> [Python-Skript relativ zu /app/pi/Install/Installer, Log-Datei]
 $docker_service_map = [
-    "e3dc-live.service"              => ["e3dc_live.py --write --loops 0 --interval 3", "e3dc_live.log"],
+    "e3dc-live.service"              => ["e3dc_live.py --write --loops 0 --interval 2", "e3dc_live.log"],
     "e3dc-epex-manager.service"      => ["epex_manager.py",                             "epex_manager.log"],
     "e3dc-weather-manager.service"   => ["Forecast/pv_forecast_service.py",             "pv_forecast.log"],
     "e3dc-storage-simulator.service" => ["storage_simulator.py",                        "storage_simulator.log"],
     "e3dc-storage-manager.service"   => ["storage_manager.py",                          "storage_manager.log"],
-    "e3dc-websocket.service"         => ["e3dc_websocket.py",                           "e3dc_websocket.log"],
     "e3dc-wallbox-manager.service"   => ["wallbox_manager.py",                          "wallbox_manager.log"],
     "energy_manager.service"         => ["luxtronik/energy_manager.py",                 "energy_manager.log"],
     "e3dc-lux-live.service"          => ["luxtronik/lux_live.py",                       "lux_live.log"],

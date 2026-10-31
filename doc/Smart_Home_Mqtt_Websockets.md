@@ -1,4 +1,4 @@
-# E3DC-Control: Smart Home MQTT & WebSocket Architektur
+# E3DC-Control: Smart Home und MQTT
 
 E3DC-Control nutzt für Web, MQTT und externe Automationen eine entkoppelte RAM-Disk-Schnittstelle. Die nativen Python-Dienste halten RSCP, Web, MQTT und Regelung getrennt, damit Netzwerkprobleme nicht direkt die Speicher- oder Wallboxregelung blockieren.
 
@@ -9,35 +9,13 @@ Der Schreibvorgang erfolgt **atomar** (durch Schreiben in eine `.tmp` Datei und 
 
 ---
 
-## 2. Echtzeit-Dashboard (WebSockets)
-Das Webportal liest Änderungen derzeit über regelmäßige HTTP-Abfragen. Der
-WebSocket-Dienst ist installiert; die Weboberfläche nutzt ihn derzeit nicht.
+## 2. Live-Daten und externe Automationen
 
-Der bisherige E3DC-WebSocket-Dienst wird mit Version 5.5.6 entfernt. Für
-externe Smart-Home-Anbindungen steht der MQTT-Hub mit den dokumentierten
-Topics zur Verfügung; das Webportal nutzt weiterhin HTTP-Abfragen. Die
-Luxtronik-Anbindung bleibt unverändert.
-
-### Der WebSocket Daemon (`e3dc_websocket.py`)
-Dieser Python-Dienst (als Systemd `e3dc-websocket.service` eingerichtet) wartet
-ausschließlich auf der lokalen Loopback-Adresse `127.0.0.1:8765`. Browser
-greifen weder bei einer nativen Installation noch im Docker-Betrieb direkt auf
-diesen internen Port zu. Der Dienst ist als Pflichtdienst installiert; die
-Weboberfläche nutzt ihn derzeit nicht und aktualisiert ihre Daten durch
-regelmäßige HTTP-Abfragen.
-
-### Apache Reverse Proxy (Der Cloudflare-Trick)
-Da moderne Webbrowser unsichere Verbindungen (`ws://`) blockieren, wenn die
-Webseite über SSL (`https://`, z. B. via Cloudflare Tunnel) geladen wird,
-konfiguriert der Installer den Apache-Webserver automatisch als Reverse Proxy.
-
-Für WebSocket-Clients steht am gleichen Host und Port wie das Dashboard der
-Pfad `/ws` bereit. Apache tunnelt diesen Verkehr intern an `127.0.0.1:8765` weiter. Damit
-bleibt der Python-Port selbst im LAN geschlossen; TLS und die externe
-Erreichbarkeit enden am Webserver.
-
-**Installation:**
-Der Dienst wird über Hauptmenü **1) Installation / Update** eingerichtet und aktiviert.
+Der E3DC-WebSocket-Dienst ist seit 5.5.6 entfernt. Ersatz ist MQTT über den
+[MQTT-Hub](#3-smart-home-integration-mqtt-hub). Bestehende externe Anwendungen
+müssen auf die dort beschriebenen MQTT-Topics umgestellt werden.
+Das Webportal verwendet weiterhin regelmäßige HTTP-Abfragen.
+Der Luxtronik-WebSocket-Client für Wärmepumpen bleibt unverändert erhalten.
 
 ---
 

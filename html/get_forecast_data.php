@@ -2119,6 +2119,20 @@ function forecastDirectMarketingPlannedChargeW($state) {
         : 0.0;
 }
 
+function forecastStandardSocForDisplay($soc, $slot, $startSoc = null) {
+    // Ausschließlich die Grafik begrenzen; kanonischer Plan bleibt unverändert.
+    $socContract = is_array($slot['soc_pct'] ?? null) ? $slot['soc_pct'] : [];
+    $floor = $socContract['notstrom_floor'] ?? null;
+    if ($soc !== null && (is_int($floor) || is_float($floor)) && is_finite((float)$floor)
+        && $floor >= 0 && $floor <= 100
+        && ($socContract['notstrom_floor_source'] ?? null) === 'physical_reserve_soc'
+        && ($socContract['notstrom_floor_hardness'] ?? null) === 'hard') {
+        if ((is_int($startSoc) || is_float($startSoc)) && is_finite((float)$startSoc)) $floor = min($floor, $startSoc);
+        $soc = max($soc, $floor);
+    }
+    return $soc;
+}
+
 function forecastLegacyStorageProjection($slot) {
     if (!is_array($slot)) return null;
     $pvW = isset($slot['pv_w']) ? (float)$slot['pv_w'] : null;
@@ -4149,6 +4163,7 @@ foreach ($merged as $key => &$row) {
     $st_soc_val = is_array($storageProjection)
         ? ($storageProjection['soc_start_pct'] ?? $storageProjection['soc_pct'] ?? $fallback_soc)
         : $fallback_soc;
+    $st_soc_val = forecastStandardSocForDisplay($st_soc_val, $canonicalSlot, $storagePlanMeta['slots'][0]['soc_pct']['start'] ?? null);
     $grid = is_array($storageProjection) && array_key_exists('grid_w', $storageProjection)
         ? $storageProjection['grid_w']
         : null;

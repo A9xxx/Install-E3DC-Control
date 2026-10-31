@@ -1353,6 +1353,7 @@ function installCenterBackupObservationProjection($value) {
         'backup_grid_price_missing_or_invalid', 'backup_timezone_invalid', 'backup_capacity_energy_or_limits_unknown',
         'pv_forecast_age_unknown_or_stale', 'load_forecast_age_unknown_or_stale', 'forecast_missing_or_invalid',
         'forecast_horizon_gap', 'pv_forecast_value_or_provenance_invalid', 'load_forecast_value_invalid',
+        'backup_observation_stale_or_unknown', 'pv_topology_coupling_missing',
         'chargeable_forecast_unbound', 'chargeable_forecast_unknown', 'chargeable_dc_forecast_unknown',
         'forecast_source_revision_invalid', 'pv_forecast_issue_mismatch'];
     $out['reason'] = in_array($value['reason'] ?? '', $reasons, true) ? $value['reason'] : 'unknown';

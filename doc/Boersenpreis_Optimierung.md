@@ -103,9 +103,9 @@ Preisfenster berücksichtigen, wenn alle Bedingungen passen:
 Bei Tariftypen mit festem Zeitfenster (z. B. Octopus Heat) ist das konfigurierte
 Tarifzeitfenster die Regelgröße, nicht der Börsenpreis. Ein preisbasierter
 Netzladevertrag des Speichers gilt bis zum Ende des günstigen Fensters, nicht
-nur bis zum Ende des laufenden 15-Minuten-Slots. Vor dem berechneten spätesten
-Ladestart bleibt der Speicher entladegesperrt und nimmt PV-Überschuss auf;
-Netzladen trotz Einspeisung beginnt erst ab diesem Zeitpunkt. Ist das Ziel
+nur bis zum Ende des laufenden 15-Minuten-Slots. Über die gewählten günstigen
+Slots verteilt der Speicher die nötige Energie gleichmäßig. PV-Überschuss
+lädt ungedrosselt; das Netz ergänzt bei Bedarf die sanfte Laderate. Ist das Ziel
 erreicht (Hysterese 1 SoC-Punkt, `market_target_hysteresis_pct`; kleinere Werte
 werden auf 1 angehoben), wird im selben Fenster nicht erneut aus dem Netz
 geladen: Der Speicher bleibt bis zum Fensterende entladegesperrt, PV lädt
@@ -116,32 +116,53 @@ freigegeben. Die Wärmepumpe gibt der normale Marktpfad nicht frei; sie
 behält ihre Prognose-, PV- und Pre-Dump-Führung mit Taktschutz. Nur der
 Negativpreis-Boost (Abschnitt 2) kann sie gesondert freigeben.
 
+Beim Halten werden nachweisbare Nachladungen in günstigen Preisfenstern
+berücksichtigt, sobald sie nach Wirkungsgrad, Akkukosten und Sicherheitskorrektur
+einschließlich Mindestabstand und Mindestmarge günstiger sind als der aktuelle
+Bezug. Der Speicher wird dann nur so lange gehalten, bis Bestand und rechtzeitig
+nachweisbares Nachladen den teuren Bedarf decken. Das gilt auch für die Profile
+„Wirtschaftlich“ und „Ausgeglichen“ bei Börsentarifen mit Preisunterschieden sowie
+für „Komfort“. Der Teil eines Netzladeauftrags, der den Puffer lädt, zählt nicht
+als Nachladen; im Komfort gibt es keinen Puffer. Beispiel: Bei 85 % Wirkungsgrad,
+4 ct/kWh Akkukosten und 24,91 ct/kWh im günstigen Fenster kostet nachgeladene
+Energie rund 33,3 ct/kWh; liegt der aktuelle Bezugspreis darunter, wird das
+Nachladen nicht angerechnet. Eine negative Sicherheitskorrektur senkt diese
+Ersatzkosten rechnerisch und kann Umladen auch dann auslösen, wenn es tatsächlich
+teurer ist. Ein Prognosefehler vor dem ersten Nachladen ist nicht abgedeckt. Wird
+ein eingeplantes Nachladen nicht ausgeführt, etwa weil E3DC-Control oder die
+Verbindung zum E3DC ausfällt, fehlt dieser Ersatz, und in teuren Stunden kann
+Netzbezug entstehen.
+
 Der Netzladebedarf wird zeitgerichtet bestimmt: Er reicht nur bis zum nächsten
 nutzbaren günstigen Preisfenster (gleicher Tarifpreis oder höchstens um die
 Mindestmarge teurer); was dieses Fenster physisch liefern kann, wird
 angerechnet. Die für das laufende Fenster erwartete PV-Erzeugung wird zuerst
 berücksichtigt; aus dem Netz wird nur der Rest geladen, der zum Fensterende
-noch fehlt, gedeckelt auf den freien Raum bis zum Ladeziel. Das Netzladen liegt
-deshalb am Ende des Fensters; nach dem spätesten Ladestart wird es auch dann
-ausgeführt, wenn PV den Speicher gerade lädt (der PV-Überschuss fließt weiter in
-den Speicher). Ladeziel und Netzladejob leiten sich aus dem Sollbestand am
+noch fehlt, gedeckelt auf den freien Raum bis zum Ladeziel. Das Netzladen
+verteilt sich über das gewählte Fenster, mit einem Ziel etwa 30 Minuten vor
+Fensterende. PV deckt die Laderate zuerst; überschreitet der Überschuss die
+Rate, lädt PV den Speicher im Automatikmodus ungedrosselt. Ladeziel und
+Netzladejob leiten sich aus dem Sollbestand am
 Fensterende ab: dem Bedarf bis zum nächsten nutzbaren Fenster zuzüglich der
 Puffer. Beide bleiben während des Fensters stabil, auch wenn der Speicher
 zwischenzeitlich aus PV oder Netz lädt; deckt der erwartete Bestand den
 Sollbestand, wird nicht aus dem Netz geladen. Während des laufenden Fensters
 wird die Hauslast nicht vom Speicherbestand abgezogen, weil der Speicher dort
-nicht entlädt. Für die Ladedauer wird die tatsächlich beobachtete Ladeleistung
-des Speichers verwendet, falls sie unter der konfigurierten liegt. Eine Messung
-zählt erst, wenn der Netzladebefehl mit gleichem Sollwert schon
-mindestens eine Minute ansteht (der erste Zyklus nach einer Umschaltung zeigt
-noch die PV-Ladung oder die Anlauframpe); eine höhere gelieferte Leistung hebt
-den Wert sofort an (höchstens bis zur konfigurierten Ladeleistung), abgesenkt
-wird er nur aus Messungen an der Ladegrenze oder bei Unterlieferung; er verfällt
-nach sieben Tagen. Begrenzt der beobachtete Wert die Planung, fordert die
-Regelung während des Netzladens einmal je Viertelstunde für rund eine Minute die
-konfigurierte Ladeleistung an (Anhebeprobe); nimmt der Speicher dann wieder mehr
-auf, steigt der Wert sofort, sonst bleibt er. Hausanschluss- und Ladegrenzen
-gelten dabei unverändert. Es zählt nur die Fehlmenge, deren späterer Bezugspreis
+nicht entlädt. Für die Ladedauer wird die gemessene Ladeleistung je Ladezustand verwendet.
+Eine Messung zählt erst nach einer Minute mit gleichem Netzladebefehl und
+weniger als 200 W PV-Leistung. Voll angenommene sanfte Laderaten senken die
+Prognose nicht; Unterlieferung und Raten ab der bisherigen Prognose liefern
+neue Erkenntnisse über die Ladefähigkeit. Die gelernte Ladeleistung bleibt
+bei einem Neustart des Dienstes erhalten und verfällt nach sieben Tagen.
+Nach einem Neustart des Geräts beginnt die Prognose wieder mit den Startwerten. Im günstigen Fenster lädt der Speicher gleichmäßig mit der
+nötigen Leistung und erreicht das Ziel etwa 30 Minuten vor Fensterende. Bei
+Fenstern unter einer Stunde bleibt die halbe verfügbare Zeit als Puffer.
+Die Planung lernt die tatsächliche Ladeleistung je Ladezustand, auch die
+Drosselung des Speichers kurz vor voll. Liegt das Laden zurück, steigt die
+Leistung bis zur Gerätegrenze. PV-Überschuss wird nie gedrosselt; vor dem
+Netzladestart bleibt die Entladung für den Hochtarif zurückgehalten.
+Gerätegrenze, „Max. Laden“, Hausanschluss und die übrigen harten Grenzen bleiben
+wirksam. Es zählt nur die Fehlmenge, deren späterer Bezugspreis
 mindestens die effektiven Ladekosten erreicht (mittlerer Preis des Fensters
 durch Wirkungsgrad plus Akkukosten plus Sicherheitskorrektur); als günstiges
 Folgefenster gelten nur vom Ladeprofil erkannte, ausführbare Ladefenster, deren
@@ -158,7 +179,9 @@ geplante spätere Netzladung werden getrennt ausgewiesen; ein bereits höherer
 Ladezustand verschiebt dadurch nicht das Ziel. Ein frisch nachgewiesener,
 laufender Auftrag darf im selben Fenster auch unter dem Startminimum bis zum
 Ziel weiterlaufen, spätestens bis zum Fensterende. Die Sicherheitszeit wird
-für neue Starts und für die Zukunftsgutschrift abgezogen. Dieser mittlere Preis wird beim
+für neue Starts und für die Zukunftsgutschrift abgezogen. Sie begrenzt die
+als lieferbar angerechnete Energie zusätzlich zum Zielpuffer von 30 Minuten;
+die Zeitabstände werden für die Zielzeit nicht addiert. Dieser mittlere Preis wird beim
 ersten Plan im Fenster über alle zusammenhängenden Fensterslots gebildet und
 bis zum Fensterende beibehalten; er wandert bei Börsentarifen nicht mit den
 ablaufenden Slots, sodass Ladeziel und Netzladejob im Fenster stabil bleiben.
@@ -189,7 +212,11 @@ ihre eigene Klassifikation. Die Entscheidungsvorschau liest beim Spezialtarif
 den Tagesplan; leere Preisfelder gelten als nicht gesetzt. Alle Zwischenstufen
 werden in der Vorschau einzeln bewertet. Ungültige Spezialtarif-Zeitpreise
 oder fehlende Octopus-Pflichtpreise erzeugen eine beratende Warnung beim
-betroffenen Feld; die Eingaben bleiben erhalten. Im Komfortprofil beendet
+betroffenen Feld; die Eingaben bleiben erhalten. Bei negativen Börsenpreisen
+bildet die Entscheidungsvorschau die Regelung nur näherungsweise ab und weist
+im Vorschauzeitraum darauf hin; der gesonderte Negativpreis-Boost ist nicht
+enthalten. Für eine Tarifart, die der Marktpfad nicht unterstützt, zeigt sie
+keine Entscheidung. Im Komfortprofil beendet
 jeder Preiswechsel das bisherige Tarifsegment, auch wenn die nächste Stufe
 noch unter dem Preislimit liegt. Dort wird ein eigener Ladejob mit neuem
 Fensterende und eigenem Referenzpreis berechnet; das Komfortziel bleibt gleich.
@@ -199,6 +226,10 @@ Marktobergrenze begrenzt eine frische Geräte-, BMS- oder eingestellte Nutzergre
 nur nach oben. Die Mindestmarge wird am gewichteten Nutzen der tatsächlich
 versorgten Defizitslots geprüft; ein einzelner Spitzenpreis reicht nicht.
 Ein reiner Zielpuffer ohne belegten Mengennutzen eröffnet keinen neuen Auftrag.
+Die Preisplanung bewertet die Frische des Livebilds und seiner Gerätegrenzen
+zum Lesezeitpunkt. Ihre anschließende Rechenzeit zählt nicht zum Messalter;
+bereits beim Lesen veraltete oder ungültige Proben geben keine Netzladung frei.
+Die bestehenden Altersgrenzen und die Toleranz für Uhrabweichungen bleiben gleich.
 Frisch nachgewiesene laufende Aufträge behalten ihren Fortsetzungsvertrag.
 Schließt die Mengenprüfung einen Rest nach bereits erfolgter Netzladung, bleibt
 der Speicher im selben Fenster gehalten; daraus entsteht kein neuer Start.
@@ -275,9 +306,9 @@ Wirksame Schlüssel:
 | `market_safety_correction_ct_per_kwh` | Sicherheitskorrektur (vom Profil gesetzt, frei bei Eigene Einstellungen) |
 | `market_autarky_horizon_buffer_wh` | Prognosepuffer im Sollbestand am Fensterende und in der Autarkieprüfung (Standard 500 Wh) |
 | `market_target_hysteresis_pct` | Zielhysterese, mindestens 1 SoC-Punkt |
-| `market_late_fill_safety_min` | Sicherheitsabstand vor dem Fensterende (Standard 15 min) |
+| `market_late_fill_safety_min` | Zeitabzug für die lieferbare Energie neuer Jobs und die Zukunftsgutschrift (Standard 15 min), zusätzlich zum 30-min-Zielpuffer; verschiebt die Zielzeit nicht nochmals |
 | `market_late_fill_buffer_pct` | Puffer im Sollbestand am Fensterende, in Prozent der Speicherkapazität (Standard 3 %) |
-| `maximumladeleistung` / `market_battery_max_w` | konfigurierte Ladeleistung, in der Planung zusätzlich durch die beobachtete Ladeleistung gedeckelt |
+| `maximumladeleistung` / `market_battery_max_w` | Obergrenze für den Ladebefehl; die Planung berücksichtigt die gelernte Ladefähigkeit je Ladezustand und holt bei Bedarf bis zur Grenze auf |
 
 Netzladen wird also nicht durch den Morgenpuffer allein ausgelöst. Der
 Morgenpuffer ist eine PV-/Autonomiegröße. Netzladen bleibt ein eigener
@@ -335,15 +366,30 @@ Wenn ein System bei günstigem Preis nicht lädt, zuerst prüfen:
 4. Blockiert Pre-Dump, Notreserve, Abregelschutz oder ein manueller Zustand?
 5. Wird der aktuelle Nutzerpreis oder nur der Rohmarktpreis betrachtet?
 
-### Ende eines laufenden Markthalts
+### Übergang zum nächsten Marktplan
 
-Ein vollständig geprüfter Folgeplan kann die Entladesperre bewusst beenden; der
-Akku darf dann wieder das Haus versorgen. Ist der Plan vorübergehend nicht lesbar
-oder unvollständig, bleibt ausschließlich ein bereits gültiger Vollslot-Markthalt
-bis zum fest erwarteten nächsten Plan plus 20 Sekunden Übergangsfrist bestehen,
-höchstens 15 Minuten ab dem ersten ungeklärten Übergang. Wiederholte Fehler
-verlängern diese Frist nicht. Danach wird die Entladung mit einem benannten
-Ablaufgrund freigegeben. Anteilige Halteenden, Nutzer-Aus, Notstromreserve und
-andere vorrangige Regelungen wirken sofort. Ein Neustart nimmt eine alte
-Fehlerbrücke nicht wieder auf. Planqualität und tatsächlich aktive Steuerung
-werden getrennt angezeigt.
+Nach einem zuvor bestätigten aktiven Halte- oder Netzladevertrag gilt bei jeder
+Unterbrechung der Planquelle eine Karenz von höchstens 20 Sekunden ab dem ersten
+Befund. Das umfasst abgelaufene Slots, Neuplanung mitten im Slot, fehlende oder
+nicht lesbare Pläne, unvollständige oder ungebundene Planqualität und Schemafehler.
+Wiederholte Befunde verlängern die Frist nicht. Währenddessen erscheint
+„Folgeplan wird gelesen“. Aktuelle Messwerte, Netzladeziel, Nutzerfreigaben,
+Notstromreserve und bekannte vorrangige Regelungen wirken weiter. Entzogene
+Befugnisse aus Konfiguration und Zustand beenden die Karenz sofort; ein erst im
+nicht lesbaren Folgeplan erkennbarer Besitzerwechsel bleibt höchstens 20 Sekunden
+unsichtbar. Das gilt auch für einen Direktvermarkter-Besitz.
+Netzladeverträge und anteilige Halte enden an ihrem Vertragsende. Nur ein Halt mit
+auf Viertelstunden ausgerichtetem Beginn und Ende darf bis höchstens 20 Sekunden
+über sein Ende hinaus bestehen. Ein gültiger Folgeplan entscheidet sofort über
+Halten, Netzladen oder Freigabe.
+
+Bei Simulatorausfall bleibt ein noch gültiger Planslot zunächst gültig. Jede
+anschließende Planunterbrechung wird höchstens 20 Sekunden überbrückt. Nach einem
+Neustart gibt es keine Karenz aus einem früheren Vertrag. Planqualität und
+tatsächlich aktive Steuerung werden getrennt angezeigt.
+
+## Prognosegrafik
+
+Die Standard-SoC-Prognose rechnet ohne Halten und ohne Nachladen und endet an der wirksamen Notstromreserve. Liegt der gemessene Startwert bereits unter der Reserve, bleibt die Linie mindestens beim Startwert; eine Reserve-Rückgewinnung durch Netzladung wird hier nicht prognostiziert. Ist keine gültige Reserve im Plan enthalten, bleibt der prognostizierte Verlauf sichtbar.
+
+Die SoC-Prognose mit Marktplan übernimmt die vollständige gültige Halteplanung bis zur letzten geplanten Akkuentnahme. Haltefenster entstehen nur, solange tatsächlich Energie oberhalb der Reserve zurückgehalten wird. PV-Überschüsse laden wie im Standardverlauf; anschließend folgt die Prognose wieder dem Standardverlauf mit Reserveboden. Netzladen wird nur für einen ausgewählten Ladeauftrag berücksichtigt. Die Linie ist geplant, wird jede Viertelstunde neu bestätigt und ist keine Zusage eines durchgehenden Betriebszustands. Ohne gültige Halteplanung, oder wenn die Marktplanung das aktuelle Halten verworfen oder eine andere Aktion gewählt hat, gilt die bisherige Anzeige ausgewählter Marktaktionen.

@@ -310,6 +310,18 @@ class WallboxDiagnostics:
         enabled = str((config or {}).get("wallbox_decision_history_enable", 1)).strip().lower()
         if enabled in ("0", "false", "no", "off", "nein", "aus"):
             return
+        cores = (record.get("decision") or {}).get("core_wallboxes") or {}
+        core_paths = tuple(
+            "decision.core_wallboxes.%s.%s" % (cid, key)
+            for cid in sorted(cores) for key in ("state", "reason")
+        )
+        # Echte Kernwechsel sofort sichern, Messwertbewegungen nur im Grundtakt.
+        # Bei Mischbetrieb bleiben ausschließlich die kernlosen Boxen im Altpfad.
+        legacy_paths = tuple(
+            "decision.legacy_wallboxes.%s.%s" % (cid, key)
+            for cid in sorted((record.get("decision") or {}).get("legacy_wallboxes") or {})
+            for key in ("state", "reason")
+        )
         try:
             write_history_record(
                 record,
@@ -322,7 +334,7 @@ class WallboxDiagnostics:
                 retention_key="wallbox_decision_history_retention_days",
                 interval_key="wallbox_decision_history_interval_s",
                 state=self.history_state,
-                signature_paths=(
+                signature_paths=(core_paths + legacy_paths) if cores else (
                     "decision.state",
                     "decision.mode_public",
                     "decision.mode_control",
@@ -339,7 +351,7 @@ class WallboxDiagnostics:
                 ),
                 critical_signature_paths=(
                     "decision.critical_events",
-                ),
+                ) + core_paths,
                 summary_paths=(
                     "inputs.grid_w",
                     "inputs.bat_w",
@@ -369,6 +381,41 @@ class WallboxDiagnostics:
         wallboxes = _wallboxes_with_pm_hold_diagnostics(
             state.get("wb_details", []), context,
         )
+        # Nur Diagnose: den Anzeigegrund über cycle_wait hinweg erhalten,
+        # passend zum bereits im Kern gehaltenen letzten echten Satz.
+        previous = self.history_state.get("core_display_reasons", {})
+        cores = {}
+        legacy = {}
+        for box in wallboxes:
+            if not isinstance(box, dict):
+                continue
+            cid = str(box.get("id"))
+            if not box.get("simple_core_active"):
+                legacy[cid] = {"state": box.get("state"), "reason": box.get("state_reason")}
+                continue
+            reason = box.get("simple_core_reason")
+            if reason == "cycle_wait":
+                reason = previous.get(cid)
+            sentence = str(box.get("simple_core_sentence") or "")
+            for suffix in ("; Hauslast je Phase", "; Hauslast (ungünstigste Lage) je Phase", "; Haus inkl. Verbraucher je Phase", "; Boxquittung"):
+                sentence = sentence.split(suffix, 1)[0]
+            data = box.get("simple_core_data_diagnostics")
+            data = data if isinstance(data, dict) else {}
+            budget = _finite_diagnostic_number(data.get("share_w"))
+            # Erkannte Phasen und ein reservierter Phasenwechsel erklären Stopp oder Abstieg.
+            phases = box.get("phases_in_use")
+            transition = box.get("transition_state")
+            transition = transition if isinstance(transition, dict) else {}
+            cores[cid] = {
+                "state": box.get("simple_core_state"), "reason": reason,
+                "sentence": sentence.strip(), "budget_w": budget,
+                "budget_reason": None if budget is not None else "share_unavailable",
+                "source": data.get("source"),
+                "phases": phases if phases in (1, 2, 3) else None,
+                "phase_change": ({"state": transition.get("state"), "target_phases": transition.get("target_phases")}
+                                 if transition.get("active") is True else None),
+            }
+        self.history_state["core_display_reasons"] = {cid: box["reason"] for cid, box in cores.items()}
         record = {
             "ts": int(time.time()),
             "time": time.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -418,6 +465,10 @@ class WallboxDiagnostics:
                 "price_plan_storage_protect": bool(state.get("price_plan_storage_protect", False)),
             },
         }
+        if cores:
+            # decision bleibt auch in der verdichteten JSONL-Historie erhalten.
+            record["decision"]["core_wallboxes"] = cores
+            record["decision"]["legacy_wallboxes"] = legacy
         self.write_history(record, config)
         try:
             write_decision_surface_records(build_wallbox_decision_records(record), path=self.ems_path)

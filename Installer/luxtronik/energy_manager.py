@@ -2770,7 +2770,7 @@ class StiebelIsgSgReady:
             self._record_failure(exc, now_ts)
             return None, exc
 
-    def refresh_readback_if_due(self, now_ts=None, min_interval_s=None):
+    def refresh_readback_if_due(self, now_ts=None, min_interval_s=None, *, user_stop_runtime=None):
         """Liest die SG-Ready-Register periodisch und nimmt nur den eigenen Eingang zurück.
 
         Die Leserunde bewertet Start, Wiederkehr nach Verbindungsverlust,
@@ -2798,27 +2798,35 @@ class StiebelIsgSgReady:
         def observe(sock):
             snapshot = self._read_registers(sock)
             self._record_snapshot(snapshot, current_ts)
-            return self._reconcile(sock, snapshot, current_ts)
+            return self._reconcile(sock, snapshot, current_ts, user_stop_runtime=user_stop_runtime)
 
         self._run_io(observe, current_ts)
         return self.readback
 
-    def _release_reason(self, input1, input2, now_ts):
+    def _release_reason(self, input1, input2, now_ts, *, user_stop_runtime=None):
         """Grund, den eigenen gesetzten Eingang zurückzunehmen, sonst leer."""
 
         if not (self.owned and input1 == 1):
             return ""
-        if self.startup_reconcile_pending:
-            return "startup_own_input_reset"
-        if self.release_pending:
+        # Automatik-Aus beendet die Absicht sofort. Nur die physische Rücknahme
+        # nutzt denselben beobachteten Laufzeitanker wie der zentrale Stopp.
+        # Der Startabgleich nutzt dieselbe Restlaufzeit; Schreibschalter
+        # und fremder Eingang behalten ihren bestehenden Vorrang.
+        user_stop_left_s = heatpump_takt_stop_block(
+            **user_stop_runtime, now_ts=now_ts) if user_stop_runtime else 0.0
+        if self.release_pending and not (
+                self.release_pending_reason in {"automatic_mode_off", "startup_own_input_reset"}
+                and user_stop_left_s > 0.0):
             return self.release_pending_reason or "release_retry"
         if not self.enabled:
             return "opt_in_off"
-        if not self.auto_mode_enabled:
-            return "automatic_mode_off"
         if input2 == 1:
             # Mit gesetztem Eingang 2 ergäbe der eigene Eingang Zustand 4 (Maximalwerte).
             return "input2_active_release"
+        if self.startup_reconcile_pending:
+            return "startup_own_input_reset" if user_stop_left_s <= 0.0 else ""
+        if not self.auto_mode_enabled:
+            return "automatic_mode_off" if user_stop_left_s <= 0.0 else ""
         if self.desired != 1:
             return "decision_normal"
         if not self.owned_confirmed and now_ts - self.last_positive_request_ts > self.UNCONFIRMED_ADOPT_S:
@@ -2849,7 +2857,7 @@ class StiebelIsgSgReady:
         self._clear_release_backoff()
         self._persist_owner_marker(False, confirmed=True, reason=reason, now_ts=now_ts)
 
-    def _reconcile(self, sock, snapshot, now_ts):
+    def _reconcile(self, sock, snapshot, now_ts, *, user_stop_runtime=None):
         input1 = snapshot.get("input1")
         input2 = snapshot.get("input2")
         # Unbestätigter Anspruch: Nur ein im Latenzfenster gelesenes „1“ ist eigen.
@@ -2860,7 +2868,7 @@ class StiebelIsgSgReady:
             # Meldet das ISG nur den Reglertyp 5002 als 0, sind 4002 und 5001
             # gültig gelesen: Der eigene Eingang darf zurückgenommen werden.
             if self._release_readback_usable(snapshot):
-                release_reason = self._release_reason(input1, input2, now_ts)
+                release_reason = self._release_reason(input1, input2, now_ts, user_stop_runtime=user_stop_runtime)
                 if release_reason:
                     return self._release_own_input(sock, release_reason, now_ts)
                 if input1 == 0 and (
@@ -2870,7 +2878,7 @@ class StiebelIsgSgReady:
                 ):
                     self._drop_own_claim("own_input_already_normal", now_ts)
             return None
-        release_reason = self._release_reason(input1, input2, now_ts)
+        release_reason = self._release_reason(input1, input2, now_ts, user_stop_runtime=user_stop_runtime)
         if release_reason:
             return self._release_own_input(sock, release_reason, now_ts)
         if self.owned and input1 == 0:
@@ -4736,9 +4744,10 @@ def heatpump_positive_actuator_permission_active(
 def heatpump_positive_actuator_readback(ctx, now_ts=None):
     """Typisiert einen frischen positiven oder nichtpositiven Aktorzustand.
 
-    Der Helfer liest keine Hardware und schreibt nichts. Er bewertet nur die
-    im aktuellen Zyklus bereits gebundene SG-/SHI-Rückmeldung. Lokale
-    Sollcaches und Restart-Checkpoints sind ausdrücklich keine Evidenz.
+    Bewertet die im aktuellen Zyklus gebundene SG-/SHI-Rückmeldung. Für iDM
+    liest ausschließlich der Rücknahmepfad die bestehenden Anforderungsregister
+    direkt; der Helfer schreibt nichts. Lokale Sollcaches und
+    Restart-Checkpoints sind ausdrücklich keine physische Evidenz.
     """
 
     source = ctx if isinstance(ctx, dict) else {}
@@ -5034,10 +5043,31 @@ def heatpump_positive_actuator_readback(ctx, now_ts=None):
             reason="dimplex_sg_state_unknown",
         )
 
+    if isinstance(wp_obj, IDMHeatpump) and source.get("withdrawal_only") is True:
+        # Bestehender Anforderungsvertrag: keine neuen Register und kein neuer
+        # periodischer Schreibpfad.
+        # Nur lesen: Ein Checkpoint allein beweist keinen gesetzten Ausgang.
+        from pymodbus.client import ModbusTcpClient
+        client = ModbusTcpClient(wp_obj.ip, port=502)
+        try:
+            if client.connect():
+                reply = client.read_holding_registers(address=1710, count=3)
+                values = getattr(reply, "registers", [])
+                if (not reply.isError() and len(values) == 3
+                        and all(type(value) is int and value in (0, 1) for value in values)):
+                    return result(state_confirmed=True, positive=any(values),
+                        provider="idm", timestamp=current_ts,
+                        state={"hz": values[0], "khl": values[1], "ww": values[2]},
+                        reason="idm_request_registers_confirmed")
+        except Exception:
+            logger.debug("iDM: Anforderungs-Readback beim Neustart nicht verfügbar")
+        finally:
+            client.close()
+
     # iDM-Sollcaches werden beim Prozessstart initialisiert und sind damit
-    # ausdrücklich kein frischer Register-Readback. Bis eine herstellergebundene
-    # Rücklesefläche vorliegt, öffnet iDM nach Neustart nur über einen neuen
-    # zentralen Demand->Budget-Handshake eine positive Kante.
+    # ausdrücklich kein frischer Register-Readback. Der direkte iDM-Lesepfad
+    # oben dient ausschließlich der Rücknahme. Eine positive Kante nach Neustart
+    # braucht weiterhin einen neuen zentralen Demand->Budget-Handshake.
     return result(
         provider="idm" if type(wp_type) is int and wp_type == 1 else "none",
         reason="positive_actuator_readback_evidence_limit",
@@ -10703,6 +10733,7 @@ def restored_heatpump_state_contract(
     auto_mode_enabled,
     now_ts=None,
     max_state_age_s=ENERGY_STATE_ACTIVE_RESTORE_MAX_AGE_S,
+    restore_withdrawal_bookkeeping=False,
 ):
     """Übernimmt nach Neustart nur konservative Holds, niemals Aktorzustände."""
 
@@ -10790,7 +10821,7 @@ def restored_heatpump_state_contract(
     )
     positive_signal_bookkeeping_valid = bool(
         state_fresh
-        and auto_enabled
+        and (auto_enabled or restore_withdrawal_bookkeeping)
         and saved_signal_started_ts is not None
         and saved_signal_demand_valid
     )
@@ -11719,10 +11750,15 @@ def main():
                 saved,
                 previous_state.get("age_s", 999999),
                 auto_mode_enabled=startup_auto_mode_enabled,
+                # Bei direkten Ausgängen bleibt nur die Rücknahmebuchhaltung:
+                # Erst frischer Aktor-Readback bestätigt den eigenen Restauftrag.
+                restore_withdrawal_bookkeeping=not isinstance(wp, SafeLuxtronik),
             )
             if restart_revalidation.get(
                 "positive_signal_bookkeeping_valid"
-            ):
+            ) or (not startup_auto_mode_enabled and not isinstance(wp, SafeLuxtronik)
+                    and restart_revalidation.get("state_fresh")
+                    and saved.get("boost_active") is True):
                 heatpump_positive_signal_started_ts = _safe_float(
                     restart_revalidation.get(
                         "heatpump_positive_signal_started_ts"
@@ -12529,7 +12565,13 @@ def main():
                         enabled=stiebel_sg_ready_output_contract(current_config)["active"],
                         auto_mode_enabled=(AUTO_MODE == 1),
                     )
-                    wp.refresh_readback_if_due()
+                    wp.refresh_readback_if_due(user_stop_runtime={
+                        "wp_takt_protect": WP_TAKT_PROTECT,
+                        "last_start_ts": (wp_last_pv_boost_start_ts if wp_live_fresh
+                            and native_live["compressor_valid"]
+                            and heatpump_compressor_running(wp_data, wp_status) else 0.0),
+                        "min_runtime_min": WP_MIN_RUNTIME_MIN,
+                    })
                 except Exception as stiebel_exc:
                     logger.error("Stiebel-ISG SG Ready: Leserunde fehlgeschlagen: %s", stiebel_exc)
             if heatpump_positive_signal_restored_unconfirmed:
@@ -12541,6 +12583,7 @@ def main():
                             "wp_status": wp_status,
                             "wp_data": wp_data,
                             "current_config": current_config,
+                            "withdrawal_only": AUTO_MODE == 0,
                         },
                         now_ts=time.time(),
                     )
@@ -12575,7 +12618,7 @@ def main():
                         "market_price",
                         "price",
                         "pv_surplus",
-                    }:
+                    } or (AUTO_MODE == 0 and restart_revalidation.get("active_command_saved")):
                         boost_active = True
                     if heatpump_positive_signal_demand_class in {
                         "market_price",
@@ -14342,9 +14385,25 @@ def main():
 
             heatpump_emergency_veto = heatpump_user_boost_emergency_veto
 
+            # Eine gemeinsame Rücknahmeentscheidung für Automatik-Aus,
+            # manuellen OFF und Ablauf. Die Nutzerabsicht bleibt sofort beendet;
+            # nur der belegte eigene Ausgang nutzt die vorhandene Restlaufzeit.
+            user_stop_left_s = (0.0 if isinstance(wp, SafeLuxtronik) else heatpump_takt_stop_block(
+                WP_TAKT_PROTECT,
+                (wp_compressor_last_start_ts or wp_last_pv_boost_start_ts) if wp_compressor_observation_valid
+                    and wp_compressor_running_now else 0.0,
+                WP_MIN_RUNTIME_MIN,
+                emergency_stop=bool(heatpump_grid_safety_stop or heatpump_user_boost_emergency_veto
+                    or heatpump_soc_stop or not e3dc_valid),
+            ))
+
             # Manueller Boost Check: vor dem ersten SHI-Connect gebunden.
-            if not (manual_boost_command.get("valid") and manual_boost_command.get("action") == "on"):
-                # Ohne gültigen Boost-Auftrag gibt es keinen eigenen manuellen Boost.
+            if not (manual_boost_command.get("valid")
+                    and (manual_boost_command.get("action") == "on"
+                        or (not isinstance(wp, SafeLuxtronik)
+                            and manual_boost_command.get("action") == "off"))):
+                # Ein OFF beendet die Absicht; bis zur bestätigten Rücknahme
+                # bleibt die vorhandene Buchhaltung des eigenen Ausgangs erhalten.
                 manual_direct_boost = {"state": "idle"}
             if manual_boost_command.get("present") and not manual_boost_command.get("valid"):
                 _warn_once(
@@ -14374,7 +14433,7 @@ def main():
                         heatpump_positive_output_block_reasons.append(
                             "manual_user_off"
                         )
-                        if wp_write_allowed:
+                        if wp_write_allowed and user_stop_left_s <= 0.0:
                             if request_heatpump_boost(wp, 0, None, 0, CONF_WWW, owner="manual"):
                                 last_wp_command_time = time.time()
                                 heatpump_positive_signal_started_ts = 0.0
@@ -14382,6 +14441,7 @@ def main():
                                 heatpump_positive_signal_restored_unconfirmed = False
                                 heatpump_positive_signal_start_reservation_allowed = False
                                 heatpump_positive_signal_hold_guard = {}
+                                manual_direct_boost = {"state": "idle"}
                                 # Nutzer-Aus beendet jeden eigenen Besitz des Ausgangs wie
                                 # der Automatik-aus-Zweig; sonst blieben boost_active bzw.
                                 # eine Pause als Rest-Besitzer stehen und sperrten spätere Starts.
@@ -14480,7 +14540,7 @@ def main():
                         heatpump_positive_output_block_reasons.append(
                             "manual_command_expired"
                         )
-                        if wp_write_allowed:
+                        if wp_write_allowed and user_stop_left_s <= 0.0:
                             logger.info("Manueller Boost abgelaufen.")
                             if request_heatpump_boost(wp, 0, None, 0, CONF_WWW, owner="manual"):
                                 last_wp_command_time = time.time()
@@ -14670,14 +14730,17 @@ def main():
 
             # --- HAUPT REGELUNG (Wärmepumpe) ---
             if not os.path.exists(FLAG_FILE) and AUTO_MODE == 0 and boost_active and wp:
-                # Die Automatik endet sofort. Der Luxtronik-Kanalautomat
-                # schützt die verbleibende Laufzeit des laufenden Verdichters.
+                # Die Automatik endet sofort; boost_active bezeichnet bis zur
+                # bestätigten Rücknahme nur noch das bestehende Geräteangebot.
+                # Luxtronik bleibt im Kanalautomaten. Direkte Aktoren nutzen den
+                # vorhandenen Taktschutz mit demselben physischen Laufzeitanker.
                 logger.info("PV-Automatik deaktiviert: Beende aktiven PV-Boost.")
                 heatpump_positive_output_blocked_this_cycle = True
                 heatpump_positive_output_block_reasons.append(
                     "automatic_mode_user_off"
                 )
-                if request_heatpump_boost(wp, 0, None, 0, CONF_WWW, owner="pv"):
+                pv_boost_pending_start = None
+                if user_stop_left_s <= 0.0 and request_heatpump_boost(wp, 0, None, 0, CONF_WWW, owner="pv"):
                     last_wp_command_time = time.time()
                     if heatpump_positive_signal_demand_class == "ww_immediate_manual":
                         # Rücknahme des Knopfsignals: Neustartsperre wie beim manuellen
@@ -18110,7 +18173,7 @@ def main():
                                     if circ_heartbeat and not circ_mode_changed:
                                         logger.debug(f"Zirkulation Heartbeat: {target_circ}")
                                     else:
-                                        logger.info(
+                                        (logger.info if ww_circ_boost_source else logger.debug)(
                                             "Zirkulation Set: %s%s",
                                             target_circ,
                                             f" (Boost: {ww_circ_boost_source})" if ww_circ_boost_source else "",

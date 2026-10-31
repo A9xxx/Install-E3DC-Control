@@ -250,7 +250,7 @@ PRESERVED_WEB_ENTRIES = (
 APPROVED_APT_PACKAGES = frozenset({
     "php-cli", "php-sqlite3", "php-mbstring", "libapache2-mod-php", "mosquitto-clients",
     "python3-sklearn", "python3-numpy", "python3-cryptography",
-    "python3-websockets", "nodejs", "npm", "avahi-daemon", "avahi-utils",
+    "nodejs", "npm", "avahi-daemon", "avahi-utils",
     "dbus", "rsync",
 })
 UPDATE_RUNTIME_APT_PACKAGES = ("rsync", "php-cli")
@@ -261,7 +261,7 @@ MATTER_ONLY_APT_PACKAGES = frozenset({
 })
 APPROVED_PIP_PACKAGES = frozenset({
     "paho-mqtt", "requests", "hyundai_kia_connect_api", "websocket-client",
-    "websockets", "pymodbus", "pyserial", "pywebpush", "pycryptodome",
+    "pymodbus", "pyserial", "pywebpush", "pycryptodome",
 })
 MANAGED_VENV_APT_POLICY_KEY = "managed_venv_apt_packages"
 APPROVED_MANAGED_VENV_APT_PACKAGES = frozenset({"python3-venv"})
@@ -2563,7 +2563,6 @@ CATALOG_FALLBACK_SERVICES = (
     'e3dc-bluelink',
     'e3dc-notifier',
     'e3dc-mqtt-hub',
-    'e3dc-websocket',
     'e3dc-shadow-sync',
 )
 
@@ -2599,7 +2598,6 @@ INSTALL_CENTER_CORE_SERVICES = (
     'e3dc-weather-manager',
     'e3dc-storage-simulator',
     'e3dc-storage-manager',
-    'e3dc-websocket',
     'e3dc-notifier',
 )
 
@@ -6748,7 +6746,7 @@ def _capture_transition_state(
     inventory: set[str] = set()
     activities: dict[str, str] = {}
     for unit in sorted(
-        set((*_catalog_units_strict(), PIGUARD_UNIT, "e3dc.service"))
+        set((*_catalog_units_strict(), PIGUARD_UNIT, "e3dc.service", "e3dc-websocket.service"))
     ):
         activity = (
             _capture_piguard_transition_activity()
@@ -7120,10 +7118,9 @@ def _ensure_install_center_core_services(
     try:
         from .epex_manager import install_epex_service
         ok = _run_core_service_installer(
-            "Live, Marktpreise, Forecast, Storage und WebSocket",
+            "Live, Marktpreise, Forecast und Storage",
             lambda: install_epex_service(
                 start_services=False,
-                include_websocket=True,
                 expected_recovery_dropins=expected_recovery_dropins,
                 allow_optional_not_found_compat=allow_optional_not_found_compat,
             ),
@@ -10588,6 +10585,8 @@ def _secure_repo_permissions(
 
 def _service_expected(service: str, state: TransitionState) -> tuple[bool, str]:
     name = str(service).removesuffix(".service")
+    if name == "e3dc-websocket":
+        return False, "WebSocket-Dienst ist seit 5.5.6 entfernt"
     if name == "e3dc":
         return False, "Legacy-C++-Dienst bleibt dauerhaft deaktiviert"
     if name in _ha_slave_standby_services(state):
@@ -13090,7 +13089,7 @@ def _stop_v4_services_impl(
     for name in _normalize_restart_services(services):
         if name not in all_names and name not in {"piguard", "e3dc"}:
             errors.append(f"Nicht katalogisierter Stop-Dienst: {name}")
-    stop_order = tuple(dict.fromkeys(("piguard", *all_names, "e3dc")))
+    stop_order = tuple(dict.fromkeys(("piguard", *all_names, "e3dc-websocket", "e3dc")))
     # Hardware-Safety: PiGuard und danach jeder katalogisierte Writer erhalten
     # den Stop aus dem bereits geladenen systemd-Zustand, bevor die potenziell
     # langsameren Show-Readbacks beginnen. Unmittelbar nach diesem Stop-Burst
@@ -17525,6 +17524,9 @@ def _sync_release_web(
             "  [OK] Bestehende Betriebskonfiguration und Legacy-Pfadspiegel "
             "bleiben im Release-Fenster unverändert."
         )
+    from .retired_websocket import remove_proxy
+    for warning in remove_proxy(_run_argv):
+        print(warning)
     from .apache_security import ensure_apache_runtime_path_protection
     if not ensure_apache_runtime_path_protection(
         run_command,
@@ -18211,6 +18213,11 @@ def finalize_release_from_target(
         if static_bootblock_contract is None:
             raise RuntimeError("Statischer Abschluss besitzt keinen Bootblockvertrag")
         _assert_managed_finalizer_service(static_bootblock_contract)
+
+    # Erst nach bestätigtem Zielstart: Rückfälle davor behalten die Alt-Unit.
+    from .retired_websocket import retire_service
+    for warning in retire_service(_run_argv):
+        print(warning)
 
     recovery_journal_contract = _advance_persistent_recovery_committed(
         recovery_journal_contract

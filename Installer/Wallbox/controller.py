@@ -95,7 +95,10 @@ def allocate_power(available_watts, chargers_status, mode, max_amp,
                    unmanaged_phase_amps=None,
                    electrical_reservation_phase_count_by_id=None,
                    pv_total_cap_w=None, storage_total_cap_w=None,
-                   current_step_amp_by_id=None):
+                   current_step_amp_by_id=None, min_amp_by_id=None,
+                   order_by_id=None, electrical_floor_amp_by_id=None,
+                   electrical_reservation_scale_by_id=None,
+                   externally_reserved_ids=None):
     """
     Verteilt 'available_watts' auf alle verbundenen Wallboxen.
 
@@ -358,6 +361,8 @@ def allocate_power(available_watts, chargers_status, mode, max_amp,
 
         # E3DC Autonom / MODE_OFF: keine Steuerbefehle, aber konservative
         # Reservierung gegen das verbleibende Phasenbudget.
+        if c_mode == 0 and c_id in (externally_reserved_ids or set()):
+            continue  # Bereits im gemeinsamen Phasenrahmen belegt.
         if c_mode == 0:
             if phase_limits is not None and phase_limits_valid:
                 c_energy_phases = _phase_count(status, c_id)
@@ -525,9 +530,16 @@ def allocate_power(available_watts, chargers_status, mode, max_amp,
             )
             continue
         w_per_amp = _watts_per_amp(c_id, phases)
-        min_w = 6 * w_per_amp
+        minimum = _mapped_value(min_amp_by_id or {}, c_id, 6.0)
         try:
-            charger_max_amp = float(per_charger_limits.get(c_id, max_amp) or max_amp)
+            minimum = float(minimum)
+        except (TypeError, ValueError):
+            minimum = 6.0
+        if not math.isfinite(minimum) or minimum <= 0:
+            minimum = 6.0
+        min_w = minimum * w_per_amp
+        try:
+            charger_max_amp = float(per_charger_limits.get(c_id, max_amp))
         except (TypeError, ValueError):
             charger_max_amp = int(max_amp)
         step = _mapped_value(current_step_amp_by_id or {}, c_id, 1.0)
@@ -538,7 +550,7 @@ def allocate_power(available_watts, chargers_status, mode, max_amp,
         if not math.isfinite(step) or step not in (0.1, 0.5, 1.0):
             step = 1.0
         charger_max_amp = math.floor((max(0.0, min(float(max_amp), charger_max_amp)) + 1e-9) / step) * step
-        if strict_watt_contract and charger_max_amp < 6:
+        if strict_watt_contract and charger_max_amp < minimum:
             alloc[c_id] = _allocation_result(
                 0,
                 1,
@@ -624,6 +636,24 @@ def allocate_power(available_watts, chargers_status, mode, max_amp,
 
     # --- Phase 2: Zuteilung gegen Wattbudget und Phasenvektor ----------------
     allocated_pcc_phase_a = [0.0, 0.0, 0.0]
+    for c in active_chargers:
+        # Skalierung ändert nur die elektrische Belegung, nie Energie oder
+        # Befehlsstrom. Ohne Netzphasenzuordnung gilt der bestehende Abstand.
+        c['reservation_scale'] = float(_mapped_value(electrical_reservation_scale_by_id or {}, c['id'], 1.0))
+        c['minimum'] = c['min_w']/c['w_per_amp']
+        c['electrical_floor'] = max(0.0, float(_mapped_value(electrical_floor_amp_by_id or {}, c['id'], 0.0)))
+        vector = _reserved_phase_vector(c['electrical_floor']*c['reservation_scale'], c['electrical_phases'], c.get('rotation'))
+        allocated_pcc_phase_a = [a+b for a, b in zip(allocated_pcc_phase_a, vector)]
+
+    def _order(c):
+        if order_by_id is not None:
+            return (_mapped_value(order_by_id, c['id'], float('inf')),)
+        return (0 if int(c.get('id', 0)) == priority_id else 1,
+                0 if c.get('behavior') == 'instant' else 1, int(c.get('id', 0)))
+
+    def _electrical_delta(c, delta):
+        floor = c['electrical_floor']
+        return max(floor, c['allocated_amp']+delta)-max(floor, c['allocated_amp'])
 
     def _can_allocate_delta(c, delta_a):
         if c['allocated_amp'] + delta_a > c['max_amp']:
@@ -642,27 +672,32 @@ def allocate_power(available_watts, chargers_status, mode, max_amp,
         ):
             return False
         if phase_limits is not None:
+            # Der eigene Kandidat zählt mit seinem Zielstrom. Die höhere
+            # Vorbelegung bleibt für die anderen Ladepunkte weiter gebucht.
+            own_candidate_slack = max(0.0, c['electrical_floor']-(c['allocated_amp']+delta_a))*c['reservation_scale']
+            delta_a = _electrical_delta(c, delta_a)*c['reservation_scale']
             if not phase_limits_valid:
                 return False
             rot = c.get('rotation')
             if c['electrical_phases'] >= 3:
-                if any(allocated_pcc_phase_a[p] + delta_a > phase_limits[p] + 1e-9 for p in range(3)):
+                if any(allocated_pcc_phase_a[p] + delta_a - own_candidate_slack > phase_limits[p] + 1e-9 for p in range(3)):
                     return False
             elif c['electrical_phases'] in (1, 2) and rot is not None:
                 phase_indexes = rot[:c['electrical_phases']]
                 if any(
-                    allocated_pcc_phase_a[idx] + delta_a
+                    allocated_pcc_phase_a[idx] + delta_a - own_candidate_slack
                     > phase_limits[idx] + 1e-9
                     for idx in phase_indexes
                 ):
                     return False
             else:
-                if any(allocated_pcc_phase_a[p] + delta_a > phase_limits[p] + 1e-9 for p in range(3)):
+                if any(allocated_pcc_phase_a[p] + delta_a - own_candidate_slack > phase_limits[p] + 1e-9 for p in range(3)):
                     return False
         return True
 
     def _apply_delta(c, delta_a):
         nonlocal remaining_watts, pv_only_allocated_w
+        phase_delta = _electrical_delta(c, delta_a)*c['reservation_scale']
         c['allocated_amp'] = round(c['allocated_amp'] + delta_a, 3)
         if math.isfinite(remaining_watts):
             remaining_watts -= delta_a * c['w_per_amp']
@@ -672,6 +707,7 @@ def allocate_power(available_watts, chargers_status, mode, max_amp,
         ):
             pv_only_allocated_w += delta_a * c['w_per_amp']
         if phase_limits is not None:
+            delta_a = phase_delta
             rot = c.get('rotation')
             if c['electrical_phases'] >= 3:
                 for p in range(3):
@@ -684,8 +720,8 @@ def allocate_power(available_watts, chargers_status, mode, max_amp,
                     allocated_pcc_phase_a[p] += delta_a
 
     def _grant_strict_minimum(c):
-        if c['allocated_amp'] < 6 and _can_allocate_delta(c, 6):
-            _apply_delta(c, 6)
+        if c['allocated_amp'] < c['minimum'] and _can_allocate_delta(c, c['minimum']):
+            _apply_delta(c, c['minimum'])
             c['state'] = 2
             return True
         return False
@@ -698,22 +734,14 @@ def allocate_power(available_watts, chargers_status, mode, max_amp,
     if strict_watt_contract or phase_limits is not None:
         running_order = sorted(
             (c for c in active_chargers if c.get('running')),
-            key=lambda c: (
-                0 if int(c.get('id', 0)) == priority_id else 1,
-                0 if c.get('behavior') == 'instant' else 1,
-                int(c.get('id', 0)),
-            ),
+            key=_order,
         )
         for c in running_order:
             _grant_strict_minimum(c)
 
         idle_order = sorted(
             (c for c in active_chargers if not c.get('running')),
-            key=lambda c: (
-                0 if int(c.get('id', 0)) == priority_id else 1,
-                0 if c.get('behavior') == 'instant' else 1,
-                int(c.get('id', 0)),
-            ),
+            key=_order,
         )
         for c in idle_order:
             if c['state'] != 2:
@@ -736,18 +764,14 @@ def allocate_power(available_watts, chargers_status, mode, max_amp,
                     pool,
                     key=lambda c: (
                         (c['allocated_amp'] * c['w_per_amp']) / c['fairness_weight'],
-                        c['id'],
+                        _order(c),
                     ),
                 )
                 _apply_delta(chosen, chosen['step_amp'])
         else:
             extra_order = sorted(
                 active_chargers,
-                key=lambda c: (
-                    0 if int(c.get('id', 0)) == priority_id else 1,
-                    0 if c.get('behavior') == 'instant' else 1,
-                    int(c.get('id', 0)),
-                ),
+                key=_order,
             )
             while remaining_watts > 0:
                 allocated_any = False
@@ -816,5 +840,43 @@ def allocate_power(available_watts, chargers_status, mode, max_amp,
             rotation=c.get('rotation'),
             source_mode=c.get('mode'),
         )
+        if phase_limits is not None:
+            # Ungerundeter Rest der Kandidatenbelegung für die Bewertung.
+            # Das Stromraster begrenzt nur Befehle, nicht die Phasenwahl.
+            own = _reserved_phase_vector(max(c['allocated_amp'], c['electrical_floor'])*c['reservation_scale'],
+                c['electrical_phases'], c.get('rotation'))
+            indexes = [p for p, value in enumerate(_reserved_phase_vector(
+                1.0, c['electrical_phases'], c.get('rotation'))) if value]
+            alloc[c['id']]['unrounded_electrical_cap_amp'] = max(0.0, min(
+                phase_limits[p]-allocated_pcc_phase_a[p]+own[p] for p in indexes))/c['reservation_scale']
+            # Rein elektrischer Rest gegen die anderen reservierten Ausgänge.
+            # Ein sinkender Energieanteil ist kein neuer harter Stromdeckel.
+            rot = c.get('rotation')
+            indexes = (rot[:c['electrical_phases']]
+                if c['electrical_phases'] in (1, 2) and rot is not None else range(3))
+            # Der harte Deckel verwendet belegte andere Ausgänge, nicht deren
+            # schwankende zukünftige Energieanteile. Der gemeinsame Zielsatz
+            # bleibt zusätzlich durch cap_amp und den Vektor oben begrenzt.
+            other_phase_a = [0.0, 0.0, 0.0]
+            for other in chargers_status:
+                if other['id'] == c['id'] or normalize_wb_mode(wb_charge_mode.get(other['id'], MODE_OFF)) == MODE_OFF:
+                    continue  # Beobachter sind bereits aus phase_limits reserviert.
+                status = other.get('status') or {}
+                fresh = not any(status.get(k) is True for k in ('driver_status_stale', 'driver_status_glitch', 'stale')) and status.get('driver_status_valid') is not False
+                values = []
+                for key in ('reported_current_amp', 'current_set_amp', 'amp', 'evse_current'):
+                    value = status.get(key)
+                    if type(value) in (int, float) and math.isfinite(value) and value >= 0:
+                        values.append(float(value))
+                measured = _strict_numeric_vector(status.get('currents'))
+                if measured is not None:
+                    values.extend(max(0.0, float(v)) for v in measured)
+                accepted = max(values) if fresh and values else (0.0 if fresh and not _status_running(status) else float(max_amp))
+                count = _electrical_phase_count(status, other['id'], _phase_count(status, other['id']))
+                rotation = normalize_rotation(_mapped_value(rotations_by_id, other['id']))
+                vector = _reserved_phase_vector(accepted, count or 3, rotation)
+                other_phase_a = [a+b for a,b in zip(other_phase_a, vector)]
+            room = min(phase_limits[p] - other_phase_a[p] for p in indexes) if phase_limits_valid else 0.0
+            alloc[c['id']]['electrical_cap_amp'] = math.floor(max(0.0, room)*10+1e-9)/10
 
     return alloc

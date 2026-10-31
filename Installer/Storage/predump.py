@@ -23,6 +23,16 @@ except ModuleNotFoundError:
     from Wallbox.modes import MODE_OFF, MODE_PRICE, normalize_wb_mode  # type: ignore
 
 
+def native_total_power_w(wb_native: Optional[Dict[str, Any]]) -> Optional[float]:
+    """Gemessene Gesamtleistung; unbekannt bleibt unbekannt, auch bei bool."""
+    if not isinstance(wb_native, dict) or wb_native.get("total_power_valid") is False:
+        return None
+    value = wb_native.get("total_power_w")
+    if type(value) not in (int, float) or not math.isfinite(value):
+        return None
+    return abs(float(value))
+
+
 def cfg_bool(cfg: Dict[str, Any], key: str, default: bool = False) -> bool:
     raw = cfg.get(key, default)
     if isinstance(raw, bool):
@@ -400,14 +410,14 @@ def predump_wallbox_floor_hold_decision(
         if intent_fresh
         else 0.0
     )
-    native_total_w = abs(safe_float(wb_native.get("total_power_w"), 0.0))
+    native_total_w = native_total_power_w(wb_native)
     for detail in details if isinstance(details, list) else []:
         if isinstance(detail, dict):
             native_total_w = max(
-                native_total_w,
-                abs(safe_float(detail.get("power_w"), 0.0)),
+                [abs(safe_float(detail.get("power_w"), 0.0))]
+                + ([native_total_w] if native_total_w is not None else [])
             )
-    observed_wallbox_w = max(wallbox_w, intent_w, native_total_w)
+    observed_wallbox_w = max(wallbox_w, intent_w, *([native_total_w] if native_total_w is not None else []))
 
     # Ein gültiger, expliziter Modus-5-Netzladeslot besitzt nach den bereits
     # vorgelagerten Hard-Safety-Gates die Wallbox. Der Pre-Dump-Floor darf

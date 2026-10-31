@@ -10,6 +10,8 @@ from typing import Any, Dict, Optional
 from .decision import status_connected, status_real_charging, status_real_power
 
 
+_NATIVE_E3DC_STOP_EFFECT_WINDOW_S = 30.0
+
 STATE_IDLE = "idle"
 STATE_OFFERED = "offered"
 STATE_STARTING = "starting"
@@ -81,12 +83,98 @@ def is_e3dc_native_charger(charger: Any) -> bool:
     )
 
 
+def native_edge_contract(sample, state, now, session_id, *, charge_proof=False, power_w=None):
+    """Ein Flankentor für Bitregel und den Rückfall ohne Bit.
+
+    Reihenfolge kommt vom Treiber, Fristen sind monoton. Fahrzeugleistung
+    bestätigt niemals eine Umschaltflanke. Sie dient nur dem freigegebenen
+    Rückfall und der Wirkungsüberwachung nach bestätigtem Abbruch.
+    Die Steckepisode wird zur Laufzeit nie geleert, sondern nur rotiert.
+    Daher übernimmt die erste Kennung den Zustand des leeren Startfensters.
+    """
+    if state.get('session_id') != session_id:
+        if state.get('session_id') and session_id:
+            state.clear()
+        state['session_id'] = session_id
+    fresh = sample.get('abort_fresh') is True
+    value = sample.get('abort_active') if fresh else None
+    request = sample.get('abort_request_seq', 0)
+    event = state.get('event') or {}
+    if request != state.get('request_seq') and fresh:
+        previous = state.get('previous_abort')
+        state['request_seq'] = request
+        state['unknown_samples'] = state.get('unknown_samples', 0) + 1 if value is None else 0
+        if previous is True and value is False and state.get('own_stop_confirmed'):
+            state['restart_seen'] = True
+        if type(value) is bool:
+            state.pop('fallback_logged', None)
+            if previous is not value:
+                state.pop('error', None)
+                state.pop('error_logged', None)
+            state['previous_abort'] = value
+    confirmed = bool(fresh and value is True)
+    if confirmed and event.get('action') == 'stop':
+        state['own_stop_confirmed'] = True
+        state['restart_seen'] = False
+        state.setdefault('confirmed_mono', now)
+    if confirmed and power_w is not None and power_w > 500:
+        state.setdefault('high_power_since', now)
+        if now - state['high_power_since'] > _NATIVE_E3DC_STOP_EFFECT_WINDOW_S:
+            state['error'] = 'native_disabled_charging'
+    else:
+        state.pop('high_power_since', None)
+        if confirmed and power_w is not None and power_w <= 500 and state.get('error') == 'native_disabled_charging':
+            state.pop('error', None)
+            state.pop('error_logged', None)
+    if (fresh and value is True and event.get('action') == 'start'
+            and state.get('error') != 'native_disabled_charging'
+            and sample.get('abort_request_mono', now) - event['mono'] >= _NATIVE_E3DC_STOP_EFFECT_WINDOW_S):
+        state['error'] = 'native_start_ineffective'
+    allowed = False
+    fallback = bool(fresh and value is None and state.get('unknown_samples', 0) > 1)
+    if fresh and value is False:
+        if event.get('action') != 'stop':
+            allowed = True
+        elif state.get('restart_seen'):
+            allowed = now - event['mono'] >= _NATIVE_E3DC_STOP_EFFECT_WINDOW_S
+        elif not state.get('own_stop_confirmed'):
+            after = sample.get('abort_request_mono', now) - event['mono']
+            # Eine verlorene Antwort ist kein Beweis einer verlorenen Flanke.
+            # Erst eine danach angefragte Bitprobe nach der Mindestwartezeit
+            # erlaubt die einzige Wiederholung.
+            allowed = bool(not event.get('fallback') and not event.get('wire_receipt') and event.get('attempts', 1) < 2 and after >= _NATIVE_E3DC_STOP_EFFECT_WINDOW_S)
+            if not allowed and after >= _NATIVE_E3DC_STOP_EFFECT_WINDOW_S and (event.get('wire_receipt') or event.get('attempts', 1) >= 2):
+                state['error'] = 'native_stop_ineffective'
+    elif fallback and charge_proof and event.get('action') != 'stop':
+        allowed = True
+    return dict(abort_active=value, abort_fresh=fresh, abort_stop_allowed=allowed,
+                abort_stop_confirmed=confirmed, abort_fallback=fallback,
+                abort_restart_seen=bool(state.get('restart_seen')),
+                abort_error=state.get('error'), abort_start_allowed=bool(fresh and value is True))
+
+
+def note_native_edge(state, *, action, now, wire_receipt, edge_seq, fallback=False):
+    """Auch ein mehrdeutiger Ausgang gehört zum laufenden Ereignis."""
+    if action == 'stop' and state.get('error') == 'native_stop_ineffective':
+        state['user_stop_consumed'] = True
+    previous = state.get('event') or {}
+    attempts = previous.get('attempts', 0) if action == 'stop' and not state.get('restart_seen') and previous.get('action') == 'stop' else 0
+    state['event'] = dict(action=action, mono=now, wire_receipt=bool(wire_receipt),
+                          edge_seq=edge_seq, attempts=attempts + 1, fallback=bool(fallback))
+    state.pop('confirmed_mono', None)
+    state.pop('high_power_since', None)
+    state['own_stop_confirmed'] = False
+    state['restart_seen'] = False
+
+
 def guard_edge_command(
     command: Optional[Dict[str, Any]],
     session: Optional[Dict[str, Any]] = None,
     *,
     hard_stop_allowed: bool = False,
     verified_active_charge: bool = False,
+    abort_active: Optional[bool] = None,
+    abort_fresh: bool = False,
     min_amp: Any = 6,
 ) -> Dict[str, Any]:
     """Return an E3DC-safe command plus a decision for edge-triggered writes.
@@ -106,12 +194,6 @@ def guard_edge_command(
     state = str(session_data.get("state") or "")
     start_blocked = bool(session_data.get("start_blocked", False))
     can_start = bool(session_data.get("can_send_start_toggle", False))
-    real_active = bool(
-        session_data.get("real_charging", False)
-        or _safe_float(session_data.get("real_power_w", 0.0), 0.0) > 500.0
-        or session_data.get("stop_active", False)
-        or bool(verified_active_charge)
-    )
     has_session = bool(session_data)
     decision = {
         "method": method,
@@ -131,6 +213,20 @@ def guard_edge_command(
         return {"command": guarded, "decision": decision}
 
     if force_state == 2:
+        if abort_fresh and abort_active is not None:
+            if start_blocked:
+                guarded['force_state'] = None
+                decision.update(action='start_toggle_blocked', execute=False,
+                                reason='session_start_blocked', force_state=None)
+            elif abort_active is True:
+                decision['action'] = 'start_toggle_allowed'
+            else:
+                # Eine bereits freigegebene Box braucht nur das normale,
+                # budgetgeprüfte Stromangebot und keine Umschaltflanke.
+                guarded['force_state'] = None
+                decision.update(action='start_toggle_downgraded',
+                                reason='box_already_released', force_state=None)
+            return {"command": guarded, "decision": decision}
         if start_blocked:
             guarded["force_state"] = None
             decision.update({
@@ -154,14 +250,14 @@ def guard_edge_command(
         return {"command": guarded, "decision": decision}
 
     if force_state == 1:
-        if hard_stop_allowed and (real_active or not has_session):
+        if hard_stop_allowed:
             decision["action"] = "stop_toggle_allowed"
         else:
             guarded["amp"] = min_current
             guarded["force_state"] = None
             decision.update({
                 "action": "stop_toggle_downgraded",
-                "reason": "no_verified_active_charge",
+                "reason": "native_abort_state_not_released",
                 "amp": min_current,
                 "force_state": None,
             })
@@ -292,6 +388,12 @@ def evaluate_session(
         and not start_blocked
         and offered_amp >= min_current
     )
+    if st.get('abort_fresh') is True and type(st.get('abort_active')) is bool:
+        # Ein alter Stromsollwert oder eine nachlaufende Ladeleistung ist
+        # kein Startverbot nach einer bestätigten Abbruchflanke.
+        start_blocked = bool(rscp_error or ended_latched or mode_off or priority_forced_stop)
+        can_send_start_toggle = bool(st['abort_active'] is True and physical_budget_ready
+                                     and not start_blocked and offered_amp >= min_current)
     if end_reason:
         reason = "%s (%s)" % (reason, end_reason)
 

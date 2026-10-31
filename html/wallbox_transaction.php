@@ -1177,6 +1177,8 @@ function e3dcWallboxPlanTransaction(array $updates, array $options = []) {
         foreach (E3DC_WB_TX_PLAN_FILES as $filename) $planTargets[$filename] = $ramdisk . '/' . $filename;
         $abortPath = $ramdisk . '/native_schedule_aborted.flag';
         $emergencyPath = $ramdisk . '/wallbox_emergency_stop.flag';
+        // Derselbe Not-Aus übersteht den Verlust der Ramdisk. Gemeinsamer Commit/Rollback.
+        $persistentEmergencyPath = dirname($ramdisk) . '/data/wallbox_emergency_stop.flag';
         $cachePath = $context['cache_path'];
         // Der Konfigurationscache ist ein abgeleiteter tmpfs-Spiegel und wird
         // von jedem regulären Lesezugriff bei Bedarf neu erzeugt. Er ist weder
@@ -1187,7 +1189,10 @@ function e3dcWallboxPlanTransaction(array $updates, array $options = []) {
         if ($savedCarsRequested) $targets[] = $savedCarsPath;
 
         if ($abortAction !== 'preserve') $targets[] = $abortPath;
-        if ($emergencyAction !== 'preserve') $targets[] = $emergencyPath;
+        if ($emergencyAction !== 'preserve') {
+            $targets[] = $persistentEmergencyPath;
+            $targets[] = $emergencyPath;
+        }
 
         $manualSoc = isset($options['manual_soc']) && is_array($options['manual_soc']) ? $options['manual_soc'] : [];
         foreach ($manualSoc as $wbId => $payload) {
@@ -1516,8 +1521,16 @@ function e3dcWallboxPlanTransaction(array $updates, array $options = []) {
         }
         // Entfernen/Erzeugen des Notfallmarkers ist bewusst der letzte öffentliche Schreibzugriff.
         // Ein früher fehlgeschlagener Auftrag kann deshalb nie eine unverriegelte Wallbox freigeben.
-        if ($emergencyAction === 'remove') $desired[] = [$emergencyPath, null, 0600];
-        if ($emergencyAction === 'create') $desired[] = [$emergencyPath, gmdate('c') . "\n", !empty($snapshots[$emergencyPath]['exists']) ? $snapshots[$emergencyPath]['mode'] : 0644];
+        if ($emergencyAction === 'remove') {
+            $desired[] = [$persistentEmergencyPath, null, 0600];
+            $desired[] = [$emergencyPath, null, 0600];
+        }
+        if ($emergencyAction === 'create') {
+            // Beide Marker bezeichnen auch während des Entfernens dieselbe Episode.
+            $emergencyPayload = json_encode(['schema' => 'wallbox_emergency_persistent_flag_v1', 'episode_token' => hash('sha256', $txId)]) . "\n";
+            $desired[] = [$persistentEmergencyPath, $emergencyPayload, 0644];
+        }
+        if ($emergencyAction === 'create') $desired[] = [$emergencyPath, $emergencyPayload, !empty($snapshots[$emergencyPath]['exists']) ? $snapshots[$emergencyPath]['mode'] : 0644];
 
         foreach ($desired as $index => $entry) {
             $path = $entry[0];

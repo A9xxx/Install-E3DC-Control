@@ -2163,5 +2163,12 @@ def _candidate_cli(argv=None):
 
 
 if __name__ == "__main__":
+    try:
+        from .runtime_logging import configure_service_logger
+        from .Wallbox.config import LOG_DIR
+    except ImportError:
+        from runtime_logging import configure_service_logger
+        from Wallbox.config import LOG_DIR
+    configure_service_logger("WallboxManager.Planer", log_path=os.path.join(LOG_DIR, "wallbox_planer.log"))
     raise SystemExit(_candidate_cli())
 

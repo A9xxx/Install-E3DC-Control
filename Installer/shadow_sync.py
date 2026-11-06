@@ -29,6 +29,11 @@ import urllib.parse
 import urllib.request
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
+try:
+    from quiet_logging import ensure_utf8_stdio
+except ImportError:
+    from Installer.quiet_logging import ensure_utf8_stdio
+
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 if SCRIPT_DIR not in sys.path:
@@ -1387,6 +1392,7 @@ def _status_log_decision(
 
 
 def run_loop() -> None:
+    ensure_utf8_stdio()
     log.info("Starte E3DC Shadow Sync.")
     last_log_signature: Optional[str] = None
     last_log_monotonic_s: Optional[float] = None

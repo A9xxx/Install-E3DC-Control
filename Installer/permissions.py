@@ -2001,6 +2001,7 @@ FILE_DEFINITIONS = [
     {"path": f"{INSTALL_PATH}/e3dc.wallbox.txt", "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": False},
     {"path": "/var/www/html/data/e3dc_v4.json", "mode": CONFIG_SECRET_FILE_MODE, "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": False},
     {"path": "/var/www/html/data/.e3dc_v4.transaction.lock", "mode": "660", "owner": "www-data", "group": "www-data", "optional": True, "executable": False},
+    {"path": "/var/www/html/data/e3dc_house_fuse.json", "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": False},
     {"path": "/var/www/html/data/wallbox_phase_transition_state.json", "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": False},
     {"path": f"{INSTALL_PATH}/data/e3dc_v4.json", "mode": CONFIG_SECRET_FILE_MODE, "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": False},
     # [LEGACY C++] e3dc.strompreise.txt: optionaler, vom PHP-Frontend gelesener Preis-Fallback.

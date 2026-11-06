@@ -48,37 +48,15 @@ def _quarantine(reason, now_s):
 
 
 def heatpump_pv_time_confirmation(clock_sample):
-    """Nur der timesyncd-Marker des laufenden Bare-Metal-Boots bestätigt Zeit.
-
-    Ein persistenter Epochenschätzer oder Container-Wanduhr allein genügt nicht.
-    Andere Zeitdienste bleiben ohne diesen Nachweis unbestätigt.
-    """
+    """Liest die Bootzeit und prüft die Wanduhr unabhängig vom Zeitdienst."""
     probe = copy.deepcopy(clock_sample)
-    probe.update(wall_confirmed=False, time_confirmation_source="clock_unconfirmed",
-                 time_confirmation_scope="bare_metal")
+    probe.update(wall_confirmed=False, time_confirmation_source="clock_implausible")
     try:
-        if os.path.exists("/.dockerenv"):
-            probe["time_confirmation_scope"] = "docker_legacy"
-            return probe
-        wall = probe.get("wall_ts", probe.get("wall_s"))
-        mono = probe.get("monotonic_ts", probe.get("monotonic_s"))
-        if (probe.get("valid") is not True or type(wall) not in (int, float)
-                or not math.isfinite(wall) or wall < 1577836800
-                or type(mono) not in (int, float) or not math.isfinite(mono) or mono < 0
-                or probe.get("boot_id") in (None, "", "unknown")):
-            return probe
-        marker = os.stat("/run/systemd/timesync/synchronized", follow_symlinks=False)
         with open("/proc/stat", encoding="ascii") as stream:
             boot_wall = next(float(line.split()[1]) for line in stream if line.startswith("btime "))
-        if (not stat.S_ISREG(marker.st_mode) or marker.st_uid != 0
-                or not math.isfinite(boot_wall) or not boot_wall < marker.st_mtime <= wall):
-            return probe
-        probe.update(boot_wall_s=boot_wall,
-                     time_confirmation_marker_wall_s=marker.st_mtime)
-        if not heatpump_pv_time_probe_plausible(probe):
-            probe["time_confirmation_source"] = "clock_implausible"
-            return probe
-        probe.update(wall_confirmed=True, time_confirmation_source="systemd_timesyncd_current_boot")
+        probe["boot_wall_s"] = boot_wall
+        if heatpump_pv_time_probe_plausible(probe):
+            probe.update(wall_confirmed=True, time_confirmation_source="wall_clock_plausible")
     except (OSError, ValueError, TypeError, StopIteration, IndexError):
         pass
     return probe

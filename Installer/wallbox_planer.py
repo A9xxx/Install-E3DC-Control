@@ -651,10 +651,10 @@ def _clear_consumed_manual_plan(wb_id, reason=""):
             json.dump(data, f, ensure_ascii=False, indent=2)
         os.replace(tmp, path)
         try:
-            if os.path.abspath(path) == os.path.abspath(V4_CONFIG_FILE):
-                apply_config_secret_permissions(path, data=data if isinstance(data, dict) else None)
-            elif _CANDIDATE_MODE:
+            if _CANDIDATE_MODE:
                 os.chmod(path, 0o600)
+            elif os.path.abspath(path) == os.path.abspath(V4_CONFIG_FILE):
+                apply_config_secret_permissions(path, data=data if isinstance(data, dict) else None)
             else:
                 os.chmod(path, 0o664)
         except Exception:
@@ -862,7 +862,7 @@ def generate_native_charging_schedule(config, wb_id=None):
         all_slots = sorted(all_slots, key=lambda x: (int(x.get("ts", 0)), int(x.get("wb_id", 1))))
         if not all_slots:
             if os.path.exists(combined_file):
-                _remove_schedule_file(combined_file, reason="Kein kombinierter Ladeplan aktiv - alten Schedule gelöscht.")
+                _remove_schedule_file(combined_file)
             return []
 
         try:
@@ -890,8 +890,6 @@ def generate_native_charging_schedule(config, wb_id=None):
     wb_native      = str(config.get("wb_native_enable", "0")).strip().lower() in ("1", "true", "yes")
     native_type_key = "wb_native_type2" if wb_id == 2 else "wb_native_type"
     wb_native_type = str(config.get(f"wb{wb_id}_type", config.get(native_type_key, config.get("wb_native_type", "")))).strip().lower()
-    legacy_sofort  = config.get("wb_sofort", "0") if wb_id == 1 else "0"
-    wb_sofort_flag = str(config.get(f"wb{wb_id}_sofort", legacy_sofort)).strip() == "1"
 
     def _parse_int(value, default=0):
         try:
@@ -941,7 +939,11 @@ def generate_native_charging_schedule(config, wb_id=None):
         config.get(f"wb{wb_id}_plan_hours", config.get(f"wb{wb_id}_wbhour", legacy_hours)),
         0
     )
-    planning_enabled = use_smart_soc or manual_wbhour_cfg > 0 or wb_sofort_flag
+    if manual_wbhour_cfg >= 99:
+        _clear_consumed_manual_plan(wb_id, reason="Veralteter Sofortplan entfernt.")
+        _remove_schedule_file(schedule_file, wb_id)
+        manual_wbhour_cfg = 0
+    planning_enabled = use_smart_soc or manual_wbhour_cfg > 0
     if not planning_enabled:
         if os.path.exists(schedule_file):
             try:
@@ -1201,26 +1203,18 @@ def generate_native_charging_schedule(config, wb_id=None):
     if von_h == 0 and von_m == 0 and bis_h == 0 and bis_m == 0:
         no_time_limit = True
 
-    wb_sofort = str(config.get("wb_sofort", "0")).strip() == "1"
     eco_mode  = str(config.get(f"wb{wb_id}_native_eco", config.get("wb_native_eco", "0"))).strip() == "1"
-    if wb_sofort:
-        no_time_limit = True
-
-    if wbhour >= 99:
-        no_time_limit = True
 
     # Tägliche Wiederholung: Ein manueller Stundenplan wird nach dem Fenster
     # nicht auf 0 h zurückgesetzt, sondern für das nächste Fenster neu
     # berechnet. Das gilt nur für ein festes Zeitfenster mit Startuhrzeit;
-    # "Jetzt", Sofortladen (99 h) und das 24h-Rollfenster kennen keine
+    # "Jetzt" und das 24h-Rollfenster kennen keine
     # Fensterinstanz, die sich wiederholen könnte.
     plan_repeat = str(config.get(f"wb{wb_id}_plan_repeat", "0")).strip().lower() in ("1", "true", "yes")
     repeat_active = bool(
         plan_repeat
         and not use_smart_soc
         and manual_wbhour_cfg > 0
-        and manual_wbhour_cfg < 99
-        and not wb_sofort_flag
         and not start_now
         and not no_time_limit
     )
@@ -1347,7 +1341,7 @@ def generate_native_charging_schedule(config, wb_id=None):
                         "Plan für das nächste Fenster wird neu berechnet." % (wbvon, wbbis),
                     )
                     old_slots_for_continuity = []
-                elif manual_wbhour_cfg > 0 or wb_sofort_flag:
+                elif manual_wbhour_cfg > 0:
                     _clear_consumed_manual_plan(
                         wb_id,
                         "alle geplanten Slots abgeschlossen - Plan verbraucht.",
@@ -1384,9 +1378,6 @@ def generate_native_charging_schedule(config, wb_id=None):
                 market_prices_by_slot[slot_ts_q] = market_price_ct
             cur += 900
 
-    # set mode to 'manual' if smart_enable is false or no_time_limit is true
-    # 'manual' is interpreted by the frontend to render the yellow blocks
-    slot_mode = "manual" if (wb_sofort or wbhour >= 99) else "auto"
     all_slots = []
     if recurring_tariff_axis:
         first_slot_ts = ((von_ts + 899) // 900) * 900
@@ -1412,7 +1403,7 @@ def generate_native_charging_schedule(config, wb_id=None):
                 "price_ct": price_ct,
                 "market_price_ct": market_price_ct,
                 "price_source": price_source,
-                "mode": slot_mode,
+                "mode": "auto",
             })
     else:
         for slot_ts in sorted(market_prices_by_slot):
@@ -1435,7 +1426,7 @@ def generate_native_charging_schedule(config, wb_id=None):
                 "price_ct": price_ct,
                 "market_price_ct": market_price_ct,
                 "price_source": "runtime_tariff" if slot_ts in tariff_prices else "dynamic_market",
-                "mode": slot_mode,
+                "mode": "auto",
             })
 
     if not all_slots:
@@ -1945,9 +1936,7 @@ def _candidate_manual_plan_required(config, wb_id):
         config.get(f"wb{wb_id}_plan_hours", config.get(f"wb{wb_id}_wbhour", legacy_hours)),
         0,
     )
-    legacy_sofort = config.get("wb_sofort", "0") if wb_id == 1 else "0"
-    sofort = str(config.get(f"wb{wb_id}_sofort", legacy_sofort)).strip().lower() in ("1", "true", "yes")
-    return hours > 0 or sofort
+    return 0 < hours < 99
 
 
 def _validate_candidate_plan(path, wb_id=None):

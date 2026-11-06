@@ -57,8 +57,8 @@ function lzHasRealCostData($row) {
 function lzRefreshDerivedCostFlags(&$row) {
     $hasRealCost = lzHasRealCostData($row);
     $row['grid_in_real'] = $hasRealCost ? (float)($row['grid_in'] ?? 0) : 0;
-    $row['home_real'] = $hasRealCost ? (float)($row['home'] ?? 0) : 0;
-    $row['wb_real'] = $hasRealCost ? (float)($row['wb'] ?? 0) : 0;
+    $row['home_real'] = $hasRealCost ? $row['home'] : 0;
+    $row['wb_real'] = $hasRealCost ? $row['wb'] : 0;
     $row['wp_real'] = $hasRealCost ? (float)($row['wp'] ?? 0) : 0;
     $row['climate_real'] = $hasRealCost ? (float)($row['climate'] ?? 0) : 0;
     $row['bat_in_sim'] = $hasRealCost ? 0 : (float)($row['bat_in'] ?? 0);
@@ -334,26 +334,32 @@ if (file_exists($dbPath)) {
         $realCostDayExpr = "(ABS(COALESCE(d.cost_total, 0)) > 0.0001 OR ABS(COALESCE(d.cost_home, 0)) > 0.0001 OR ABS(COALESCE(d.cost_wb, 0)) > 0.0001 OR ABS(COALESCE(d.cost_wb2, 0)) > 0.0001 OR ABS(COALESCE(d.cost_wp, 0)) > 0.0001 OR ABS(COALESCE(d.cost_climate, 0)) > 0.0001)";
         $realCostAggExpr = "(ABS(COALESCE(cost_total, 0)) > 0.0001 OR ABS(COALESCE(cost_home, 0)) > 0.0001 OR ABS(COALESCE(cost_wb, 0)) > 0.0001 OR ABS(COALESCE(cost_wb2, 0)) > 0.0001 OR ABS(COALESCE(cost_wp, 0)) > 0.0001 OR ABS(COALESCE(cost_climate, 0)) > 0.0001)";
 
+        $dayDisplay = e3dcArchiveDisplaySelection($db, 'd');
+        $display = e3dcArchiveDisplaySelection($db);
+
         // Hole Tagesdaten (letzte 30 Tage) inkl. ML-Trainingsdaten
         $queryDay = "SELECT
             d.date as day,
             d.house_unknown_wallbox_minutes,
             d.pv_yield as pv,
-            d.home_consumption as home,
+            {$dayDisplay['home_consumption']} as home,
+            d.home_consumption as learning_home,
+            d.wb_consumption as learning_wb1,
+            d.wb2_consumption as learning_wb2,
             COALESCE(d.house_includes_unknown_wallbox,0) as house_includes_unknown_wallbox,
             d.grid_in as grid_in,
             d.grid_out as grid_out,
             d.bat_in as bat_in,
             d.bat_out as bat_out,
-            d.wb_consumption as wb1,
-            d.wb2_consumption as wb2,
-            (d.wb_consumption + d.wb2_consumption) as wb,
+            {$dayDisplay['wb_consumption']} as wb1,
+            {$dayDisplay['wb2_consumption']} as wb2,
+            ({$dayDisplay['wb_consumption']} + {$dayDisplay['wb2_consumption']}) as wb,
             d.wp_consumption as wp,
             d.climate_consumption as climate,
             COALESCE(d.cost_total, 0) as cost_total,
-            COALESCE(d.cost_home, 0) as cost_home,
-            (COALESCE(d.cost_wb, 0) + COALESCE(d.cost_wb2, 0)) as cost_wb,
-            COALESCE(d.cost_wb2, 0) as cost_wb2,
+            {$dayDisplay['cost_home']} as cost_home,
+            ({$dayDisplay['cost_wb']} + {$dayDisplay['cost_wb2']}) as cost_wb,
+            {$dayDisplay['cost_wb2']} as cost_wb2,
             COALESCE(d.cost_wp, 0) as cost_wp,
             COALESCE(d.cost_climate, 0) as cost_climate,
             COALESCE(d.pv_balance_rest, 0) as pv_balance_rest,
@@ -368,8 +374,8 @@ if (file_exists($dbPath)) {
             COALESCE(d.saved_td, 0) as saved_td,
             COALESCE(d.saved_wb, 0) as saved_wb,
             CASE WHEN $realCostDayExpr THEN d.grid_in ELSE 0 END as grid_in_real,
-            CASE WHEN $realCostDayExpr THEN d.home_consumption ELSE 0 END as home_real,
-            CASE WHEN $realCostDayExpr THEN (d.wb_consumption + d.wb2_consumption) ELSE 0 END as wb_real,
+            CASE WHEN $realCostDayExpr THEN {$dayDisplay['home_consumption']} ELSE 0 END as home_real,
+            CASE WHEN $realCostDayExpr THEN ({$dayDisplay['wb_consumption']} + {$dayDisplay['wb2_consumption']}) ELSE 0 END as wb_real,
             CASE WHEN $realCostDayExpr THEN d.wp_consumption ELSE 0 END as wp_real,
             CASE WHEN $realCostDayExpr THEN d.climate_consumption ELSE 0 END as climate_real,
             CASE WHEN $realCostDayExpr THEN 0 ELSE d.bat_in END as bat_in_sim
@@ -438,6 +444,7 @@ if (file_exists($dbPath)) {
                             $row['saved_td'] = $savedLive['saved_td'];
                             $row['saved_wb'] = $savedLive['saved_wb'];
                         }
+                        e3dcArchiveLiveDisplay($row, $liveStats);
                         lzRefreshDerivedCostFlags($row);
                         lzAddPvTotalFields($row);
                         $foundToday = true;
@@ -495,6 +502,7 @@ if (file_exists($dbPath)) {
                     $newRow['pv_balance_rest'] = $balanceRest['pv_balance_rest'];
                     $newRow['bat_balance_rest'] = $balanceRest['bat_balance_rest'];
                     $newRow['balance_unknown_rest'] = $balanceRest['balance_unknown_rest'];
+                    e3dcArchiveLiveDisplay($newRow, $liveStats);
                     lzRefreshDerivedCostFlags($newRow);
                     lzAddPvTotalFields($newRow);
                     $dailyData[] = $newRow;
@@ -510,21 +518,23 @@ if (file_exists($dbPath)) {
             (COUNT(*) > MIN(COUNT(pv_yield), COUNT(home_consumption), COUNT(wp_consumption), COUNT(wb_consumption), COUNT(wb2_consumption), COUNT(climate_consumption), COUNT(grid_in), COUNT(grid_out), COUNT(bat_in), COUNT(bat_out))) as incomplete,
             SUM(pv_yield) as pv,
             SUM(CASE WHEN pv_yield IS NULL THEN NULL WHEN COALESCE(grid_out, 0) > 0.5 AND COALESCE(grid_out, 0) > COALESCE(pv_yield, 0) + 0.5 AND COALESCE(grid_out, 0) > MAX(1.0, COALESCE(bat_out, 0) * 1.5) THEN COALESCE(pv_yield, 0) + COALESCE(grid_out, 0) ELSE COALESCE(pv_yield, 0) END) as pv_total,
-            SUM(home_consumption) as home,
+            SUM({$display['home_consumption']}) as home,
+            SUM({$display['energy_split']}) as split_days,
+            SUM(1 - {$display['energy_split']}) as unsplit_days,
             MAX(COALESCE(house_includes_unknown_wallbox,0)) as house_includes_unknown_wallbox,
             SUM(grid_in) as grid_in,
             SUM(grid_out) as grid_out,
             SUM(bat_in) as bat_in,
             SUM(bat_out) as bat_out,
-            SUM(COALESCE(wb_consumption, 0)) as wb1,
-            SUM(COALESCE(wb2_consumption, 0)) as wb2,
-            SUM(COALESCE(wb_consumption, 0) + COALESCE(wb2_consumption, 0)) as wb,
+            SUM({$display['wb_consumption']}) as wb1,
+            SUM({$display['wb2_consumption']}) as wb2,
+            SUM({$display['wb_consumption']} + {$display['wb2_consumption']}) as wb,
             SUM(wp_consumption) as wp,
             SUM(COALESCE(climate_consumption, 0)) as climate,
             COALESCE(SUM(cost_total), 0) as cost_total,
-            COALESCE(SUM(cost_home), 0) as cost_home,
-            COALESCE(SUM(cost_wb), 0) + COALESCE(SUM(cost_wb2), 0) as cost_wb,
-            COALESCE(SUM(cost_wb2), 0) as cost_wb2,
+            SUM({$display['cost_home']}) as cost_home,
+            SUM({$display['cost_wb']} + {$display['cost_wb2']}) as cost_wb,
+            SUM({$display['cost_wb2']}) as cost_wb2,
             COALESCE(SUM(cost_wp), 0) as cost_wp,
             COALESCE(SUM(cost_climate), 0) as cost_climate,
             COALESCE(SUM(pv_balance_rest), 0) as pv_balance_rest,
@@ -539,8 +549,8 @@ if (file_exists($dbPath)) {
             COALESCE(SUM(saved_td), 0) as saved_td,
             COALESCE(SUM(saved_wb), 0) as saved_wb,
             SUM(CASE WHEN $realCostAggExpr THEN grid_in ELSE 0 END) as grid_in_real,
-            SUM(CASE WHEN $realCostAggExpr THEN home_consumption ELSE 0 END) as home_real,
-            SUM(CASE WHEN $realCostAggExpr THEN (COALESCE(wb_consumption, 0) + COALESCE(wb2_consumption, 0)) ELSE 0 END) as wb_real,
+            SUM(CASE WHEN $realCostAggExpr THEN {$display['home_consumption']} ELSE 0 END) as home_real,
+            SUM(CASE WHEN $realCostAggExpr THEN ({$display['wb_consumption']} + {$display['wb2_consumption']}) ELSE 0 END) as wb_real,
             SUM(CASE WHEN $realCostAggExpr THEN wp_consumption ELSE 0 END) as wp_real,
             SUM(CASE WHEN $realCostAggExpr THEN COALESCE(climate_consumption, 0) ELSE 0 END) as climate_real,
             SUM(CASE WHEN $realCostAggExpr THEN 0 ELSE bat_in END) as bat_in_sim
@@ -557,21 +567,23 @@ if (file_exists($dbPath)) {
             (COUNT(*) > MIN(COUNT(pv_yield), COUNT(home_consumption), COUNT(wp_consumption), COUNT(wb_consumption), COUNT(wb2_consumption), COUNT(climate_consumption), COUNT(grid_in), COUNT(grid_out), COUNT(bat_in), COUNT(bat_out))) as incomplete,
             SUM(pv_yield) as pv,
             SUM(CASE WHEN pv_yield IS NULL THEN NULL WHEN COALESCE(grid_out, 0) > 0.5 AND COALESCE(grid_out, 0) > COALESCE(pv_yield, 0) + 0.5 AND COALESCE(grid_out, 0) > MAX(1.0, COALESCE(bat_out, 0) * 1.5) THEN COALESCE(pv_yield, 0) + COALESCE(grid_out, 0) ELSE COALESCE(pv_yield, 0) END) as pv_total,
-            SUM(home_consumption) as home,
+            SUM({$display['home_consumption']}) as home,
+            SUM({$display['energy_split']}) as split_days,
+            SUM(1 - {$display['energy_split']}) as unsplit_days,
             MAX(COALESCE(house_includes_unknown_wallbox,0)) as house_includes_unknown_wallbox,
             SUM(grid_in) as grid_in,
             SUM(grid_out) as grid_out,
             SUM(bat_in) as bat_in,
             SUM(bat_out) as bat_out,
-            SUM(COALESCE(wb_consumption, 0)) as wb1,
-            SUM(COALESCE(wb2_consumption, 0)) as wb2,
-            SUM(COALESCE(wb_consumption, 0) + COALESCE(wb2_consumption, 0)) as wb,
+            SUM({$display['wb_consumption']}) as wb1,
+            SUM({$display['wb2_consumption']}) as wb2,
+            SUM({$display['wb_consumption']} + {$display['wb2_consumption']}) as wb,
             SUM(wp_consumption) as wp,
             SUM(COALESCE(climate_consumption, 0)) as climate,
             COALESCE(SUM(cost_total), 0) as cost_total,
-            COALESCE(SUM(cost_home), 0) as cost_home,
-            COALESCE(SUM(cost_wb), 0) + COALESCE(SUM(cost_wb2), 0) as cost_wb,
-            COALESCE(SUM(cost_wb2), 0) as cost_wb2,
+            SUM({$display['cost_home']}) as cost_home,
+            SUM({$display['cost_wb']} + {$display['cost_wb2']}) as cost_wb,
+            SUM({$display['cost_wb2']}) as cost_wb2,
             COALESCE(SUM(cost_wp), 0) as cost_wp,
             COALESCE(SUM(cost_climate), 0) as cost_climate,
             COALESCE(SUM(pv_balance_rest), 0) as pv_balance_rest,
@@ -586,8 +598,8 @@ if (file_exists($dbPath)) {
             COALESCE(SUM(saved_td), 0) as saved_td,
             COALESCE(SUM(saved_wb), 0) as saved_wb,
             SUM(CASE WHEN $realCostAggExpr THEN grid_in ELSE 0 END) as grid_in_real,
-            SUM(CASE WHEN $realCostAggExpr THEN home_consumption ELSE 0 END) as home_real,
-            SUM(CASE WHEN $realCostAggExpr THEN (COALESCE(wb_consumption, 0) + COALESCE(wb2_consumption, 0)) ELSE 0 END) as wb_real,
+            SUM(CASE WHEN $realCostAggExpr THEN {$display['home_consumption']} ELSE 0 END) as home_real,
+            SUM(CASE WHEN $realCostAggExpr THEN ({$display['wb_consumption']} + {$display['wb2_consumption']}) ELSE 0 END) as wb_real,
             SUM(CASE WHEN $realCostAggExpr THEN wp_consumption ELSE 0 END) as wp_real,
             SUM(CASE WHEN $realCostAggExpr THEN COALESCE(climate_consumption, 0) ELSE 0 END) as climate_real,
             SUM(CASE WHEN $realCostAggExpr THEN 0 ELSE bat_in END) as bat_in_sim
@@ -1303,7 +1315,7 @@ document.addEventListener("DOMContentLoaded", function() {
             tr.innerHTML = `
                 <td class="fw-bold text-start">${lzPeriodLabel(d)}${d.incomplete ? '<div class="small text-warning">unvollständig</div>' : ''}</td>
                 <td>${lzKwh(d.pv_total ?? d.pv)}</td>
-	                <td>${lzKwh(d.home)}${d.house_includes_unknown_wallbox ? '<div class="small text-warning">' + (currentViewMode === 'day' && d.house_unknown_wallbox_minutes != null ? 'Haus inkl. Wallbox (unbekannt, ' + d.house_unknown_wallbox_minutes + ' Min. ohne Messwert)' : 'Haus inkl. Wallbox (unbekannt)') + '</div>' : ''}</td>
+	                <td>${lzKwh(d.home)}${d.split_days > 0 && d.unsplit_days > 0 ? '<div class="small text-muted">Haus enthält an ' + d.unsplit_days + ' Tagen die Wallbox</div>' : ''}${d.house_includes_unknown_wallbox ? '<div class="small text-warning">' + (currentViewMode === 'day' && d.house_unknown_wallbox_minutes != null ? 'Haus inkl. Wallbox (unbekannt, ' + d.house_unknown_wallbox_minutes + ' Min. ohne Messwert)' : 'Haus inkl. Wallbox (unbekannt)') + '</div>' : ''}</td>
 	                <td>${lzKwh(d.wp)}</td>
 	                <td>${lzKwh(d.climate)}${lzClimateBreakdownHtml(d)}</td>
 	                <td>${lzKwh(d.wb1)}</td>
@@ -1656,13 +1668,13 @@ document.addEventListener("DOMContentLoaded", function() {
     window.openStatsEditor = function(data) {
         document.getElementById('edit-date').value = data.day;
         document.getElementById('edit-pv').value = lzFormatEditKwh(data.pv_total ?? data.pv);
-        document.getElementById('edit-home').value = lzFormatEditKwh(data.home);
+        document.getElementById('edit-home').value = lzFormatEditKwh(data.learning_home);
         document.getElementById('edit-grid-in').value = lzFormatEditKwh(data.grid_in);
         document.getElementById('edit-grid-out').value = lzFormatEditKwh(data.grid_out);
         document.getElementById('edit-bat-in').value = lzFormatEditKwh(data.bat_in);
         document.getElementById('edit-bat-out').value = lzFormatEditKwh(data.bat_out);
-        document.getElementById('edit-wb').value = lzFormatEditKwh(data.wb1 ?? data.wb);
-        document.getElementById('edit-wb2').value = lzFormatEditKwh(data.wb2 ?? 0);
+        document.getElementById('edit-wb').value = lzFormatEditKwh(data.learning_wb1);
+        document.getElementById('edit-wb2').value = lzFormatEditKwh(data.learning_wb2);
         document.getElementById('edit-wp').value = lzFormatEditKwh(data.wp);
         document.getElementById('edit-climate').value = lzFormatEditKwh(data.climate);
 

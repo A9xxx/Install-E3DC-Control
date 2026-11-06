@@ -7,6 +7,16 @@ import threading
 import signal
 import sys
 
+# Installer nur während dieses Imports voranstellen.
+_stdio_import_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, _stdio_import_path)
+try:
+    from quiet_logging import ensure_utf8_stdio
+except ImportError:
+    from Installer.quiet_logging import ensure_utf8_stdio
+finally:
+    sys.path.pop(0)
+
 LOGIN_PAYLOAD = "LOGIN;"
 
 def handle_sigterm(signum, frame):
@@ -212,6 +222,7 @@ def on_open(ws):
     ws.send(LOGIN_PAYLOAD)
 
 if __name__ == "__main__":
+    ensure_utf8_stdio()
     ip = _read_ip()
     if not ip or ip == "0.0.0.0":
         print("Luxtronik IP nicht konfiguriert (0.0.0.0). Beende Live-Stream.")

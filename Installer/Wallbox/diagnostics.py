@@ -13,6 +13,80 @@ from decision_history import HISTORY_NORMAL_HEARTBEAT_S, write_history_record
 from ems_decision_diagnostics import build_wallbox_decision_records, write_decision_surface_records
 
 
+def _core_gate_event(wb_id, now_ts, since_ts=None):
+    """Letzter Auditbeleg dieser Box; keine Freigabe und kein Gerätezugriff."""
+    from .command_gate import AUDIT_LOG
+
+    latest = None
+    # Auch nach einer Rotation bleibt der letzte vorhandene Beleg lesbar.
+    for path in (AUDIT_LOG + ".1", AUDIT_LOG):
+        try:
+            with open(path, "rb") as handle:
+                handle.seek(0, os.SEEK_END)
+                size = handle.tell()
+                handle.seek(max(0, size - 262144))
+                if size > 262144:
+                    handle.readline()
+                lines = handle.read().splitlines()
+        except OSError:
+            continue
+        for line in reversed(lines):
+            try:
+                event = json.loads(line)
+                stamp = float(event.get("ts"))
+            except (ValueError, TypeError, AttributeError):
+                continue
+            if (str(event.get("wb")) != str(wb_id)
+                    or event.get("decision") not in ("allowed", "blocked", "emergency_allowed")
+                    or not math.isfinite(stamp) or stamp > now_ts or stamp <= 0
+                    or (since_ts is not None and stamp < since_ts)):
+                continue
+            if latest is None or stamp > latest[0]:
+                latest = (stamp, event["decision"])
+            break
+    return latest
+
+
+def core_status_sentence(status, box, *, now_ts, box_stopped=False):
+    """Lesbarer Status mit getrenntem Treiberergebnis, Boxzustand und Gatebeleg."""
+    sentence = str(status.get("sentence") or "Regelkern wartet auf gültigen Zyklus")
+    # Die bestehenden Suffixe bleiben für die Diagnosehistorie abtrennbar.
+    suffixes = ("; Hauslast je Phase", "; Hauslast (ungünstigste Lage) je Phase",
+                "; Haus inkl. Verbraucher je Phase", "; Boxquittung")
+    end = min((sentence.find(key) for key in suffixes if key in sentence), default=len(sentence))
+    head, tail = sentence[:end], sentence[end:]
+    tail = tail.replace("; Boxquittung ", "; Sollstrom-Boxquittung ")
+    states = {"idle": "bereit", "start_wait": "Start abwarten", "charging": "lädt",
+              "hold": "halten", "stop_wait": "Stopp abwarten", "stopped": "gestoppt",
+              "protection": "Schutzstopp"}
+    actions = {"none": "kein neuer Befehl", "stop": "Stopp senden",
+               "stop_confirmed": "Stopp nachlesen", "start": "Start senden",
+               "set_current": "Sollstrom senden", "set_phases": "Phasen wechseln"}
+    parts = [head, "Zustand " + states.get(status.get("state"), "unbekannt"),
+             "Aktion " + actions.get(status.get("action"), "unbekannt")]
+    stopping = (status.get("action") in ("stop", "stop_confirmed")
+                or status.get("state") in ("stopped", "stop_wait"))
+    if status.get("action") in ("stop", "start", "set_current", "set_phases"):
+        result = status.get("command_confirmed")
+        parts.append("Treiberbefehl " + ("bestätigt" if result is True else
+                     "nicht bestätigt" if result is False else "Ergebnis unbekannt"))
+    if stopping:
+        parts.append("Box hat den Stopp bestätigt" if box_stopped else
+                     "Box hat den Stopp noch nicht bestätigt")
+    since = _finite_diagnostic_number((box.get("_simple_core_diagnostics") or {}).get("stop_since_ts")) if stopping else None
+    event = _core_gate_event(box.get("id"), now_ts, since)
+    if event:
+        stamp, decision = event
+        parts.append("Befehl am Gate: ja (" + time.strftime("%d.%m. %H:%M:%S", time.localtime(stamp))
+                     + (", abgewiesen)" if decision == "blocked" else ", zugelassen)"))
+    else:
+        parts.append("Befehl am Gate: nein (kein Auditbeleg" + (" seit Stoppbeginn)" if since is not None else ")"))
+        if (stopping and status.get("action") != "stop_confirmed" and not box_stopped
+                and since is not None and now_ts - since > 10):
+            parts.append("Hinweis: Kern fordert seit mehr als einem Zyklus Stopp; kein Befehl am Gate belegt")
+    return " · ".join(parts) + tail
+
+
 def _safe_float(value, default=0.0):
     try:
         return float(value)
@@ -397,7 +471,10 @@ class WallboxDiagnostics:
             if reason == "cycle_wait":
                 reason = previous.get(cid)
             sentence = str(box.get("simple_core_sentence") or "")
-            for suffix in ("; Hauslast je Phase", "; Hauslast (ungünstigste Lage) je Phase", "; Haus inkl. Verbraucher je Phase", "; Boxquittung"):
+            # Die verdichtete Historie behält den Beschlusssatz ohne die
+            # wechselnden Anzeigeangaben zu Aktion, Quittung und Gatezeit.
+            sentence = sentence.split(" · Zustand ", 1)[0]
+            for suffix in ("; Hauslast je Phase", "; Hauslast (ungünstigste Lage) je Phase", "; Haus inkl. Verbraucher je Phase", "; Boxquittung", "; Sollstrom-Boxquittung"):
                 sentence = sentence.split(suffix, 1)[0]
             data = box.get("simple_core_data_diagnostics")
             data = data if isinstance(data, dict) else {}
@@ -438,8 +515,10 @@ class WallboxDiagnostics:
                 ),
             },
             "inputs": {
-                "grid_w": int(round(_safe_float(state.get("grid_w_raw"), 0.0))),
-                "bat_w": int(round(_safe_float(state.get("bat_w_raw"), 0.0))),
+                "grid_w": (int(round(state["grid_w_raw"]))
+                    if _finite_diagnostic_number(state.get("grid_w_raw")) is not None else None),
+                "bat_w": (int(round(state["bat_w_raw"]))
+                    if _finite_diagnostic_number(state.get("bat_w_raw")) is not None else None),
                 "budget_raw_w": int(round(_safe_float(state.get("wb_budget_raw_w"), 0.0))),
                 "effective_budget_w": int(round(_safe_float(state.get("wb_effective_budget_w"), 0.0))),
                 # Legacy-Rohbudget ist bereits im Empfänger bearbeitet. Die

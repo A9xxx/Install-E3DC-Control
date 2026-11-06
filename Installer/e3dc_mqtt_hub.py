@@ -16,9 +16,9 @@ except ImportError:  # pragma: no cover - Nur nicht-POSIX Testumgebungen
     fcntl = None
 
 try:
-    from quiet_logging import install_quiet_info_filter
+    from quiet_logging import ensure_utf8_stdio, install_quiet_info_filter
 except ImportError:  # pragma: no cover - Paketimport
-    from Installer.quiet_logging import install_quiet_info_filter
+    from Installer.quiet_logging import ensure_utf8_stdio, install_quiet_info_filter
 try:
     from json_cache import read_json_cached as _read_json_cached
 except ImportError:  # pragma: no cover - Paketimport
@@ -66,7 +66,7 @@ def setup_logging():
     logger.handlers.clear()
     formatter = logging.Formatter('%(asctime)s - %(message)s', datefmt='%d.%m %H:%M:%S')
 
-    fh = RotatingFileHandler(os.path.join(LOG_DIR, "e3dc_mqtt_hub.log"), maxBytes=1024*1024, backupCount=1)
+    fh = RotatingFileHandler(os.path.join(LOG_DIR, "e3dc_mqtt_hub.log"), maxBytes=1024*1024, backupCount=1, encoding="utf-8")
     fh.setFormatter(formatter)
     logger.addHandler(fh)
     install_quiet_info_filter(
@@ -1377,6 +1377,7 @@ def on_wb_message(client, userdata, msg):
         logger.error(f"Fehler in on_wb_message: {e}")
 
 def main():
+    ensure_utf8_stdio()
     if not _mqtt_context_valid(refresh=True):
         _write_disabled_mqtt_state()
         logger.error("MQTT-Hub gesperrt: Installationskontext ist nicht vertrauenswuerdig.")

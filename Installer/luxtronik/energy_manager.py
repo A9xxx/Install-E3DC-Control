@@ -19,7 +19,7 @@ import requests
 import sqlite3
 from luxtronik import LuxtronikModbus
 try:
-    from quiet_logging import install_quiet_info_filter
+    from quiet_logging import ensure_utf8_stdio, install_quiet_info_filter
     from decision_history import HISTORY_NORMAL_HEARTBEAT_S, write_history_record
     from ems_decision_diagnostics import (
         build_energy_surface_record,
@@ -34,7 +34,7 @@ except ModuleNotFoundError:
     _INSTALLER_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     if _INSTALLER_DIR not in sys.path:
         sys.path.insert(0, _INSTALLER_DIR)
-    from quiet_logging import install_quiet_info_filter
+    from quiet_logging import ensure_utf8_stdio, install_quiet_info_filter
     from decision_history import HISTORY_NORMAL_HEARTBEAT_S, write_history_record
     from ems_decision_diagnostics import (
         build_energy_surface_record,
@@ -6029,9 +6029,11 @@ def luxtronik_pv_contract_cycle(ctx, previous, *, clock_sample):
         protection = "heat_source_limit"
     elif control_data_invalid or state.get("intent_quarantined"):
         protection = "invalid_control_data"
-    elif ctx.get("heatpump_emergency_veto") == "ep_reserve":
-        # Der frische lokale Storage-Zustand bleibt ein Reservebeleg, auch
-        # wenn durch die Producerlücke kein PV-Teilgrant mehr gebunden ist.
+    elif (fresh and not e3dc_expired and not ctx.get("heatpump_emergency_veto")
+          and ctx.get("budget_is_fresh")
+          and ctx.get("storage_state_name") == "ep_reserve_discharge_hold"):
+        # Ein frischer Reservebeleg gilt auch ohne gebundenen PV-Teilgrant.
+        # Ungültige WP-/E3DC-Daten haben Vorrang; Nutzerbefehle bleiben frei.
         protection = "emergency_reserve"
     elif not fresh or e3dc_expired or control_data_invalid or control_source_expired or state.get("intent_quarantined"):
         protection = "invalid_control_data"
@@ -7527,10 +7529,9 @@ MANUAL_WW_CENTRAL_START_IGNORED_BLOCK_REASONS = frozenset({
     "luxtronik_ww_start_budget_expired",
 })
 # Speicherzustände des Storage Managers, in denen er alle externen Budgets sperrt
-# (Notstrom/Inselbetrieb) bzw. die Notstromreserve hält. Der PV- und Preis-Boost
-# sind darüber am zentralen Budget gebunden; Nutzerbefehle ohne Budget prüfen
-# denselben Zustand.
-HEATPUMP_EMERGENCY_STORAGE_STATES = frozenset({"emergency_power", "ep_reserve_discharge_hold"})
+# (Notstrom/Inselbetrieb). Die Notstromreserve sperrt die Akkuentladung
+# im Speicher; Nutzerbefehle dürfen aus dem Netz laufen. Der PV-Auftrag bleibt
+# an das zentrale Budget und dessen Schutzart gebunden.
 
 
 def manual_ww_central_actuator_for(wp, wp_type):
@@ -7543,9 +7544,9 @@ def manual_ww_central_actuator_for(wp, wp_type):
 
 
 def heatpump_emergency_power_veto(storage_state_name, notstrom_status):
-    """Notstrom-/Inselbetrieb oder Notstromreserve: kein Nutzer-Boost ohne Budget.
+    """Notstrom-/Inselbetrieb: kein Nutzer-Boost ohne Budget.
 
-    Rückgabe ist der Grund (``emergency_power``, ``ep_reserve``) oder leer.
+    Rückgabe ist der Grund ``emergency_power`` oder leer.
     Gewertet werden der E3DC-Notstromstatus (1 Notstrom, 4 Inselbetrieb) und
     der Speicherzustand aus dem frischen Budget des Storage Managers. Fehlen
     beide, gibt es keinen Beleg für ein Veto.
@@ -7556,8 +7557,6 @@ def heatpump_emergency_power_veto(storage_state_name, notstrom_status):
     state = str(storage_state_name or "").strip()
     if state == "emergency_power":
         return "emergency_power"
-    if state in HEATPUMP_EMERGENCY_STORAGE_STATES:
-        return "ep_reserve"
     return ""
 # Warmwasser sofort: 'Ziel erreicht' ist das reguläre Ende eines Warmwasser-Zyklus - Toleranz zur Solltemperatur und
 # die Laufzustände, in denen kein Warmwasser-Zyklus mehr läuft. Die eingestellte Dauer bleibt die Obergrenze.
@@ -10322,6 +10321,7 @@ def send_webpush(config_key, title, body, url="/", actions=None):
 
 def setup_logging():
     """Initialisiert ein rotierendes Logfile für den Energy Manager."""
+    ensure_utf8_stdio()
     os.makedirs(LOG_DIR, exist_ok=True)
     log_file = os.path.join(LOG_DIR, "energy_manager.log")
 
@@ -11370,6 +11370,12 @@ def read_e3dc_live_for_energy_manager(
         mapped.update(storage_plan_meta={}, heat_price_boost_forecast={},
                       heat_forecast_source_reason="forecast_reader_unavailable")
     return mapped
+
+try:
+    from ..house_fuse import resolve_house_fuse, house_fuse_config, system_house_fuse
+except ImportError:
+    from house_fuse import resolve_house_fuse, house_fuse_config, system_house_fuse
+
 
 def main():
     setup_logging()
@@ -14323,6 +14329,7 @@ def main():
             wallbox_grid_hold = read_wallbox_grid_hold(time.time(), config=current_config) if luxtronik_pv_direct else {}
 
             _grid_live = e3dc if e3dc_valid and isinstance(e3dc, dict) else {}
+            grid_stop_config = house_fuse_config(current_config, resolve_house_fuse(current_config, system_house_fuse(_grid_live)))
             heatpump_grid_stop_state = heatpump_grid_stop(
                 heatpump_grid_stop_state,
                 dict(fresh=wp_status.get("valid") is True and wp_status.get("source_fresh") is True,
@@ -14331,7 +14338,7 @@ def main():
                 dict(fresh=e3dc_valid, sample_ts=_grid_live.get("_ts"),
                      grid_w=_grid_live.get("grid"),
                      **{key: _grid_live.get(key) for key in ("grid_p1", "grid_p2", "grid_p3")}),
-                clock_sample=control_time.sample(), config=current_config)
+                clock_sample=control_time.sample(), config=grid_stop_config)
             heatpump_grid_safety_stop = heatpump_grid_stop_state["stop"]
 
             # Direkte Kanäle (insbesondere Tarif) haben ihren eigenen Signalbeleg.
@@ -14377,13 +14384,11 @@ def main():
                 )
             # Inselbetrieb beendet auch einen bereits laufenden PV-Kanal.
             # An der Notstromreserve sperrt der Speicher die Entladung;
-            # der PV-Verdichter behält seine Mindestlaufzeit aus dem Netz.
-            heatpump_user_boost_emergency_veto = heatpump_emergency_power_veto(
+            # Nutzerbefehle laufen aus dem Netz, der Verdichter behält seine Mindestlaufzeit.
+            heatpump_emergency_veto = heatpump_emergency_power_veto(
                 storage_state_name if budget_is_fresh else "",
                 e3dc.get("notstrom_status") if e3dc_valid and isinstance(e3dc, dict) else None,
             )
-
-            heatpump_emergency_veto = heatpump_user_boost_emergency_veto
 
             # Eine gemeinsame Rücknahmeentscheidung für Automatik-Aus,
             # manuellen OFF und Ablauf. Die Nutzerabsicht bleibt sofort beendet;
@@ -14393,7 +14398,7 @@ def main():
                 (wp_compressor_last_start_ts or wp_last_pv_boost_start_ts) if wp_compressor_observation_valid
                     and wp_compressor_running_now else 0.0,
                 WP_MIN_RUNTIME_MIN,
-                emergency_stop=bool(heatpump_grid_safety_stop or heatpump_user_boost_emergency_veto
+                emergency_stop=bool(heatpump_grid_safety_stop or heatpump_emergency_veto
                     or heatpump_soc_stop or not e3dc_valid),
             ))
 
@@ -14563,7 +14568,7 @@ def main():
                             and (
                                 "pre_control_independent_safety_stop" in heatpump_positive_output_block_reasons
                                 or heatpump_soc_stop
-                                or heatpump_user_boost_emergency_veto
+                                or heatpump_emergency_veto
                             )
                         )
                         manual_direct_gap_action = (
@@ -14591,8 +14596,8 @@ def main():
                                         "(Ladestand %s %%, Netz %s W%s); der Auftrag bleibt bestehen.",
                                         soc,
                                         grid,
-                                        ", Notstromveto %s" % heatpump_user_boost_emergency_veto
-                                        if heatpump_user_boost_emergency_veto else "",
+                                        ", Notstromveto %s" % heatpump_emergency_veto
+                                        if heatpump_emergency_veto else "",
                                     )
                                 else:
                                     logger.warning(
@@ -16231,7 +16236,7 @@ def main():
                     # Warmwasser sofort (zentraler Startweg) folgt denselben Regeln wie der
                     # manuelle Direkt-Boost: In einer E3DC-Datenlücke wird das Signal
                     # höchstens 5 min gehalten und dann zurückgenommen; bei Notstrom-/
-                    # Inselbetrieb oder unter der Notstromreserve sofort. Ein nicht mehr
+                    # Inselbetrieb sofort. Ein nicht mehr
                     # frisches Speicher-Budget gilt wie eine Datenlücke (höchstens 5 min
                     # halten). Der Befehl bleibt in allen Fällen angefordert.
                     manual_ww_window_active = bool(
@@ -16258,7 +16263,7 @@ def main():
                         == "stop"
                     )
                     manual_ww_emergency_stop = bool(
-                        manual_ww_window_active and heatpump_user_boost_emergency_veto
+                        manual_ww_window_active and heatpump_emergency_veto
                     )
                     manual_ww_protective_stop = bool(
                         manual_ww_gap_stop or manual_ww_budget_stop or manual_ww_emergency_stop
@@ -16364,9 +16369,9 @@ def main():
                                 elif manual_ww_emergency_stop:
                                     _manual_ww_end_reason = "emergency_power_veto"
                                     logger.warning(
-                                        "Warmwasser sofort unterbrochen: Notstrom-/Inselbetrieb oder "
-                                        "Notstromreserve (%s); der Befehl bleibt angefordert.",
-                                        heatpump_user_boost_emergency_veto,
+                                        "Warmwasser sofort unterbrochen: Notstrom-/Inselbetrieb "
+                                        "(%s); der Befehl bleibt angefordert.",
+                                        heatpump_emergency_veto,
                                     )
                                 elif heatpump_signal_independent_safety_stop:
                                     _manual_ww_end_reason = "independent_safety_stop"
@@ -16428,7 +16433,7 @@ def main():
                                 "Netz-, Hardware- oder Herstellerschranke"
                                 if heatpump_signal_independent_safety_stop
                                 else heatpump_soc_state["text"] if heatpump_soc_stop
-                                else "Notstrom-/Reserveveto"
+                                else "Notstrom-/Inselveto"
                                 if manual_ww_emergency_stop
                                 else "E3DC-Datenlücke länger als die Toleranz"
                                 if manual_ww_gap_stop
@@ -16930,8 +16935,8 @@ def main():
                     # (sonst läuft dieser Block nicht), Schreibfreigabe, gültige
                     # E3DC-Livedaten, keine unabhängige Sicherheits-/Herstellerschranke
                     # (SoC unter Mindest-SoC − 5 %, anhaltender WP-Netzbezug über 2500 W, Hardware-/
-                    # Quellenschutz), kein Notstrom-/Inselbetrieb und keine Notstrom-
-                    # reserve, kein Nutzer-Aus, die Wiedereinschaltsperre ab
+                    # Quellenschutz), kein Notstrom-/Inselbetrieb, kein Nutzer-Aus,
+                    # die Wiedereinschaltsperre ab
                     # Verdichterstillstand und wie beim manuellen Direkt-Boost die
                     # Sperre nach der letzten Rücknahme. Wie der PV- und Preis-Boost
                     # braucht der Start ein frisches, gebundenes Speicher-Budget
@@ -16979,7 +16984,7 @@ def main():
                             now_ts=time.time(),
                         )
                         manual_ww_wait_reason = (
-                            heatpump_user_boost_emergency_veto
+                            heatpump_emergency_veto
                             or manual_ww_foreign_lock
                             or ("" if manual_ww_budget_fresh else "storage_budget_stale")
                         )
@@ -16988,8 +16993,8 @@ def main():
                             if manual_ww_wait_reason:
                                 logger.warning(
                                     "Warmwasser sofort wartet: %s (%s); kein Start.",
-                                    "Notstrom-/Inselbetrieb oder Notstromreserve"
-                                    if heatpump_user_boost_emergency_veto
+                                    "Notstrom-/Inselbetrieb"
+                                    if heatpump_emergency_veto
                                     else "fremde Sperre am Ausgang, der Knopf überschreibt sie nicht"
                                     if manual_ww_foreign_lock
                                     else "kein frisches Speicher-Budget",
@@ -17008,7 +17013,7 @@ def main():
                             wp_write_allowed
                             and e3dc_valid
                             and not heatpump_signal_independent_safety_stop
-                            and not heatpump_user_boost_emergency_veto
+                            and not heatpump_emergency_veto
                             and not manual_ww_foreign_lock
                             and manual_ww_budget_fresh
                             and not manual_ww_start_blockers

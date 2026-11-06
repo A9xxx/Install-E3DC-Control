@@ -34,7 +34,7 @@ try:
         config_secret_file_mode,
         config_secret_file_mode_text,
     )
-    from Installer.quiet_logging import install_quiet_info_filter
+    from Installer.quiet_logging import ensure_utf8_stdio, install_quiet_info_filter
     from Installer.ha_writer_admission import instance_role_anchor_matches
 except ImportError:
     import config_secret_permissions as _config_secret_permissions
@@ -44,7 +44,7 @@ except ImportError:
         config_secret_file_mode,
         config_secret_file_mode_text,
     )
-    from quiet_logging import install_quiet_info_filter
+    from quiet_logging import ensure_utf8_stdio, install_quiet_info_filter
     from ha_writer_admission import instance_role_anchor_matches
 
 PATHS_FILE = "/var/www/html/e3dc_paths.json"
@@ -2058,6 +2058,7 @@ def main_loop():
 
 
 if __name__ == "__main__":
+    ensure_utf8_stdio()
     if os.geteuid() == 0 and not PRIVILEGED_RUNTIME_BOUND:
         raise SystemExit(
             "HA-Manager verweigert Root-Start ohne root-eigene Laufzeitbindung."

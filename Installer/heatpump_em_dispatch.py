@@ -416,7 +416,7 @@ class LuxtronikChannelController:
         # eigenen Auftrag. Je Kanal gilt unten die Toleranz seines Besitzers.
         e3dc_scoped = bool(protection_reason == "invalid_control_data"
                            and pv_output.get("protection_scope") == "e3dc_live_gap")
-        if protection_reason not in ("", "user_off") and not e3dc_scoped:
+        if protection_reason not in ("", "user_off", "emergency_reserve") and not e3dc_scoped:
             hard = True
         gap = ctx.get("e3dc_live_gap") if isinstance(ctx.get("e3dc_live_gap"), dict) else {}
         e3dc_gap = gap.get("valid") is False
@@ -698,7 +698,13 @@ class LuxtronikChannelController:
                 and not (reason == "storage_free_missing_or_blocked" and not e3dc_gap)
                 and not (e3dc_gap and reason in (
                     "data_fresh_missing_or_blocked", "storage_free_missing_or_blocked")))))
-            channel_hard = bool(hard or gap_expired or tariff_hard)
+            # Die PV-Rücknahme behält ihre bestehende Wiederanlauffrist.
+            # Der Laufzeithalt unten gilt weiter; Nutzer- und Tarifangebote
+            # werden durch den Reservegrund des PV-Auftrags nicht gesperrt.
+            channel_hard = bool(hard or gap_expired or tariff_hard
+                or state["owner"] == "pv" and state["possible_effect"]
+                and protection_reason == "emergency_reserve"
+                and (desired[name] is None or desired[name]["owner"] not in ("manual", "tariff", "price")))
             if channel_hard:
                 desired[name] = None
             elif e3dc_gap and desired[name] is not None:
@@ -802,7 +808,7 @@ class LuxtronikChannelController:
                     or (state["owner"] == "tariff" and (tariff.get("storage_safety_veto") is True
                         or any(reason in tariff.get("blockers", []) for reason in (
                             "device_free_missing_or_blocked", "source_free_missing_or_blocked",
-                            "emergency_free_missing_or_blocked", "reserve_free_missing_or_blocked"))))
+                            "emergency_free_missing_or_blocked"))))
                     or blocks.intersection({"manual_source_temperature_stop"})
                     or ctx.get("heatpump_grid_safety_stop") is True
                     or (blocks.intersection({
@@ -904,7 +910,8 @@ class LuxtronikChannelController:
                 manual_owned=bool(manual_owned and automatic and not user_off and not channel_hard),
                 baseline_target_c=baseline,
                 release_on_baseline_readback=bool(wp_holiday and name == "ww"),
-                stop_reason=(None if boost_left_s > 0 else "user_off" if user_off else (protection_reason or "hard_protection") if hard else
+                stop_reason=(None if boost_left_s > 0 else "user_off" if user_off else (protection_reason or "hard_protection")
+                             if (hard or channel_hard and protection_reason == "emergency_reserve") else
                              "soc_below_stop_threshold" if soc_withdrawal else
                              "invalid_control_data" if channel_hard else
                              "timer_target" if timer_idle else

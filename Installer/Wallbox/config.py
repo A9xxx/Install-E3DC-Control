@@ -19,9 +19,9 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 try:
-    from quiet_logging import install_quiet_info_filter
+    from quiet_logging import ensure_utf8_stdio, install_quiet_info_filter
 except ModuleNotFoundError:
-    from Installer.quiet_logging import install_quiet_info_filter
+    from Installer.quiet_logging import ensure_utf8_stdio, install_quiet_info_filter
 try:
     from data_models import normalize_live_data_dict
 except ModuleNotFoundError:
@@ -89,6 +89,7 @@ def _configure_wallbox_logging():
     einem stabil laufenden Manager, aber dauerhaft leerer Web-Diagnosedatei.
     """
 
+    ensure_utf8_stdio()
     root_logger = logging.getLogger()
     root_logger.setLevel(logging.INFO)
     formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')

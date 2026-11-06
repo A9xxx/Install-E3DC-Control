@@ -359,7 +359,6 @@ function installCenterModuleConfigFields($moduleKey) {
                 ['value' => '2', 'label' => 'Vorrang Wallbox 2']
             ]),
             installCenterConfigField('wbmaxladestrom', 'Standard-Maximalstrom je Wallbox (6–32 A)', 'number', [], '', false, '16'),
-            installCenterConfigField('grid_max_amps', 'Hausabsicherung (A je Phase)', 'number', [], '', false, '35'),
             installCenterConfigField('wbminsoc', 'Batterie-Reserve für Wallbox (%)', 'number', [], '', false, '45'),
         ],
         'heatpump' => array_merge($commonHeatPump, [
@@ -1180,7 +1179,7 @@ function installCenterDiagnosticIdentifierKind($key, $value = null) {
     if (preg_match('/(?:^|[_-])mac(?:[_-]?addr(?:ess)?)?$/', $key)) return 'mac';
     if (preg_match('/(?:^|[_-])rfid(?:[_-]?tag)?$/', $key)) return 'rfid';
     if (preg_match('/(?:^|[_-])(?:device[_-]?ids|device[_-]?unique[_-]?id|unique[_-]?id[_-]?tail|ac[_-]?id(?:[_-]?tail)?|config[_-]?selector)$/', $key)) return 'device';
-    if (preg_match('/^(?:surface_id|group_id|binding_id|resource_key)$/', $key)) return 'pv';
+    if (preg_match('/^(?:surface_id|group_id|binding_id|resource_key|generator_group_id|inverter_group|group_ids)$/', $key)) return 'pv';
     if (preg_match('/(?:^|[_-])(?:home[_-]?id|resource[_-]?id(?:[_-]?\d+)?|client[_-]?id)$/', $key)) return 'account';
     if (preg_match('/(?:^|[_-])(?:vin|profile[_-]?id)$/', $key)) return 'vehicle';
     // Anzeigenamen der MQTT-SoC-Fahrzeuge (mqtt_hub_sub_soc_name[_2]); der MQTT-Hub
@@ -1474,7 +1473,7 @@ function installCenterRedactConfigValue($key, $value, $context = '') {
     if ($kind !== null && is_scalar($value)) {
         return installCenterDiagnosticPseudonymizeValue($kind, $value);
     }
-    if ($kind !== null && in_array($kind, installCenterDiagnosticDeviceIdentifierKinds(), true)
+    if ($kind !== null && ($kind === 'pv' || in_array($kind, installCenterDiagnosticDeviceIdentifierKinds(), true))
         && is_array($value) && array_is_list($value)
         && count(array_filter($value, fn($item) => !is_scalar($item) && $item !== null)) === 0) {
         return array_map(fn($item) => installCenterDiagnosticPseudonymizeValue($kind, $item), $value);
@@ -1485,7 +1484,7 @@ function installCenterRedactConfigValue($key, $value, $context = '') {
             $childContext = 'vehicle_list';
         } elseif ($context === 'vehicle_list' && ctype_digit((string)$key)) {
             $childContext = 'vehicle_item';
-        } elseif (in_array($normalizedKey, ['generator_groups', 'surfaces', 'pv_resources', 'allocations', 'bindings'], true)) {
+        } elseif (in_array($normalizedKey, ['generator_groups', 'surfaces', 'pv_resources', 'allocations', 'bindings', 'provider_resources'], true)) {
             $childContext = 'pv_items';
         } elseif ($context === 'pv_items' && ctype_digit((string)$key)) {
             $childContext = 'pv_item';
@@ -1508,6 +1507,14 @@ function installCenterRedactConfigValue($key, $value, $context = '') {
         return $out;
     }
     if (is_string($value)) {
+        // Gültige Topologie im Textformat nutzt dieselbe Bereinigung wie das Objekt.
+        if ($normalizedKey === 'pv_forecast_topology_config') {
+            $decoded = json_decode($value, true);
+            if (json_last_error() === JSON_ERROR_NONE && is_array($decoded)) {
+                return json_encode(installCenterRedactConfigValue($key, $decoded, $context),
+                    JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_PRESERVE_ZERO_FRACTION);
+            }
+        }
         return installCenterRedactText($value);
     }
     return $value;
@@ -3004,6 +3011,19 @@ function installCenterDiagnosticCandidates() {
             'privacy' => 'Live-/Planungsdaten, Text wird bereinigt; Seriennummern und Gerätekennungen werden pseudonymisiert.'
         ];
     }
+    $houseFusePath = '/var/www/html/data/e3dc_house_fuse.json';
+    if (is_file($houseFusePath)) {
+        $items[] = [
+            'id' => 'data:e3dc_house_fuse.json',
+            'label' => 'Gespeicherte Hausabsicherung',
+            'kind' => 'data',
+            'path' => $houseFusePath,
+            'size' => @filesize($houseFusePath) ?: 0,
+            'bundle_size' => min(@filesize($houseFusePath) ?: 0, 16384),
+            'default' => true,
+            'privacy' => 'Systemwert mit Ampere, Rohwatt, Quelle und Lesezeit; keine persönlichen Daten.'
+        ];
+    }
     $auxMigrationPath = '/var/www/html/data/direct_marketing_aux_inverter_shelly_migration.json';
     $batteryVitalsHistoryPath = '/var/www/html/data/battery_vitals_history.json';
     if (is_file($batteryVitalsHistoryPath)) {
@@ -3131,6 +3151,8 @@ function installCenterDiagnosticPresets($items) {
         'log:e3dc_live.log',
         'log:storage_manager.log',
         'log:wallbox_manager.log',
+        'ramdisk:storage_manager_state.json',
+        'ramdisk:wb_pv_budget.json',
     ];
     $powerDecisionPreset = array_merge([
         'status:power_decision',
@@ -3427,12 +3449,95 @@ function installCenterDiagnosticIsKnownMachineJsonlName($name) {
     return preg_match('/^(storage_decision_history|wallbox_decision_history|energy_decision_history|ems_reaction_history|live_plausibility_glitches)_\d+\.jsonl(?:\.gz)?$/', $base) === 1;
 }
 
+function installCenterDiagnosticJsonExcerpt($value, $startTs, $endTs) {
+    if (!is_array($value)) return $value;
+    if (array_is_list($value)) {
+        $rows = [];
+        foreach ($value as $row) {
+            $ts = is_array($row) ? installCenterDiagnosticRowTs($row) : 0;
+            if ($ts <= 0 && is_numeric($row['start_ts_ms'] ?? null)) $ts = (float)$row['start_ts_ms'] / 1000;
+            if ($ts > 0 && ($ts < $startTs || $ts > $endTs)) continue;
+            $rows[] = installCenterDiagnosticJsonExcerpt($row, $startTs, $endTs);
+        }
+        return $rows;
+    }
+    foreach ($value as $key => $child) {
+        $value[$key] = installCenterDiagnosticJsonExcerpt($child, $startTs, $endTs);
+    }
+    return $value;
+}
+
+function installCenterReadDiagnosticJsonExcerpt($path, $archiveName, $sourceSize, $maxBytes, $jsonText) {
+    // JSON immer vollständig parsen und vor jeder Auswahl strukturiert bereinigen.
+    $decoded = json_decode((string)$jsonText, true);
+    $limit = min(150000, (int)$maxBytes);
+    $now = time();
+    $valid = json_last_error() === JSON_ERROR_NONE && is_array($decoded);
+    $excerpt = $valid
+        ? installCenterDiagnosticJsonExcerpt(installCenterRedactConfigValue('', $decoded), $now - 4 * 3600, $now + 48 * 3600)
+        : ['error' => 'invalid_json'];
+    // Der Kopf bleibt erhalten; große Zusatzdetails werden ausdrücklich als ausgelassen markiert.
+    $omitted = [];
+    $encode = static fn($value) => json_encode($value, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) . "\n";
+    $data = $encode($excerpt);
+    while (strlen($data) > $limit) {
+        $largest = null;
+        $largestSize = 0;
+        foreach ($excerpt as $key => $value) {
+            if ($value === null || (!is_array($value) && strlen($encode($value)) < 4096)) continue;
+            $size = strlen($encode($value));
+            // Zeitreihen bleiben bis zuletzt erhalten, einschließlich ihrer Slot-Zeitpunkte.
+            $isSeries = is_array($value) && array_is_list($value) && count($value) > 0
+                && is_array($value[0]) && (installCenterDiagnosticRowTs($value[0]) > 0 || is_numeric($value[0]['start_ts_ms'] ?? null));
+            if ($isSeries) continue;
+            if ($size > $largestSize) { $largest = $key; $largestSize = $size; }
+        }
+        if ($largest === null) {
+            // Überlange Slot-Details entfernen, ohne die Zeitabdeckung zu verkürzen.
+            foreach ($excerpt as $key => &$rows) {
+                if (!is_array($rows) || !array_is_list($rows)) continue;
+                foreach ($rows as &$row) {
+                    if (!is_array($row)) continue;
+                    $row = array_intersect_key($row, array_flip(['ts', 'timestamp', 'start_ts_ms', 'end_ts_ms', 'soc', 'target_soc', 'pv_w', 'home_w', 'surplus_w', 'grid_charge_w', 'grid_dump_w', 'price', 'action', 'reason']));
+                }
+                unset($row);
+            }
+            unset($rows);
+            $omitted[] = 'slot_details';
+            $data = $encode($excerpt);
+            if (strlen($data) > $limit) {
+                $excerpt = ['error' => 'excerpt_size_limit', 'reason' => 'Zeitreihen überschreiten auch ohne Zusatzdetails die Größengrenze.'];
+            }
+            break;
+        }
+        $omitted[] = (string)$largest;
+        $excerpt[$largest] = null;
+        $data = $encode($excerpt);
+    }
+    $data = $encode($excerpt);
+    $name = preg_replace('/\.json$/i', '.excerpt.json', (string)$archiveName);
+    return ['name' => $name, 'data' => $data, 'meta' => [
+        'archive_name' => $name, 'source_archive_name' => $archiveName,
+        'source_path' => $path, 'source_size_bytes' => $sourceSize,
+        'source_compressed' => false, 'source_format' => 'json', 'content_format' => 'json',
+        'truncated' => true, 'max_bytes' => $limit, 'included_bytes' => strlen($data),
+        'excerpt_start_ts' => $now - 4 * 3600, 'excerpt_end_ts' => $now + 48 * 3600,
+        'omitted_fields' => $omitted, 'excerpt_valid' => $valid && !isset($excerpt['error']), 'redacted' => true, 'readable' => true,
+        'note' => 'gekürzt von ' . $sourceSize . ' auf ' . strlen($data) . ' Byte',
+    ]];
+}
+
 function installCenterReadDiagnosticFile($path, $archiveName, $maxBytes = 90000) {
-    if (!is_file($path) || !is_readable($path)) {
+    $exists = is_file($path);
+    if (!$exists || !is_readable($path)) {
+        $dockerDetected = is_file('/.dockerenv') || getenv('E3DC_WEB_PORT') !== false || getenv('E3DC_WEB_BIND') !== false;
+        $hint = $dockerDetected
+            ? 'Container neu starten.'
+            : '„Rechte reparieren“ in der Installationszentrale ausführen.';
         $name = installCenterDiagnosticMachineArchiveName($archiveName, 'text', false, false);
         return [
             'name' => $name,
-            'data' => "Datei nicht lesbar: " . $path . "\n",
+            'data' => ($exists ? "Datei nicht lesbar: " : "Datei fehlt: ") . $path . "\n" . $hint . "\n",
             'meta' => [
                 'archive_name' => $name,
                 'source_path' => $path,
@@ -3446,6 +3551,14 @@ function installCenterReadDiagnosticFile($path, $archiveName, $maxBytes = 90000)
     $sourceSize = is_numeric($sourceSize) ? (int)$sourceSize : null;
     $sourceCompressed = str_ends_with((string)$path, '.gz');
     $sourceFormat = installCenterDiagnosticContentFormat($path);
+    if (!$sourceCompressed && $sourceFormat === 'json' && $sourceSize > $maxBytes) {
+        $jsonText = @file_get_contents($path);
+        // Mehrzeilige Dateien behalten den bisherigen bereinigten Zeilenauszug.
+        if (basename($path) === 'storage_plan.json'
+            || (is_string($jsonText) && strpos(rtrim($jsonText), "\n") === false)) {
+            return installCenterReadDiagnosticJsonExcerpt($path, $archiveName, $sourceSize, $maxBytes, $jsonText);
+        }
+    }
     $truncated = false;
     $text = '';
     $decompressedBytes = null;
@@ -3561,6 +3674,7 @@ function installCenterReadRedactedFile($path, $maxBytes = 90000) {
 }
 
 function installCenterDiagnosticReadLimit($id) {
+    if ($id === 'ramdisk:storage_plan.json') return 150000;
     if (str_starts_with($id, 'log:')) return 90000;
     if (str_starts_with($id, 'ramdisk:')) return 250000;
     if ($id === 'data:battery_vitals_history.json') return 500000;
@@ -3592,8 +3706,8 @@ function installCenterDiagnosticIncidentContext($context = []) {
     $now = time();
     $incidentTs = is_numeric($context['incident_ts'] ?? null) ? (int)$context['incident_ts'] : $now;
     if ($incidentTs < $now - 31 * 86400 || $incidentTs > $now + 86400) $incidentTs = $now;
-    $beforeS = max(60, min(6 * 3600, (int)($context['incident_before_s'] ?? 1800)));
-    $afterS = max(60, min(2 * 3600, (int)($context['incident_after_s'] ?? 600)));
+    $beforeS = max(60, min(6 * 3600, (int)($context['incident_before_s'] ?? $context['before_s'] ?? 1800)));
+    $afterS = max(60, min(2 * 3600, (int)($context['incident_after_s'] ?? $context['after_s'] ?? 600)));
     return [
         'incident_ts' => $incidentTs,
         'start_ts' => $incidentTs - $beforeS,
@@ -5007,6 +5121,7 @@ function renderConfigEditor(payload) {
                 <strong><i class="fas fa-pen-to-square text-info me-1"></i>Direkt bearbeiten</strong>
                 <span class="text-secondary small">Backup wird vor dem Speichern automatisch angelegt.</span>
             </div>
+            <p class="small text-secondary">Hausabsicherung und Bestätigung im <a href="index.php?seite=config&amp;focus=grid_max_amps">Config-Editor unter „Wallbox &amp; Fahrzeug“</a> eintragen.</p>
             <div class="config-edit-grid">${formFields}</div>
             <div id="configModalSaveState" class="config-save-state text-secondary"></div>
         </form>

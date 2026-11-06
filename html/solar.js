@@ -2354,7 +2354,7 @@ function marketSocDisplay(data = {}, nowMs = Date.now()) {
     }
     const windows = (Array.isArray(t.selected_actions) ? t.selected_actions : []).filter(action =>
         action && ['hold_economic', 'grid_charge'].includes(action.action)
-        && ['hold_discharge', 'hold_horizon', 'selected_grid_wait', 'grid_charge'].includes(action.origin)
+        && ['hold_discharge', 'hold_horizon', 'hold_replacement', 'selected_grid_wait', 'grid_charge'].includes(action.origin)
         && finite(action.start_ts_ms) && finite(action.end_ts_ms) && action.end_ts_ms > action.start_ts_ms);
     return {complete: true, reasonCode: null, planId: t.plan_id, points, windows,
         expiresAt: Math.min(t.valid_until_ts_ms, sample + 300001)};
@@ -2423,10 +2423,22 @@ const storageMarketWindowsPlugin = {
         chart.ctx.clip();
         chart.data.datasets.forEach((dataset, index) => {
             if (!dataset.marketWindow || !chart.isDatasetVisible(index)) return;
-            const left = chart.scales.x.getPixelForValue(dataset.data[0].x);
-            const right = chart.scales.x.getPixelForValue(dataset.data[1].x);
             chart.ctx.fillStyle = dataset.backgroundColor;
-            chart.ctx.fillRect(left, area.top, right - left, area.bottom - area.top);
+            chart.ctx.strokeStyle = dataset.borderColor;
+            chart.ctx.lineWidth = 1;
+            // Je Fenster ein Punktpaar (Beginn, Ende); ein Datensatz trägt alle Fenster einer Art.
+            for (let i = 0; i + 1 < dataset.data.length; i += 2) {
+                const left = chart.scales.x.getPixelForValue(dataset.data[i].x);
+                const right = chart.scales.x.getPixelForValue(dataset.data[i + 1].x);
+                chart.ctx.fillRect(left, area.top, right - left, area.bottom - area.top);
+                // Feine Grenzlinien halten das Fenster auch auf dunklem Grund sichtbar.
+                chart.ctx.beginPath();
+                chart.ctx.moveTo(left, area.top);
+                chart.ctx.lineTo(left, area.bottom);
+                chart.ctx.moveTo(right, area.top);
+                chart.ctx.lineTo(right, area.bottom);
+                chart.ctx.stroke();
+            }
         });
         chart.ctx.restore();
     }
@@ -2455,17 +2467,25 @@ function appendMarketSocDatasets(datasets, data, timestamps, yAxisID = 'y1', his
     datasets.push({label: 'SoC-Prognose mit Marktplan (%)', data: view.points,
         marketSoc: true, borderColor: '#20c997', borderWidth: 2.5, pointRadius: 0,
         tension: 0, spanGaps: false, fill: false, yAxisID, order: 3});
+    // Ein Datensatz je Fensterart, damit die Legende jede Art nur einmal nennt.
+    const windowSets = new Map();
+    const darkTheme = typeof document !== 'undefined' && document.documentElement?.getAttribute?.('data-bs-theme') === 'dark';
     view.windows.forEach(action => {
         const left = Math.max(from, action.start_ts_ms);
         const right = fullHorizon ? action.end_ts_ms : Math.min(until, action.end_ts_ms);
         if (left >= right) return;
-        const hold = action.action === 'hold_economic';
-        datasets.push({label: marketSocActionText(action.action, action.origin),
-            marketWindow: true, data: [{x: action.start_ts_ms, y: 0, action: action.action, origin: action.origin},
-                {x: action.end_ts_ms, y: 100, action: action.action, origin: action.origin}],
-            backgroundColor: hold ? 'rgba(245,158,11,0.08)' : 'rgba(59,130,246,0.08)',
-            borderColor: hold ? '#d49b31' : '#6495d4', showLine: false, pointRadius: 0,
-            pointHitRadius: 0, borderWidth: 0, yAxisID, order: 20});
+        const label = marketSocActionText(action.action, action.origin);
+        if (!windowSets.has(label)) {
+            const hold = action.action === 'hold_economic';
+            windowSets.set(label, {label, marketWindow: true, data: [],
+                backgroundColor: hold ? (darkTheme ? 'rgba(245,158,11,0.24)' : 'rgba(245,158,11,0.16)')
+                    : (darkTheme ? 'rgba(96,165,250,0.28)' : 'rgba(59,130,246,0.16)'),
+                borderColor: hold ? '#f59e0b' : (darkTheme ? '#60a5fa' : '#3b82f6'), showLine: false, pointRadius: 0,
+                pointHitRadius: 0, borderWidth: 0, yAxisID, order: 20});
+            datasets.push(windowSets.get(label));
+        }
+        windowSets.get(label).data.push({x: action.start_ts_ms, y: 0, action: action.action, origin: action.origin},
+            {x: action.end_ts_ms, y: 100, action: action.action, origin: action.origin});
     });
     datasets.forEach(dataset => {
         dataset.data = dataset.data.map((value, index) => value && typeof value === 'object'
@@ -5559,7 +5579,7 @@ function storageOperationalDisplay(data = {}) {
             : storageStateDisplayLabel(stateRaw, data.storage_state_label),
         detail: marketText,
         badge: autoStates.has(state) ? 'E3/DC regelt frei' : '',
-        color: colors[state] || '#adb5bd',
+        color: colors[state] || 'var(--regler-neutral, #adb5bd)',
         active: !autoStates.has(state),
         holdActive: false,
         confirmed: false,
@@ -6384,6 +6404,14 @@ function storageStateDisplayLabel(state, providedLabel = '') {
     return labels[normalized] || providedLabel || String(state || 'Speicherregelung').replace(/_/g, ' ');
 }
 
+function storageMarketPlanIncompleteReasons(quality) {
+    const labels = {"current_price_invalid": [0, "Aktueller Preis ungültig"], "price_horizon_incomplete": [0, "Preishorizont unvollständig"], "billing_price_unavailable": [0, "Abrechnungspreis fehlt"], "no_timeline": [0, "Preiszeitreihe fehlt"], "no_current_slot": [0, "Aktuelles Preisintervall fehlt"], "pv_missing": [1, "PV-Prognose fehlt"], "home_missing": [1, "Hausverbrauchsprognose fehlt"], "forecast_freshness_missing": [1, "Prognosealter unbekannt"], "forecast_stale": [1, "PV-Prognose veraltet"], "home_forecast_missing": [1, "Hausverbrauchsprognose fehlt"], "home_forecast_invalid": [1, "Hausverbrauchsprognose ungültig"], "home_forecast_stale": [1, "Hausverbrauchsprognose veraltet"], "home_forecast_unresolved": [1, "Hausverbrauchsprognose ungeklärt"], "energy_horizon_gap": [1, "Prognosehorizont lückenhaft"], "energy_horizon_empty": [1, "Prognosehorizont leer"], "energy_horizon_tail_missing": [1, "Prognosehorizont am Ende unvollständig"], "forecast_energy_horizon_incomplete": [2, "Energieprognose unvollständig"], "energy_inputs_incomplete": [2, "Energiedaten unvollständig"]};
+    const codes = [...(quality.blocked_reasons || []), ...(quality.forecast?.energy_horizon_reasons || [])];
+    const reasons = codes.map(code => labels[code] || [2, 'Weitere Eingaben fehlen'])
+        .sort((a, b) => a[0] - b[0]).map(item => item[1]);
+    return [...new Set(reasons)].slice(0, 2).join('; ');
+}
+
 function storageMarketPlanQualityText(data) {
     const quality = data.storage_market_plan_quality;
     if (!quality || typeof quality !== 'object') return '';
@@ -6393,7 +6421,8 @@ function storageMarketPlanQualityText(data) {
     if (quality.status === 'other_owner') return 'Preisplanung: Keine Steuerungsfreigabe.';
     if (quality.complete === true) return 'Preisplanung: Plan vollständig geprüft.';
     if (quality.quality_bound === false) return 'Preisplanung: Qualität noch nicht bestätigt.';
-    return 'Preisplanung: Eingaben unvollständig.';
+    const reasons = storageMarketPlanIncompleteReasons(quality);
+    return reasons ? `Preisplanung: Eingaben unvollständig (${reasons}).` : 'Preisplanung: Eingaben unvollständig.';
 }
 
 function storageBackupReasonText(code) {
@@ -9222,10 +9251,6 @@ function switchChartMode(mode, view = 'normal') {
             forecastSummaryBar.innerHTML = '';
         }
     }
-    const forecastDiagnosticCard = document.getElementById('pv-forecast-diagnostic-card');
-    if (forecastDiagnosticCard && mode !== 'forecast' && mode !== 'hybrid') {
-        forecastDiagnosticCard.hidden = true;
-    }
     // Diagnosekarte des Zusatzwechselrichters nur im PV-Diagramm.
     const extInverterCard = document.getElementById('ext-inverter-diagnostic-card');
     if (extInverterCard && (mode !== 'live' || view !== 'pv')) {
@@ -11239,7 +11264,6 @@ function loadJsForecastChart(file = '') {
             if (!isCurrentJsChartRequest('forecast', requestGeneration)) return;
             const marketData = marketSocRequestData(data, marketEpoch);
             renderForecastKwhSummary(data);
-            updatePvForecastDiagnostics(data);
             const directMarketingView = renderDirectMarketingForecastChart(data, {exclusive: true});
             updateForecastProjectionStatus(data, directMarketingView);
             renderMarketSocHint(marketData, document.getElementById('liveChartContainer'));
@@ -11565,7 +11589,6 @@ function loadJsHybridChart(hours, file = null) {
         const directMarketingView = renderDirectMarketingForecastChart(forecastData);
         updateForecastProjectionStatus(forecastData, directMarketingView);
         renderMarketSocHint(marketData, document.getElementById('liveChartContainer'));
-        updatePvForecastDiagnostics(forecastData);
         if (forecastData.error || !forecastData.labels) forecastData = { labels: [], pv: [], home: [], bat: [], grid: [], soc: [] };
 
         const isDarkMode = typeof DARK_MODE !== 'undefined' ? DARK_MODE : true;
@@ -12588,11 +12611,11 @@ function wallboxEmergencyHint() {
 function updateWallboxControlStatus(data) {
     const active = data?.emergency_stop_active === true;
     window.E3DC_WALLBOX_EMERGENCY_STOP = active;
-    document.querySelectorAll('[data-dashboard-wb-force-start], [data-dashboard-wb-pause], [data-wallbox-pause-button]').forEach(button => {
+    document.querySelectorAll('[data-dashboard-wb-force-start], [data-dashboard-wb-pause], [data-wallbox-pause-button], [data-wallbox-lock-simple]').forEach(button => {
         if (active && button.dataset.wallboxEmergency !== '1') button.dataset.wallboxNormalTitle = button.title;
-        const slot = button.dataset.dashboardWbForceStart || button.dataset.dashboardWbPause || button.dataset.wallboxPauseButton || '1';
+        const slot = button.dataset.dashboardWbForceStart || button.dataset.dashboardWbPause || button.dataset.wallboxPauseButton || button.dataset.wbId || '1';
         const prefix = Number(slot) === 2 ? 'wb2' : 'wb';
-        const measureOnly = data?.[prefix + '_measure_only'] === true;
+        const measureOnly = !button.hasAttribute?.('data-wallbox-lock-simple') && data?.[prefix + '_measure_only'] === true;
         if (button.style) {
             if (measureOnly) button.style.setProperty('display', 'none', 'important');
             else button.style.removeProperty('display');
@@ -14374,11 +14397,12 @@ function updateGridHealthUI(data) {
     }
 
 
-    // Lese Absicherung (Default 63A) aus globaler PHP Konfiguration
-    const maxAmps = typeof GRID_MAX_AMPS !== 'undefined' ? parseFloat(GRID_MAX_AMPS) : 63;
-    const maxWattsPerPhase = maxAmps * 230;
-
-    $('#gh-max-scale').text(`Max: ${maxAmps}A`);
+    // Wirksamer Wert des Reglers; ein fehlender Wert bleibt unbekannt.
+    const maxAmps = typeof GRID_MAX_AMPS !== 'undefined' && GRID_MAX_AMPS !== null
+        && Number.isFinite(Number(GRID_MAX_AMPS)) && Number(GRID_MAX_AMPS) > 0 ? Number(GRID_MAX_AMPS) : null;
+    const maxWattsPerPhase = maxAmps === null ? null : maxAmps * 230;
+    const fuseSource = typeof GRID_MAX_AMPS_SOURCE !== 'undefined' ? GRID_MAX_AMPS_SOURCE : 'Quelle nicht gelesen';
+    $('#gh-max-scale').text(maxAmps === null ? fuseSource : `Max: ${maxAmps} A · ${fuseSource}`);
 
     const alertEl = $('#gridHealthAlert');
     const iconEl = $('#gridHealthIcon');
@@ -14410,9 +14434,9 @@ function updateGridHealthUI(data) {
         const l2a = (absL2 / 230).toFixed(1);
         const l3a = (absL3 / 230).toFixed(1);
 
-        const l1pct = Math.min(100, Math.max(0, (absL1 / maxWattsPerPhase) * 100));
-        const l2pct = Math.min(100, Math.max(0, (absL2 / maxWattsPerPhase) * 100));
-        const l3pct = Math.min(100, Math.max(0, (absL3 / maxWattsPerPhase) * 100));
+        const l1pct = maxWattsPerPhase === null ? null : Math.min(100, Math.max(0, (absL1 / maxWattsPerPhase) * 100));
+        const l2pct = maxWattsPerPhase === null ? null : Math.min(100, Math.max(0, (absL2 / maxWattsPerPhase) * 100));
+        const l3pct = maxWattsPerPhase === null ? null : Math.min(100, Math.max(0, (absL3 / maxWattsPerPhase) * 100));
 
         $('#gh-l1-w').text(`${Math.round(l1)} W`);
         $('#gh-l2-w').text(`${Math.round(l2)} W`);
@@ -14422,15 +14446,15 @@ function updateGridHealthUI(data) {
         $('#gh-l2-a').text(`${l2a} A`);
         $('#gh-l3-a').text(`${l3a} A`);
 
-        $('#gh-l1-bar').css('width', `${l1pct}%`);
-        $('#gh-l2-bar').css('width', `${l2pct}%`);
-        $('#gh-l3-bar').css('width', `${l3pct}%`);
+        $('#gh-l1-bar').css('width', l1pct === null ? '0%' : `${l1pct}%`);
+        $('#gh-l2-bar').css('width', l2pct === null ? '0%' : `${l2pct}%`);
+        $('#gh-l3-bar').css('width', l3pct === null ? '0%' : `${l3pct}%`);
 
         const setBarColor = (id, pct, val) => {
-            let bg = 'bg-info';
+            let bg = pct === null ? 'bg-secondary' : 'bg-info';
             if (pct > 95) bg = 'bg-danger';
             else if (pct > 80) bg = 'bg-warning text-dark';
-            else if (val < -100) bg = 'bg-success';
+            else if (pct !== null && val < -100) bg = 'bg-success';
 
             $(id).removeClass('bg-info bg-success bg-warning bg-danger bg-secondary text-dark text-white').addClass(bg);
         };
@@ -15175,13 +15199,64 @@ function showStorageCurveModal() {
 
 }
 
+const STORAGE_CURVE_READOUT_HINT = 'Für die Werte eines Zeitpunkts den Zeiger auf das Diagramm führen oder darauf tippen.';
+
+function renderStorageCurveReadout(tooltip) {
+    const box = document.getElementById('storageCurveReadout');
+    if (!box) return;
+    box.replaceChildren();
+    const rows = !tooltip || tooltip.opacity === 0 ? [] : (tooltip.body || [])
+        .map((row, index) => ({lines: (row.lines || []).filter(Boolean), color: tooltip.labelColors?.[index]}))
+        .filter(row => row.lines.length);
+    if (!rows.length) {
+        const hint = document.createElement('div');
+        hint.className = 'text-muted';
+        hint.textContent = STORAGE_CURVE_READOUT_HINT;
+        box.appendChild(hint);
+        return;
+    }
+    const title = document.createElement('div');
+    title.className = 'fw-bold mb-1';
+    title.textContent = (tooltip.title || []).join(' ');
+    box.appendChild(title);
+    const grid = document.createElement('div');
+    grid.style.cssText = 'display:grid; grid-template-columns:repeat(auto-fit,minmax(260px,1fr)); gap:2px 16px;';
+    rows.forEach(row => {
+        const item = document.createElement('div');
+        item.style.cssText = 'display:flex; gap:6px; align-items:baseline;';
+        const chip = document.createElement('span');
+        chip.style.cssText = 'flex:0 0 10px; height:10px; border-radius:2px;';
+        chip.style.backgroundColor = row.color?.borderColor || row.color?.backgroundColor || 'transparent';
+        const text = document.createElement('span');
+        row.lines.forEach((line, index) => {
+            if (index) text.appendChild(document.createElement('br'));
+            text.appendChild(document.createTextNode(line));
+        });
+        item.append(chip, text);
+        grid.appendChild(item);
+    });
+    box.appendChild(grid);
+}
+
+// Das offene Fenster baut das Diagramm alle paar Sekunden neu auf. Solange jemand Werte liest, wartet es damit.
+const STORAGE_CURVE_READ_HOLD_MS = 30000;
+let _storageCurveReadUntil = 0;
+
 function _renderStorageCurveChart(socPoints) {
     const canvas = document.getElementById('storageCurveChart');
     if (!canvas) return;
     _storageCurvePendingSocPoints = Array.isArray(socPoints) ? socPoints : [];
+    if (!canvas.$readHold) {
+        canvas.$readHold = true;
+        ['mousemove', 'touchstart', 'touchmove'].forEach(name => canvas.addEventListener?.(name, () => {
+            _storageCurveReadUntil = Date.now() + STORAGE_CURVE_READ_HOLD_MS;
+        }, {passive: true}));
+        canvas.addEventListener?.('mouseleave', () => { _storageCurveReadUntil = 0; });
+    }
 
     // Chart.js aus dem lokal mitgelieferten, lizenzierten Vendor-Bundle laden.
     function doRender() {
+        if (_storageCurveChartInstance && Date.now() < _storageCurveReadUntil) return;
         const currentSocPoints = _storageCurvePendingSocPoints;
         if (_storageCurveChartInstance) {
             if (_storageCurveChartInstance.$marketExpiryTimer) clearTimeout(_storageCurveChartInstance.$marketExpiryTimer);
@@ -15324,7 +15399,7 @@ function _renderStorageCurveChart(socPoints) {
                     {
                         label: reachability.label,
                         data: sollData,
-                        borderColor: reachability.unreachable ? 'rgba(77,171,247,0.4)' : '#4dabf7',
+                        borderColor: reachability.unreachable ? 'rgba(77,171,247,0.65)' : '#4dabf7',
                         backgroundColor: 'rgba(77,171,247,0.1)',
                         borderWidth: 2.5,
                         borderDash: [6, 3],
@@ -15507,9 +15582,12 @@ function _renderStorageCurveChart(socPoints) {
                         }
                     },
                     tooltip: {
+                        // Die Werte stehen unter dem Diagramm, damit nichts die Kurven verdeckt.
+                        enabled: false,
+                        external: ({tooltip}) => renderStorageCurveReadout(tooltip),
                         callbacks: {
                             title: items => items.length
-                                ? new Date(items[0].parsed.x).toLocaleTimeString('de-DE', {hour: '2-digit', minute: '2-digit', second: '2-digit'}) : '', 
+                                ? new Date(items[0].parsed.x).toLocaleTimeString('de-DE', {hour: '2-digit', minute: '2-digit', second: '2-digit'}) : '',
                             label: ctx => {
                                 const label = ctx.dataset && ctx.dataset.label ? ctx.dataset.label : '';
                                 const marketText = marketSocTooltip(ctx);
@@ -15577,19 +15655,37 @@ function _renderStorageCurveChart(socPoints) {
                     const yAxis = chart.scales.ySoc;
                     ctx.save();
                     ctx.beginPath();
-                    ctx.strokeStyle = 'rgba(255,255,255,0.5)';
+                    ctx.strokeStyle = isDark ? 'rgba(255,255,255,0.5)' : 'rgba(0,0,0,0.5)';
                     ctx.lineWidth = 1.5;
                     ctx.setLineDash([4, 4]);
                     ctx.moveTo(x, yAxis.top);
                     ctx.lineTo(x, yAxis.bottom);
                     ctx.stroke();
-                    ctx.fillStyle = 'rgba(255,255,255,0.7)';
+                    ctx.fillStyle = isDark ? 'rgba(255,255,255,0.7)' : 'rgba(0,0,0,0.7)';
                     ctx.font = '11px sans-serif';
                     ctx.fillText('Jetzt', x + 4, yAxis.top + 14);
                     ctx.restore();
                 }
+            }, {
+                // Dünne Linie am gelesenen Zeitpunkt, die Werte stehen unter dem Diagramm.
+                id: 'storageCurveCursor',
+                afterDraw: chart => {
+                    const active = chart.tooltip?.getActiveElements?.() || [];
+                    if (!active.length) return;
+                    const ctx = chart.ctx;
+                    const area = chart.chartArea;
+                    ctx.save();
+                    ctx.beginPath();
+                    ctx.strokeStyle = isDark ? 'rgba(255,255,255,0.45)' : 'rgba(0,0,0,0.45)';
+                    ctx.lineWidth = 1;
+                    ctx.moveTo(active[0].element.x, area.top);
+                    ctx.lineTo(active[0].element.x, area.bottom);
+                    ctx.stroke();
+                    ctx.restore();
+                }
             }]
         };
+        renderStorageCurveReadout(null);
         const marketData = window._storageLiveData || {};
         renderMarketSocHint(marketData, canvas.parentNode);
         const marketView = appendMarketSocDatasets(chartConfig.data.datasets, marketData, sortedTs, 'ySoc');

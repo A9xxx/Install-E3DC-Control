@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Fail-closed Logrotate-Taktgeber für den Docker-Dienstsatz."""
+"""Logrotate-Taktgeber für den Docker-Dienstsatz; ein Rotationsfehler beendet ihn nicht."""
 
 from __future__ import annotations
 
@@ -110,17 +110,21 @@ def main() -> int:
         return 1
 
     while True:
-        result = subprocess.run(
-            [LOGROTATE_BIN, "--state", str(STATE_PATH), str(CONFIG_PATH)],
-            capture_output=True,
-            text=True,
-            timeout=120,
-            check=False,
-        )
-        if result.returncode != 0:
-            detail = (result.stderr or result.stdout or str(result.returncode)).strip()
-            print(f"Docker-Logrotate fehlgeschlagen: {detail}", file=sys.stderr, flush=True)
-            return 1
+        # Ein Rotationsfehler betrifft nur die Logs: melden, im nächsten Takt erneut
+        # versuchen. Der Nachweis unten belegt den laufenden Taktgeber.
+        try:
+            result = subprocess.run(
+                [LOGROTATE_BIN, "--state", str(STATE_PATH), str(CONFIG_PATH)],
+                capture_output=True,
+                text=True,
+                timeout=120,
+                check=False,
+            )
+            if result.returncode != 0:
+                detail = (result.stderr or result.stdout or str(result.returncode)).strip()
+                print(f"Docker-Logrotate fehlgeschlagen: {detail}", file=sys.stderr, flush=True)
+        except (OSError, subprocess.SubprocessError) as exc:
+            print(f"Docker-Logrotate fehlgeschlagen: {exc}", file=sys.stderr, flush=True)
         try:
             _write_health(time.time())
         except Exception as exc:

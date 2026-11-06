@@ -177,11 +177,11 @@
                 isPointForecast ? 'Punktprognose' : 'Prognosevertrag nicht belegt',
                 p50Proven ? 'P50 bestätigt' : 'kein belegtes P50'
             ];
-            if (externalQuality && Number(externalQuality.meter_confirmed_slots) > 0) {
+            if (diagnostic.external_ac_configured === true && externalQuality && Number(externalQuality.meter_confirmed_slots) > 0) {
                 parts.push((progressFresh ? '' : 'Archivstand: ') + (externalQuality.calibration?.status === 'validated'
                     ? 'Zusatz-WR: Korrekturfaktor auf späteren Tagen geprüft'
                     : 'Zusatz-WR: Erzeugungszähler bestätigt, Kalibrierung sammelt Daten'));
-            } else if (externalAcMissing) {
+            } else if (diagnostic.external_ac_configured === true && externalAcMissing) {
                 parts.push('Zusatz-WR ohne getrennte Ist-Kalibrierung');
             }
             if (qualitySources.some(item => Number(item.quality_slots) > 0)) {

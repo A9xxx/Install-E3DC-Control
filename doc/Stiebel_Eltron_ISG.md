@@ -508,9 +508,15 @@ Storage Managers; fehlt es, wartet der Befehl (Log: `storage_budget_stale`).
 Wie bei einer Luxtronik-Anlage braucht der Start eingeschaltete Automatik,
 keinen manuellen Wärmepumpen-Boost, gültige E3DC-Livedaten, ein gültiges
 Warmwasser-Ist unter dem Ziel und keine Sicherheitsabschaltung (Speicher unter
-Mindest-SoC minus 5 %, Netzbezug über 2500 W, Hardware- oder Quellenschutz). Im Notstrom- oder
-Inselbetrieb und während der Speicher die Notstromreserve hält, startet und
-hält der Knopf nicht. Es gelten die Wiedereinschaltsperre ab
+Mindest-SoC minus 5 %, 30 Sekunden WP-Netzanteil über 2500 W – ohne eigene
+WP-Messung der gesamte Netzbezug abzüglich 200 W –, Hardware- oder
+Quellenschutz). Im Notstrom- oder
+Inselbetrieb startet und hält der Knopf nicht. An der Notstromreserve läuft
+der Nutzerbefehl aus dem Netz, solange Mindest-Ladestand,
+Sicherheitsabschaltung und Hausanschluss es erlauben; der Speicher gibt keine
+Akkuentladung frei. Ein PV-Auftrag endet an
+der Reserve, ein laufender Verdichter behält seine Mindestlaufzeit.
+Es gelten die Wiedereinschaltsperre ab
 Verdichterstillstand und, wie beim manuellen Wärmepumpen-Boost, nach jeder
 Rücknahme eine Sperre von mindestens 10 Minuten bzw. `wp_restart_block_min`,
 auch wenn der Verdichter nicht lief. Eine laufende eigene Preis- oder PV-Pause

@@ -879,6 +879,15 @@ function e3dcWebAuthAuthorizationHeader() {
     return '';
 }
 
+/**
+ * Seitenname aus der Anfrage: nur Buchstaben, Ziffern und Unterstrich.
+ * Alles andere gilt wie keine Angabe, damit der Name nie als Code in der Seite landet.
+ */
+function e3dcRequestedPage($default) {
+    $page = $_GET['seite'] ?? $default;
+    return (is_string($page) && preg_match('/\A[A-Za-z0-9_]+\z/D', $page) === 1) ? $page : $default;
+}
+
 function isWebAuthenticated() {
     if (PHP_SAPI === 'cli') {
         return true;
@@ -7438,7 +7447,7 @@ function handleUpdateCheck() {
 
 /**
  * Prüft den veröffentlichten Stable-Release für die Update-Anzeige.
- * Cache-Dauer: 4 Stunden; der eigentliche Update-Start bleibt davon unabhängig.
+ * Cache-Dauer: 30 Minuten; der eigentliche Update-Start bleibt davon unabhängig.
  */
 function handleSelfUpdateCheck() {
     if (isset($_GET['action']) && $_GET['action'] === 'check_self_update') {
@@ -7449,14 +7458,14 @@ function handleSelfUpdateCheck() {
         $isDocker = e3dcIsDockerEnvironment();
         $cacheFile = '/var/www/html/ramdisk/e3dc_self_update_status.json';
         $forceCheck = isset($_GET['force']) || isset($_GET['force_check']);
-        if (!$forceCheck && file_exists($cacheFile) && (time() - filemtime($cacheFile) < 14400)) {
+        if (!$forceCheck && file_exists($cacheFile) && (time() - filemtime($cacheFile) < 1800)) {
             $cachedRaw = (string)file_get_contents($cacheFile);
             $cachedData = json_decode($cachedRaw, true);
             if (!is_array($cachedData) || empty($cachedData['updating'])) {
                 echo $cachedRaw;
                 exit;
             }
-            // Ein Startmarker ist kein vier Stunden gültiges Prüfergebnis.
+            // Ein Startmarker ist kein 30 Minuten gültiges Prüfergebnis.
             // Nach dem Start folgt deshalb wieder der normale Stable-Vergleich.
         }
         $result = e3dcStableUpdateCheck();
@@ -9591,6 +9600,7 @@ function renderUpdateModal($dialogClass = 'modal-lg modal-dialog-scrollable') {
                             <div id="update-progress-bar" class="progress-bar progress-bar-striped progress-bar-animated" style="width: 5%;"></div>
                         </div>
                         <div id="update-status-elapsed" class="small text-body-secondary mt-2">Laufzeit: 0 min 00 s</div>
+                        <div id="update-status-plug-hint" class="small mt-2"><i class="fas fa-plug me-1"></i>Während des Vorgangs kein Fahrzeug anstecken: Solange die Dienste neu starten, regelt E3DC-Control keine Wallbox.</div>
                     </div>
                     <details id="update-details" class="border border-secondary rounded p-2">
                         <summary class="fw-semibold" style="cursor:pointer;">Technische Details</summary>
@@ -12549,6 +12559,55 @@ function renderGridHealthModal($dialogClass = 'modal-md modal-dialog-scrollable'
  * Speichert, aktualisiert oder löscht einen Tageseintrag in der SQLite Statistik-Datenbank.
  * Berechnet Autarkie und Eigenverbrauch basierend auf den neuen Werten nach.
  */
+/**
+ * Eine Aufteilung je Zeile: Energie und Kosten wählen unabhängig vollständige Dreiergruppen.
+ * PDO liefert SQL-Ausdrücke, eine Live-Zeile liefert Werte nach derselben Regel.
+ * Fehlende Anzeigespalten werden ausschließlich erkannt, niemals angelegt.
+ */
+function e3dcArchiveDisplaySelection($source, $alias = '') {
+    $sql = $source instanceof PDO;
+    $columns = $sql ? array_column($source->query('PRAGMA table_info(daily_stats)')->fetchAll(PDO::FETCH_ASSOC), 'name') : array_keys($source);
+    $prefix = $alias === '' ? '' : $alias . '.';
+    $result = [];
+    foreach (['energy' => ['home_consumption', 'wb_consumption', 'wb2_consumption'],
+              'cost' => ['cost_home', 'cost_wb', 'cost_wb2']] as $group => $fields) {
+        $complete = true;
+        $conditions = [];
+        foreach ($fields as $field) {
+            $display = 'display_' . $field;
+            if (!in_array($display, $columns, true)) $complete = false;
+            if ($sql) $conditions[] = $prefix . $display . ' IS NOT NULL';
+            elseif (!array_key_exists($display, $source) || $source[$display] === null) $complete = false;
+        }
+        $condition = $complete ? implode(' AND ', $conditions) : '0';
+        $result[$group . '_split'] = $sql ? '(CASE WHEN ' . $condition . ' THEN 1 ELSE 0 END)' : $complete;
+        foreach ($fields as $field) {
+            $result[$field] = $sql
+                ? ($complete ? '(CASE WHEN ' . $condition . ' THEN ' . $prefix . 'display_' . $field . ' ELSE ' . $prefix . $field . ' END)' : $prefix . $field)
+                : ($complete ? $source['display_' . $field] : $source[$field]);
+        }
+    }
+    return $result;
+}
+
+/** Wendet die Archivauswahl auch auf die verschachtelte Live-Tagesstatistik an. */
+function e3dcArchiveLiveDisplay(&$row, $live) {
+    $values = [];
+    foreach (['home_consumption' => 'total_home_kwh', 'wb_consumption' => 'total_wb_kwh', 'wb2_consumption' => 'total_wb2_kwh'] as $field => $key) {
+        $values[$field] = array_key_exists($key, $live['stats']) ? $live['stats'][$key] : null;
+        $values['display_' . $field] = $live['measure_only_display']['stats'][$key] ?? null;
+    }
+    foreach (['cost_home' => 'home', 'cost_wb' => 'wb', 'cost_wb2' => 'wb2'] as $field => $key) {
+        $values[$field] = $live['costs'][$key] ?? null;
+        $values['display_' . $field] = $live['measure_only_display']['costs'][$key] ?? null;
+    }
+    $selected = e3dcArchiveDisplaySelection($values);
+    foreach (['home' => 'home_consumption', 'wb1' => 'wb_consumption', 'wb2' => 'wb2_consumption',
+              'cost_home' => 'cost_home', 'cost_wb2' => 'cost_wb2'] as $key => $field) $row[$key] = $selected[$field];
+    $row['wb'] = $row['wb1'] === null || $row['wb2'] === null ? null : $row['wb1'] + $row['wb2'];
+    $row['cost_wb'] = $selected['cost_wb'] === null || $selected['cost_wb2'] === null ? null : $selected['cost_wb'] + $selected['cost_wb2'];
+}
+
 function saveDailyStats($date, $data, $action = 'save') {
     $dbPath = '/var/www/html/data/e3dc_stats.db';
     if (!file_exists($dbPath)) return false;
@@ -12588,7 +12647,12 @@ function saveDailyStats($date, $data, $action = 'save') {
 
 	        if ($exists) {
 	            $updateSql = "UPDATE daily_stats SET pv_yield=?, home_consumption=?, grid_in=?, grid_out=?, bat_in=?, bat_out=?, wb_consumption=?, wb2_consumption=?, wp_consumption=?, climate_consumption=?, autarky=?, self_con=? WHERE date=?";
-	            $stmt = $db->prepare($updateSql);
+	            $displayReset = [];
+                foreach ($db->query('PRAGMA table_info(daily_stats)') as $column) {
+                    if (in_array($column['name'], ['display_home_consumption', 'display_wb_consumption', 'display_wb2_consumption', 'display_cost_home', 'display_cost_wb', 'display_cost_wb2'], true)) $displayReset[] = $column['name'] . '=NULL';
+                }
+                if ($displayReset) $updateSql = str_replace(' WHERE date=?', ', ' . implode(', ', $displayReset) . ' WHERE date=?', $updateSql);
+                $stmt = $db->prepare($updateSql);
 	            return $stmt->execute([$pv, $home, $grid_in, $grid_out, $bat_in, $bat_out, $wb, $wb2, $wp, $climate, $autarky, $self_con, $date]);
 	        } else {
 	            $cols = "date, pv_yield, home_consumption, grid_in, grid_out, bat_in, bat_out, wb_consumption, wb2_consumption, wp_consumption, climate_consumption, autarky, self_con";
@@ -12734,118 +12798,18 @@ function renderE3dcModalThemeStyles() {
     </style>';
 }
 
-/**
- * Liest den Git-Hash direkt aus .git. Die WebUI darf für die Footer-Anzeige
- * keinen sudo/git-Shellpfad brauchen, weil Wrapper-only-Systeme das blocken.
- */
-function getGitCommitInfo() {
-    foreach (getFooterInstallRootCandidates() as $repoDir) {
-        if (!is_dir($repoDir . '/.git')) continue;
-
-        $headFile = $repoDir . '/.git/HEAD';
-        $cacheFile = '/var/www/html/ramdisk/git_commit_info_cache.json';
-        $headContentForCache = is_readable($headFile) ? trim((string)@file_get_contents($headFile)) : '';
-        $cacheKeyParts = [$repoDir, $headContentForCache];
-        if ($headContentForCache !== '' && strpos($headContentForCache, 'ref:') === 0) {
-            $refPath = trim(substr($headContentForCache, 4));
-            $refFile = $repoDir . '/.git/' . $refPath;
-            $cacheKeyParts[] = is_readable($refFile) ? trim((string)@file_get_contents($refFile)) : '';
-        } else {
-            $cacheKeyParts[] = $headContentForCache;
-        }
-        $cacheKey = sha1(implode('|', $cacheKeyParts));
-        if (is_readable($cacheFile)) {
-            $cached = @json_decode((string)@file_get_contents($cacheFile), true);
-            if (is_array($cached)
-                && ($cached['key'] ?? '') === $cacheKey
-                && (time() - (int)($cached['ts'] ?? 0)) < 3600
-                && !empty($cached['info']['hash'])
-            ) {
-                return $cached['info'];
-            }
-        }
-
-        $commitHash = null;
-        $commitTime = null;
-        if (!is_readable($headFile)) continue;
-        $headContent = trim((string)@file_get_contents($headFile));
-        if (strpos($headContent, 'ref:') === 0) {
-            $refPath = trim(substr($headContent, 4));
-            $refFile = $repoDir . '/.git/' . $refPath;
-            if (is_readable($refFile)) {
-                $commitHash = trim((string)@file_get_contents($refFile));
-            }
-            if (!$commitHash) {
-                $packedRefsFile = $repoDir . '/.git/packed-refs';
-                $packedRefs = is_readable($packedRefsFile)
-                    ? @file($packedRefsFile, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES)
-                    : false;
-                if (is_array($packedRefs)) {
-                    foreach ($packedRefs as $line) {
-                        $line = trim((string)$line);
-                        if ($line === '' || $line[0] === '#' || $line[0] === '^') continue;
-                        $parts = preg_split('/\s+/', $line, 2);
-                        if (count($parts) === 2
-                            && $parts[1] === $refPath
-                            && preg_match('/^[0-9a-f]{7,40}$/i', $parts[0])
-                        ) {
-                            $commitHash = $parts[0];
-                            break;
-                        }
-                    }
-                }
-            }
-        } else {
-            $commitHash = $headContent;
-        }
-
-        if (!$commitHash || strlen($commitHash) < 7) continue;
-        $info = [
-            'hash' => substr($commitHash, 0, 7),
-            'date' => $commitTime ? date('d.m.Y', $commitTime) : null,
-            'time' => $commitTime ? date('H:i', $commitTime) : null,
-        ];
-        @file_put_contents($cacheFile, json_encode(['key' => $cacheKey, 'ts' => time(), 'info' => $info], JSON_UNESCAPED_SLASHES));
-        return $info;
-    }
-
-    return null;
-}
-
 function renderFooterVersion() {
-    $info = getGitCommitInfo();
+    // Version und Datum kommen aus dem installierten Release. Ein vorhandenes Nutzer-Git führt der
+    // reguläre Updater nicht nach; sein Commit beschreibt den installierten Stand nicht.
     $release = getInstalledReleaseInfo();
-    // Der reguläre Updater führt ein vorhandenes Nutzer-Git nicht nach. Ist dessen Commit älter als das
-    // installierte Release, gehört der Hash nicht zu diesem Stand und entfällt in der Anzeige.
-    $gitDay = ($info && !empty($info['date'])) ? DateTime::createFromFormat('!d.m.Y', (string)$info['date']) : false;
-    $releaseDay = !empty($release['date_raw']) ? DateTime::createFromFormat('!Y-m-d', (string)$release['date_raw']) : false;
-    if ($gitDay && $releaseDay && $gitDay < $releaseDay) {
-        $info = null;
-    }
     $version = $release['version'] ?? '';
-    $date = $release['date'] ?: ($info['date'] ?? null);
-    $time = ($release['date'] ? null : ($info['time'] ?? null));
-
-    if ($info) {
-        $label = 'A9x ' . htmlspecialchars($info['hash'])
-               . ($date ? ' vom ' . htmlspecialchars($date) : '');
-        if ($time) $label .= ' um ' . htmlspecialchars($time);
-        if ($version) $label .= ' (v' . htmlspecialchars($version) . ')';
-        return ' | <a href="https://github.com/A9xxx/Install-E3DC-Control/commits/main"'
-             . ' target="_blank" class="text-decoration-none text-secondary"'
-             . ' title="Commit-Verlauf auf GitHub">' . $label . '</a>';
-    }
-
-    if ($version) {
-        $label = 'A9xxx'
-               . ($date ? ' vom ' . htmlspecialchars($date) : '')
-               . ' (v' . htmlspecialchars($version) . ')';
-        return ' | <a href="https://github.com/A9xxx/Install-E3DC-Control/tree/main"'
-             . ' target="_blank" class="text-decoration-none text-secondary"'
-             . ' title="Zum Quellcode (main branch)">' . $label . '</a>';
-    }
-
-    return '';
+    if (!$version) return '';
+    $label = 'A9xxx'
+           . (!empty($release['date']) ? ' vom ' . htmlspecialchars($release['date']) : '')
+           . ' (v' . htmlspecialchars($version) . ')';
+    return ' | <a href="https://github.com/A9xxx/Install-E3DC-Control/tree/main"'
+         . ' target="_blank" class="text-decoration-none text-secondary"'
+         . ' title="Zum Quellcode (main branch)">' . $label . '</a>';
 }
 
 // Anzeigevertrag: nur prüfen und durchreichen; keine Marktentscheidung und
@@ -12914,7 +12878,7 @@ function e3dcMarketSocTrajectoryForDisplay($plan, $live, $nowMs = null) {
     if (!$finite($market['valid_until_ts'] ?? null) || $market['valid_until_ts'] <= 0
         || $market['valid_until_ts'] + 20000 < $nowMs) return $fail('plan_expired');
     $horizon = $market['forecast']['hold_horizon'] ?? [];
-    // Reine Anzeige: dieselben Planer-Slots ohne Puffer, keine eigene Verteilung.
+    // Reine Anzeige: Ersatzslots belegen die Menge, der Auftrag bestimmt den Verlauf.
     $replacementProjection = static function () use ($plan, $market, $horizon, $finite) {
         if (($horizon['valid'] ?? null) !== true
             || ($horizon['replacement_reason'] ?? null) !== 'executable_cheaper_replacement'
@@ -12937,34 +12901,38 @@ function e3dcMarketSocTrajectoryForDisplay($plan, $live, $nowMs = null) {
             $proof = $matches[0];
             if (($proof['active'] ?? null) !== true
                 || ($proof['basis'] ?? null) !== 'projected_executable_without_own_credit') return [[], 1.0];
-            foreach (['window_start_ts', 'delivery_end_ts', 'job_grid_wh', 'max_charge_power_w'] as $key)
+            foreach (['window_start_ts', 'delivery_end_ts', 'job_grid_wh', 'max_charge_power_w', 'planned_charge_w', 'target_ts', 'target_end_soc_pct'] as $key)
                 if (!$finite($proof[$key] ?? null)) return [[], 1.0];
             $start = $proof['window_start_ts']; $delivery = $proof['delivery_end_ts'];
             $job = $proof['job_grid_wh']; $cap = min($proof['max_charge_power_w'], $plan['max_charge_w']);
+            $power = $proof['planned_charge_w']; $target = $proof['target_ts']; $targetSoc = $proof['target_end_soc_pct'];
             $hours = ($delivery - $start) / 3600000;
             if (!($plan['simulation_start_ts_ms'] < $start && $start < $delivery && $delivery <= $end
                     && $end <= $plan['horizon_end_ts_ms'])
                 || $start != floor($start) || $delivery != floor($delivery) || $end != floor($end)
+                || !($start < $target && $target <= $end) || $target != floor($target)
+                || $targetSoc < 0 || $targetSoc > 100 || $power < 300 || $power > $plan['max_charge_w']
                 || $amount <= 0 || $buffer < 0 || $job <= 0 || $cap < 300
                 || $amount + $buffer > $job * $eta + 0.002
                 || $amount > $cap * $hours * $eta + 0.002) return [[], 1.0];
             $slots = $window['slots'] ?? null;
             if (!is_array($slots) || !$slots || array_keys($slots) !== range(0, count($slots) - 1)) return [[], 1.0];
-            $slotTotal = 0.0;
+            $slotTotal = 0.0; $previousEnd = $start;
             foreach ($slots as $slot) {
                 foreach (['start_ts', 'end_ts', 'amount_wh'] as $key)
                     if (!$finite($slot[$key] ?? null)) return [[], 1.0];
                 $left = $slot['start_ts']; $right = $slot['end_ts']; $energy = $slot['amount_wh'];
                 $slotHours = ($right - $left) / 3600000;
                 if (!($start <= $left && $left < $delivery && $left < $right && $right <= $end)
-                    || $left != floor($left) || $right != floor($right) || $energy <= 0
+                    || $left < $previousEnd || $left != floor($left) || $right != floor($right) || $energy <= 0
                     || $energy > $cap * $slotHours * $eta + 0.002) return [[], 1.0];
-                $actions[] = ['action' => 'grid_charge', 'origin' => 'hold_replacement',
-                    'start_ts_ms' => (int)$left, 'end_ts_ms' => (int)$right,
-                    'power_w' => $energy / $slotHours / $eta];
-                $slotTotal += $energy;
+                $slotTotal += $energy; $previousEnd = $right;
             }
             if (abs($slotTotal - $amount) > 0.002) return [[], 1.0];
+            $actions[] = ['action' => 'grid_charge', 'origin' => 'hold_replacement',
+                'start_ts_ms' => (int)$start, 'end_ts_ms' => (int)$end,
+                'power_w' => $power, 'job_grid_wh' => $job, 'target_soc_pct' => $targetSoc,
+                'target_ts_ms' => (int)$target];
             $total += $amount;
         }
         usort($actions, static function ($a, $b) { return $a['start_ts_ms'] <=> $b['start_ts_ms']; });
@@ -13082,7 +13050,8 @@ function e3dcMarketSocTrajectoryForDisplay($plan, $live, $nowMs = null) {
                     !empty($late['active']) && !empty($late['wait_active']) ? ($late['latest_start_ts'] ?? PHP_INT_MAX) : 0);
                 if ($sourceAction !== 'grid_charge' || ($a['origin'] ?? null) !== 'grid_charge'
                     || $a['start_ts_ms'] != $expectedStart || $a['power_w'] != $job['planned_charge_w']
-                    || $a['end_ts_ms'] != min($contract['end_ts'], $job['window_end_ts'] ?? 0)) return $fail('market_selection_invalid');
+                    || $a['end_ts_ms'] != min($contract['end_ts'], $job['window_end_ts'] ?? 0)
+                    || ($a['target_ts_ms'] ?? null) != min($a['end_ts_ms'], ($job['target_ts'] ?? 0) ?: ($a['end_ts_ms'] - min(1800000, ($a['end_ts_ms'] - (($job['window_start_ts'] ?? 0) ?: max($t['integration_start_ts_ms'], $contract['start_ts']))) / 2)))) return $fail('market_selection_invalid');
             } elseif (($a['action'] ?? null) === 'hold_economic') {
                 if (($market['consumer_policy']['storage_hold'] ?? null) !== true || $a['power_w'] != 0) return $fail('market_selection_invalid');
                 $holdEnd = $sourceAction === 'hold_discharge' ? $contract['end_ts'] : ($late['latest_start_ts'] ?? 0);
@@ -13104,7 +13073,7 @@ function e3dcMarketSocTrajectoryForDisplay($plan, $live, $nowMs = null) {
     if (!is_array($slots) || !$slots || count($slots) > 600) return $fail('market_projection_endpoint_missing');
     $material = [$t['plan_id']];
     foreach ($numberKeys as $key) $material[] = sprintf('%.6F', $t[$key]);
-    $expected = $t['integration_start_ts_ms']; $previousSoc = $t['anchor_soc_pct']; $gridWh = 0.0;
+    $expected = $t['integration_start_ts_ms']; $previousSoc = $t['anchor_soc_pct'];
     foreach ($slots as $s) {
         if (!is_array($s) || !is_string($s['slot_id'] ?? null) || $s['slot_id'] === '')
             return $fail('market_projection_slot_id_invalid');
@@ -13119,7 +13088,7 @@ function e3dcMarketSocTrajectoryForDisplay($plan, $live, $nowMs = null) {
         $hours = ($s['end_ts_ms'] - $s['start_ts_ms']) / 3600000.0;
         if (abs(($s['soc_end_pct'] - $s['soc_start_pct']) * $capacity / 100 - $s['power_w'] * $hours) > 0.01
             || $s['power_w'] > $t['max_charge_w'] + 0.01 || $s['power_w'] < -$t['max_discharge_w'] - 0.01
-            || $s['grid_charge_w'] < 0 || $s['grid_charge_w'] > $t['max_charge_w'] + 0.01) return $fail('market_projection_physics_invalid');
+            || $s['grid_charge_w'] < 0 || $s['grid_charge_w'] * $eta > $t['max_charge_w'] + 0.01) return $fail('market_projection_physics_invalid');
         $chosen = null;
         foreach ($selected as $a) if ($a['start_ts_ms'] <= $s['start_ts_ms'] && $s['start_ts_ms'] < $a['end_ts_ms']) $chosen = $a;
         if (($s['action'] ?? null) !== ($chosen['action'] ?? 'none')
@@ -13128,8 +13097,8 @@ function e3dcMarketSocTrajectoryForDisplay($plan, $live, $nowMs = null) {
             || ($chosen && $s['end_ts_ms'] > $chosen['end_ts_ms'])
             || ($s['action'] === 'hold_economic' && ($s['power_w'] < -0.01 || $s['grid_charge_w'] != 0))
             || ($s['action'] !== 'grid_charge' && $s['grid_charge_w'] != 0)
-            || ($s['action'] === 'grid_charge' && ($s['grid_charge_w'] > $chosen['power_w'] + 0.01
-                || (($chosen['origin'] ?? null) !== 'hold_replacement' && $s['power_w'] + 0.01 < $s['grid_charge_w'] * $eta)))) return $fail('market_projection_action_invalid');
+            || ($s['action'] === 'grid_charge' && ($s['grid_charge_w'] * $eta > ($s['start_ts_ms'] < ($chosen['target_ts_ms'] ?? PHP_INT_MAX) ? $chosen['power_w'] : $t['max_charge_w']) + 0.01
+                || $s['power_w'] + 0.01 < $s['grid_charge_w'] * $eta))) return $fail('market_projection_action_invalid');
         $allocation = null;
         foreach ($schedule as $item) if ($item['start_ts'] <= $s['start_ts_ms'] && $s['start_ts_ms'] < $item['end_ts']) $allocation = $item;
         if ($horizonOnly) {
@@ -13142,8 +13111,8 @@ function e3dcMarketSocTrajectoryForDisplay($plan, $live, $nowMs = null) {
                 'contract_id' => $contractId, 'power_w' => 0.0];
             if (($shouldHold || $replacement !== null) !== ($chosen !== null)) return $fail('market_selection_invalid');
         }
-        $checkScheduled = $allocation && (!$chosen || in_array($chosen['origin'] ?? null, ['hold_horizon', 'hold_replacement'], true));
-        if ($checkScheduled || ($chosen['origin'] ?? null) === 'hold_replacement') {
+        $checkScheduled = $allocation && (!$chosen || ($chosen['origin'] ?? null) === 'hold_horizon');
+        if ($checkScheduled || ($chosen['action'] ?? null) === 'grid_charge') {
             $scheduledPower = max(0, $s['base_power_w']);
             if ($checkScheduled) {
                 if ($s['end_ts_ms'] > $allocation['end_ts']) return $fail('market_projection_action_invalid');
@@ -13151,16 +13120,21 @@ function e3dcMarketSocTrajectoryForDisplay($plan, $live, $nowMs = null) {
                     ? max(-$t['max_discharge_w'], -$allocation['battery_pv_supply_wh'] / (($allocation['end_ts'] - $allocation['start_ts']) / 3600000))
                     : max(0, $s['base_power_w']));
             }
-            if (($chosen['origin'] ?? null) === 'hold_replacement') {
-                $gridPower = min($chosen['power_w'], max(0, $t['max_charge_w'] - max(0, $scheduledPower)) / $eta,
-                    max(0, (100 - $s['soc_start_pct']) * $capacity / 100 / $hours - $scheduledPower) / $eta);
-                $scheduledPower += $gridPower * $eta;
+            if (($chosen['action'] ?? null) === 'grid_charge') {
+                $isReplacement = ($chosen['origin'] ?? null) === 'hold_replacement';
+                $targetSoc = $isReplacement ? $chosen['target_soc_pct'] : $forecast['grid_charge_target_soc_pct'];
+                // Die Rate enthält PV; nach dem Ziel bleibt ausschließlich PV-Laden.
+                $pv = max(0, $s['base_power_w']);
+                $rate = min($s['start_ts_ms'] < $chosen['target_ts_ms'] ? $chosen['power_w'] : $t['max_charge_w'],
+                    max(0, ($targetSoc - $s['soc_start_pct']) * $capacity / 100 / $hours), $t['max_charge_w']);
+                $scheduledPower = min($t['max_charge_w'], max($pv, $rate));
+                $scheduledSoc = max($reserve, min(100, $s['soc_start_pct'] + $scheduledPower * $hours / $capacity * 100));
+                $gridPower = max(0, ($scheduledSoc - $s['soc_start_pct']) * $capacity / 100 / $hours - $pv) / $eta;
                 if (abs($gridPower - $s['grid_charge_w']) > 0.01) return $fail('market_projection_energy_invalid');
             }
             $scheduledSoc = max($reserve, min(100, $s['soc_start_pct'] + $scheduledPower * $hours / $capacity * 100));
             if (abs($scheduledSoc - $s['soc_end_pct']) > 0.001) return $fail('market_projection_energy_invalid');
         }
-        $gridWh += $s['grid_charge_w'] * $hours;
         foreach (['slot_id', 'action', 'origin', 'contract_id'] as $key) $material[] = (string)($s[$key] ?? '');
         foreach (['start_ts_ms', 'end_ts_ms', 'soc_start_pct', 'soc_end_pct', 'power_w', 'grid_charge_w', 'base_power_w', 'reserve_soc_pct'] as $key)
             $material[] = sprintf('%.6F', $s[$key]);
@@ -13168,7 +13142,6 @@ function e3dcMarketSocTrajectoryForDisplay($plan, $live, $nowMs = null) {
     }
     if ($horizonOnly && (!$expectedSelected || $selected != $expectedSelected)) return $fail('market_selection_invalid');
     if ($expected != $t['horizon_end_ts_ms']) return $fail('market_projection_endpoint_missing');
-    if ($sourceAction === 'grid_charge' && $gridWh > $job['job_grid_wh'] + 0.01) return $fail('market_projection_energy_invalid');
     if (($t['trajectory_revision'] ?? null) !== 'sha256:' . hash('sha256', implode('|', $material))) return $fail('market_projection_revision_invalid');
     if (!is_array($live)) return $fail('live_soc_missing');
     $soc = array_key_exists('SOC', $live) ? $live['SOC'] : ($live['soc'] ?? null);

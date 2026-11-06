@@ -78,7 +78,7 @@ if (isset($_POST['save_lux_global'])) {
     exit;
 }
 
-$seite = $_GET['seite'] ?? 'dashboard';
+$seite = e3dcRequestedPage('dashboard');
 if ($seite === 'charging') {
     $seite = !empty($wbEnabled) ? 'wallbox' : 'dashboard';
 }
@@ -140,6 +140,8 @@ if (isset($_GET['ajax']) && $_GET['ajax'] == '1') {
     <script src="assets/vendor/hammerjs/hammer.min.js"></script>
     <script src="assets/vendor/chartjs-plugin-zoom/chartjs-plugin-zoom.min.js"></script>
     <style>
+        :root { --regler-neutral: #6c757d; }
+        [data-theme="dark"], [data-bs-theme="dark"] { --regler-neutral: #adb5bd; }
         .wallbox-data-outage { opacity: 1 !important; outline: 3px solid #f59e0b !important; outline-offset: 2px; animation: wallbox-data-outage-pulse 1.4s ease-in-out infinite; }
         .wallbox-data-outage, .wallbox-data-outage .card, .wallbox-data-outage .card-body, .wallbox-data-outage-message { background: #fff3cd !important; color: #664d03 !important; }
         .wallbox-data-outage-message { display: block; padding: .5rem; border-radius: .5rem; white-space: normal; font-size: .8rem; }
@@ -1453,7 +1455,7 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                     </div>
                     <div class="fw-bold text-truncate mb-1" style="font-size:1.05rem; line-height:1.25;" id="wb-stor-state">--</div>
                     <div id="wb-stor-metrics" class="d-flex align-items-start gap-2" tabindex="0" role="group" aria-label="Speicherkennzahlen">
-                        <span class="badge rounded-pill" style="font-size:0.65rem; background:rgba(108,117,125,0.12); color:#adb5bd;" id="wb-budget-state-badge">--</span>
+                        <span class="badge rounded-pill" style="font-size:0.65rem; background:rgba(108,117,125,0.12); color:var(--regler-neutral);" id="wb-budget-state-badge">--</span>
                         <span class="text-muted" style="font-size:0.78rem;" id="wb-stor-soll-soc">Soll: -- %</span>
                         <span class="badge rounded-pill" style="display:none; font-size:0.65rem; background:rgba(129,140,248,0.14); color:#a5b4fc;" id="wb-stor-ifc">Rahmen: -- W</span>
                         <span class="badge rounded-pill" style="display:none; font-size:0.65rem; background:rgba(14,165,233,0.12); color:#38bdf8;" id="wb-stor-curve">Kurve: --</span>
@@ -1481,7 +1483,7 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                             <div class="text-muted" style="font-size:0.65rem;" id="heat-manager-state-label">Manager</div>
                         </div>
                         <div class="d-flex flex-column gap-1">
-                            <span class="badge rounded-pill" style="font-size:0.65rem; background:rgba(108,117,125,0.12); color:#adb5bd;" id="heat-manager-mode-badge">--</span>
+                            <span class="badge rounded-pill" style="font-size:0.65rem; background:rgba(108,117,125,0.12); color:var(--regler-neutral);" id="heat-manager-mode-badge">--</span>
                             <span style="font-size:0.75rem;" id="heat-manager-wp-mode">--</span>
                         </div>
                     </div>
@@ -1738,30 +1740,6 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                     <?php endif; ?>
                     <div id="diagramDetails" class="px-3 pb-2 text-info small fw-bold" style="display:none;"></div>
                     <div id="forecast-kwh-summary" class="forecast-summary px-3 pb-2 text-info small fw-bold" style="display:none;"></div>
-                    <div id="pv-forecast-diagnostic-card" class="mx-3 mb-2 rounded border border-secondary-subtle bg-body-tertiary px-3 py-2 small" hidden>
-                        <div class="d-flex flex-wrap align-items-center justify-content-between gap-2">
-                            <span class="fw-bold"><i class="fas fa-chart-bar text-info me-1"></i>PV-Prognosediagnose</span>
-                            <span id="pv-forecast-diagnostic-status" class="badge text-bg-secondary">Noch keine Auswertung</span>
-                        </div>
-                        <div class="d-flex flex-wrap gap-2 gap-lg-3 mt-1 text-body">
-                            <span title="Mittlerer absoluter Fehler je Ertragsfenster: Ist oder Prognose mindestens 25 Wh">Trefferabweichung: <strong id="pv-forecast-diagnostic-hit">–</strong></span>
-                            <span title="Positiv bedeutet im Mittel mehr, negativ weniger Ertrag als vorhergesagt">Richtungsversatz: <strong id="pv-forecast-diagnostic-direction">–</strong></span>
-                            <span title="Quadratische Fehlerwurzel; gewichtet größere Fehler stärker">RMSE: <strong id="pv-forecast-diagnostic-rmse">–</strong></span>
-                            <span title="Positiv bedeutet besser als die vor Ausgabe bekannte Tagespersistenz">Skill gegen Tagespersistenz: <strong id="pv-forecast-diagnostic-skill">–</strong></span>
-                            <span title="Gesamtabweichung, gewichtet nach der tatsächlich erzeugten Energie">Energieabweichung: <strong id="pv-forecast-diagnostic-energy">–</strong></span>
-                            <span title="Anteil der archivierten Prognosefenster mit gültigem Messwert">Abdeckung: <strong id="pv-forecast-diagnostic-coverage">–</strong></span>
-                        </div>
-                        <div class="d-flex flex-wrap justify-content-between gap-2 mt-1 text-muted">
-                            <span id="pv-forecast-diagnostic-sample">Noch keine vergleichbaren Fenster</span>
-                            <span>Nur Diagnose – ändert keine Regelung und wählt kein Modell aus.</span>
-                        </div>
-                        <div id="pv-forecast-diagnostic-contract" class="mt-1 text-warning">
-                            Punktprognose – kein belegtes P50.
-                        </div>
-                        <div id="pv-forecast-diagnostic-horizons" class="mt-1 text-muted">
-                            Erfassungs-Vorlauf: noch keine revisionsgebundenen Stichproben.
-                        </div>
-                    </div>
                     <?php /* Diagnosekarte Zusatzwechselrichter (Direktlesung), nur im PV-Diagramm und nur bei konfigurierter Lesung */ ?>
                     <div id="ext-inverter-diagnostic-card" class="mx-3 mb-2 rounded border border-secondary-subtle bg-body-tertiary px-3 py-2 small" hidden>
                         <div class="d-flex flex-wrap align-items-center justify-content-between gap-2">
@@ -2584,6 +2562,7 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
               <div style="position:relative; height:260px;">
                 <canvas id="storageCurveChart"></canvas>
               </div>
+              <div id="storageCurveReadout" class="small border-top mt-2 pt-2" style="min-height:7.5em;"></div>
             </div>
             <div id="sc-direct-marketing-chart-wrap" style="display:none;">
               <div class="d-flex flex-wrap align-items-center gap-2 mb-2 small">
@@ -2613,7 +2592,6 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
 
     <script src="assets/vendor/jquery/jquery-3.6.0.min.js"></script>
     <script src="assets/vendor/bootstrap/js/bootstrap.bundle.min.js"></script>
-    <script src="<?= getAssetUrl('pv_forecast_diagnostics.js') ?>" defer></script>
     <script src="<?= getAssetUrl('update_status.js') ?>" defer></script>
     <script src="<?= getAssetUrl('solar.js') ?>" defer></script>
     <script>
@@ -2632,6 +2610,7 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
         const LON = <?= json_encode($lon) ?>;
         const BAT_CAPACITY = <?= json_encode($batteryCapacity) ?>;
         const GRID_MAX_AMPS = <?= json_encode($gridMaxAmps) ?>;
+        const GRID_MAX_AMPS_SOURCE = <?= json_encode($gridMaxAmpsSource, JSON_UNESCAPED_UNICODE) ?>;
         const PV_ATMOSPHERE = <?= json_encode($pvAtmosphere) ?>;
         let SHOW_FORECAST = <?= $showForecast ? 'true' : 'false' ?>;
         let DARK_MODE = <?= $darkMode ? 'true' : 'false' ?>;
@@ -3110,7 +3089,7 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                         );
                     } else {
                         storStateEl.textContent = data.storage_state_label || data.storage_state || '--';
-                        storStateEl.style.color = '#adb5bd';
+                        storStateEl.style.color = 'var(--regler-neutral)';
                     }
                 }
                 if (storReasonEl && storageOperational && storageOperational.holdActive) {
@@ -3455,7 +3434,7 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                     const bstLabels = {run:'Signal OK',reduce:'Gedrosselt',hold:'Halten',stop:'STOP',timeout:'TIMEOUT',unknown:'--'};
                     const bstColors = {run:'#10b981',reduce:'#f59e0b',hold:'#f59e0b',stop:'#ef4444',timeout:'#ef4444',unknown:'#6b7280'};
                     budgetStateBadge.textContent = bstLabels[bst] || bst;
-                    budgetStateBadge.style.color = bstColors[bst] || '#adb5bd';
+                    budgetStateBadge.style.color = bstColors[bst] || 'var(--regler-neutral)';
                     const ageS = data.wb_budget_age_s || 0;
                     if (ageS > 10) budgetStateBadge.textContent += ' (' + Math.round(ageS) + 's)';
                 }
@@ -3504,7 +3483,7 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                             heatReason = heatReason ? (heatReason + ' · ' + unfundedReason) : unfundedReason;
                         }
                         const wpModeText = data.wp_mode_text || ({0:'Heizen',1:'WW',5:'Standby'}[data.wp_mode] || 'Standby');
-                        const stateColor = heatActive ? '#fb923c' : (budgetW !== null && budgetW > 0 ? '#10b981' : '#adb5bd');
+                        const stateColor = heatActive ? '#fb923c' : (budgetW !== null && budgetW > 0 ? '#10b981' : 'var(--regler-neutral)');
                         if (heatStateEl) {
                             heatStateEl.textContent = heatLabel;
                             heatStateEl.title = heatReason;
@@ -3514,11 +3493,11 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                             heatBadgeEl.textContent = heatActive ? 'Aktiv' : (budgetW !== null && budgetW > 0 ? 'Budget' : 'Bereit');
                             heatBadgeEl.title = heatReason;
                             heatBadgeEl.style.background = heatActive ? 'rgba(251,146,60,0.16)' : (budgetW !== null && budgetW > 0 ? 'rgba(16,185,129,0.15)' : 'rgba(108,117,125,0.12)');
-                            heatBadgeEl.style.color = heatActive ? '#fb923c' : (budgetW !== null && budgetW > 0 ? '#10b981' : '#adb5bd');
+                            heatBadgeEl.style.color = heatActive ? '#fb923c' : (budgetW !== null && budgetW > 0 ? '#10b981' : 'var(--regler-neutral)');
                         }
                         if (heatWpModeEl) {
                             heatWpModeEl.textContent = wpModeText;
-                            heatWpModeEl.style.color = wpModeText === 'WW' ? '#38bdf8' : (wpModeText === 'Heizen' ? '#fb923c' : '#adb5bd');
+                            heatWpModeEl.style.color = wpModeText === 'WW' ? '#38bdf8' : (wpModeText === 'Heizen' ? '#fb923c' : 'var(--regler-neutral)');
                         }
                         if (heatBudgetEl) {
                             if (budgetW !== null && budgetW > 0) {
@@ -4512,7 +4491,7 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                     const phases = realCharging ? observed.phases : null;
                     const rawApparentKva = parseFloat(wb.apparent_power_kva);
                     const rawApparentVa = parseFloat(wb.apparent_power_va);
-                    const apparentKva = Number.isFinite(rawApparentKva) && rawApparentKva > 0
+                    const apparentKva = wb.apparent_power_complete === false ? null : Number.isFinite(rawApparentKva) && rawApparentKva > 0
                         ? rawApparentKva
                         : (Number.isFinite(rawApparentVa) && rawApparentVa > 0 ? rawApparentVa / 1000 : null);
                     return {
@@ -4903,7 +4882,8 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                     }, 0);
                     const detailPower = wbAmpRows.reduce((sum, wb) =>
                         sum === null || wb.power === null ? null : sum + wb.power, 0);
-                    const nativeKva = detailKva > 0 ? detailKva : parseFloat(data.apparent_power_kva || 0);
+                    const incompleteApparent = wbDetails.some(wb => wb.apparent_power_complete === false);
+                    const nativeKva = incompleteApparent ? null : detailKva > 0 ? detailKva : parseFloat(data.apparent_power_kva || 0);
                     if (multiPowerDisplay) {
                         kvaEl.title = 'Scheinleistung und Phasen sind ladepunktspezifisch und stehen in den Wallbox-Details.';
                         kvaEl.style.display = 'none';

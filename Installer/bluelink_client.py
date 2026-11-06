@@ -16,6 +16,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 try:
+    from quiet_logging import ensure_utf8_stdio
+except ImportError:
+    from Installer.quiet_logging import ensure_utf8_stdio
+
+try:
     import fcntl
 except ImportError:  # pragma: no cover - Nur nicht-POSIX Testumgebungen
     fcntl = None
@@ -1029,6 +1034,7 @@ def _publish_refresh_pause(state, now):
 
 
 def main():
+    ensure_utf8_stdio()
     if VehicleManager is None:
         logger.error(f"Fehler beim Laden der Bluelink-API: {IMPORT_ERROR}")
         logger.error("Bitte prüfe die Installation manuell auf der Konsole.")

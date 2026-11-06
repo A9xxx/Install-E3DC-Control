@@ -227,7 +227,9 @@ class CommandExecutor:
                 except TypeError:
                     return bool(charger.trigger_cp_interrupt())
             if method == "release_to_e3dc":
-                return bool(charger.release_to_e3dc(max_amp=_amp_limit(
+                return bool(charger.release_to_e3dc(**(
+                    {"send_default_frame": False} if cmd.get("send_default_frame") is False else {}),
+                    max_amp=_amp_limit(
                     cmd.get("max_amp", cmd.get("amp", 6)),
                     int(_driver_max_amp(charger)),
                 )))

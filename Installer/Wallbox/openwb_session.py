@@ -69,12 +69,13 @@ def secondary_heartbeat_refresh_due(
     interval_s: Any = SECONDARY_HEARTBEAT_INTERVAL_S,
     retry_s: Any = SECONDARY_HEARTBEAT_RETRY_S,
 ) -> bool:
-    """Return whether the official Secondary heartbeat must be refreshed.
+    """Prüft, ob der offizielle Secondary-Heartbeat aufgefrischt werden muss.
 
-    openWB requires a current Unix timestamp at least every 60 seconds. The
-    manager deliberately uses a 30-second success window and retries failed
-    attempts after five seconds. A backwards clock jump is treated as due so
-    that a stale future timestamp cannot suppress the safety heartbeat.
+    Nach mehr als 80 s ohne Heartbeat setzt die openWB im Secondary-Betrieb
+    den Sollstrom auf 0 A und stoppt die Ladung. Der Manager verwendet ein
+    30-s-Erfolgsfenster und wiederholt Fehlversuche nach fünf Sekunden.
+    Ein Rücksprung der Uhr gilt als fällig, damit ein veralteter zukünftiger
+    Zeitstempel den Heartbeat nicht unterdrückt.
     """
 
     now = _safe_float(now_ts, 0.0)

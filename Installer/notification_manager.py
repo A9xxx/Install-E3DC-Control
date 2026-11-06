@@ -7,6 +7,11 @@ import json
 import stat
 from datetime import datetime
 
+try:
+    from quiet_logging import ensure_utf8_stdio
+except ImportError:
+    from Installer.quiet_logging import ensure_utf8_stdio
+
 V4_CONFIG = '/var/www/html/data/e3dc_v4.json'
 
 def read_config():
@@ -43,7 +48,8 @@ def safe_execute(cmd_list, silent=False):
         script_path = cmd_list[1] if len(cmd_list) > 1 else cmd_list[0]
         if os.path.exists(script_path):
             
-            res = subprocess.run(cmd_list, capture_output=True, text=True, check=False)
+            res = subprocess.run(cmd_list, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                env={**os.environ, "PYTHONIOENCODING": "utf-8"}, check=False)
             
             if res.stderr.strip() and res.returncode != 0:
                 print(f"[{datetime.now().strftime('%H:%M:%S')}] Fehler bei {' '.join(cmd_list)}:\n{res.stderr.strip()}", flush=True)
@@ -155,7 +161,8 @@ def notify_heatpump_channel_alarm(cfg, last_run, script_dir):
         result = subprocess.run([
             sys.executable, os.path.join(script_dir, 'send_push.py'), title, body,
             '--url', '/index.php?seite=waermepumpe',
-        ], capture_output=True, text=True, timeout=30, check=False)
+        ], capture_output=True, text=True, encoding="utf-8", errors="replace",
+                env={**os.environ, "PYTHONIOENCODING": "utf-8"}, timeout=30, check=False)
         delivery = json.loads(result.stdout)
         delivered = result.returncode == 0 and isinstance(delivery, dict) and delivery.get('success') is True
     except (OSError, ValueError, subprocess.SubprocessError):
@@ -167,6 +174,7 @@ def notify_heatpump_channel_alarm(cfg, last_run, script_dir):
 
 
 def main():
+    ensure_utf8_stdio()
     print("Starte E3DC Notification & Schedule Manager...", flush=True)
     last_run = {}
     script_dir = os.path.dirname(os.path.abspath(__file__))

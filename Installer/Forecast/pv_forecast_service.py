@@ -1669,7 +1669,7 @@ class EnsemblePVForecaster:
         return 0.0 <= age < float(MODEL_TTL.get(model_id, 3600))
 
     def _mark_local_model_refresh_failure(self, model_id: str, reason: str):
-        """Behält nur den alten Totalcache und entzieht jedem Split die Frische."""
+        """Behält die letzte erfolgreiche Lieferung samt Aufteilung und Abruf-Backoff."""
 
         import time as _t
 
@@ -1682,8 +1682,6 @@ class EnsemblePVForecaster:
         if not isinstance(data, dict) or not data:
             return
         entry = dict(cached)
-        for key in ("resource_data", "resource_schema", "topology_revision"):
-            entry.pop(key, None)
         entry["resource_refresh_attempt_ts"] = _t.time()
         entry["resource_refresh_attempt_revision"] = (
             self._pv_topology_contract_or_unbound().get("revision")
@@ -1756,19 +1754,23 @@ class EnsemblePVForecaster:
             )
         return False
 
+    def _model_freshness_limit_s(self, model_id: str, success_ts: float):
+        """Zwei planmäßige Abstände nach der letzten erfolgreichen Lieferung."""
+        ttl = (getattr(self, "solcast_ttl_s", MODEL_TTL["m3"])
+               if model_id == "m3" else MODEL_TTL.get(model_id, 3600))
+        gap1 = max(float(ttl), _sleep_seconds_for_hour(datetime.fromtimestamp(success_ts).hour))
+        gap2 = max(float(ttl), _sleep_seconds_for_hour(datetime.fromtimestamp(success_ts + gap1).hour))
+        return gap1 + gap2
+
     def _model_split_freshness(self, model_id: str):
-        """Liefert eine nach TTL und Provenienz belegte Modellfrische."""
+        """Liefert die durch Lieferalter und Provenienz belegte Modellfrische."""
 
         import time as _t
         cached = self._model_cache.get(model_id, {})
-        ttl = MODEL_TTL.get(model_id, 3600)
         if model_id == "m3":
             state = str((getattr(self, "solcast_status", {}) or {}).get("state") or "")
-            if state == "stale_complete_fallback":
-                return {"fresh": False, "source": "m3_stale_complete_fallback"}
             cached = self._trusted_solcast_cache_entry()
-            ttl = getattr(self, "solcast_ttl_s", MODEL_TTL.get(model_id, 3600))
-            if state not in {"complete_fresh", "complete_cached"}:
+            if state not in {"complete_fresh", "complete_cached", "stale_complete_fallback"}:
                 return {"fresh": False, "source": "m3_provenance_" + (state or "unknown")}
         compatible, resource_reason = self._model_resource_cache_state(
             model_id,
@@ -1779,10 +1781,14 @@ class EnsemblePVForecaster:
         if not isinstance(cached, dict) or not cached.get("data"):
             return {"fresh": False, "source": f"{model_id}_cache_missing"}
         try:
-            age = _t.time() - float(cached.get("ts"))
-        except (TypeError, ValueError):
+            success_ts = float(cached.get("ts"))
+            age = _t.time() - success_ts
+            limit = self._model_freshness_limit_s(model_id, success_ts)
+        except (TypeError, ValueError, OverflowError, OSError):
             return {"fresh": False, "source": f"{model_id}_cache_timestamp_unknown"}
-        if age < 0.0 or age >= float(ttl):
+        if age < 0.0 or age >= limit:
+            if model_id == "m3" and state == "stale_complete_fallback":
+                return {"fresh": False, "source": "m3_stale_complete_fallback"}
             return {"fresh": False, "source": f"{model_id}_cache_stale"}
         return {"fresh": True, "source": f"{model_id}_cache_within_ttl"}
 
@@ -2629,10 +2635,20 @@ class EnsemblePVForecaster:
         )
         self._mark_local_model_refresh_failure(model_id, failure_class)
         if cached_total:
+            # Nur die Meldung wertet den Zeitstempel aus; ein unlesbarer Wert
+            # bleibt unbekannt und bricht den Prognoselauf nicht ab.
+            try:
+                success_ts = float((self._model_cache.get(model_id) or {}).get("ts"))
+                age_text = "%.0f s" % (time.time() - success_ts)
+                limit_text = "%.0f s" % self._model_freshness_limit_s(model_id, success_ts)
+            except (TypeError, ValueError, OverflowError, OSError):
+                age_text = limit_text = "unbekannt"
             logger.warning(
-                "Modell %s: Refresh fehlgeschlagen; alter Totalforecast bleibt "
-                "ohne Ressourcen-/Splitwirkung im Ensemble.",
+                "Modell %s: Refresh fehlgeschlagen; letzte erfolgreiche Lieferung "
+                "%s alt, Frischegrenze %s; gebundene Aufteilung bleibt bis zur Grenze wirksam.",
                 model_id,
+                age_text,
+                limit_text,
             )
         return cached_total
 
@@ -2731,6 +2747,14 @@ class EnsemblePVForecaster:
             w1 = self.weight_m1 if val1 is not None else 0.0
             w2 = self.weight_m2 if val2 is not None else 0.0
             w3 = self.weight_m3 if val3 is not None else 0.0
+            candidates = {"m1": w1, "m2": w2, "m3": w3}
+            omitted_models = []
+            if any(weight > 0 and model_freshness[model_id].get("fresh") is True
+                   for model_id, weight in candidates.items()):
+                omitted_models = [model_id for model_id, weight in candidates.items()
+                                  if weight > 0 and model_freshness[model_id].get("fresh") is not True]
+                w1, w2, w3 = (0.0 if model_id in omitted_models else weight
+                              for model_id, weight in candidates.items())
             total_weight = w1 + w2 + w3
 
             if total_weight == 0:
@@ -2784,7 +2808,7 @@ class EnsemblePVForecaster:
             #   Misch (val2 0.08-0.30):                ausgeglichen
             #   Bedeckt (val2 < 0.08 kWh/h):           M2 NWP-Diffusmodell bevorzugt
             # Faktor: Multiplikator auf norm_w1 (Anteil M1), Rest geht an M2
-            if val2 is not None and val2 > 0:
+            if "m2" not in omitted_models and val2 is not None and val2 > 0:
                 if val2 >= 0.30:     # Klar: M1 bekommt Bonus (geometrische Dachgenauigkeit)
                     wc_factor = 1.25
                 elif val2 >= 0.08:   # Mischbewoelkt: neutral
@@ -2833,6 +2857,7 @@ class EnsemblePVForecaster:
                 "resource_kwh": resource_kwh,
                 "resource_projection_state": resource_projection_state,
                 "split_freshness": split_freshness,
+                "omitted_models": omitted_models,
                 "diagnostic_weights": {"m1": norm_w1, "m2": norm_w2, "m3": norm_w3},
             })
 
@@ -2933,7 +2958,9 @@ class EnsemblePVForecaster:
                     diagnostic_entities = {"schema_version": entity_archive.SCHEMA,
                         "decision_use_allowed": False, "entities": [], "status": "diagnostic_error"}
                 diagnostic_slots[start_ms] = diagnostic_entities
+                omitted_models = sorted(set(hr["omitted_models"]) | set(adjacent_hr["omitted_models"]))
                 ensemble_forecast.append({
+                    **({"pv_forecast_omitted_models": omitted_models} if omitted_models else {}),
                     "start_timestamp": start_ms,
                     "end_timestamp": start_ms + (900 * 1000),
                     "predicted_kwh": round(slotted_kw, 4),
@@ -3188,6 +3215,10 @@ class EnsemblePVForecaster:
             with open(meta_path, 'w') as f:
                 json.dump({"fetched_at": output["fetched_at"], "slots": output["slots"],
                            "models_ok": output["models_ok"],
+                           "models_omitted": {
+                               model_id: model_freshness[model_id]["source"]
+                               for model_id in sorted({m for hr in hourly_values for m in hr["omitted_models"]})
+                           },
                            "solcast": dict(self.solcast_status),
                            "pv_topology": dict(pv_topology_contract),
                            "pv_topology_slot_status_counts": topology_status_counts,
@@ -4224,10 +4255,14 @@ def _get_sleep_seconds():
     - Nacht (21-07 Uhr):  120 Minuten
     Die echten API-Calls werden durch Modell-TTLs und Solcast-Tagesbudget gesteuert.
     """
-    hour = datetime.now().hour  # datetime = Klasse aus 'from datetime import datetime'
+    return _sleep_seconds_for_hour(datetime.now().hour)
+
+
+def _sleep_seconds_for_hour(hour):
+    """Gemeinsamer Tag-/Nachttakt für Dienstlauf und Lieferfrische."""
     if 7 <= hour < 21:
-        return 60 * 60   # 60 Minuten tags\u00fcber
-    return 120 * 60      # 2 Stunden nachts
+        return 60 * 60
+    return 120 * 60
 
 
 

@@ -181,6 +181,7 @@
 !/Installer/heatpump_pv_contract.py
 !/Installer/heatpump_pv_state.py
 !/Installer/heizstab_manager.py
+!/Installer/house_fuse.py
 !/Installer/idm/idm_scanner.py
 !/Installer/idm/idm_live.py
 !/Installer/install_all.py
@@ -329,6 +330,7 @@
 !/doc/Speicher_Ladesteuerung_Ablauf.md
 !/doc/Statistik_Wartung.md
 !/doc/Stiebel_Eltron_ISG.md
+!/doc/Umzug_neue_Hardware.md
 !/doc/Unwetterwaechter.md
 !/doc/Update.md
 !/doc/V2x_Dokumentation.md

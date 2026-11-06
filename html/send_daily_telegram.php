@@ -117,7 +117,10 @@ try {
 }
 
 $targetDate = date('Y-m-d', strtotime('-1 days'));
-$stmt = $db->prepare("SELECT * FROM daily_stats WHERE date = ?");
+$display = e3dcArchiveDisplaySelection($db);
+$selectedColumns = [];
+foreach (['home_consumption', 'wb_consumption', 'wb2_consumption', 'cost_home', 'cost_wb', 'cost_wb2'] as $column) $selectedColumns[] = $display[$column] . ' AS ' . $column;
+$stmt = $db->prepare("SELECT *, " . implode(', ', $selectedColumns) . " FROM daily_stats WHERE date = ?");
 $stmt->execute([$targetDate]);
 $row = $stmt->fetch(PDO::FETCH_ASSOC);
 

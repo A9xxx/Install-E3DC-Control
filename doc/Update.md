@@ -5,12 +5,23 @@ Updates werden ausschließlich über den Installer ausgeführt. Ein manuelles
 Nutzerinstallation ist für den regulären Ziel-Updater weder Voraussetzung noch
 Updateautorität.
 
-Der aktuelle Stable-Stand ist `v5.5.6`. Das Dashboard startet ausschließlich
+Der aktuelle Stable-Stand ist `v5.5.7`. Das Dashboard startet ausschließlich
 den root-eigenen Systemjob ohne freie Argumente. Die einzige Ausnahme ist
 die tokengebundene Driftfreigabe. Dieser installiert den neuesten
 veröffentlichten Stable-Stand oder repariert dieselbe Version. Der
 Stable-Versionscheck ist nur eine Anzeige und keine Startfreigabe. Freie Pfade,
 Release-Tags, Neuinstallationen und Rückfälle bleiben im Web gesperrt.
+
+5.5.7 ist ein Funktions- und Korrekturupdate zu 5.5.6 (Hausabsicherung aus dem
+E3DC-Systemwert, „Sofort bis Preislimit“ ohne Ladeplan, Netzladeplanung mit
+bekannten Preisen, Prognose bei Quellenausfall, Dimplex-Temperaturen).
+Bestehende Installationen aktualisieren wie gewohnt über **System Update** bzw.
+das [Docker-Update](#docker-update). Während des Updates kein Fahrzeug
+anstecken. Danach im Config-Editor unter „Wallbox & Fahrzeug“ die
+Hausabsicherung prüfen: Ohne eigenen Wert und ohne Systemwert ist kein Netzladen
+möglich. Der Docker-Host-Helfer benötigt Docker Compose ab 2.17. Ein fester
+Docker-Pin wird bewusst auf `E3DC_IMAGE_TAG=v5.5.7` geändert. Einzelheiten
+stehen in den [Release Notes](../RELEASE_NOTES.md).
 
 5.5.6 ist ein Funktions- und Korrekturupdate zu 5.5.5c (gemeinsamer
 Wallbox-Regelkern, Hausanschluss je Phase aus den Phasenwerten des
@@ -206,7 +217,11 @@ erneut. Eine zwischenzeitlich veränderte Datei stoppt, statt still überschrieb
 zu werden. Erst danach erstellt beziehungsweise verwendet der Ziel-Updater das
 Vollbackup, sichert nach dem kurzen Dienststopp die nun ruhenden veränderlichen
 Daten nach, tauscht Dateien, Rechte, Core-Units und Launcher aus und startet die
-benötigten Dienste neu. Die unterschiedlichen Web-Launcher aus 5.4.4a, 5.4.4b
+benötigten Dienste neu. Solange die Dienste stehen, regelt E3DC-Control keine
+Wallbox; eine Box mit eigenem Ladestrom, etwa eine openWB Pro, kann ein in dieser
+Zeit angestecktes Fahrzeug mit ihrem zuletzt gesetzten Strom laden. Während des
+Updates deshalb kein Fahrzeug anstecken; das Update-Fenster nennt das ebenfalls.
+Die unterschiedlichen Web-Launcher aus 5.4.4a, 5.4.4b
 und 5.4.4c werden direkt unterstützt: Fehlen spätere Übergabeparameter, lädt der
 commitgebundene Ziel-Bootstrap den vollständigen Releasebaum selbst und prüft
 Tag und Commit erneut.

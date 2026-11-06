@@ -1,9 +1,9 @@
 {
-  "version": "5.5.6",
+  "version": "5.5.7",
   "min_version": "4.0.0",
-  "stable_release": "v5.5.6",
-  "release_date": "2026-10-31",
-  "description": "v5.5.6 - Wallbox-Regelkern (Phasenabstieg nach 60 s, PV-Kontingent über die Ladeepisode), Netzladen im Marktfenster, Wärmepumpe nach Neustart, Preisplanung auf langsamen Geräten und Anzeigen",
+  "stable_release": "v5.5.7",
+  "release_date": "2026-11-07",
+  "description": "v5.5.7 - Hausabsicherung aus dem E3DC, Sofort bis Preislimit, Netzladen mit bekannten Preisen, Prognose bei Quellenausfall, Dimplex-Temperatur und Bedienung",
   "update_strategy": "backup_replace_restart_v1",
   "installer_requires": "python3",
   "sanitized_republication": false,

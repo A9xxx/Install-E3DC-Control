@@ -12,6 +12,71 @@ if (!function_exists('e3dcRunArgvProcess')) {
     require_once __DIR__ . '/helpers.php';
 }
 
+
+// Gemeinsames Eingabeprädikat für Webaktionen; die Laufzeitauflösung bleibt im Regler.
+function e3dcHouseFusePositive($value) {
+    if (is_bool($value) || !is_scalar($value)) return null;
+    $text = str_replace(',', '.', trim((string)$value));
+    return is_numeric($text) && is_finite((float)$text) && (float)$text > 0 ? (float)$text : null;
+}
+
+function e3dcHouseFuseSystem($path = '/var/www/html/data/e3dc_house_fuse.json') {
+    $raw = e3dcReadRegularFileBound($path, 16384);
+    $data = is_string($raw) ? json_decode($raw, true) : null;
+    if (!is_array($data)) return [];
+    $amps = $data['e3dc_fuse_amps'] ?? null;
+    $watts = $data['e3dc_fuse_raw_w'] ?? null;
+    $stamp = $data['e3dc_fuse_read_ts'] ?? null;
+    if (!is_int($amps) || $amps < 1 || $amps >= 999 || !is_int($watts)
+        || $watts < 0 || $watts > 4294967295 || intdiv($watts, 690) !== $amps
+        || (!is_int($stamp) && !is_float($stamp)) || !is_finite((float)$stamp) || $stamp <= 0
+        || ($data['e3dc_fuse_source'] ?? '') !== 'rscp') return [];
+    return $data;
+}
+
+function e3dcHouseFuseProblem(array $config, $path = '/var/www/html/data/e3dc_house_fuse.json') {
+    $raw = $config['grid_max_amps'] ?? null;
+    $present = $raw !== null && (is_bool($raw) || !is_scalar($raw) || trim((string)$raw) !== '');
+    if ($present && e3dcHouseFusePositive($raw) === null) return 'house_fuse_invalid';
+    return e3dcHouseFusePositive($raw) !== null || e3dcHouseFuseSystem($path) ? '' : 'house_fuse_missing';
+}
+
+function e3dcHouseFuseMessage($code = 'house_fuse_missing') {
+    return ($code === 'house_fuse_invalid' ? 'Hausabsicherung ungültig – Netzladen nicht möglich.'
+        : 'Keine Hausabsicherung hinterlegt – Netzladen nicht möglich.')
+        . ' Im Config-Editor unter „Wallbox & Fahrzeug“, Feld „Hausabsicherung/SLS (A je Phase)“ prüfen.';
+}
+
+function e3dcHouseFuseLink() {
+    $page = basename((string)($_SERVER['SCRIPT_NAME'] ?? '')) === 'mobile.php' ? 'mobile.php' : 'index.php';
+    return $page . '?seite=config&focus=grid_max_amps';
+}
+
+function e3dcHouseFuseNotice($code) {
+    return htmlspecialchars(e3dcHouseFuseMessage($code), ENT_QUOTES, 'UTF-8')
+        . ' <a href="' . e3dcHouseFuseLink() . '">Sicherungsstärke eintragen</a>';
+}
+
+function e3dcWallboxHasGridShare(array $config, $wb) {
+    $prefix = 'wb' . $wb . '_';
+    $mode = trim((string)($config[$prefix . 'mode'] ?? '0'));
+    if (in_array($mode, ['0', '12'], true)) return false;
+    return $mode === '5' || (string)($config[$prefix . 'smart_wbhour_enable'] ?? '0') === '1'
+        || (($hours = e3dcHouseFusePositive($config[$prefix . 'plan_hours'] ?? null)) !== null && $hours < 99);
+}
+
+// Anzeige ausschließlich aus dem vom Manager veröffentlichten UI-State.
+function e3dcHouseFuseDisplay($path = '/var/www/html/ramdisk/wallbox_native.json') {
+    $raw = e3dcReadRegularFileBound($path);
+    $state = is_string($raw) ? json_decode($raw, true) : null;
+    $fuse = is_array($state) ? ($state['house_fuse'] ?? []) : [];
+    $value = e3dcHouseFusePositive($fuse['effective'] ?? null);
+    $labels = ['user' => 'Nutzereingabe', 'user_confirmed' => 'bestätigte Nutzereingabe',
+        'e3dc_unconfirmed_user' => 'E3DC; höherer Nutzerwert unbestätigt', 'e3dc' => 'Systemwert aus dem E3DC',
+        'none' => 'Keine Hausabsicherung hinterlegt', 'invalid' => 'Hausabsicherung ungültig'];
+    return ['effective' => $value, 'source' => $labels[$fuse['source'] ?? ''] ?? 'noch kein wirksamer Wert gelesen'];
+}
+
 const E3DC_WB_TX_SCHEMA = 'wallbox_plan_candidate_v1';
 const E3DC_WB_TX_RESULT_SCHEMA = 'wallbox_plan_candidate_result_v1';
 const E3DC_WB_TX_PLAN_FILES = [
@@ -773,9 +838,7 @@ function e3dcWbTxManualPlanRequired(array $flat, $wbId, $runtimeWb2 = null) {
     if (array_key_exists($modeKey, $flat) && trim((string)$flat[$modeKey]) !== '' && (int)$flat[$modeKey] === 0) return false;
     $legacy = $wbId === 1 ? ($flat['wbhour'] ?? $flat['Wbhour'] ?? 0) : 0;
     $hours = (int)($flat['wb' . $wbId . '_plan_hours'] ?? $flat['wb' . $wbId . '_wbhour'] ?? $legacy);
-    $legacySofort = $wbId === 1 ? ($flat['wb_sofort'] ?? '0') : '0';
-    $sofort = e3dcWbTxTruthy($flat['wb' . $wbId . '_sofort'] ?? $legacySofort);
-    return $hours > 0 || $sofort;
+    return $hours > 0 && $hours < 99;
 }
 
 function e3dcWbTxValidateUpdates(array $updates) {
@@ -945,6 +1008,25 @@ function e3dcWbTxWallboxConfiguredAsOpenWbPro(array $config, $wbId) {
     return normalizeWallboxTypeConfig($flat[$typeKey] ?? '') === 'openwb_pro';
 }
 
+function e3dcWbTxMode5WithoutPlugSession($path, $wbId) {
+    // Ohne gestecktes Fahrzeug gibt es keine Pro-Stecksession und damit keine
+    // Startablehnung, die der Sofortauftrag zurücksetzen könnte. Nur ein
+    // lesbarer Sitzungsstand mit Boot-Generation, leerer Stecksession und ohne
+    // Receipt belegt das; fehlende oder unlesbare Stände bleiben streng gebunden.
+    $snapshot = e3dcWbTxSnapshot($path, 4194304);
+    if (empty($snapshot['exists'])) return false;
+    $state = json_decode((string)$snapshot['bytes'], true);
+    if (!is_array($state) || ($state['schema'] ?? '') !== 'wallbox_phase_state_v3') return false;
+    $bootId = trim((string)($state['boot_id'] ?? ''));
+    if ($bootId === '' || strlen($bootId) > 128) return false;
+    $key = (string)max(1, min(2, (int)$wbId));
+    $entry = isset($state['wallboxes'][$key]) && is_array($state['wallboxes'][$key])
+        ? $state['wallboxes'][$key]
+        : [];
+    if (($entry['mode5_user_start_request_receipt'] ?? null) !== null) return false;
+    return trim((string)($entry['openwb_pro_plug_session_id'] ?? '')) === '';
+}
+
 function e3dcWbTxMode5SessionBinding($path, $wbId) {
     $snapshot = e3dcWbTxSnapshot($path, 4194304);
     if (empty($snapshot['exists'])) {
@@ -1100,6 +1182,16 @@ function e3dcWallboxPlanTransaction(array $updates, array $options = []) {
             $mode5IntentRequested = false;
             $mode5RequestStatus = 'not_required_for_driver';
         }
+        if ($mode5IntentRequested && e3dcWbTxMode5WithoutPlugSession(
+                dirname($context['config_path']) . '/wallbox_phase_transition_state.json',
+                $mode5WbId
+            )) {
+            // Ohne Auto scheiterte "Sofort bis Preislimit" an der openWB Pro mit
+            // "Speichern fehlgeschlagen". Der Modus wird dann wie bei den übrigen
+            // Treibern gespeichert; die nächste Stecksession beginnt ohne Ablehnung.
+            $mode5IntentRequested = false;
+            $mode5RequestStatus = 'not_required_without_plug_session';
+        }
         if ($mode5IntentRequested) {
             $mode5RequestStatus = 'bound';
             $mode5SessionBinding = e3dcWbTxMode5SessionBinding(
@@ -1154,6 +1246,16 @@ function e3dcWallboxPlanTransaction(array $updates, array $options = []) {
         $candidate = $rawConfig;
         foreach ($updates as $key => $value) $candidate[$key] = $value;
 
+        foreach ([1, 2] as $wb) {
+            if (!e3dcWallboxHasGridShare($rawConfig, $wb) && e3dcWallboxHasGridShare($candidate, $wb)) {
+                $fusePath = e3dcWbTxIsTest($options)
+                    ? (string)($options['house_fuse_path'] ?? dirname($configPath) . '/e3dc_house_fuse.json')
+                    : '/var/www/html/data/e3dc_house_fuse.json';
+                $problem = e3dcHouseFuseProblem($candidate, $fusePath);
+                if ($problem !== '') return e3dcWbTxResult(false, $problem, e3dcHouseFuseMessage($problem));
+            }
+        }
+
         $operation = (string)($options['operation'] ?? 'plan');
         if (!in_array($operation, ['plan', 'clear', 'preserve'], true)) {
             throw new InvalidArgumentException('Ungültige Wallbox-Transaktionsart.');
@@ -1179,6 +1281,10 @@ function e3dcWallboxPlanTransaction(array $updates, array $options = []) {
         $emergencyPath = $ramdisk . '/wallbox_emergency_stop.flag';
         // Derselbe Not-Aus übersteht den Verlust der Ramdisk. Gemeinsamer Commit/Rollback.
         $persistentEmergencyPath = dirname($ramdisk) . '/data/wallbox_emergency_stop.flag';
+        if (!empty($options['reject_emergency_release']) && $emergencyAction === 'remove'
+            && (is_file($emergencyPath) || is_file($persistentEmergencyPath))) {
+            return e3dcWbTxResult(false, 'emergency_release_requires_advanced', e3dcWallboxEmergencyHint());
+        }
         $cachePath = $context['cache_path'];
         // Der Konfigurationscache ist ein abgeleiteter tmpfs-Spiegel und wird
         // von jedem regulären Lesezugriff bei Bedarf neu erzeugt. Er ist weder

@@ -196,3 +196,9 @@ eigene Grenzen:
 Die Langzeitansicht verwendet weiterhin die kompakten Tageswerte aus
 `e3dc_stats.db`. Die minutengenaue Kurve eines einzelnen Tages ist nach Ablauf
 der 30 Tage dagegen bewusst nicht mehr Teil des direkt vorgehaltenen Bestands.
+
+## Umzug auf neue Hardware
+
+Das Vollbackup ist an die Installation gebunden und kein Umzugsweg. Den Wechsel
+auf ein anderes Gerät mit Konfiguration, Statistik, Historien und Lernmodell
+beschreibt [Umzug auf neue Hardware](Umzug_neue_Hardware.md).

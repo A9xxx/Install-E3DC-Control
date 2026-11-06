@@ -33,6 +33,12 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
+try:
+    from .house_fuse import read_house_fuse, store_house_fuse
+except ImportError:
+    from house_fuse import read_house_fuse, store_house_fuse
+
+
 LIVE_DATA_PATH = "/var/www/html/ramdisk/live_data_py.json"
 LIVE_LAST_VALID_PATH = "/var/www/html/ramdisk/live_data_last_valid.json"
 LIVE_DECISION_STABILITY_PATH = "/var/www/html/ramdisk/live_decision_stability.json"
@@ -193,8 +199,9 @@ def _safe_int_config_value(value, default):
         return int(default)
 
 
-def persistent_acquisition_sections(cfg):
-    """Definiert Poll-Gruppen; regelrelevante Werte haben immer TTL 0."""
+def persistent_acquisition_sections(cfg, fuse_reader=None):
+    """Definiert Poll-Gruppen und den gelegentlich gelesenen Systemeintrag."""
+    fuse_reader = fuse_reader if fuse_reader is not None else HouseFuseReader(cfg)
 
     history_poll_s = max(30.0, _safe_float_config_value(cfg.get("e3dc_live_history_poll_s", 60), 60))
     system_poll_s = max(
@@ -212,7 +219,8 @@ def persistent_acquisition_sections(cfg):
         ("Wärmepumpe (E3DC PM)", lambda conn: get_wp_pm(conn, cfg), 0.0, False),
         # Dieser Block enthält neben Stammdaten auch aktive EMS-Leistungsgrenzen.
         # Er darf deshalb nicht als statischer Bereich gecacht werden.
-        ("EMS Anlagendata", lambda conn: get_ems_config(conn), 0.0, False),
+        ("EMS Anlagendata", lambda conn: get_ems_config(conn, include_house_fuse=False), 0.0, False),
+        ("Hausabsicherung", fuse_reader.read_persistent, fuse_reader.poll_s, False),
         ("DB-History (kWh)", lambda conn: get_db_history(conn), history_poll_s, False),
         ("System-Info", lambda conn: get_system_info(conn), system_poll_s, False),
     ]
@@ -442,7 +450,7 @@ def _iv(resp, tag, default=0):
         return default
 
 
-def _typed_int_tag(resp, tag):
+def _typed_int_tag(resp, tag, expected_type=None):
     """Liefert RSCP-Integer mit expliziter Missing-/0-Unterscheidung."""
 
     item = find_tag(resp, tag)
@@ -450,20 +458,15 @@ def _typed_int_tag(resp, tag):
     valid = bool(
         isinstance(item, dict)
         and item.get("type") not in {RscpType.Nil, RscpType.Container, RscpType.Error}
+        and (expected_type is None or item.get("type") == expected_type)
         and isinstance(value, int)
         and not isinstance(value, bool)
     )
     return (int(value) if valid else None, valid)
 
 def _float_in_container(item):
-    """Extrahiert Float-Wert aus einem Container-Item."""
-    if item and isinstance(item.get('value'), list):
-        for sub in item['value']:
-            if sub.get('type') in (RscpType.Float32, RscpType.Double64):
-                return float(sub.get('value') or 0)
-    elif item and item.get('type') in (RscpType.Float32, RscpType.Double64):
-        return float(item.get('value') or 0)
-    return 0.0
+    """Fehlende oder ungültige Containerwerte bleiben unbekannt."""
+    return _optional_float_in_container(item)
 
 
 def _optional_float_in_container(item):
@@ -620,11 +623,88 @@ def get_ems_live(conn):
     return _decode_ems_live_response(conn.request(_ems_live_request_items()))
 
 
-def get_ems_config(conn):
+def _decode_house_fuse(resp):
+    item = find_tag(resp, RscpTag.EMS_GET_MAX_FUSE_POWER)
+    raw, valid = _typed_int_tag(resp, RscpTag.EMS_GET_MAX_FUSE_POWER, RscpType.Uint32)
+    if raw is not None and not 0 <= raw <= 0xFFFFFFFF:
+        raw, valid = None, False
+    amps = raw // 690 if valid else None
+    source = ("rscp_missing" if item is None else "rscp_invalid" if not valid
+        else "rscp_zero" if amps < 1 else "rscp_not_set" if amps >= 999 else "rscp")
+    valid = source == "rscp"
+    return dict(e3dc_fuse_amps=amps if valid else None, e3dc_fuse_valid=valid,
+        e3dc_fuse_source=source, e3dc_fuse_raw_w=raw,
+        e3dc_fuse_read_ts=None)
+
+
+def get_house_fuse(conn):
+    """Liest ausschließlich die selten veränderte Hausabsicherung."""
+    return _decode_house_fuse(conn.request([_nil(RscpTag.EMS_REQ_GET_MAX_FUSE_POWER)]))
+
+
+class HouseFuseReader:
+    """Gelegentliche Abfrage mit gespeichertem Systemwert; Fehler ändern ihn nicht."""
+
+    def __init__(self, cfg, now_fn=None, path=None):
+        self.path = path
+        self.now_fn = now_fn or time.time
+        self.poll_s = max(300.0, _safe_float_config_value(
+            cfg.get("e3dc_live_system_poll_s", cfg.get("e3dc_live_static_poll_s", 900)), 900))
+        stored = read_house_fuse(self.path)
+        self.last_good = stored if stored["e3dc_fuse_valid"] else None
+        self.initial_read_done = False
+        self.change_hint = ""
+        self.last_attempt_ts = None
+        self.diagnostic = None if self.last_good else "rscp_missing"
+        self.current = _decode_house_fuse([])
+
+    def snapshot(self):
+        return dict(self.last_good or self.current, e3dc_fuse_read_error=self.diagnostic,
+            e3dc_fuse_change_hint=self.change_hint)
+
+    def read_persistent(self, conn):
+        value = self.read(conn)
+        if not self.initial_read_done:
+            # Der gespeicherte Wert bleibt in snapshot() wirksam. Erst eine gültige
+            # RSCP-Antwort seit Dienststart (Wert oder „nicht eingetragen“)
+            # befüllt den Abschnittscache.
+            raise ValueError(self.diagnostic or "RSCP-Hausabsicherung noch nicht gelesen")
+        return value
+
+    def read(self, conn):
+        now_s = self.now_fn()
+        if (self.initial_read_done and self.last_attempt_ts is not None
+                and 0 <= now_s - self.last_attempt_ts < self.poll_s):
+            return self.snapshot()
+        self.last_attempt_ts = now_s
+        try:
+            value = get_house_fuse(conn)
+        except Exception:
+            value = _decode_house_fuse([])
+            value["e3dc_fuse_source"] = "rscp_invalid"
+        self.current = value
+        if value["e3dc_fuse_valid"] or value["e3dc_fuse_source"] == "rscp_not_set":
+            value["e3dc_fuse_read_ts"] = now_s
+            # Die gültige Antwort gilt auch, wenn das Speichern scheitert: Die
+            # Dienste lesen sie aus den Live-Daten vor der Datei (system_house_fuse).
+            self.last_good = value if value["e3dc_fuse_valid"] else None
+            self.initial_read_done = True
+            try:
+                self.change_hint = store_house_fuse(value, self.path)
+                self.diagnostic = None
+            except OSError as exc:
+                self.diagnostic = f"Systemwert konnte nicht gespeichert werden: {type(exc).__name__}"
+        else:
+            self.diagnostic = value["e3dc_fuse_source"]
+        return self.snapshot()
+
+
+def get_ems_config(conn, *, include_house_fuse=True):
     """EMS Anlagenparameter: kWp, Abregelung, Lade-Limits."""
     print("  -> EMS Anlagenparameter ...")
     resp = conn.request([
         _nil(RscpTag.EMS_REQ_INSTALLED_PEAK_POWER),
+        *([_nil(RscpTag.EMS_REQ_GET_MAX_FUSE_POWER)] if include_house_fuse else []),
         _nil(RscpTag.EMS_REQ_DERATE_AT_PERCENT_VALUE),
         _nil(RscpTag.EMS_REQ_DERATE_AT_POWER_VALUE),
         # Korrekte GET-Tags! 0x01000101/102 sind SET-Tags -> liefern Fehlercode 7
@@ -678,6 +758,16 @@ def get_ems_config(conn):
     settings_max_ch = _iv(resp, RscpTag.EMS_MAX_CHARGE_POWER)
     settings_max_dis = _iv(resp, RscpTag.EMS_MAX_DISCHARGE_POWER)
     settings_dis_start = _iv(resp, RscpTag.EMS_DISCHARGE_START_POWER)
+    powersave_item = find_tag(resp, RscpTag.EMS_POWERSAVE_ENABLED)
+    powersave_valid = (
+        isinstance(powersave_item, dict)
+        and powersave_item.get("type") != RscpType.Error
+        and isinstance(powersave_item.get("value"), bool)
+    )
+    powersave_enabled = powersave_item["value"] if powersave_valid else None
+    powersave_source = "rscp" if powersave_valid else (
+        "rscp_missing" if powersave_item is None else "rscp_invalid"
+    )
     limits_on  = bool(find_tag_value(resp, RscpTag.EMS_POWER_LIMITS_USED))
     weather_ch = bool(find_tag_value(resp, RscpTag.EMS_WEATHER_REGULATED_CHARGE_ENABLED))
     manual_ch  = bool(find_tag_value(resp, RscpTag.EMS_MANUAL_CHARGE_ACTIVE))
@@ -715,7 +805,8 @@ def get_ems_config(conn):
             f"Energie={ep_reserve_energy_wh:.0f}Wh  Max={ep_reserve_max_energy_wh:.0f}Wh"
         )
     print(f"     Lade-Limit: genutzt={used_ch}W  Nutzer={user_ch}W  Bat={bat_ch}W")
-    print(f"     Entlade-Limit={used_dis}W  ExtLimits={limits_on}  Wetter={weather_ch}  Manuell={manual_ch}")
+    powersave_label = ("an" if powersave_enabled else "aus") if powersave_valid else "unbekannt"
+    print(f"     Entlade-Limit={used_dis}W  ExtLimits={limits_on}  Wetter={weather_ch}  Manuell={manual_ch}  Energiesparen={powersave_label}")
     print(
         f"     E3DC-Wallbox: Batterie->Auto={battery_to_car_mode}  "
         f"Batterie-vor-Auto={battery_before_car_mode}  "
@@ -729,6 +820,7 @@ def get_ems_config(conn):
         )
 
     return {
+        **(_decode_house_fuse(resp) if include_house_fuse else {}),
         "installed_peak_power_w": int(kwp) if peak_valid else None,
         "installed_peak_power_kwp": round(kwp / 1000, 2) if peak_valid else None,
         "installed_peak_power_valid": bool(peak_valid),
@@ -757,6 +849,9 @@ def get_ems_config(conn):
         "power_limits_active": limits_on,
         "ems_power_settings_read": settings_read,
         "ems_power_settings_valid": settings_valid,
+        "ems_powersave_enabled": powersave_enabled,
+        "ems_powersave_enabled_valid": powersave_valid,
+        "ems_powersave_enabled_source": powersave_source,
         "ems_max_charge_power_w": settings_max_ch,
         "ems_max_discharge_power_w": settings_max_dis,
         "ems_discharge_start_power_w": settings_dis_start,
@@ -1040,7 +1135,8 @@ def get_pvi(conn):
     ac_count = int(ac_count_tag.get('value') or 3) if ac_count_tag else 3
 
     temp_tag = find_tag(pd, RscpTag.PVI_TEMPERATURE)
-    result["pvi_temperature_c"] = round(_float_in_container(temp_tag), 1)
+    temperature = _float_in_container(temp_tag)
+    result["pvi_temperature_c"] = round(temperature, 1) if temperature is not None else None
     frequency_hz = _optional_float_in_container(
         find_tag(pd, RscpTag.PVI_AC_FREQUENCY)
     )
@@ -1062,9 +1158,10 @@ def get_pvi(conn):
         if frequency_valid
         else "nicht verfügbar"
     )
+    temperature_text = f"{temperature:.1f}C" if temperature is not None else "nicht verfügbar"
     print(
         f"     PVI: {dc_count} DC-Strings, {ac_count} AC-Phasen, "
-        f"T={result['pvi_temperature_c']:.1f}C, f={frequency_text}"
+        f"T={temperature_text}, f={frequency_text}"
     )
 
     # DC-Strings einzeln abfragen
@@ -1972,6 +2069,10 @@ def _cfg_flag(cfg, key, default=False):
     return _finite_bool(_cfg_lookup(cfg, key, default), default)
 
 
+# Längere Lücke zwischen zwei Proben beendet die durchgehende Abweichung.
+GRID_PM_CONTINUITY_MAX_GAP_S = 30.0
+
+
 def _grid_pm_delta_status(delta_w, cfg=None, *, state_path=None, now_s=None):
     """Klassifiziert die EMS-/PM-Abweichung als rein diagnostisch oder regelwirksam."""
     cfg_present = isinstance(cfg, dict)
@@ -1988,8 +2089,13 @@ def _grid_pm_delta_status(delta_w, cfg=None, *, state_path=None, now_s=None):
     diagnostic_high = delta_abs_w > soft_threshold_w
 
     observations = []
+    high_since = None
     if debounce_enabled and state_path:
         state = _read_json_file(state_path)
+        previous_ts = _finite_optional_float(state.get("ts")) if isinstance(state, dict) else None
+        if (diagnostic_high and previous_ts is not None
+                and 0.0 <= now - previous_ts <= GRID_PM_CONTINUITY_MAX_GAP_S):
+            high_since = _finite_optional_float(state.get("high_since_ts"))
         raw_observations = state.get("observations", []) if isinstance(state, dict) else []
         if isinstance(raw_observations, list):
             for item in raw_observations:
@@ -2016,6 +2122,10 @@ def _grid_pm_delta_status(delta_w, cfg=None, *, state_path=None, now_s=None):
             observations = observations[-persist_count:]
     else:
         observations = []
+    if diagnostic_high and high_since is None:
+        high_since = now
+    # Durchgehende Dauer für den Hinweis; ein Treffer innerhalb der Schwelle setzt sie zurück.
+    high_for_s = max(0.0, now - high_since) if diagnostic_high else 0.0
 
     if diagnostic_high and not debounce_enabled:
         effective = True
@@ -2043,6 +2153,7 @@ def _grid_pm_delta_status(delta_w, cfg=None, *, state_path=None, now_s=None):
         "persist_count": int(persist_count),
         "persist_window_s": int(round(persist_window_s)),
         "observed_count": int(len(observations)),
+        "high_for_s": int(round(high_for_s)),
     }
 
     if debounce_enabled and state_path:
@@ -2050,6 +2161,7 @@ def _grid_pm_delta_status(delta_w, cfg=None, *, state_path=None, now_s=None):
             _atomic_write_json(state_path, {
                 "schema_version": "live_grid_pm_delta_state_v1",
                 "ts": int(round(now)),
+                "high_since_ts": high_since,
                 "observations": observations,
                 "latest": {
                     "delta_w": int(round(delta_w)),
@@ -4220,6 +4332,7 @@ def run_test(host, port, user, pw, aes_pw, cfg, loops=1, interval=2, write=False
     write=True -> schreibt live_data_py.json atomar (--write Flag)
     """
     run = 0
+    fuse_reader = HouseFuseReader(cfg)
     kwh_retter = KwhRetterState()
     external_pv_topology = ExternalPvTopologyEvidenceTracker()
     daemon_quiet = bool(write and loops == 0)
@@ -4262,7 +4375,7 @@ def run_test(host, port, user, pw, aes_pw, cfg, loops=1, interval=2, write=False
         errors = []
         acquisition_diagnostics = {"schema_version": "rscp_acquisition_v1", "mode": "legacy_per_cycle"}
         if persistent_session is not None:
-            sections = persistent_acquisition_sections(cfg)
+            sections = persistent_acquisition_sections(cfg, fuse_reader)
             output_context = contextlib.redirect_stdout(io.StringIO()) if daemon_quiet else contextlib.nullcontext()
             with output_context:
                 data, errors, acquisition_diagnostics = persistent_session.acquire(sections)
@@ -4271,6 +4384,10 @@ def run_test(host, port, user, pw, aes_pw, cfg, loops=1, interval=2, write=False
             for error in errors:
                 key = "rscp_connection" if error.startswith(("Verbindung:", "Reconnect-Backoff")) else "persistent_section"
                 _live_log_limiter.failure(logger, key, "RSCP-Akquise: %s", error)
+            # Der statische Eintrag ist keine Messgröße der Leistungsprobe.
+            # Sein Fehler bleibt im Abschnitt und im Leser diagnostizierbar,
+            # ohne gültige Leistungswerte oder PV-Laden zu entwerten.
+            errors = [error for error in errors if not error.startswith("Hausabsicherung:")]
         else:
             conn = RscpConnection(host, port, aes_pw)
             try:
@@ -4284,7 +4401,8 @@ def run_test(host, port, user, pw, aes_pw, cfg, loops=1, interval=2, write=False
 
                 sections = [
                     ("Power Snapshot",   lambda: get_power_snapshot(conn, cfg)),
-                    ("EMS Anlagendata",  lambda: get_ems_config(conn)),
+                    ("EMS Anlagendata",  lambda: get_ems_config(conn, include_house_fuse=False)),
+                    ("Hausabsicherung", lambda: fuse_reader.read(conn)),
                     ("DB-History (kWh)", lambda: get_db_history(conn)),
                     ("PVI DC/AC",        lambda: get_pvi(conn)),
                     ("Batterie",         lambda: get_bat(conn, cfg)),
@@ -4317,6 +4435,7 @@ def run_test(host, port, user, pw, aes_pw, cfg, loops=1, interval=2, write=False
             finally:
                 conn.close()
 
+        data.update(fuse_reader.snapshot())
         data = normalise_live_ep_reserve(data, cfg)
 
         # Effizienz & Umwandlungsverluste sind reine Diagnose. Fehlende zwingende

@@ -215,7 +215,8 @@ def distribute(boxes, budget_w, budget_pv_w, phase_limits, distribution=0, power
                 command_amp = core._floor(min(actual_max, room,
                     max(minima[cid] if box.get('charging') else 0.0, (share or 0.0)/(230*actual))), steps[cid])
             result[cid] = dict(shares[cid], target_phases=target, cap_amp=amp,
-                house_fuse_cap_amp=physical, phase_grant=bool(amp >= minima[cid] and watts+1e-6 >= need),
+                house_fuse_cap_amp=physical, reservation_scale=scales[cid],
+                phase_grant=bool(amp >= minima[cid] and watts+1e-6 >= need),
                 sentence='Gemeinsame Verteilung: %dp, Anteil %.0f W, Zuteilung %g A' % (target or 0, share or 0.0, amp),
                 allocation=dict(slot, target_amp=command_amp, target_amp_per_phase=command_amp,
                     unrounded_electrical_cap_amp=command_unrounded_cap,

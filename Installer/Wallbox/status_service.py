@@ -270,6 +270,8 @@ class StatusService:
                 hint += " Ursache: MQTT verbunden, aber noch keine bestätigten Lesedaten."
             elif any(code in reason_code for code in ("certificate", "cert_verify", "tls_pin", "tls_untrusted", "tls_required", "ssl")):
                 hint += " Ursache: Zertifikat nicht bestätigt oder ungültig."
+            elif "openwb_chargepoint_missing" in reason_code:
+                hint += f" Ursache: Der eingestellte Ladepunkt {sample.get('cp_id')} fehlt in der openWB-Antwort; Ladepunktnummer prüfen."
             elif "measurement_implausible" in reason_code:
                 hint += " Ursache: Messwert außerhalb der physikalischen Wallbox-Grenzen."
             elif "source_timestamp_implausible" in reason_code:
@@ -345,7 +347,7 @@ class StatusService:
             reason = driver_state.get("driver_status_reason") if isinstance(driver_state, dict) else None
             if isinstance(reason, str) and reason.startswith("openwb_"):
                 raw_status = {key: driver_state[key] for key in self.diagnostic_keys if key in driver_state}
-                raw_status.update(driver_status_valid=False, driver_status_reason=reason)
+                raw_status.update(driver_status_valid=False, driver_status_reason=reason, cp_id=driver_state.get("cp_id"))
         raw_invalid = bool(isinstance(raw_status, dict) and (
             raw_status.get("driver_status_valid") is False
             or raw_status.get("driver_status_stale") is True
@@ -410,7 +412,7 @@ class StatusService:
                 "driver_status_last_sample_ts": int(now_value),
                 "driver_status_last_ok_ts": int(last_ok_ts),
             })
-            for key in ('openwb_mqtt_field_age_s', 'openwb_mqtt_field_received_ts', 'openwb_mqtt_field_reason', 'openwb_mqtt_status_reason', 'openwb_status_fallback_reason', 'openwb_simpleapi_status_ts') + ("driver_status_source", "driver_status_plausible", "driver_status_glitch", "driver_status_glitch_reason", "driver_status_last_good_ts"):
+            for key in ('openwb_mqtt_field_age_s', 'openwb_mqtt_field_received_ts', 'openwb_mqtt_field_reason', 'openwb_mqtt_status_reason', 'openwb_status_fallback_reason', 'openwb_simpleapi_status_ts') + ("driver_status_source", "driver_status_plausible", "driver_status_glitch", "driver_status_glitch_reason", "driver_status_last_good_ts", "cp_id"):
                 if isinstance(raw_status, dict) and key in raw_status:
                     status[key] = raw_status[key]
             _invalidate_native_status(
@@ -436,7 +438,7 @@ class StatusService:
             or "status_timeout"
         )
         stale = self.safe_stale_status(box, now_ts=now_value, age_s=age_s, reason=str(stale_reason))
-        for key in ('openwb_mqtt_field_age_s', 'openwb_mqtt_field_received_ts', 'openwb_mqtt_field_reason', 'openwb_mqtt_status_reason', 'openwb_status_fallback_reason', 'openwb_simpleapi_status_ts') + ("driver_status_source",):
+        for key in ('openwb_mqtt_field_age_s', 'openwb_mqtt_field_received_ts', 'openwb_mqtt_field_reason', 'openwb_mqtt_status_reason', 'openwb_status_fallback_reason', 'openwb_simpleapi_status_ts') + ("driver_status_source", "cp_id"):
             if isinstance(raw_status, dict) and key in raw_status:
                 stale[key] = raw_status[key]
         stale["wallbox_data_outage_since_ts"] = since

@@ -76,14 +76,14 @@ try:
     from .market_economics import (
         HORIZON_MS as MARKET_HORIZON_MS,
         WINDOW_REFERENCE_CLOCK_TOLERANCE_MS,
-        build_market_economics_plan,
+        build_market_economics_plan, market_charge_target_ts,
         _market_plan_contract_error,
     )
 except Exception:
     from market_economics import (
         HORIZON_MS as MARKET_HORIZON_MS,
         WINDOW_REFERENCE_CLOCK_TOLERANCE_MS,
-        build_market_economics_plan,
+        build_market_economics_plan, market_charge_target_ts,
         _market_plan_contract_error,
     )
 
@@ -793,7 +793,8 @@ def _slot_storage_chargeable_forecast_contract(
 def _market_projection_replacements(plan, horizon):
     """Nur belegte Ersatzmengen projizieren; kein Ladeauftrag und kein Puffer.
 
-    Die Anzeige übernimmt ausschließlich die veröffentlichten Planer-Slots.
+    Die veröffentlichten Ersatzslots belegen die Menge. Für die Anzeige gilt
+    die Leistung des ausführbaren Auftrags bis zu dessen Zielzeit.
     Fehlt die Verteilung oder eine Nachweisbindung, bleibt der bisherige Pfad.
     """
     try:
@@ -830,9 +831,14 @@ def _market_projection_replacements(plan, horizon):
             delivery = number(proof["delivery_end_ts"])
             job = number(proof["job_grid_wh"])
             cap = min(number(proof["max_charge_power_w"]), number(plan["max_charge_w"]))
+            power = number(proof["planned_charge_w"])
+            target = number(proof["target_ts"])
+            target_soc = number(proof["target_end_soc_pct"])
             hours = (delivery - start) / 3600000
             if (not plan["simulation_start_ts_ms"] < start < delivery <= end <= plan["horizon_end_ts_ms"]
                     or any(value != int(value) for value in (start, delivery, end))
+                    or not start < target <= end or target != int(target)
+                    or not 0 <= target_soc <= 100 or not 300 <= power <= number(plan["max_charge_w"])
                     or amount <= 0 or buffer < 0 or job <= 0 or cap < 300
                     or amount + buffer > job * eta + 0.002
                     or amount > cap * hours * eta + 0.002):
@@ -841,21 +847,24 @@ def _market_projection_replacements(plan, horizon):
             if not isinstance(slots, list) or not slots:
                 return [], 1.0
             slot_total = 0.0
+            previous_end = start
             for slot in slots:
                 left = number(slot["start_ts"])
                 right = number(slot["end_ts"])
                 energy = number(slot["amount_wh"])
                 slot_hours = (right - left) / 3600000
                 if (not start <= left < delivery or not left < right <= end
-                        or left != int(left) or right != int(right) or energy <= 0
+                        or left < previous_end or left != int(left) or right != int(right) or energy <= 0
                         or energy > cap * slot_hours * eta + 0.002):
                     return [], 1.0
-                actions.append({"action": "grid_charge", "origin": "hold_replacement",
-                    "start_ts_ms": int(left), "end_ts_ms": int(right),
-                    "power_w": energy / slot_hours / eta})
                 slot_total += energy
+                previous_end = right
             if abs(slot_total - amount) > 0.002:
                 return [], 1.0
+            actions.append({"action": "grid_charge", "origin": "hold_replacement",
+                "start_ts_ms": int(start), "end_ts_ms": int(end),
+                "power_w": power, "job_grid_wh": job, "target_soc_pct": target_soc,
+                "target_ts_ms": int(target)})
             total += amount
         actions.sort(key=lambda a: a["start_ts_ms"])
         if (abs(total - number(horizon["replacement_total_wh"])) > 0.002
@@ -864,6 +873,13 @@ def _market_projection_replacements(plan, horizon):
         return actions, eta
     except (ValueError, TypeError, KeyError, AttributeError, OverflowError, ZeroDivisionError):
         return [], 1.0
+
+
+def _market_projection_charge(base_power, rate, charge_cap, remaining_wh, hours, efficiency):
+    """Akkurate einschließlich PV; Netzanteil ist nur eine abgeleitete Anzeige."""
+    pv = max(0.0, base_power)
+    battery = min(charge_cap, max(pv, min(rate, max(0.0, remaining_wh) / hours, charge_cap)))
+    return battery, max(0.0, battery - pv) / efficiency
 
 
 def build_market_soc_trajectory(plan, live=None):
@@ -1065,7 +1081,9 @@ def build_market_soc_trajectory(plan, live=None):
                 return unavailable("grid_charge_job_invalid")
             selected.append({"action": "grid_charge", "origin": "grid_charge",
                 "start_ts_ms": charge_start, "end_ts_ms": end,
-                "contract_id": contract_id, "power_w": power})
+                "contract_id": contract_id, "power_w": power,
+                "target_ts_ms": min(end, int(number(job.get("target_ts"))) or
+                    market_charge_target_ts(int(number(job.get("window_start_ts"))) or start, end))})
         rows = {int(number(row.get("ts"))): row for row in plan.get("timeline") or []}
         slots = []
         expected = generated
@@ -1089,7 +1107,7 @@ def build_market_soc_trajectory(plan, live=None):
             base_power = (number(row.get("target_charge_w", row.get("charge_w")))
                 if net >= 0 else max(-discharge_cap, net))
             base_power = min(charge_cap, max(-discharge_cap, base_power))
-            cuts = sorted({left, base_end} | {int(item[k]) for item in schedule for k in ("start_ts", "end_ts") if left < item[k] < base_end} | {int(a[k]) for a in selected for k in ("start_ts_ms", "end_ts_ms") if left < a[k] < base_end})
+            cuts = sorted({left, base_end} | {int(item[k]) for item in schedule for k in ("start_ts", "end_ts") if left < item[k] < base_end} | {int(a[k]) for a in selected for k in ("start_ts_ms", "end_ts_ms", "target_ts_ms") if k in a and left < a[k] < base_end})
             for seg_start, seg_end in zip(cuts, cuts[1:]):
                 chosen = next((a for a in selected if a["start_ts_ms"] <= seg_start < a["end_ts_ms"]), None)
                 allocation = next((item for item in schedule if item["start_ts"] <= seg_start < item["end_ts"]), None)
@@ -1106,14 +1124,11 @@ def build_market_soc_trajectory(plan, live=None):
                 if chosen:
                     power = max(0.0, base_power)
                     if mode == "grid_charge" and chosen["origin"] != "hold_replacement":
-                        # Netzladen ersetzt die Entladung; Hausbedarf stammt
-                        # dann aus dem Netz und wird nicht nochmals abgezogen.
-                        grid_power = min(chosen["power_w"], charge_cap,
-                            grid_budget_wh / hours,
-                            max(0.0, target_soc - soc) * capacity / 100.0 / hours / efficiency)
-                        power = max(power, grid_power * efficiency)
+                        power, grid_power = _market_projection_charge(base_power,
+                            chosen["power_w"] if seg_start < chosen["target_ts_ms"] else charge_cap,
+                            charge_cap, (target_soc - soc) * capacity / 100.0, hours, efficiency)
                 # Schedule enthält bereits den Restanteil der ersten Viertelstunde.
-                if allocation and (chosen is None or chosen["origin"] in ("hold_horizon", "hold_replacement")):
+                if allocation and (chosen is None or chosen["origin"] == "hold_horizon"):
                     if chosen and chosen["origin"] == "hold_horizon":
                         power = 0.0
                     elif net < 0:
@@ -1122,16 +1137,13 @@ def build_market_soc_trajectory(plan, live=None):
                     else:
                         power = max(0.0, base_power)
                 if chosen and chosen["origin"] == "hold_replacement":
-                    # Ersatzmenge ist batteriebezogen; PV und Last bleiben im
-                    # Fahrplan enthalten. Pufferenergie wird nicht addiert.
-                    grid_power = min(chosen["power_w"], max(0.0, charge_cap - max(0.0, power)) / efficiency,
-                        max(0.0, (100.0 - soc) * capacity / 100.0 / hours - power) / efficiency)
-                    power += grid_power * efficiency
+                    power, grid_power = _market_projection_charge(base_power,
+                        chosen["power_w"] if seg_start < chosen["target_ts_ms"] else charge_cap,
+                        charge_cap, (chosen["target_soc_pct"] - soc) * capacity / 100.0, hours, efficiency)
                 end_soc = max(reserve, min(100.0, soc + power * hours / capacity * 100.0))
                 actual_power = (end_soc - soc) * capacity / 100.0 / hours
-                if mode == "grid_charge" and chosen["origin"] != "hold_replacement":
-                    grid_power = min(grid_power, max(0.0, actual_power) / efficiency)
-                    grid_budget_wh = max(0.0, grid_budget_wh - grid_power * hours)
+                if mode == "grid_charge":
+                    grid_power = max(0.0, actual_power - max(0.0, base_power)) / efficiency
                 slots.append({"start_ts_ms": seg_start, "end_ts_ms": seg_end,
                     "slot_id": base.get("slot_id"), "soc_start_pct": round(soc, 6),
                     "soc_end_pct": round(end_soc, 6), "action": mode,

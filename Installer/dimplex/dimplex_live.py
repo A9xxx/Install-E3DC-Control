@@ -169,6 +169,14 @@ def scale_dimplex_register_temperature(raw_value: int | None, scale: Any = "auto
     return scale_temperature(raw_value, scale)
 
 
+def scale_wpm_temperature(raw_value: int | None, register: Any, scale: Any = "auto") -> float | None:
+    # Register der Datenpunktliste (unter 5000) liefern Zehntelgrad.
+    # Eingetragene 5xxx-Register bleiben bei der Erkennung am Wert.
+    if safe_int(register, 0) < 5000:
+        return scale_dimplex_register_temperature(raw_value, scale)
+    return scale_temperature(raw_value, scale)
+
+
 def scale_power_w(raw_value: int | None) -> int | None:
     if raw_value is None:
         return None
@@ -365,8 +373,8 @@ def read_dimplex(client: Any, cfg: dict[str, Any], unit_id: int) -> dict[str, An
     heartbeat_out_raw = read_one_register(client, pdu_address(heartbeat_out_register, zero_based), unit_id)
     detected_software, software_raw = read_wpm_software(client, unit_id)
 
-    outdoor_c = scale_temperature(outdoor_raw, temp_scale)
-    dhw_c = scale_temperature(dhw_raw, temp_scale)
+    outdoor_c = scale_wpm_temperature(outdoor_raw, outdoor_register, temp_scale)
+    dhw_c = scale_wpm_temperature(dhw_raw, dhw_register, temp_scale)
     return_c = plausible_temperature(return_c, min_c=-5.0)
     flow_c = plausible_temperature(flow_c, min_c=-5.0)
     return_setpoint_c = plausible_temperature(return_setpoint_c, min_c=-5.0)

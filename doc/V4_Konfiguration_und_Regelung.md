@@ -55,7 +55,7 @@ hängt, ist er genannt; die Detailabläufe stehen in `doc/Native_Wallbox.md`,
 
 ### Oberste Regelziele
 
-E3DC-Control regelt auf die Messwerte des E3DC. Messgrößen werden nicht gegeneinander geprüft; Abweichungen erscheinen als Hinweis.
+E3DC-Control regelt auf die Messwerte des E3DC. Messgrößen werden nicht gegeneinander geprüft; eine Abweichung zwischen Netzwert und Phasenwerten erscheint erst nach 5 Minuten durchgehender Abweichung als Hinweis.
 
 Geregelt wird so, wie es eingestellt ist; Einstellungen haben Vorrang in der
 Regelung, Schutzfunktionen gehen vor. Die Verbraucherpriorität
@@ -121,6 +121,30 @@ Schranken gilt die folgende Rangfolge:
      (etwa die 60 Sekunden Deckung für die Hochschaltung 1p→3p); es gibt keine
      pauschale Leistungsdifferenz für alle Ein- und Ausschaltschwellen.
 
+### Ladeprofil und bekannte Preise
+
+Preisbasiertes Netzladen plant mit den bekannten Preisen. Stunden ohne Preis
+sperren keinen Auftrag und begründen keinen zusätzlichen Energiebedarf. Neue
+Preise führen zur normalen Neuplanung. Der vollständige Preis des laufenden
+Slots, frische Quellen, der erforderliche Energiehorizont und der lückenlose
+Preisvergleich für die gewählte Aktion bleiben Voraussetzung. Interne
+Preislücken werden nicht durch angenommene Preise geschlossen.
+
+Das Ladeprofil bestimmt die Menge: Wirtschaftlich berücksichtigt Bedarf,
+PV-Prognose und Mindestmarge, Ausgeglichen den Bedarf ohne Margenaufschlag.
+Komfort lädt im günstigen Preisfenster bis zum eingestellten Ziel, auch wenn
+am Folgetag viel PV erwartet wird. Eigene Einstellungen verwenden die
+gespeicherten Profilwerte. Haus und enthaltene Verbraucher zählen genau einmal.
+Der Hausanschluss geht vor; im gemeinsamen Rahmen erhält der Hausspeicher
+seine Ladeleistung vor den Fahrzeugen.
+
+Die Linie „SoC-Prognose mit Marktplan“ stellt ein nachgewiesenes späteres
+Nachladen mit der gesamten Akkuladeleistung einschließlich PV und dem Ziel dar.
+Die veröffentlichte Netzenergiemenge ist kein laufender Energiezähler. Im
+Ladefenster kommt der Hausbedarf aus dem Netz, der Akku wird nicht entladen.
+Die Legende kennzeichnet diese Fenster als „Nachladen bei günstigem Preis“.
+Ein neuer Plan beginnt beim dann gemessenen SoC.
+
 ### Regelungstechnik und Hardware-Schutz
 
 - Reale Relais, Schütze, Wechselrichter und Wallboxen dürfen nicht flattern.
@@ -137,7 +161,7 @@ Schranken gilt die folgende Rangfolge:
   plus Gültigkeit und Quelle (`*_valid`, `*_source`). Fehlende Daten sind keine
   Freigabe: Ohne frische, gültige Live-Werte bleiben Budgets geschlossen,
   Konten eingefroren und Aktoren im sicheren Zustand.
-- Notstromschutz: An der Notstromreserve wird die Entladung sofort gesperrt. Ab 5.5.6 entfällt nur die zusätzliche EMS-Entladegrenze, wenn das Reservefeld leer oder 0 ist, die Gerätereserve frisch und gültig gelesen wird und sie den wirksamen Boden bildet: Der E3DC hält die Reserve selbst; eigene Entlade-, Verkaufs- und Exportbefehle bleiben bis zur bestehenden SoC-Erholung gesperrt. Leer bedeutet weiterhin 8 % Rückfallreserve; liegt diese über der Gerätereserve, bleibt die 0-W-Grenze aktiv. Ein gespeicherter Wert, auch 8,0, zählt als eigene Reserve. Für den Freilauf das Feld leeren oder 0 eintragen. Nach ungültigen oder veralteten Daten bleibt die 0-W-Grenze bis Reserve + 1,5 Prozentpunkte und 30 Sekunden stabilen Messwerten bestehen. Erlaubtes Netzladen bleibt möglich.
+- Notstromschutz: An der Notstromreserve wird die Entladung sofort gesperrt. Ab 5.5.6 entfällt nur die zusätzliche EMS-Entladegrenze, wenn das Reservefeld leer oder 0 ist, die Gerätereserve frisch und gültig gelesen wird und sie den wirksamen Boden bildet: Der E3DC hält die Reserve selbst; eigene Entlade-, Verkaufs- und Exportbefehle bleiben bis zur bestehenden SoC-Erholung gesperrt. Leer bedeutet weiterhin 8 % Rückfallreserve; liegt diese über der Gerätereserve, bleibt die 0-W-Grenze aktiv. Ein gespeicherter Wert, auch 8,0, zählt als eigene Reserve. Für den Freilauf das Feld leeren oder 0 eintragen. Nach ungültigen oder veralteten Daten bleibt die 0-W-Grenze bis Reserve + 1,5 Prozentpunkte und 30 Sekunden stabilen Messwerten bestehen. Die Reserve sperrt nur die Akkuentladung: Laden aus PV und vom Speicherplan angeforderte Netzladungen bleiben möglich, Wallbox und Wärmepumpe werden weiter aus dem Netz versorgt, der Hausanschluss je Phase geht vor. Die Unwetter-Vorladung und das Komfort-Netzladen in günstigen Preisfenstern starten an der Reserve nicht.
   Ein Export- oder Verkaufsbefehl (`FORCE_EXPORT`) endet an dieser Grenze
   beziehungsweise am Reserveboden der Direktvermarktung; der Speicher fällt in
   den normalen Betrieb zurück, unabhängig davon, was Preis- oder
@@ -233,11 +257,11 @@ Schranken gilt die folgende Rangfolge:
   physikalische Glitches, Netzwerk-/API-Latenz, veraltete Daten, Phasenmessung
   und Hardwaregrenzen prüfen, bevor Einstellungen oder Regeln geändert werden.
 - **Reaktionszeit des Speichers.** Der Kern setzt den Budgetanteil direkt
-  mit 1-A-Totband um. Die Netzbremse zählt zwei Takte über 300 W; nach eigener
-  Anhebung und nach Start, Anhebung oder Phasenwechsel einer Netzbox zählen
-  20 Sekunden nicht mit. Nur frische gemessene Netzboxleistung wird einmal
-  vom Netzpunkt abgezogen. Nach einer Korrektur braucht eine Anhebung 30 s
-  unter 300 W. Elektrische Grenzen und Nutzer-Aus wirken sofort.
+  mit 1-A-Totband um. Die Netzbremse zählt zwei Takte über 300 W; solange ein
+  eigener Ausgang oder Start, Anhebung oder Phasenwechsel einer Netzbox noch
+  nicht quittiert ist, zählt der Takt nicht mit. Nur frische gemessene
+  Netzboxleistung wird einmal vom Netzpunkt abgezogen. Nach einer Korrektur
+  braucht eine Anhebung 30 s unter 300 W. Elektrische Grenzen und Nutzer-Aus wirken sofort.
 - **Ungültige Liveprobe.** Eine einzelne ungültige Probe stoppt keine laufende
   Ladung: Bei allen geregelten Wallbox-Typen bleibt der zuletzt ausgeführte
   Strom höchstens 10 s nach der letzten gültigen Probe (ihrem Zeitstempel)
@@ -247,7 +271,7 @@ Schranken gilt die folgende Rangfolge:
   laufenden Mindeststrom und kein Netzbezug über der Toleranz; ein als gültig
   markierter Netzwert mit Bezug in der ungültigen Probe verhindert den Halt
   ebenfalls. Sonst gilt das bisherige Verhalten. Nutzer-`Aus`, Pause, Sperre,
-  Notaus, Zwangsstopp, Notstromreserve, Ladefensterende, Ladeende sowie
+  Notaus, Zwangsstopp, Ladefensterende, Ladeende sowie
   Hausanschluss- und Phasenstromüberlast wirken sofort; Absenkungen bis
   hinunter zum Mindeststrom (ohne Schütz) laufen durch. Details:
   `doc/Native_Wallbox.md`, Abschnitt „Ungültige Liveprobe: kurzer Halt“.
@@ -337,7 +361,8 @@ Pre-Dump, Haltezone und die Stützung oberhalb des offenen Tors behalten ihr
 bisheriges Verhalten. Ein Rahmen unter der Mindestleistung verhindert einen
 Start, ohne bei ruhendem Fahrzeug eine zusätzliche Akkugrenze zu setzen.
 Ein ausreichender Kandidat darf den Akku zur Bestätigung des Startangebots
-begrenzen; die bestehende Startablehnung beendet ein erfolgloses Angebot.
+begrenzen; ein Startangebot, das das Fahrzeug nicht abnimmt, endet dabei
+nicht von selbst.
 Eine Wärmepumpe allein ändert die Akkufreigabe nicht.
 
 Akkuanteil, flüchtiges AUTO-Limit und Budgetabzug sind dieselbe Zahl. Ein
@@ -415,11 +440,12 @@ Datenwächter behalten Vorrang.
   einphasig, Mindeststrom, Weckverhalten oder fehlende Steuerfähigkeit sind
   Fähigkeits-Eingaben der zentralen Policy, keine eigenen Regelwelten.
   Messprotokoll und Steuerautorität sind zwei verschiedene Dinge.
-- Pause, Not-Aus und Ladepunktsperre beenden eine laufende Ladung sofort mit quittiertem Stopp, auch in „Beobachten“. Anti-Flattern und Mindestladezeit verzögern diesen Stopp nicht. Das Abbruchbit der Box zeigt, ob die Box eine Ladung freigibt oder gesperrt hat. Native E3DC-Wallboxen erhalten einen Stoppimpuls nur, wenn sie frisch „nicht abgebrochen“ melden, auch ohne Leistungsbezug. „Abgebrochen“ quittiert den Stopp ohne weitere Flanke. Fehlt die Abbruchmeldung der Box über mehrere Proben, ist genau ein Stopp mit frischem Ladebeleg zulässig; die Anzeige meldet „Zustand der Box nicht lesbar“. Andere Typen nehmen auch ein stehendes Angebot zurück. Bleibt nach einer nativen Stoppflanke der Bitwechsel 30 Sekunden aus, entsteht ein Fehler. Im Fehlerzustand „Box reagiert nicht auf den Stopp“ erhalten Pause, Ladepunktsperre, Not-Aus, Notstromreserve und Hausanschluss gemeinsam genau eine zusätzliche Stoppflanke: frühestens 60 Sekunden nach dem letzten Stoppversuch, bei frischer Probe mit „nicht abgebrochen“ oder unbekanntem Bit und nur mit frischem Ladebeleg. Die Fehleranzeige erscheint ab Fehlerbeginn. Die zusätzliche Einmalflanke ist höchstens einmal je Stecksession und Dienstlauf zulässig; ist sie verbraucht oder für den Stoppgrund nicht berechtigt, bittet die Oberfläche, den Ladepunkt zu prüfen. Nach einem Neustart des Dienstes steht sie einmal neu zur Verfügung. Eine Stecksession endet erst mit bestätigtem Abstecken: mindestens drei aufeinanderfolgende frische Proben ohne gestecktes Fahrzeug über mindestens zehn Sekunden. Insgesamt sind höchstens drei Versuche je Ereignis zulässig; eine bereits verbrauchte Einmalflanke wird durch einen späteren Nutzer-Stopp nicht erneuert. Ein beobachteter externer Neustart wird bei Nutzer-Aus, Schutzgründen, Ladefensterende, Ziel erreicht, Abfahrt oder Budget-Zeitlimit erneut gestoppt, frühestens 30 Sekunden nach der letzten Flanke. Bei Unterdeckung übernimmt der Regelkern die externe Ladung und beendet sie nach seinen normalen Sitzungsregeln. Sperre, Pause und Not-Aus bleiben nach Dienst- und Host-Neustart sowie Containerstart bestehen. Die Ladepunktsperre gilt als Nutzer-Aus. Sperre und Not-Aus lassen sich nur über den Schalter mit dem Power-Symbol des jeweiligen Ladepunkts in der erweiterten Ansicht auf der Seite „Wallbox“ aufheben. Moduswahl, Abstecken und Speichern in der einfachen Ansicht heben die Sperre nicht auf. Fortsetzen, ein bewusster Moduswechsel, Sofortstart, Abstecken oder externes Fortsetzen an einer openWB Primary heben nur die Pause auf. In den PV-Modi kehrt eine Primary nach Freigabe eines eigenen Stopp- oder Sofortauftrags, bewusstem Moduswechsel oder aufgehobener importierter Fremdpause genau einmal auf PV zurück; dies gilt auch nach Abstecken und Wiederanstecken. Während Pause, Not-Aus oder Ladepunktsperre gibt es keine PV-Rückgabe. Eine Nutzerwahl an der openWB ohne solche Aktion bleibt bestehen. Bleibt „Beobachten“ eingestellt, wird beim Fortsetzen oder Freigeben einmalig die Grundeinstellung freigegeben und anschließend wieder beobachtet. Bei nativen Boxen hebt Fortsetzen in „Beobachten“ nur die eigene Pause oder Ladepunktsperre derselben Stecksession genau einmal auf, wenn die Box frisch „abgebrochen“ meldet. Diese Übergabe benötigt kein Regelbudget. Eine App-Sperre wird nicht aufgehoben. Nach Not-Aus erfolgt in „Beobachten“ keine automatische Freigabe; die Box bleibt bis zur App-Freigabe gesperrt. Endet eine Pause in „Beobachten“ durch bestätigtes Abstecken, bleibt eine native Box gesperrt, bis sie in der E3DC-App freigegeben oder ein Regelmodus gewählt wird. Die bewusste Freigabe über den Schalter der Ladepunktsperre gibt die Box genau einmal frei, auch ohne gestecktes Fahrzeug, solange seit der Sperre weder eine Pause noch ein neues Anstecken dazwischenlag.
+- Pause, Not-Aus und Ladepunktsperre beenden eine laufende Ladung sofort mit quittiertem Stopp, auch in „Beobachten“. Anti-Flattern und Mindestladezeit verzögern diesen Stopp nicht. Das Abbruchbit der Box zeigt, ob die Box eine Ladung freigibt oder gesperrt hat. Native E3DC-Wallboxen erhalten einen Stoppimpuls nur, wenn sie frisch „nicht abgebrochen“ melden, auch ohne Leistungsbezug. „Abgebrochen“ quittiert den Stopp ohne weitere Flanke. Fehlt die Abbruchmeldung der Box über mehrere Proben, ist genau ein Stopp mit frischem Ladebeleg zulässig; die Anzeige meldet „Zustand der Box nicht lesbar“. Andere Typen nehmen auch ein stehendes Angebot zurück. Bleibt nach einer nativen Stoppflanke der Bitwechsel 30 Sekunden aus, entsteht ein Fehler. Im Fehlerzustand „Box reagiert nicht auf den Stopp“ erhalten Pause, Ladepunktsperre, Not-Aus und Hausanschluss gemeinsam genau eine zusätzliche Stoppflanke: frühestens 60 Sekunden nach dem letzten Stoppversuch, bei frischer Probe mit „nicht abgebrochen“ oder unbekanntem Bit und nur mit frischem Ladebeleg. Die Fehleranzeige erscheint ab Fehlerbeginn. Die zusätzliche Einmalflanke ist höchstens einmal je Stecksession und Dienstlauf zulässig; ist sie verbraucht oder für den Stoppgrund nicht berechtigt, bittet die Oberfläche, den Ladepunkt zu prüfen. Nach einem Neustart des Dienstes steht sie einmal neu zur Verfügung. Eine Stecksession endet erst mit bestätigtem Abstecken: mindestens drei aufeinanderfolgende frische Proben ohne gestecktes Fahrzeug über mindestens zehn Sekunden. Insgesamt sind höchstens drei Versuche je Ereignis zulässig; eine bereits verbrauchte Einmalflanke wird durch einen späteren Nutzer-Stopp nicht erneuert. Ein beobachteter externer Neustart wird bei Nutzer-Aus, Schutzgründen, Ladefensterende, Ziel erreicht, Abfahrt oder Budget-Zeitlimit erneut gestoppt, frühestens 30 Sekunden nach der letzten Flanke. Bei Unterdeckung übernimmt der Regelkern die externe Ladung und beendet sie nach seinen normalen Sitzungsregeln. Sperre, Pause und Not-Aus bleiben nach Dienst- und Host-Neustart sowie Containerstart bestehen. Die Ladepunktsperre gilt als Nutzer-Aus. Die Ladepunktsperre über den Schalter mit dem Power-Symbol des jeweiligen Ladepunkts aufheben. Nach Not-Aus bleibt die Freigabe in der erweiterten Ansicht auf der Seite „Wallbox“. Moduswahl, Abstecken und Speichern in der einfachen Ansicht heben die Sperre nicht auf. Fortsetzen, ein bewusster Moduswechsel, Sofortstart oder externes Fortsetzen an einer openWB Primary heben nur die Pause auf. Eine Pause an einer leeren Box bleibt bis „Fortsetzen“. Abstecken beendet sie nur, wenn E3DC-Control das Fahrzeug während der Pause gesteckt gelesen hat. Konnte die Box in dieser Zeit nicht gelesen werden (Statuslücke, Neustart), bleibt die Pause nach dem Abziehen bestehen und endet mit „Fortsetzen“. Fehlt der eingestellte Ladepunkt in der openWB-Antwort, zeigt die Diagnose dessen Nummer; die Ladepunktnummer im Config-Editor prüfen. In den PV-Modi kehrt eine Primary nach Freigabe eines eigenen Stopp- oder Sofortauftrags, bewusstem Moduswechsel oder aufgehobener importierter Fremdpause genau einmal auf PV zurück; dies gilt auch nach Abstecken und Wiederanstecken. Während Pause, Not-Aus oder Ladepunktsperre gibt es keine PV-Rückgabe. Eine Nutzerwahl an der openWB ohne solche Aktion bleibt bestehen. Bleibt „Beobachten“ eingestellt, wird beim Fortsetzen oder Freigeben einmalig die Grundeinstellung freigegeben und anschließend wieder beobachtet. Bei nativen Boxen hebt Fortsetzen in „Beobachten“ nur die eigene Pause oder Ladepunktsperre derselben Stecksession genau einmal auf, wenn die Box frisch „abgebrochen“ meldet. Diese Übergabe benötigt kein Regelbudget. Eine in der E3DC-App gesetzte Sperre hebt „Beobachten“ nicht auf. Nach Not-Aus erfolgt in „Beobachten“ keine automatische Freigabe; die Box bleibt bis zur App-Freigabe gesperrt. Endet eine Pause in „Beobachten“ durch bestätigtes Abstecken, bleibt eine native Box gesperrt, bis sie in der E3DC-App freigegeben oder ein Regelmodus gewählt wird. In einem Regelmodus ist eine App-Sperre kein dauerhaftes Aus: Die Box erhält Start und Stopp über denselben Umschaltbefehl, deshalb hebt der nächste reguläre Start der Regelung eine vor dem Start in der App gesetzte Sperre auf. Für ein dauerhaftes Aus die Ladepunktsperre (Schalter mit dem Power-Symbol) verwenden. Die bewusste Freigabe über den Schalter der Ladepunktsperre gibt die Box genau einmal frei, auch ohne gestecktes Fahrzeug, solange seit der Sperre weder eine Pause noch ein neues Anstecken dazwischenlag.
 - `Aus` ist der bewusste Beobachtungsmodus: keine Regelbefehle, keine
   Auto-Erkennung. Nur beim bewussten Wechsel auf `Aus` in der WebUI wird einmalig
   die Wallbox-Grundeinstellung freigegeben; zusätzlich einmal beim Fortsetzen
   einer Pause in diesem Modus, nicht bei Reconnect oder Neustart.
+  Beim bewussten Wechsel auf „Beobachten“ und beim Fortsetzen einer Pause in diesem Modus setzt E3DC-Control eine E3DC-Wallbox einmalig auf die gewählte Betriebsart und den eingestellten Maximalstrom, begrenzt auf Hausanschluss minus Reserve. Die gemeinsame Einstellung „Betriebsart für Beobachten wählen“ im Config-Editor bietet Sonnenmodus (Werkseinstellung) und Mischmodus. Ein fehlender oder unbekannter Wert bedeutet Sonnenmodus. Änderungen wirken erst beim nächsten bewussten Wechsel oder Fortsetzen, nicht während „Beobachten“. Der Rahmen ändert die Start-/Stoppfreigabe nicht. Ohne PV-Überschuss kann die Box im Sonnenmodus trotzdem aufhören zu laden. Im Mischmodus kann die Box je nach E3DC-Einstellung auch Netz und Hausakku nutzen; dies entspricht derselben Einstellung im E3DC-Portal. Danach regelt der E3DC selbst.
   Deaktivierte Wallboxen werden weder erkannt noch gesteuert.
 
 ### Akkustützung der Wallbox in `PV-Kurve ruhig` nach Korridorlage
@@ -461,10 +487,10 @@ Datenwächter behalten Vorrang.
    zusätzlichen Halt.
 5. **`wbminsoc`.** Die Untergrenze begrenzt nur Akkustützung. Ein ausreichender
    veröffentlichter PV-Anteil erlaubt weiterhin Laden. Die bestehende
-   SoC-Hysterese und Speicher-Haltezone bleiben erhalten. Das Reserve-Tor
-   begrenzt Netzstarts und laufende Netzsitzungen; es sperrt keinen ausreichenden
-   PV-Anteil. Ein geschlossenes Tor bleibt beim Dienstneustart geschlossen und
-   öffnet erst ab Reserve plus 2 Prozentpunkten (Standardwerte). „PV + Akku bis
+   SoC-Hysterese und Speicher-Haltezone bleiben erhalten. Netzladen im
+   freigegebenen Netzfenster und Netzangebote bleiben an der Notstromreserve
+   zulässig; der Speicherregler sperrt die Akkuentladung, die Akkustützung
+   der Wallbox endet an der Reserve. „PV + Akku bis
    Untergrenze“, „Sofort bis Preislimit“ ohne Netzfenster und „Akku bis Abfahrt“
    im Abfahrtsfenster nutzen oberhalb der offenen Untergrenze das Gesamtbudget;
    darunter nur den PV-Anteil. „Grundladung stabil“ hält Mindeststrom nur,
@@ -513,7 +539,8 @@ Datenwächter behalten Vorrang.
   Anzeige und Diagnose passen zur tatsächlichen Rolle und Befehlsautorität.
 - openWB Pro wird im Standalone-Betrieb ausschließlich über `connect.php`
   gesteuert: Lesen per `GET`, Sollstrom `ampere` (0 oder 6,0–32,0), Phasenziel
-  `phasetarget` 1 oder 3, Weckruf `cp_interrupt=true`, Heartbeat `update=1`.
+  `phasetarget` 1 oder 3, Weckruf `cp_interrupt=true`, Heartbeat `heartbeatenabled`.
+  `update=1` löst das Firmware-Update der Box aus und gehört nicht zur Regelung.
   Regelmäßiges Lesen und Steuern hält den Heartbeat aktiv.
 - openWB-Serien- und native MQTT-Wallboxen liefern reale Zählerwerte, wenn
   vorhanden. Langzeitberechnung und Hausverbrauch rechnen mit echten
@@ -830,8 +857,10 @@ Wichtige Schutzlogik:
   `grid_pcc_imbalance_max_a` (Schieflast-Wächter, 10–32 A, Standard 20 A ≙
   4,6 kVA) stehen im Config-Editor unter Wallbox → „Hausanschluss & gemeinsame
   Grenzen“ → „Einphasiger Deckel openWB Pro (Messbasis)“. Voraussetzungen: eine einphasige Obergrenze über 20 A in `wb<n>_openwb_pro_1p_max_amp` (leer = 20 A), eine
-  ausdrücklich eingetragene Hausabsicherung `grid_max_amps` (der stille
-  Standard 35 A zählt nicht) und die Zuordnung `wb<n>_grid_phase`; der
+  gültige Hausabsicherung aus dem E3DC oder der Nutzereingabe und die Zuordnung
+  `wb<n>_grid_phase`; der 35-A-Ersatzrahmen für PV-Laden zählt nicht. Ein höherer
+  Nutzerwert überschreibt den E3DC-Wert erst nach ausdrücklicher Bestätigung.
+  Ohne beide Werte ist Netzladen nicht möglich; der
   automatische Software-Nachweis dieser Zuordnung beim Laden ist nur ein Hinweis (Dashboard:
   „Zuordnung bestätigt“); ohne frische Messwerte (10 s) gilt sofort wieder
   20 A. Anhebung +1 A je Regelschritt, Absenkung sofort. Details:
@@ -1184,8 +1213,17 @@ Aufträge wirken Nutzer-Aus, Hardware- und Quellenschutz sofort. Die unabhängig
 Sicherheitsabschaltung (Ladestand unter `min_soc` minus 5 Prozentpunkte oder
 30 Sekunden zusammenhängend frischer WP-Netzanteil (ohne frische WP-Einzelmessung: gesamter Netzbezug abzüglich 200 W) über 2.500 W) nimmt auch
 einen laufenden manuellen Boost zurück. Der SoC-Teil wirkt sofort; der Auftrag bleibt bestehen. Dasselbe gilt bei iDM,
-Dimplex und SG-Ready im Notstrom- oder Inselbetrieb und solange der Speicher
-die Notstromreserve hält.
+Dimplex und SG-Ready im Notstrom- oder Inselbetrieb.
+
+An der Notstromreserve gibt der Speicher keine Akkuentladung für die Wärmepumpe
+frei. Nutzerbefehle wie „Warmwasser sofort“ und der manuelle Boost laufen dann
+aus dem Netz, solange der eingestellte Mindest-Ladestand, die oben beschriebene
+Sicherheitsabschaltung und der Hausanschluss es erlauben. Ohne frische
+WP-Einzelmessung zählt die Sicherheitsabschaltung den gesamten Netzbezug;
+weil der Akku an der Reserve nichts deckt, kann sie einen Nutzerbefehl dann
+schon bei üblicher Hauslast nach 30 Sekunden beenden.
+Ein PV-Auftrag endet an der Reserve; ein laufender Verdichter behält seine
+Mindestlaufzeit.
 
 Die Wiedereinschaltsperre (`wp_restart_block_min`) zählt ab dem gemessenen
 Verdichterstillstand und gilt für alle Startwege, auch für den manuellen Boost
@@ -1205,7 +1243,9 @@ wie beim manuellen Boost, nach jeder Rücknahme mindestens zehn Minuten
 beziehungsweise `wp_restart_block_min` bis zum nächsten Start. In einer
 E3DC-Datenlücke und wenn das Speicher-Budget nicht mehr frisch ist, hält
 der Manager das Signal höchstens fünf Minuten; im Notstrom- oder Inselbetrieb
-und unter der Notstromreserve startet und hält der Knopf nicht. Eine fremde
+startet und hält der Knopf nicht. An der Notstromreserve läuft er aus dem
+Netz, solange Mindest-Ladestand, Sicherheitsabschaltung und Hausanschluss es
+erlauben. Eine fremde
 Sperre (von außen ausgeschalteter Pause-Kontakt, Dimplex „Rot“) überschreibt
 er nicht. Nutzer-Aus, Hardware- und Quellenschutz und das erreichte Ziel
 beenden den Befehl. Bei SG Ready bewirkt der Knopf den verstärkten Betrieb der
@@ -1402,6 +1442,10 @@ Der Speicher veröffentlicht das absolute Gruppenbudget in zwei Teilen:
 Wallboxleistung werden davon nicht erneut abgezogen. Externe Wallboxen stecken
 im Hauswert, native E3DC-Wallboxen haben einen eigenen Messpunkt.
 
+Die Hausbasis der Speicherregelung (Abzug externer Wallboxen, Rückfall bei
+unbekanntem Typ oder ungültiger Messung) beschreibt
+`doc/Speicher_Ladesteuerung_Ablauf.md`, Abschnitt „4. Verbraucherbudget“.
+
 Je Ladepunkt und Zyklus gilt eine Anteilsquelle: Netz bei ausdrücklicher
 Netzfreigabe; Akku in „PV + Akku bis Untergrenze“, außerhalb des Netzfensters
 in „Sofort bis Preislimit“ und im Abfahrtsfenster in „Akku bis Abfahrt“, jeweils
@@ -1434,9 +1478,10 @@ auch ohne Stützungsfreigabe. Nutzer-Aus und Schutzstopps wirken sofort.
 Die Netzbremse zählt nur unerlaubten Bezug: Netzpunkt minus frisch gemessene
 Leistung der Netzboxen. Fehlt eine Messung oder ist sie älter als 15 Sekunden,
 gilt der rohe Netzwert. Zwei Regeltakte über 300 W senken den Strom ab.
-Die ersten 20 Sekunden nach Start, Anhebung oder Phasenwechsel einer Netzbox
-zählen für die anderen Boxen nicht als Bezugstakt; nach eigener Anhebung gilt
-dieselbe Frist. Netzboxen selbst haben keine Netzbremse. Nach einer Korrektur
+Solange eine Netzbox nach Start, Anhebung oder Phasenwechsel noch nicht
+quittiert ist, zählt ihr Einschwingen für die anderen Boxen nicht als
+Bezugstakt; nach eigenem Ausgang gilt dieselbe Quittungsregel. Netzboxen selbst
+haben keine Netzbremse. Nach einer Korrektur
 braucht eine erneute Anhebung 30 Sekunden Beruhigung unter 300 W.
 
 Die Regelung wählt die Phasen aller Ladepunkte gemeinsam. Je Netzphase darf
@@ -1477,7 +1522,7 @@ Auch eine auf 16 A begrenzte Wallbox kann bei ausreichendem dreiphasigem
 Anteil aufsteigen. Die vorhandenen Gerätesequenzen, Reservierungen und
 frischen Rücklesebelege bleiben verbindlich. Nutzer-Aus, Notstromreserve,
 Hausanschluss, Datenvalidität und sichere Hardwarekommandos haben Vorrang.
-Eine native Stoppflanke braucht den frischen Zustand „nicht abgebrochen“. Fehlt das Bit, gilt der einmalige Rückfall mit frischem Ladebeleg. Im Fehlerzustand „Box reagiert nicht auf den Stopp“ erhalten Pause, Ladepunktsperre, Not-Aus, Notstromreserve und Hausanschluss gemeinsam genau eine zusätzliche Stoppflanke: frühestens 60 Sekunden nach dem letzten Stoppversuch, bei frischer Probe mit „nicht abgebrochen“ oder unbekanntem Bit und nur mit frischem Ladebeleg. Die Fehleranzeige erscheint ab Fehlerbeginn. Die zusätzliche Einmalflanke ist höchstens einmal je Stecksession und Dienstlauf zulässig; ist sie verbraucht oder für den Stoppgrund nicht berechtigt, bittet die Oberfläche, den Ladepunkt zu prüfen. Nach einem Neustart des Dienstes steht sie einmal neu zur Verfügung. Eine Stecksession endet erst mit bestätigtem Abstecken: mindestens drei aufeinanderfolgende frische Proben ohne gestecktes Fahrzeug über mindestens zehn Sekunden. Insgesamt sind höchstens drei Versuche je Ereignis zulässig; eine bereits verbrauchte Einmalflanke wird durch einen späteren Nutzer-Stopp nicht erneuert.
+Eine native Stoppflanke braucht den frischen Zustand „nicht abgebrochen“. Fehlt das Bit, gilt der einmalige Rückfall mit frischem Ladebeleg. Im Fehlerzustand „Box reagiert nicht auf den Stopp“ erhalten Pause, Ladepunktsperre, Not-Aus und Hausanschluss gemeinsam genau eine zusätzliche Stoppflanke: frühestens 60 Sekunden nach dem letzten Stoppversuch, bei frischer Probe mit „nicht abgebrochen“ oder unbekanntem Bit und nur mit frischem Ladebeleg. Die Fehleranzeige erscheint ab Fehlerbeginn. Die zusätzliche Einmalflanke ist höchstens einmal je Stecksession und Dienstlauf zulässig; ist sie verbraucht oder für den Stoppgrund nicht berechtigt, bittet die Oberfläche, den Ladepunkt zu prüfen. Nach einem Neustart des Dienstes steht sie einmal neu zur Verfügung. Eine Stecksession endet erst mit bestätigtem Abstecken: mindestens drei aufeinanderfolgende frische Proben ohne gestecktes Fahrzeug über mindestens zehn Sekunden. Insgesamt sind höchstens drei Versuche je Ereignis zulässig; eine bereits verbrauchte Einmalflanke wird durch einen späteren Nutzer-Stopp nicht erneuert.
 
 „Beobachten“, reine Messquellen und extern geführte openWB-Primary-PV-Rollen
 erhalten keine Start- oder Strombefehle. Pause, Sperre und Not-Aus bleiben

@@ -23,6 +23,16 @@ import urllib.parse
 import urllib.request
 from typing import Any
 
+# Installer nur während dieses Imports voranstellen.
+_stdio_import_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, _stdio_import_path)
+try:
+    from quiet_logging import ensure_utf8_stdio
+except ImportError:
+    from Installer.quiet_logging import ensure_utf8_stdio
+finally:
+    sys.path.pop(0)
+
 
 CONFIG_FILE = "/var/www/html/data/e3dc_v4.json"
 RAMDISK_DIR = "/var/www/html/ramdisk"
@@ -932,6 +942,7 @@ def configured_for_stiebel(cfg: dict[str, Any]) -> bool:
 
 
 def main() -> None:
+    ensure_utf8_stdio()
     print(f"[{time.strftime('%H:%M:%S')}] Starte {LOG_PREFIX} (read-only)...", flush=True)
     while not _stop:
         cfg = read_config()

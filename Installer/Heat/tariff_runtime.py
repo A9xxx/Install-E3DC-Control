@@ -134,8 +134,7 @@ class TariffShiftRuntime:
         evidence = {
             'forecast': forecast,
             'data_fresh': ctx.get('e3dc_valid') is True and status.get('valid') is True and status.get('source_fresh') is True,
-            'reserve_free': ctx.get('heatpump_user_boost_emergency_veto') == '',
-            'emergency_free': ctx.get('heatpump_user_boost_emergency_veto') == '',
+            'emergency_free': ctx.get('heatpump_emergency_veto') == '',
             'storage_free': fresh_grant and grant.get('safety_free') is True,
             'device_free': not ctx.get('heatpump_signal_typed_protection_stop') and data.get('Betriebsart') != 3,
             'source_free': number(ctx.get('wq_aus')) is not None and number(ctx.get('WQ_MIN_TEMP')) is not None and ctx['wq_aus'] >= ctx['WQ_MIN_TEMP'],

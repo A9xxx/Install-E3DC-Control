@@ -50,14 +50,17 @@ def _dict(value):
 
 
 def heatpump_pv_time_probe_plausible(probe):
-    """Boot-, Marker- und monotone Zeit müssen dieselbe Wanduhrprobe belegen."""
+    """Bootzeit und monotone Zeit müssen dieselbe plausible Wanduhrprobe belegen."""
     probe = _dict(probe)
     wall = _number(probe.get("wall_s", probe.get("wall_ts")))
     mono = _number(probe.get("monotonic_s", probe.get("monotonic_ts")))
     boot = _number(probe.get("boot_wall_s"))
-    marker = _number(probe.get("time_confirmation_marker_wall_s"))
-    return bool(wall is not None and mono is not None and boot is not None
-                and marker is not None and boot <= marker <= wall
+    return bool(probe.get("valid") is True and wall is not None and wall >= 1577836800
+                and mono is not None and boot is not None
+                and type(probe.get("wall_s", probe.get("wall_ts"))) in (int, float)
+                and type(probe.get("monotonic_s", probe.get("monotonic_ts"))) in (int, float)
+                and isinstance(probe.get("boot_id"), str)
+                and probe["boot_id"] not in ("", "unknown")
                 and abs(wall - boot - mono) <= TIME_PROBE_TOLERANCE_S)
 
 
@@ -490,26 +493,19 @@ def _reconcile_heatpump_energy_clock(state, clock_sample, cfg):
         return False
     probe = _dict(clock_sample)
     wall = _number(probe.get("wall_s", probe.get("wall_ts")))
-    plausible = bool(probe.get("valid") is True
-        and wall is not None and wall >= 1577836800
-        and probe.get("boot_id") not in (None, "", "unknown"))
-    confirmed = bool(plausible and probe.get("wall_confirmed") is True
-        and _number(probe.get("monotonic_s", probe.get("monotonic_ts"))) is not None
-        and probe.get("time_confirmation_source") == "systemd_timesyncd_current_boot")
-    state["time_confirmation_source"] = probe.get("time_confirmation_source", "clock_unconfirmed")
+    plausible = heatpump_pv_time_probe_plausible(probe)
+    state["time_confirmation_source"] = "wall_clock_plausible" if plausible else "clock_implausible"
     state["energy_quarantine_until_wall_s"] = None
     state["quarantine_remaining_s"] = 0.0
     state["uncertain_state"] = True
-    state["energy_recovery_reason"] = "clock_unconfirmed"
-    if (not plausible or probe.get("time_confirmation_source") == "clock_implausible"
-            or confirmed and not heatpump_pv_time_probe_plausible(probe)):
-        state["energy_recovery_reason"] = "clock_implausible"
+    state["energy_recovery_reason"] = "clock_implausible"
+    if not plausible:
         return True
     anchor = recovery["anchor_wall_s"]
     if anchor is not None and wall < max(anchor, _number(recovery.get("saved_wall_s"), anchor)):
         state["energy_recovery_reason"] = "clock_implausible"
         return True
-    if anchor is not None and confirmed:
+    if anchor is not None:
         span = max(0.0, probe["boot_wall_s"] +
                    probe.get("monotonic_s", probe.get("monotonic_ts")) - anchor)
         if wall - anchor > span + TIME_PROBE_TOLERANCE_S:
@@ -518,7 +514,7 @@ def _reconcile_heatpump_energy_clock(state, clock_sample, cfg):
         logical = recovery["anchor_logical_s"] + wall - anchor
         _charge_heatpump_recovery_gap(state, recovery, logical, cfg)
     else:
-        # Ohne Zeitnachweis oder belegte Historie gilt das Quellenkontingent als verbraucht.
+        # Ohne belegte Historie gilt das Quellenkontingent als verbraucht.
         # PV ohne Überbrückung bleibt im ersten gültigen Zyklus möglich.
         logical = state["last_ts"]
         amounts = []
@@ -535,18 +531,17 @@ def _reconcile_heatpump_energy_clock(state, clock_sample, cfg):
     recovery.pop("quarantine_until_wall_s", None)
     state["uncertain_state"] = False
     state["checkpoint_reconciliation_required"] = False
-    state["energy_recovery_reason"] = ("checkpoint_wall_clock_resumed" if confirmed
-        else "checkpoint_gap_consumed_clock_unconfirmed")
+    state["energy_recovery_reason"] = ("checkpoint_wall_clock_resumed" if anchor is not None
+        else "checkpoint_gap_consumed_history_missing")
     return False
 
 
 def heatpump_energy_recovery_diagnostics(state):
     recovery = _dict(state.get("energy_recovery"))
     reason = state.get("energy_recovery_reason", "")
-    text = ("Wartet auf Zeitbestätigung" if reason == "clock_unconfirmed" else
-            "Wartet auf plausible Zeitbestätigung (widersprüchliche Zeitprobe)" if reason == "clock_implausible" else
-            "WP-Energiekonto nach Neustart fortgeführt; Ausfallzeit ohne Zeitnachweis als verbraucht gebucht"
-            if reason == "checkpoint_gap_consumed_clock_unconfirmed" else
+    text = ("Wartet auf plausible Uhrzeit (widersprüchliche Zeitprobe)" if reason == "clock_implausible" else
+            "WP-Energiekonto nach Neustart fortgeführt; Kontingente ohne belegte Historie als verbraucht gebucht"
+            if reason == "checkpoint_gap_consumed_history_missing" else
             "WP-Energiekonto nach Neustart fortgeführt" if reason == "checkpoint_wall_clock_resumed" else "")
     return {"time_confirmation_source": state.get("time_confirmation_source"),
             "energy_recovery_reason": reason, "energy_recovery_text": text,
@@ -941,7 +936,8 @@ def curve_forecast_hold_contract(plan, *, now_s, horizon_end_s, soc, capacity_kw
             except OverflowError:
                 return False
         return True
-    if not finite_tree((plan, now_s, horizon_end_s, soc, capacity_kwh, power_w, config, target_soc)):
+    if not finite_tree((now_s, horizon_end_s, soc, capacity_kwh, power_w, target_soc,
+                        config.get("min_runtime_s"), config.get("boost_release_s"))):
         return {**result, "horizon_end_ts": None, "reason": "curve_forecast_nonfinite"}
     target = number(target_soc)
     if target_soc is None:
@@ -965,6 +961,23 @@ def curve_forecast_hold_contract(plan, *, now_s, horizon_end_s, soc, capacity_kw
     charge_limit = number(max_charge_w)
     if charge_limit is None or charge_limit < 0:
         return {**result, "reason": "curve_charge_limit_missing"}
+    # Nur gelesene Werte prüfen; unbenutzte Planmetadaten beeinflussen den Halt nicht.
+    plan_values = [plan.get(k) for k in (
+        "schema_version", "plan_id", "generated_at", "valid_until",
+        "effective_target_soc", "planning_target_soc", "target_soc", "input_revisions")]
+    for slot in plan.get("slots", []) if isinstance(plan.get("slots"), list) else []:
+        slot = _dict(slot)
+        forecast_w = _dict(slot.get("forecast_w"))
+        plan_values.extend((slot.get("start_ts_ms"), slot.get("end_ts_ms")))
+        for component, keys in (("pv", ("p10", "p50", "point")),
+                                ("house", ("p50", "point")),
+                                ("heat", ("p50", "point")),
+                                ("wallbox", ("p50", "point")),
+                                ("evidence", ("pv_fresh", "load_valid"))):
+            values = _dict(forecast_w.get(component))
+            plan_values.extend(values.get(k) for k in keys)
+    if not finite_tree(plan_values):
+        return {**result, "horizon_end_ts": None, "reason": "curve_forecast_nonfinite"}
     forecast = forecast_contract(project_plan_forecast(plan), now_s, end,
                                  max_absorption_w=charge_limit + power)
     if not forecast["valid"]:

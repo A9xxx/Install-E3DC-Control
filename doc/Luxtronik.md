@@ -514,8 +514,10 @@ Unbekannte Ausfallzeiten werden mit getrennten konservativen Obergrenzen für
 Akku- und Netzenergie gebucht. Fehlt ein vertrauenswürdiges Konto, gelten die
 Wh-Kontingente zunächst als verbraucht. Es gibt kein zusätzliches Sperrfenster:
 Mit der ersten gültigen Zeit- und Messprobe ist PV-Betrieb ohne Überbrückung
-wieder möglich. Mit Zeitnachweis des Systems wird die belegte Ausfallzeit gebucht. Ohne
-Zeitnachweis, etwa im Docker-Container, gilt die Ausfallzeit als verbraucht.
+wieder möglich. Bei plausibler Systemuhr wird die tatsächlich vergangene Ausfallzeit gebucht,
+auch im Docker-Container und unabhängig vom Zeitdienst. Die Wanduhr muss ab 2020
+liegen und zur Bootzeit und monotonen Zeit passen; ein Rücksprung vor den
+gespeicherten Zeitanker ist unzulässig. Ein Synchronisationsmarker ist nicht nötig.
 Widersprüchliche Uhrdaten verhindern neue PV-Aufträge nur so lange, wie sie
 widersprüchlich sind. Mindestlaufzeit und
 Mindeststillstand bleiben erhalten. Normale Heizung und berechtigte

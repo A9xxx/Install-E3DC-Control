@@ -30,6 +30,11 @@ from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any, Callable
 
+try:
+    from quiet_logging import ensure_utf8_stdio
+except ImportError:
+    from Installer.quiet_logging import ensure_utf8_stdio
+
 
 CONFIG_FILE = Path("/var/www/html/data/e3dc_v4.json")
 CLIMATE_LOAD_FILE = Path("/var/www/html/ramdisk/climate_load.json")
@@ -941,6 +946,7 @@ def run_once(
 
 
 def main(argv: list[str] | None = None) -> int:
+    ensure_utf8_stdio()
     parser = argparse.ArgumentParser(description="Klimaanlagen-Regelstatus vorbereiten.")
     parser.add_argument("--config", default=str(CONFIG_FILE))
     parser.add_argument("--climate-load", default=str(CLIMATE_LOAD_FILE))

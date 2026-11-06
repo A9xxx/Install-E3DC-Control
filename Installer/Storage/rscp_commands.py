@@ -1480,7 +1480,8 @@ class BattCtrl:
             if same_command and force:
                 log.debug("RSCP REFRESH: %s(%d) %dW%s", mode_label(mode), mode, value_w, suffix)
             else:
-                log.info("RSCP SET: %s(%d) %dW%s", mode_label(mode), mode, value_w, suffix)
+                log.info("RSCP SET: %s(%d) %dW%s", mode_label(mode), mode, value_w, suffix,
+                         extra={"e3dc_no_throttle": True})
         except Exception as exc:
             log.error("RSCP send: %s", exc)
             self._c = None

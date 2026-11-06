@@ -1409,8 +1409,6 @@ class WatchdogBundleInstaller:
             ["/usr/bin/systemd-analyze", "verify", str(candidate)],
             check=False,
         )
-        if result.returncode == 0:
-            return
         guard = str(self.paths.guard)
         expected = f"Command {guard} is not executable: No such file or directory"
         findings = [
@@ -1418,15 +1416,39 @@ class WatchdogBundleInstaller:
             for line in f"{result.stderr}\n{result.stdout}".splitlines()
             if line.strip()
         ]
-        if (
-            findings
-            and not os.path.lexists(guard)
-            and all(line.endswith(expected) for line in findings)
-        ):
+        own_findings = []
+        for line in findings:
+            # systemd nennt entweder die Unit vor dem Doppelpunkt oder die
+            # Datei nach „Configuration file“. Unklare Zeilen bleiben Fehler.
+            unit_type = r"(?:service|socket|target|timer|path|mount|automount|swap|slice|scope)"
+            match = re.match(
+                rf"^(?:Configuration file (?P<path>/\S+\.{unit_type}) "
+                rf"|(?P<unit>[A-Za-z0-9_.@\\-]+\.{unit_type}): )", line
+            )
+            unit = (match.group("path") or match.group("unit")) if match else None
+            own = (
+                unit is None
+                or Path(unit).name == candidate.name
+                or any(program in line for program in (guard, str(self.paths.notify)))
+            )
+            # Befundtexte können Environment-Werte oder Programmargumente
+            # enthalten; diese Werte gehören nicht in die Diagnoseausgabe.
+            safe = re.sub(r"(\bCommand\s+\S+)\s+.+?( is not executable:)",
+                          r"\1 [Argumente maskiert]\2", line)
+            safe = re.sub(r"(?i)(\b(?:Environment|[\w-]*(?:pass(?:word)?|token|secret|pin|user|key)[\w-]*)\s*[=:]\s*).*",
+                          r"\1[maskiert]", safe)
+            safe = safe[:400]
+            if not own:
+                print(f"Hinweis: systemd-analyze (fremde Unit): {safe}")
+            elif not (not os.path.lexists(guard) and line.endswith(expected)):
+                own_findings.append(safe)
+        if result.returncode == 0 or (findings and not own_findings):
             return
-        raise WatchdogTransitionError(
-            f"systemd-analyze scheiterte mit Exitcode {result.returncode}"
-        )
+        detail = "; ".join(own_findings[:12]) or "keine Befundzeilen"
+        message = f"systemd-analyze scheiterte mit Exitcode {result.returncode}: {detail}"
+        # Die äußere Transaktion meldet anschließend nur den Rückrollstatus.
+        print(f"Fehler: {message}")
+        raise WatchdogTransitionError(message)
 
     def _capture_snapshot(self, target: Path, tx_dir: Path, index: int) -> _FileSnapshot:
         self._validate_target(target)

@@ -39,6 +39,9 @@ sudo systemctl restart apache2
 
 ## Installer-Reparatur
 
+Bei der Watchdog-Installation erscheinen eindeutig fremde Unit-Befunde von
+`systemd-analyze verify` nur als Hinweis; eigene oder unklare Fehler brechen ab.
+
 Wenn Dienste fehlen, falsche Rechte haben oder Web-Aktionen keine sudo-Freigabe
 haben:
 

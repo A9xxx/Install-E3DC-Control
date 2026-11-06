@@ -2,8 +2,8 @@
 
 Veröffentlichte Images entstehen ausschließlich aus einem versionierten stabilen Release-Tag. `latest` verweist damit auf die zuletzt veröffentlichte stabile Version.
 
-Der aktuelle Stable-Stand ist `v5.5.6`. Die Tags `latest`, `v5.5.6` und
-`5.5.6` bezeichnen denselben Stable-Stand.
+Der aktuelle Stable-Stand ist `v5.5.7`. Die Tags `latest`, `v5.5.7` und
+`5.5.7` bezeichnen denselben Stable-Stand.
 
 **Updates im Überblick:** Der Knopf **System Update** in der Weboberfläche und
 das **Auto-Update** im Config-Editor geben dem optionalen Watchtower-Dienst das
@@ -131,14 +131,14 @@ installieren, anschließend das Ziel ausdrücklich wählen:
 
 ```bash
 curl -q -fsS --proto '=https' --tlsv1.2 \
-  -o ./docker_compose_update-5.5.6.py \
-  https://raw.githubusercontent.com/A9xxx/Install-E3DC-Control/v5.5.6/Installer/docker_compose_update.py
+  -o ./docker_compose_update-5.5.7.py \
+  https://raw.githubusercontent.com/A9xxx/Install-E3DC-Control/v5.5.7/Installer/docker_compose_update.py
 if [ ! -d ./Installer ]; then
   sudo install -d -m 0755 ./Installer
 fi
-sudo install -m 0644 ./docker_compose_update-5.5.6.py ./Installer/docker_compose_update.py
+sudo install -m 0644 ./docker_compose_update-5.5.7.py ./Installer/docker_compose_update.py
 sudo python3 ./Installer/docker_compose_update.py \
-  --compose-dir . --sudo --image-tag v5.5.6
+  --compose-dir . --sudo --image-tag v5.5.7
 ```
 
 Der aktuelle Helfer akzeptiert die gebundene gestoppte Altinstanz, ergänzt bei
@@ -278,7 +278,7 @@ bleibt `root:root 0600`. Alle anderen privilegierten Pfade und abweichende
 Metadaten bleiben streng fail-closed. Containerbetrieb, EMS-Regelung und
 Hardwareausgänge entsprechen unverändert 5.4.3m.
 
-E3DC-Control kann isoliert über **Docker** betrieben werden. Der Container kapselt die Anwendung; persistente Betriebsdaten liegen in den dafür vorgesehenen Volumes. Der Multi-Architektur-Support (`arm64`, `amd64`) deckt die vorgesehenen Plattformen ab. Docker benötigt dabei zwingend ein 64-Bit-Betriebssystem; `armhf`, `arm/v7` und andere 32-Bit-Installationen können das veröffentlichte Image nicht starten.
+E3DC-Control kann isoliert über **Docker** betrieben werden. Der Container kapselt die Anwendung; persistente Betriebsdaten liegen in den dafür vorgesehenen Volumes. Der Multi-Architektur-Support (`arm64`, `amd64`) deckt die vorgesehenen Plattformen ab. Docker benötigt dabei zwingend ein 64-Bit-Betriebssystem; `armhf`, `arm/v7` und andere 32-Bit-Installationen können das veröffentlichte Image nicht starten. Den Umzug der Volumes auf einen anderen Host beschreibt [Umzug auf neue Hardware](Umzug_neue_Hardware.md), Teil B.
 
 Bei aktivierter Matter-Bridge startet der Container zuerst D-Bus und den
 Bookworm-Avahi-Daemon, überwacht dessen Prozess und wartet begrenzt auf den
@@ -442,8 +442,9 @@ Das Docker-Engine-Log des Hauptcontainers ist damit auf drei Dateien zu je
 10 MiB begrenzt. Diese Grenze gilt zusätzlich zu den getrennt persistierten
 Produktlogs im Volume `e3dc_logs`. Im Image läuft dafür ein eigener, vom Healthcheck
 überwachter Logrotate-Taktgeber: Er rotiert Produkt- und Apache-Logs ab 10 MiB,
-hält sieben Generationen und beendet den Container bei einem Rotationsfehler
-ungleich null. Fachliche Historien und Backups gehören nicht zu dieser Rotation.
+hält sieben Generationen und meldet einen Rotationsfehler im Containerlog. Der
+Container läuft weiter, der nächste Takt versucht es erneut. Fachliche Historien
+und Backups gehören nicht zu dieser Rotation.
 
 Die fünf persistenten Bereiche sind absichtlich nach Datenklasse und
 Rechtevertrag getrennt:
@@ -692,7 +693,7 @@ Ohne ausdrücklichen Tag verwendet der Helfer das Image des ausgewählten Dienst
 Die mitgelieferte variable Zeile folgt ohne `E3DC_IMAGE_TAG` dem geprüften Stable-Tag
 `latest`. Ein vorhandener fester Tag bleibt absichtlich bestehen.
 
-`--image-tag v5.5.6` funktioniert auch bei einer fest eingetragenen OMV-Imagezeile.
+`--image-tag v5.5.7` funktioniert auch bei einer fest eingetragenen OMV-Imagezeile.
 Der Helfer schreibt diese Auswahl dauerhaft nur in das `image:`-Feld des
 Zieldienstes. Die `.env` und das Image anderer E3DC-Dienste bleiben unverändert.
 Bei einem gescheiterten Update wird die vorherige Zeile im Rahmen des verifizierten
@@ -714,7 +715,7 @@ sudo docker compose config --images e3dc-control
 
 Gezielte Rückfallversion:
 
-Den Stable-Container `v5.5.6` auf den veröffentlichten Rollback-Root
+Den Stable-Container `v5.5.7` auf den veröffentlichten Rollback-Root
 `v5.3.2b` zurücksetzen:
 
 ```bash
@@ -999,7 +1000,7 @@ Port, etwa `E3DC_PUBLISH_BIND=192.0.2.20` und `E3DC_PUBLISH_PORT=8085`.
 Verwende denselben Compose-Ordner und Projektnamen. Sichere vorher die
 funktionierende `docker-compose.yml` als `docker-compose.host.bak`, die
 vorhandene `.env` und die persistenten Daten. Halte den aktuell eingesetzten
-versionierten Runtime-Image-Tag für den Rückweg fest, beispielsweise `v5.5.6`.
+versionierten Runtime-Image-Tag für den Rückweg fest, beispielsweise `v5.5.7`.
 Ein älterer Root-Tag eignet sich nicht für diesen ersten Netzwerk-Rückweg.
 Prüfe eine administrativ zugängliche Kopie der aktuellen
 Konfiguration, ohne ihren Inhalt auszugeben:
@@ -1117,7 +1118,7 @@ Laufzeitpfade und den Produktbaum besitzt:
 | `/app/pi/Install` samt `Installer/` und Wrappern | `root:root` | `0755` / `0644` | Unveränderlicher Produktcode; nur ein neues Image ändert ihn |
 | `/var/www/html` | `root:www-data` | `0755` | Webroot, beim Start aus dem Produktbaum gefüllt |
 | `/var/www/html/tmp`, `/var/www/html/ramdisk` | `www-data:www-data` | `2775` | Laufzeitdaten von Web und Diensten |
-| `/var/www/html/logs` | `www-data:www-data` | `775` | Protokolle |
+| `/var/www/html/logs` | `www-data:www-data` | `2775` | Protokolle; neue Dateien erben die Gruppe `www-data` und bleiben mit `0660` für den Webdienst lesbar |
 | `/var/www/html/data` | `www-data:www-data` | `2770` (Kompatibilitätsmodus `2775`) | Persistente Daten, Konfiguration, Backups |
 | `/var/www/html/data/e3dc_v4.json` | `www-data:www-data` (oder `root:www-data`) | `0660` (Kompatibilitätsmodus `0664`) | Konfiguration; der Webserver schreibt sie, die Dienste lesen sie über die Gruppe |
 
@@ -1342,7 +1343,7 @@ ihre Weboberfläche nennt höchstens die Host-Befehle.
    beschrieben: die unveränderte mitgelieferte Datei ersetzen; eine vom
    Installer erzeugte Datei mit `./data`- und `./logs`-Ordnern sowie OMV- und
    eigene Dateien nicht ersetzen, sondern die Änderungen übertragen.
-2. Einen festen Pin in `.env` gegebenenfalls bewusst auf `v5.5.6` ändern.
+2. Einen festen Pin in `.env` gegebenenfalls bewusst auf `v5.5.7` ändern.
    Wer noch kein Watchtower-Token hat (`grep -c '^E3DC_WATCHTOWER_API_TOKEN=.' .env`
    zählt nicht leere Einträge, ohne das Token auszugeben; `0` bedeutet kein Eintrag), trägt es jetzt mit dem zweiten Befehl aus
    „Watchtower einmalig freischalten“ in `.env` ein. Dann erstellt der
@@ -1426,6 +1427,10 @@ bindet dann das alte Image über seine ID und OCI-Version und weist ausdrücklic
 darauf hin, wenn dessen Laufzeit-`VERSION` gerade nicht gelesen werden kann.
 Ein neuer Container oder ein Rückfall gilt weiterhin erst nach erfolgreichem
 Healthcheck und stabiler Laufzeitprüfung als bestätigt.
+
+Der Helfer braucht Docker Compose ab 2.17, weil er `up --wait-timeout` verwendet.
+Ältere Stände lehnt er vor jeder Änderung mit klarer Meldung ab; der laufende
+Container bleibt unverändert.
 
 Vor dem `pull` verlangt der Helfer mindestens 2 GiB nachweisbaren freien Platz
 im DockerRootDir. Schlägt die Prüfung oder das Entpacken mit Platzmangel fehl,

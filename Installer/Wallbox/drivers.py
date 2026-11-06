@@ -2736,8 +2736,10 @@ class OpenWBCharger(WallboxDriver):
 
     def _primary_set_instant_current(self, target_amp) -> bool:
         """Bereitet Strom vor und aktiviert Sofortladen erst nach Readback."""
-        raw = float(target_amp or 0)
-        if raw < 0.5:
+        raw = self._normalize_command_current(target_amp)
+        if raw is None:
+            return False
+        if raw == 0.0:
             self._clear_primary_start_transition()
             return self._primary_set_chargemode("stop")
         amp = _quantize_current_amp(
@@ -2906,6 +2908,17 @@ class OpenWBCharger(WallboxDriver):
         except Exception:
             return "0.0.0.0"
 
+    @staticmethod
+    def _normalize_command_current(target_amp, force_state=None):
+        """Validiert den Strom und vereinheitlicht alle Stoppvorgaben auf 0 A."""
+        try:
+            amp = float(target_amp)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if not math.isfinite(amp):
+            return None
+        return 0.0 if force_state == 1 or amp < 0.5 else amp
+
     def _remember_command_result(self, ok):
         if ok is None:
             return
@@ -2916,7 +2929,9 @@ class OpenWBCharger(WallboxDriver):
             self.state["command_blocked_until"] = 0
             return
         self._command_failure_count += 1
-        if self._command_failure_count >= self.command_failure_limit:
+        if (self._command_failure_count >= self.command_failure_limit
+                and not self._command_blocked_until):
+            # Fehlstopps innerhalb der laufenden Pause verschieben ihr Ende nicht.
             self._command_blocked_until = time.time() + self.command_block_s
             self.state["command_blocked"] = True
             self.state["command_blocked_until"] = int(self._command_blocked_until)
@@ -3428,6 +3443,9 @@ class OpenWBCharger(WallboxDriver):
                 cp_key = f"chargepoint_{self.cp_id}"
             if cp_key and isinstance(payload.get(cp_key), dict):
                 cp_data = payload[cp_key]
+            elif cp_key:
+                self._simpleapi_status_reason = "openwb_chargepoint_missing"
+                return False
             else:
                 chargepoints = []
                 for key, value in payload.items():
@@ -3438,7 +3456,7 @@ class OpenWBCharger(WallboxDriver):
                 if chargepoints:
                     index = max(0, min(len(chargepoints) - 1, int(self.wb_id or 1) - 1))
                     detected_cp_id, cp_data = chargepoints[index]
-        if not self._simpleapi_status_payload_valid(cp_data):
+        if "plug_state" not in cp_data or not self._simpleapi_status_payload_valid(cp_data):
             return False
         if self.cp_id == "" and detected_cp_id is not None:
             self._set_runtime_chargepoint_id(detected_cp_id)
@@ -3995,6 +4013,7 @@ class OpenWBCharger(WallboxDriver):
                 self._update_from_mqtt(sample)
                 self._last_status_http_error = ""
                 return self._fresh_status("openwb_mqtt")
+        self._simpleapi_status_reason = "openwb_http_status_invalid"
         try:
             http_valid = payload is not None and self._update_from_simpleapi(payload, observe_only=observe_only)
         except (TypeError, ValueError, ArithmeticError):
@@ -4004,7 +4023,7 @@ class OpenWBCharger(WallboxDriver):
             return self._fresh_status(self._observation_source)
         self._observe_openwb_display_episode(None)
         reason = ((self.state.get("openwb_http_reason") or self._transport_error or "openwb_http_status_unavailable")
-                  if payload is None else "openwb_http_status_invalid")
+                  if payload is None else self._simpleapi_status_reason)
         self.state.update({
             "openwb_chargemode": None, "driver_status_valid": False,
             "driver_status_stale": True, "driver_status_degraded": True,
@@ -4012,7 +4031,9 @@ class OpenWBCharger(WallboxDriver):
             "driver_status_last_sample_ts": int(time.time()),
         })
         if mqtt_path and reason != self._last_status_http_error:
-            logger.warning("[WB%d] openWB-Statusrückfall: %s", self.wb_id, MESSAGES.get(reason, "Status nicht verfügbar"))
+            hint = (f"Der eingestellte Ladepunkt {self.cp_id} fehlt in der openWB-Antwort; Ladepunktnummer prüfen."
+                    if reason == "openwb_chargepoint_missing" else MESSAGES.get(reason, "Status nicht verfügbar"))
+            logger.warning("[WB%d] openWB-Statusrückfall: %s", self.wb_id, hint)
             self._last_status_http_error = reason
         self.write_openwb_status()
         return None
@@ -4025,18 +4046,20 @@ class OpenWBCharger(WallboxDriver):
         openWB Primary Opt-in: PV/Sofort/Stop per simpleAPI, openWB regelt den
         Ladepunkt weiter selbst.
         """
+        amp = self._normalize_command_current(target_amp, force_state)
+        if amp is None:
+            return False
         if not command_gate.allow_command(
             self,
             action="openwb_set_amp_and_state",
-            payload={"target_amp": target_amp, "force_state": force_state},
+            payload={"target_amp": amp, "force_state": force_state},
         ):
             return False
-        if self._commands_temporarily_blocked():
+        if self._commands_temporarily_blocked() and amp != 0.0:
             return False
         try:
-            amp = 0 if force_state == 1 else target_amp
             if self.primary_mode_enabled:
-                if force_state == 1 or float(amp or 0) < 0.5:
+                if amp == 0.0:
                     return self._primary_set_chargemode("stop")
                 return self._primary_set_instant_current(amp)
             return self._secondary_set_current(amp)
@@ -4069,7 +4092,7 @@ class OpenWBCharger(WallboxDriver):
 
     def release_to_default(self, max_amp=16):
         """openWB sauber loslassen."""
-        if self._commands_temporarily_blocked():
+        if self._commands_temporarily_blocked() and self.primary_mode_enabled:
             return False
         if self.primary_mode_enabled:
             ok = self._primary_set_chargemode("pv")
@@ -4084,17 +4107,24 @@ class OpenWBCharger(WallboxDriver):
 
     def set_direct_current(self, target_amp):
         """Setzt Secondary-Sollstrom oder Primary-Sofortladen."""
+        amp = self._normalize_command_current(target_amp)
+        if amp is None:
+            return False
         if not command_gate.allow_command(
             self,
             action="openwb_set_direct_current",
-            payload={"target_amp": target_amp},
+            payload={"target_amp": amp},
         ):
             return False
-        if self._commands_temporarily_blocked():
+        if self._commands_temporarily_blocked() and amp != 0.0:
             return False
-        if self.primary_mode_enabled:
-            return self._primary_set_instant_current(target_amp)
-        return self._secondary_set_current(target_amp)
+        try:
+            if self.primary_mode_enabled:
+                return self._primary_set_instant_current(amp)
+            return self._secondary_set_current(amp)
+        except Exception as e:
+            logger.error(f"[WB{self.wb_id}] set_direct_current Fehler: {type(e).__name__}")
+            return False
 
     def set_phases(self, phases):
         """Normale openWB bekommt keine Phasenbefehle von E3DC-Control."""
@@ -5175,7 +5205,8 @@ class E3DCCharger(WallboxDriver):
         if not command_gate.allow_command(
             self,
             action="e3dc_set_extern",
-            payload={"target_amp": target_amp, "force_state": force_state, "heartbeat": bool(is_heartbeat)},
+            payload={"target_amp": target_amp, "force_state": force_state, "heartbeat": bool(is_heartbeat),
+                     "mode": 1 if self.sonnenmodus else 2, "toggle": 0 if force_state is None and target_amp > 0 else None},
             audit_allowed=not bool(is_heartbeat),
         ):
             return False
@@ -5264,7 +5295,8 @@ class E3DCCharger(WallboxDriver):
                 if not command_gate.allow_command(
                     self,
                     action="e3dc_set_extern_wire",
-                    payload={"target_amp": target_amp, "force_state": force_state, "heartbeat": bool(is_heartbeat)},
+                    payload={"target_amp": target_amp, "force_state": force_state, "heartbeat": bool(is_heartbeat),
+                             "mode": mode, "toggle": abort_flag},
                     audit_allowed=False,
                 ):
                     return False
@@ -5342,16 +5374,34 @@ class E3DCCharger(WallboxDriver):
                 if self._native_abort_edge_seq != before:
                     binding['consumed'] = True
 
-    def release_to_e3dc(self, max_amp=16):
-        """
-        Echte Freigabe für wb_mode=0: keine SET_EXTERN-Kommandos mehr senden.
-        Der bisherige "Sonnenmodus-Heartbeat" hielt die E3DC-Wallbox weiter in
-        externer RSCP-Kontrolle. Einige Anlagen laden dann erst wieder, wenn der
-        Pi offline ist. Mode 0 bedeutet deshalb ab jetzt wirklich Python stumm.
-        """
-        ok = self._release_owned_native_pause(max_amp)
-        self.suspend_external_control("Mode 0 / E3DC autonom")
-        return ok
+    def _release_native_default_frame(self, max_amp):
+        """Sendet die gewählte Betriebsart einmal ohne Start-/Stoppflanke."""
+        from .config import get_config
+        mode = 2 if get_config().get("wb_e3dc_observe_mode") == "mixed" else 1
+        payload = dict(mode=mode, toggle=0, force_state=None, heartbeat=False)
+        if not command_gate.native_default_handoff_allowed(self, "e3dc_set_extern", payload):
+            return True
+        if self.control_backend != E3DC_BACKEND_WBCHAR6:
+            return True
+        self.external_suspended = False
+        self.sonnenmodus = mode == 1
+        ok = self._send_command_internal(max_amp, None, is_heartbeat=False)
+        logger.info(
+            f"[WB{self.wb_id}] Beobachten: letzter {'Sonnenmodus' if mode == 1 else 'Mischmodus'}-Rahmen "
+            f"Mode={mode} Amp={int(max_amp)} Toggle=0 "
+            f"{'gesendet' if ok else 'Übertragung nicht bestätigt'}; danach stumm."
+        )
+        return bool(ok)
+
+    def release_to_e3dc(self, max_amp=16, *, send_default_frame=True):
+        """Gibt einmal die gewählte Betriebsart frei und beendet die externe Steuerung."""
+        with self.lock:
+            try:
+                released = self._release_owned_native_pause(max_amp)
+                ok = self._release_native_default_frame(max_amp) if send_default_frame else True
+                return bool(released and ok)
+            finally:
+                self.suspend_external_control("Mode 0 / E3DC autonom")
 
     def release_to_default(self, max_amp=16):
         return self.release_to_e3dc(max_amp=max_amp)
@@ -6352,7 +6402,8 @@ class E3DCMultiConnectCharger(E3DCCharger):
         if not command_gate.allow_command(
             self,
             action="e3dc_multi_send_command",
-            payload={"target_amp": target_amp, "force_state": force_state, "heartbeat": bool(is_heartbeat)},
+            payload={"target_amp": target_amp, "force_state": force_state, "heartbeat": bool(is_heartbeat),
+                     "mode": 1 if self.sonnenmodus else 2, "toggle": 0 if force_state is None and target_amp > 0 else None},
             audit_allowed=False,
         ):
             return False
@@ -6738,29 +6789,23 @@ class E3DCMultiConnectCharger(E3DCCharger):
             observed_phase_power=observed_phase_power,
         )
 
-    def release_to_e3dc(self, max_amp=16):
+    def release_to_e3dc(self, max_amp=16, *, send_default_frame=True):
         with self.lock:
-            released = self._release_owned_native_pause(max_amp)
-            if not self.external_suspended:
-                logger.info(f"[WB{self.wb_id}] Multi Connect Direktsteuerung pausiert (Mode 0 / E3DC autonom).")
-            # Die Freigabekante ist vor jedem Lesen/Wiederherstellen sichtbar.
-            # Ein bereits an dieser Sperre wartender Heartbeat oder Direktbefehl
-            # muss den Pausenzustand daher erneut prüfen und ohne Rahmen enden.
-            self._control_generation += 1
-            self.external_suspended = True
-            self.last_amp = None
-            self.last_force_state = None
-            ok_default = self._restore_transition_state_once()
-            failed_conn = self.conn
-            self.conn = None
-            if failed_conn is not None:
-                try:
-                    failed_conn.close()
-                except Exception as close_error:
-                    logger.debug(
-                        f"[WB{self.wb_id}] RSCP close nach Release fehlgeschlagen: {close_error}"
-                    )
-            return bool(released and ok_default)
+            try:
+                released = self._release_owned_native_pause(max_amp)
+                if not self.external_suspended:
+                    logger.info(f"[WB{self.wb_id}] Multi Connect Direktsteuerung pausiert (Mode 0 / E3DC autonom).")
+                # Die Freigabekante ist vor jedem Lesen/Wiederherstellen sichtbar.
+                # Ein wartender Heartbeat prüft nach der Freigabe erneut.
+                self._control_generation += 1
+                self.external_suspended = True
+                self.last_amp = None
+                self.last_force_state = None
+                ok_default = self._restore_transition_state_once()
+                ok_frame = self._release_native_default_frame(max_amp) if send_default_frame else True
+                return bool(released and ok_default and ok_frame)
+            finally:
+                self.suspend_external_control("Mode 0 / E3DC autonom")
 
     def release_to_default(self, max_amp=16):
         return self.release_to_e3dc(max_amp=max_amp)
@@ -6773,6 +6818,7 @@ class E3DCMultiConnectCharger(E3DCCharger):
             self.external_suspended = True
             self.last_amp = None
             self.last_force_state = None
+            self.sonnenmodus = False
             failed_conn = self.conn
             self.conn = None
             if failed_conn is not None:
@@ -8347,6 +8393,7 @@ class OpenWBProCharger(WallboxDriver):
             "phase_current_l3_a": round(self.state.get("phase_current_l3_a", 0.0), 2),
             "apparent_power_va": round(self.state.get("apparent_power_va", 0.0), 1),
             "apparent_power_kva": round(self.state.get("apparent_power_va", 0.0) / 1000.0, 2),
+            "apparent_power_complete": self.state.get("apparent_power_complete") is True,
             "power_factor": round(self.state.get("power_factor", 0.0), 2),
             "evse_current": self.state["evse_current"],
             "phases_in_use": self.state["phases_in_use"],
@@ -8624,6 +8671,16 @@ class OpenWBProCharger(WallboxDriver):
                 phase_currents.append(0.0)
                 phase_apparent.append(0.0)
         apparent_power_va = sum(phase_apparent)
+        # Nur die Anzeige benötigt vollständige Messpaare. Die bestehende
+        # Teilsumme bleibt für Phasen- und Absteckerkennung unverändert.
+        apparent_power_complete = len(currents) >= 3
+        for idx in range(3):
+            current = self._float(currents[idx], None) if idx < len(currents) else None
+            voltage = self._float(voltages[idx], None) if idx < len(voltages) else None
+            if current is None or not math.isfinite(current):
+                apparent_power_complete = False
+            elif current > 0.2 and (voltage is None or not math.isfinite(voltage) or voltage <= 0):
+                apparent_power_complete = False
         power_factor = (phase_power_sum / apparent_power_va) if apparent_power_va > 50.0 and phase_power_sum > 0 else 0.0
         offered_current = self._float(data.get("offered_current"), 0.0)
         phases_actual = int(self._float(data.get("phases_actual"), 0.0))
@@ -8815,6 +8872,7 @@ class OpenWBProCharger(WallboxDriver):
             "phase_current_l2_a": phase_currents[1],
             "phase_current_l3_a": phase_currents[2],
             "apparent_power_va": apparent_power_va,
+            "apparent_power_complete": apparent_power_complete,
             "power_factor": power_factor,
             "evse_current": visible_current,
             "amp": round(visible_current, 1) if visible_current > 0 else 0,

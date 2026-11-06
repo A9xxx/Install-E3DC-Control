@@ -61,7 +61,7 @@ Der Live-Dienst `e3dc-dimplex-live` liest nur. Aktive SG-Schreibbefehle kommen a
 
 ## Temperatur-Skalierung
 
-`dimplex_temp_scale=auto` erkennt einfache INT-Werte und Zehntelgradwerte plausibel automatisch. Falls deine Anlage feste Rohwerte liefert, kann die Skalierung explizit gesetzt werden:
+`dimplex_temp_scale=auto` liest die Register der Dimplex-Datenpunktliste als Zehntelgrad. Trägst du für Außen- oder Warmwassertemperatur ein eigenes Register ab 5000 ein, erkennt `auto` ganze Grad oder Zehntelgrad am Wert. Falls deine Anlage feste Rohwerte liefert, kann die Skalierung explizit gesetzt werden:
 
 - `1` für direkte Grad Celsius
 - `0.1` für Zehntelgrad

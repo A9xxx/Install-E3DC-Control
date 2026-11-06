@@ -150,8 +150,9 @@ Sollbestand, wird nicht aus dem Netz geladen. Während des laufenden Fensters
 wird die Hauslast nicht vom Speicherbestand abgezogen, weil der Speicher dort
 nicht entlädt. Für die Ladedauer wird die gemessene Ladeleistung je Ladezustand verwendet.
 Eine Messung zählt erst nach einer Minute mit gleichem Netzladebefehl und
-weniger als 200 W PV-Leistung. Voll angenommene sanfte Laderaten senken die
-Prognose nicht; Unterlieferung und Raten ab der bisherigen Prognose liefern
+weniger als 200 W PV-Leistung. Sanfte Laderaten mit weniger als 300 W
+Unterlieferung senken die Prognose nicht. Mindestens 300 W weniger als
+angefordert oder eine Akkuantwort oberhalb der bisherigen Prognose liefern
 neue Erkenntnisse über die Ladefähigkeit. Die gelernte Ladeleistung bleibt
 bei einem Neustart des Dienstes erhalten und verfällt nach sieben Tagen.
 Nach einem Neustart des Geräts beginnt die Prognose wieder mit den Startwerten. Im günstigen Fenster lädt der Speicher gleichmäßig mit der

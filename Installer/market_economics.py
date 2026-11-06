@@ -1540,7 +1540,7 @@ def _executable_future_window(annotated, idx, reserve, efficiency, horizon_end,
                                 slot_allowed=allowed, reserve=projected,
                                 observed_charge_w=None, profile=profile)
     price_proof = _price_action_contract("grid_charge", annotated[idx], independent, True,
-        max(int(window["end_ts"]), int(independent.get("last_shortage_end_ts_ms") or 0)))
+        int(window["end_ts"]))
     if not job.get("active") or not independent.get("energy_horizon_complete") or not price_proof.get("complete"):
         return dict(window, active=False, blocked_reason=job.get("blocked_reason") or "future_window_inputs_incomplete",
                     window_end_ts=int(window["end_ts"]))
@@ -1943,11 +1943,11 @@ def _future_need(
             window_energy_complete = False
         uncovered_total_wh = sum(wh for wh, _ct in uncovered_after_window)
         if econ_cut_ct is None:
-            job_econ_wh = uncovered_total_wh
+            job_econ_wh = sum(wh for wh, ct in uncovered_after_window if ct is not None)
         else:
             job_econ_wh = sum(
                 wh for wh, ct in uncovered_after_window
-                if ct is None or ct + 0.001 >= safe_float(econ_cut_ct, 0.0)
+                if ct is not None and ct + 0.001 >= safe_float(econ_cut_ct, 0.0)
             )
         # Sollbestand am Fensterende R = min(hard_usable, Bedarf ab E0 = 0
         # (econ_cut) + Puffer); Bedarf jetzt = max(0, R − Bestand am Fensterende ohne Netz), gedeckelt auf die
@@ -1956,11 +1956,11 @@ def _future_need(
         # invariant, der Fertig-Latch greift am Ziel (kein Wandern mit dem SoC).
         required_total_wh = sum(wh for wh, _ct in required_after_window)
         if econ_cut_ct is None:
-            required_econ_wh = required_total_wh
+            required_econ_wh = sum(wh for wh, ct in required_after_window if ct is not None)
         else:
             required_econ_wh = sum(
                 wh for wh, ct in required_after_window
-                if ct is None or ct + 0.001 >= safe_float(econ_cut_ct, 0.0)
+                if ct is not None and ct + 0.001 >= safe_float(econ_cut_ct, 0.0)
             )
         required_stock_raw_wh = required_econ_wh + max(0.0, safe_float(need_buffer_wh, 0.0))
         required_stock_wh = min(hard_usable_capacity_wh, required_stock_raw_wh)
@@ -2500,6 +2500,11 @@ def _price_action_contract(
         int(safe_float(current.get("end_ts"), 0.0)),
         int(safe_float(required_end_ts_ms, 0.0)),
     )
+    # Eine interne Preislücke bleibt ein fehlender Vergleich bis zum Bedarf.
+    # Nur das unbekannte Ende der Preisliste verliert die Fehlmengenfrist.
+    if action == "grid_charge" and forecast.get("price_horizon_internal_gap"):
+        required_end_ts_ms = max(required_end_ts_ms,
+            int(safe_float(forecast.get("last_shortage_end_ts_ms"), 0.0)))
     prefix_usable = bool(forecast.get("price_prefix_usable"))
     complete = bool(
         current_price_complete
@@ -3206,7 +3211,6 @@ def build_market_economics_plan(
                 0.0,
             )
         ),
-        int(safe_float(forecast.get("last_shortage_end_ts_ms"), 0.0)),
     )
     grid_charge_price_action_contract = _price_action_contract(
         "grid_charge",
@@ -3577,14 +3581,6 @@ def build_market_economics_plan(
                     int(
                         safe_float(
                             (slot_job or {}).get("window_end_ts"),
-                            0.0,
-                        )
-                    ),
-                    int(
-                        safe_float(
-                            slot_forecast.get(
-                                "last_shortage_end_ts_ms"
-                            ),
                             0.0,
                         )
                     ),

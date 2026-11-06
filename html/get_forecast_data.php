@@ -1,4 +1,35 @@
 <?php
+// Optionale Übertragungskomprimierung; interne PHP-Aufrufe bleiben unverändert.
+if (PHP_SAPI !== 'cli') {
+    header('Vary: Accept-Encoding', false);
+    $jsonGzipOffered = false;
+    foreach (explode(',', strtolower((string)($_SERVER['HTTP_ACCEPT_ENCODING'] ?? ''))) as $coding) {
+        $parts = array_map('trim', explode(';', $coding));
+        if (array_shift($parts) !== 'gzip') continue;
+        $quality = 1.0;
+        foreach ($parts as $part) {
+            if (preg_match('/^q\s*=\s*(.*)$/', $part, $match)) {
+                $quality = is_numeric($match[1]) ? (float)$match[1] : 0.0;
+            }
+        }
+        if ($quality > 0.0 && $quality <= 1.0) $jsonGzipOffered = true;
+    }
+    if ($jsonGzipOffered && function_exists('gzencode')
+        && !filter_var(ini_get('zlib.output_compression'), FILTER_VALIDATE_BOOLEAN)
+        && (int)ini_get('zlib.output_compression') === 0
+        && !in_array('ob_gzhandler', ob_list_handlers(), true)) {
+        ob_start(static function ($body) {
+            foreach (headers_list() as $header) {
+                if (stripos($header, 'Content-Encoding:') === 0) return $body;
+            }
+            $compressed = @gzencode($body, 1);
+            if ($compressed === false || headers_sent()) return $body;
+            header('Content-Encoding: gzip');
+            return $compressed;
+        });
+    }
+}
+
 require_once __DIR__ . '/helpers.php';
 requireWebAuth(true);
 if (session_status() === PHP_SESSION_ACTIVE) {
@@ -2556,6 +2587,12 @@ function forecastDiagnosticContinuityProjection(
     ];
 }
 
+function forecastDiagnosticExternalAcConfiguredFromPlanMeta($storagePlanMeta) {
+    // Den bereits gültig gelesenen Topologievertrag für die Anzeige übernehmen.
+    return is_array($storagePlanMeta)
+        && ($storagePlanMeta['pv_topology']['external_ac_source_configured'] ?? null) === true;
+}
+
 function loadPvForecastDiagnosticEvidence($currentTopologyRevision, $diagnosticsEnabled) {
     $metricLabels = [
         'trefferabweichung_wh' => 'Trefferabweichung',
@@ -4565,6 +4602,7 @@ $data['pv_forecast_diagnostics'] = loadPvForecastDiagnosticEvidence(
     $currentTopologyRevision,
     pvForecastDiagnosticsEnabled($conf)
 );
+$data['pv_forecast_diagnostics']['external_ac_configured'] = forecastDiagnosticExternalAcConfiguredFromPlanMeta($data['storage_plan_meta']);
 // Der Hybrid-Verlauf benötigt die Day-Ahead-Preise des laufenden Tages.
 // Archivdateien und reine Prognosen behalten ihren bisherigen Zeithorizont.
 // Vergangene Nettoerlöse werden ohne damaligen gebundenen Plan nicht erfunden.

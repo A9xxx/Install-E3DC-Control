@@ -1,4 +1,35 @@
 <?php
+// Optionale Übertragungskomprimierung; interne PHP-Aufrufe bleiben unverändert.
+if (PHP_SAPI !== 'cli') {
+    header('Vary: Accept-Encoding', false);
+    $jsonGzipOffered = false;
+    foreach (explode(',', strtolower((string)($_SERVER['HTTP_ACCEPT_ENCODING'] ?? ''))) as $coding) {
+        $parts = array_map('trim', explode(';', $coding));
+        if (array_shift($parts) !== 'gzip') continue;
+        $quality = 1.0;
+        foreach ($parts as $part) {
+            if (preg_match('/^q\s*=\s*(.*)$/', $part, $match)) {
+                $quality = is_numeric($match[1]) ? (float)$match[1] : 0.0;
+            }
+        }
+        if ($quality > 0.0 && $quality <= 1.0) $jsonGzipOffered = true;
+    }
+    if ($jsonGzipOffered && function_exists('gzencode')
+        && !filter_var(ini_get('zlib.output_compression'), FILTER_VALIDATE_BOOLEAN)
+        && (int)ini_get('zlib.output_compression') === 0
+        && !in_array('ob_gzhandler', ob_list_handlers(), true)) {
+        ob_start(static function ($body) {
+            foreach (headers_list() as $header) {
+                if (stripos($header, 'Content-Encoding:') === 0) return $body;
+            }
+            $compressed = @gzencode($body, 1);
+            if ($compressed === false || headers_sent()) return $body;
+            header('Content-Encoding: gzip');
+            return $compressed;
+        });
+    }
+}
+
 // get_live_json.php
 require_once 'helpers.php';
 require_once __DIR__ . '/heatpump_season.php';
@@ -938,6 +969,7 @@ function pickOpenwbTotalRangeKm($openwbData) {
 
 function liveWallboxApparentKva($wallboxData) {
     if (!is_array($wallboxData)) return 0.0;
+    if (array_key_exists('apparent_power_complete', $wallboxData) && $wallboxData['apparent_power_complete'] !== true) return null;
     $va = 0.0;
     if (isset($wallboxData['apparent_power_va']) && is_numeric($wallboxData['apparent_power_va'])) {
         $va = max(0.0, (float)$wallboxData['apparent_power_va']);
@@ -957,6 +989,7 @@ function liveWallboxApparentKva($wallboxData) {
 
 function liveWallboxPowerFactor($wallboxData, $powerW = 0.0) {
     if (!is_array($wallboxData)) return 0.0;
+    if (array_key_exists('apparent_power_complete', $wallboxData) && $wallboxData['apparent_power_complete'] !== true) return null;
     if (isset($wallboxData['power_factor']) && is_numeric($wallboxData['power_factor']) && (float)$wallboxData['power_factor'] > 0) {
         return round(max(0.0, min(1.0, (float)$wallboxData['power_factor'])), 2);
     }

@@ -177,7 +177,7 @@ Das alte Wallbox-Management wurde durch den nativen **Python Wallbox Manager** e
 
 Geplantes Netzladen per Zeitfenster/Slot ist davon getrennt: Es darf in allen aktiven Modi laden und ignoriert das globale Wallbox-Preislimit, weil die günstigsten Stunden bereits bei der Slotplanung ausgewählt werden. Im Modus **Aus** bleibt geplantes Laden gesperrt.
 
-Pause, Not-Aus und Ladepunktsperre beenden eine laufende Ladung sofort mit quittiertem Stopp, auch in „Beobachten“. Anti-Flattern und Mindestladezeit verzögern diesen Stopp nicht. Das Abbruchbit der Box zeigt, ob die Box eine Ladung freigibt oder gesperrt hat. Native E3DC-Wallboxen erhalten einen Stoppimpuls nur, wenn sie frisch „nicht abgebrochen“ melden, auch ohne Leistungsbezug. „Abgebrochen“ quittiert den Stopp ohne weitere Flanke. Fehlt die Abbruchmeldung der Box über mehrere Proben, ist genau ein Stopp mit frischem Ladebeleg zulässig; die Anzeige meldet „Zustand der Box nicht lesbar“. Andere Typen nehmen auch ein stehendes Angebot zurück. Bleibt nach einer nativen Stoppflanke der Bitwechsel 30 Sekunden aus, entsteht ein Fehler. In diesem Fehlerzustand erhalten Pause, Ladepunktsperre, Not-Aus, Notstromreserve und Hausanschluss gemeinsam genau eine zusätzliche Stoppflanke: frühestens 60 Sekunden nach dem letzten Stoppversuch, bei frischer Probe mit „nicht abgebrochen“ oder unbekanntem Bit und nur mit frischem Ladebeleg. Die Fehleranzeige erscheint ab Fehlerbeginn. Die zusätzliche Einmalflanke ist höchstens einmal je Stecksession und Dienstlauf zulässig; ist sie verbraucht oder für den Stoppgrund nicht berechtigt, bittet die Oberfläche, den Ladepunkt zu prüfen. Nach einem Neustart des Dienstes steht sie einmal neu zur Verfügung. Eine Stecksession endet erst mit bestätigtem Abstecken: mindestens drei aufeinanderfolgende frische Proben ohne gestecktes Fahrzeug über mindestens zehn Sekunden. Insgesamt sind höchstens drei Versuche je Ereignis zulässig; eine bereits verbrauchte Einmalflanke wird durch einen späteren Nutzer-Stopp nicht erneuert. Ein beobachteter externer Neustart wird bei Nutzer-Aus, Schutzgründen, Ladefensterende, Ziel erreicht, Abfahrt oder Budget-Zeitlimit erneut gestoppt, frühestens 30 Sekunden nach der letzten Flanke. Bei Unterdeckung übernimmt der Regelkern die externe Ladung und beendet sie nach seinen normalen Sitzungsregeln. Sperre, Pause und Not-Aus bleiben nach Dienst- und Host-Neustart sowie Containerstart bestehen. Die Ladepunktsperre gilt als Nutzer-Aus. Sperre und Not-Aus lassen sich nur über den Schalter mit dem Power-Symbol des jeweiligen Ladepunkts in der erweiterten Ansicht auf der Seite „Wallbox“ aufheben. Moduswahl, Abstecken und Speichern in der einfachen Ansicht heben die Sperre nicht auf. Fortsetzen, ein bewusster Moduswechsel, Sofortstart, Abstecken oder externes Fortsetzen an einer openWB Primary heben nur die Pause auf. Bleibt „Beobachten“ eingestellt, wird beim Fortsetzen oder Freigeben einmalig die Grundeinstellung freigegeben und anschließend wieder beobachtet. Bei nativen Boxen hebt Fortsetzen in „Beobachten“ nur die eigene Pause oder Ladepunktsperre derselben Stecksession genau einmal auf, wenn die Box frisch „abgebrochen“ meldet. Diese Übergabe benötigt kein Regelbudget. Eine App-Sperre wird nicht aufgehoben. Nach Not-Aus erfolgt in „Beobachten“ keine automatische Freigabe; die Box bleibt bis zur App-Freigabe gesperrt. Endet eine Pause in „Beobachten“ durch bestätigtes Abstecken, bleibt eine native Box gesperrt, bis sie in der E3DC-App freigegeben oder ein Regelmodus gewählt wird. Die bewusste Freigabe über den Schalter der Ladepunktsperre gibt die Box genau einmal frei, auch ohne gestecktes Fahrzeug, solange seit der Sperre weder eine Pause noch ein neues Anstecken dazwischenlag.
+Pause, Not-Aus und Ladepunktsperre beenden eine laufende Ladung sofort mit quittiertem Stopp, auch in „Beobachten“. Anti-Flattern und Mindestladezeit verzögern diesen Stopp nicht. Das Abbruchbit der Box zeigt, ob die Box eine Ladung freigibt oder gesperrt hat. Native E3DC-Wallboxen erhalten einen Stoppimpuls nur, wenn sie frisch „nicht abgebrochen“ melden, auch ohne Leistungsbezug. „Abgebrochen“ quittiert den Stopp ohne weitere Flanke. Fehlt die Abbruchmeldung der Box über mehrere Proben, ist genau ein Stopp mit frischem Ladebeleg zulässig; die Anzeige meldet „Zustand der Box nicht lesbar“. Andere Typen nehmen auch ein stehendes Angebot zurück. Bleibt nach einer nativen Stoppflanke der Bitwechsel 30 Sekunden aus, entsteht ein Fehler. In diesem Fehlerzustand erhalten Pause, Ladepunktsperre, Not-Aus und Hausanschluss gemeinsam genau eine zusätzliche Stoppflanke: frühestens 60 Sekunden nach dem letzten Stoppversuch, bei frischer Probe mit „nicht abgebrochen“ oder unbekanntem Bit und nur mit frischem Ladebeleg. Die Fehleranzeige erscheint ab Fehlerbeginn. Die zusätzliche Einmalflanke ist höchstens einmal je Stecksession und Dienstlauf zulässig; ist sie verbraucht oder für den Stoppgrund nicht berechtigt, bittet die Oberfläche, den Ladepunkt zu prüfen. Nach einem Neustart des Dienstes steht sie einmal neu zur Verfügung. Eine Stecksession endet erst mit bestätigtem Abstecken: mindestens drei aufeinanderfolgende frische Proben ohne gestecktes Fahrzeug über mindestens zehn Sekunden. Insgesamt sind höchstens drei Versuche je Ereignis zulässig; eine bereits verbrauchte Einmalflanke wird durch einen späteren Nutzer-Stopp nicht erneuert. Ein beobachteter externer Neustart wird bei Nutzer-Aus, Schutzgründen, Ladefensterende, Ziel erreicht, Abfahrt oder Budget-Zeitlimit erneut gestoppt, frühestens 30 Sekunden nach der letzten Flanke. Bei Unterdeckung übernimmt der Regelkern die externe Ladung und beendet sie nach seinen normalen Sitzungsregeln. Sperre, Pause und Not-Aus bleiben nach Dienst- und Host-Neustart sowie Containerstart bestehen. Die Ladepunktsperre gilt als Nutzer-Aus. Die Ladepunktsperre über den Schalter mit dem Power-Symbol des jeweiligen Ladepunkts aufheben. Nach Not-Aus bleibt die Freigabe in der erweiterten Ansicht auf der Seite „Wallbox“. Moduswahl, Abstecken und Speichern in der einfachen Ansicht heben die Sperre nicht auf. Fortsetzen, ein bewusster Moduswechsel, Sofortstart oder externes Fortsetzen an einer openWB Primary heben nur die Pause auf. Eine Pause an einer leeren Box bleibt bis „Fortsetzen“. Abstecken beendet sie nur, wenn E3DC-Control das Fahrzeug während der Pause gesteckt gelesen hat. Konnte die Box in dieser Zeit nicht gelesen werden (Statuslücke, Neustart), bleibt die Pause nach dem Abziehen bestehen und endet mit „Fortsetzen“. Fehlt der eingestellte Ladepunkt in der openWB-Antwort, zeigt die Diagnose dessen Nummer; die Ladepunktnummer im Config-Editor prüfen. Bleibt „Beobachten“ eingestellt, wird beim Fortsetzen oder Freigeben einmalig die Grundeinstellung freigegeben und anschließend wieder beobachtet. Bei nativen Boxen hebt Fortsetzen in „Beobachten“ nur die eigene Pause oder Ladepunktsperre derselben Stecksession genau einmal auf, wenn die Box frisch „abgebrochen“ meldet. Diese Übergabe benötigt kein Regelbudget. Eine in der E3DC-App gesetzte Sperre hebt „Beobachten“ nicht auf. Nach Not-Aus erfolgt in „Beobachten“ keine automatische Freigabe; die Box bleibt bis zur App-Freigabe gesperrt. Endet eine Pause in „Beobachten“ durch bestätigtes Abstecken, bleibt eine native Box gesperrt, bis sie in der E3DC-App freigegeben oder ein Regelmodus gewählt wird. In einem Regelmodus ist eine App-Sperre kein dauerhaftes Aus: Die Box erhält Start und Stopp über denselben Umschaltbefehl, deshalb hebt der nächste reguläre Start der Regelung eine vor dem Start in der App gesetzte Sperre auf. Für ein dauerhaftes Aus die Ladepunktsperre (Schalter mit dem Power-Symbol) verwenden. Die bewusste Freigabe über den Schalter der Ladepunktsperre gibt die Box genau einmal frei, auch ohne gestecktes Fahrzeug, solange seit der Sperre weder eine Pause noch ein neues Anstecken dazwischenlag.
 
 ### Externe Wallboxen und MQTT
 Externe Wallboxen können gesteuert oder nur gemessen werden:
@@ -211,7 +211,8 @@ Einschwingfrist, Anhebung und Grid-Wächter“. Eine einzelne ungültige
 Liveprobe stoppt keine laufende Ladung: Der zuletzt ausgeführte Strom bleibt
 höchstens 10 s nach der letzten gültigen Probe stehen (je Wallbox höchstens
 10 s in 60 s), sofern diese Probe keinen Netzbezug zeigte; harte Grenzen wie
-Nutzer-`Aus`, Notstromreserve und Hausanschluss wirken sofort (Abschnitt
+Nutzer-`Aus` und Hausanschluss wirken sofort; die Notstromreserve begrenzt
+die Akkustützung und sperrt kein freigegebenes Netzfenster (Abschnitt
 „Ungültige Liveprobe: kurzer Halt“).
 
 ---
@@ -227,21 +228,25 @@ in `Verbrauchsprognose_Dokumentation.md` beschrieben.
 **Inselnetz-Schutz:** Fällt das öffentliche Stromnetz aus, schaltet der Energy Manager sofort in den "Survival Mode". Alle Großverbraucher (wie Wärmepumpen-Boost oder das Laden des Autos) werden hart abgeworfen. Das System regelt extrem defensiv, um die Energie im Hausakku maximal lange für kritische Infrastruktur (Kühlschrank, Router) zu erhalten.
 
 
-## Startknopf und Wiederanlauf nach Kaskaden-Stop
+## Startknopf und Wiederanlauf
 
-Der Startknopf erhält den gewählten Lademodus und betrifft die ausgewählte
-Wallbox. Bei „Aus / autonom“ entsteht kein Startbefehl. Ein angenommener
-Start löst eigene Ladeende-, Untergrenzen- und Kaskadenanker derselben
-Stecksession. Nach Kontingent-Ende oder gescheitertem Phasenabstieg gilt
-derselbe Vertrag. Fremde oder geschützte Stopps bleiben erhalten.
+Der Startknopf erhält den gewählten Lademodus und betrifft nur die
+ausgewählte Wallbox. Bei „Aus / autonom“ entsteht kein Startbefehl. Ein
+angenommener Start bestätigt die Anforderung; die Ladung beginnt erst mit
+gültigen Messwerten, ausreichendem zugeteiltem Quellenanteil und den
+Freigaben der Box. Eigene Ladeende- und Untergrenzenanker werden nur in
+derselben Stecksession gelöst. Fremde oder geschützte Stopps bleiben erhalten.
 
-Nach einem regulären Stopp benötigt ein PV-Start 60 Sekunden ausreichenden
-Anteil. Bei freigegebener Netzquelle entfällt diese Startqualifizierung.
-Eine zusätzliche fünfminütige Wiederanlaufsperre besteht nicht.
-Wh-Konten, Untergrenzen, Messwertgültigkeit und Hardware-Schutzfristen
-gelten weiter. Die Startflanke bleibt mindestens 60 Sekunden und mindestens
-bis zum wirksamen Start-/Stop-Abstand des Geräteprofils zuzüglich eines
-Regelzyklus verfügbar; sie verkürzt die Schutzfrist nicht.
+Ein PV- oder Akkustart benötigt 60 Sekunden ausreichenden, gültigen
+Quellenanteil. Eine freigegebene Netzquelle startet ohne diese Wartezeit.
+Pause, Ladepunktsperre, Not-Aus, Notstromreserve, Hausanschluss,
+Messwertgültigkeit und Wh-Konten gelten weiter. Ein reguläres Sitzungsende
+folgt der Unterdeckungs- und Mindestladeregel; eine neue Ladung benötigt
+danach erneut die Startqualifizierung. Eine zusätzliche Wartefrist aus der
+früheren Kaskadensteuerung gibt es nicht. Der Startknopf verkürzt keine
+laufende Halte- oder Gerätefrist: Die Startflanke bleibt mindestens
+60 Sekunden und mindestens bis zum wirksamen Start-/Stop-Abstand des
+Geräteprofils zuzüglich eines Regelzyklus verfügbar.
 
 Die Oberfläche unterscheidet gespeicherte, angenommene und abgelehnte
 Startanforderungen. Eine Ablehnung nennt ihren Grund und verbraucht die
@@ -252,7 +257,7 @@ bestätigt die Entsperrung, nicht bereits die physische Fahrzeugladung.
 Das globale Abbruchflag der automatischen SoC-Planung bleibt beim Einzelstart
 erhalten. Sofortladen wird für die jeweilige Wallbox über den Modus
 „Sofort bis Preislimit“ gewählt; die andere Wallbox bleibt unverändert.
-Die Konfigurationsvariablen `wbhour`, `wb_sofort`, `wbvon` und `wbbis` bleiben
+Die Konfigurationsvariablen `wbhour`, `wbvon` und `wbbis` bleiben
 für die Ladeplanung verfügbar. Veraltete Direktsteuerungsformulare ändern
 keine Einstellungen.
 

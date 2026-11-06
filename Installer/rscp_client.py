@@ -451,11 +451,13 @@ class RscpTag:
     EMS_DISCHARGE_START_POWER                   = 0x01000103
     EMS_EMERGENCY_POWER_STATUS                  = 0x01800073
     EMS_GET_POWER_SETTINGS                      = 0x0180008B
+    EMS_GET_MAX_FUSE_POWER                     = 0x01800273
     EMS_GET_WB_DISCHARGE_BAT_UNTIL              = 0x0180027D
     EMS_INSTALLED_PEAK_POWER                    = 0x01800013
     EMS_MANUAL_CHARGE_ACTIVE                    = 0x01000151
     EMS_MAX_CHARGE_POWER                        = 0x01000101
     EMS_MAX_DISCHARGE_POWER                     = 0x01000102
+    EMS_POWERSAVE_ENABLED                       = 0x01000104  # Referenz: E3DC-Control/RscpTags.h
     EMS_POWER_ADD                               = 0x01800005
     EMS_POWER_BAT                               = 0x01800002
     EMS_POWER_GRID                              = 0x01800004
@@ -474,6 +476,7 @@ class RscpTag:
     EMS_REQ_DERATE_AT_POWER_VALUE               = 0x01000015
     EMS_REQ_EMERGENCY_POWER_STATUS              = 0x01000073
     EMS_REQ_GET_POWER_SETTINGS                  = 0x0100008B
+    EMS_REQ_GET_MAX_FUSE_POWER                 = 0x01000273
     EMS_REQ_GET_WB_DISCHARGE_BAT_UNTIL          = 0x0100027D
     EMS_REQ_INSTALLED_PEAK_POWER                = 0x01000013
     EMS_REQ_MODE                                = 0x01000011
@@ -634,6 +637,7 @@ PROVISIONAL_READ_ONLY_REQUEST_TAG_NAMES = frozenset({
     "BAT_REQ_FCC",
     "BAT_REQ_SPECIFICATION",
     "BAT_REQ_USABLE_CAPACITY",
+    "EMS_REQ_GET_MAX_FUSE_POWER",
     "EMS_REQ_GET_WB_DISCHARGE_BAT_UNTIL",
 })
 PROVISIONAL_READ_ONLY_RESPONSE_TAG_NAMES = frozenset({
@@ -641,6 +645,7 @@ PROVISIONAL_READ_ONLY_RESPONSE_TAG_NAMES = frozenset({
     "BAT_SPECIFICATION",
     "BAT_SPECIFIED_CAPACITY",
     "BAT_USABLE_CAPACITY",
+    "EMS_GET_MAX_FUSE_POWER",
     "EMS_GET_WB_DISCHARGE_BAT_UNTIL",
 })
 PROVISIONAL_READ_ONLY_TAG_PROVENANCE = {

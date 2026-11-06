@@ -4,10 +4,23 @@
 
 from __future__ import annotations
 
+import codecs
+import sys
 import logging
 import re
 import time
 from typing import Dict, Iterable, Optional
+
+
+def ensure_utf8_stdio() -> None:
+    """Stellt die Dienstausgabe bestmöglich auf UTF-8 um."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            if codecs.lookup(stream.encoding).name != "utf-8":
+                stream.reconfigure(encoding="utf-8", errors="backslashreplace")
+        except Exception:
+            # Eingebettete oder bereits geschlossene Ströme dürfen den Start nicht stoppen.
+            pass
 
 
 class QuietInfoFilter(logging.Filter):

@@ -4033,6 +4033,17 @@ def _diagnostics(cli: DockerCli) -> None:
             print(output, file=sys.stderr)
 
 
+def _require_compose_wait_contract(cli: DockerCli) -> None:
+    """Prüft vor jeder Änderung, ob Compose die Startoptionen des Helfers kennt."""
+    help_text = _require_success(cli.run(["compose", "up", "--help"]), "Abfrage der Compose-Startoptionen")
+    missing = [option for option in ("--wait", "--wait-timeout", "--pull") if option not in help_text]
+    if missing:
+        raise DockerUpdateError(
+            "Docker Compose ist für den Helfer zu alt, es fehlt " + ", ".join(missing)
+            + ". Nötig ist Compose ab 2.17. Der laufende Container blieb unverändert."
+        )
+
+
 def update_container(args: argparse.Namespace) -> dict[str, Any]:
     compose_dir = Path(os.path.abspath(Path(args.compose_dir).expanduser()))
     if compose_dir == Path("/") or not compose_dir.is_dir():
@@ -4052,6 +4063,7 @@ def update_container(args: argparse.Namespace) -> dict[str, Any]:
                     compose_files=selected_files, service_name=getattr(args, "service", "") or "",
                     project_name=getattr(args, "project_name", "") or "")
     cli.requested_image = f"{OFFICIAL_IMAGE_REPOSITORY}:{args.image_tag}" if args.image_tag else ""
+    _require_compose_wait_contract(cli)
 
     compose_contract = _prepare_compose_contract(cli)
     previous: dict[str, Any] | None = None

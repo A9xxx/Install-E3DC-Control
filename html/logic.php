@@ -14,7 +14,10 @@ $wpMax = 5000;
 $pvMax = 10000; // Fallback
 $maxBatPower = 3000; // Fallback
 $batteryCapacity = 0; // Fallback
-$gridMaxAmps = 35; // Fallback (Ampere pro Phase)
+require_once __DIR__ . '/wallbox_transaction.php';
+$houseFuseDisplay = e3dcHouseFuseDisplay();
+$gridMaxAmps = $houseFuseDisplay['effective'];
+$gridMaxAmpsSource = $houseFuseDisplay['source'];
 $lat = 51.16; $lon = 10.45; // Default (Mitte DE)
 $pvStrings = [];
 $showForecast = true; // Default an
@@ -38,7 +41,7 @@ $_c = $_v4conf['config'] ?? [];
 if (!empty($_c['wpmax'])) { $wpMax = parseConfigFloat($_c['wpmax']) * 1000; }
 if (!empty($_c['maximumladeleistung'])) { $maxBatPower = parseConfigFloat($_c['maximumladeleistung']); }
 if (!empty($_c['speichergroesse'])) { $batteryCapacity = parseConfigFloat($_c['speichergroesse']); }
-if (!empty($_c['grid_max_amps'])) { $gridMaxAmps = parseConfigFloat($_c['grid_max_amps']); }
+// Die Hausabsicherung kommt als wirksamer Wert samt Quelle aus dem UI-State.
 if (!empty($_c['hoehe'])) { $lat = parseConfigFloat($_c['hoehe']); }
 if (!empty($_c['laenge'])) { $lon = parseConfigFloat($_c['laenge']); }
 if (isset($_c['show_forecast'])) {

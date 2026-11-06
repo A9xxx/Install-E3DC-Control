@@ -11,9 +11,9 @@ from logging.handlers import RotatingFileHandler
 from typing import Any, Dict, Iterable, Optional
 
 try:
-    from .quiet_logging import install_quiet_info_filter
+    from .quiet_logging import ensure_utf8_stdio, install_quiet_info_filter
 except ImportError:  # pragma: no cover - direkter Skriptstart
-    from quiet_logging import install_quiet_info_filter
+    from quiet_logging import ensure_utf8_stdio, install_quiet_info_filter
 
 
 def configure_service_logger(
@@ -29,6 +29,7 @@ def configure_service_logger(
     warning_max_interval_s: float = 3600.0,
     always_keywords: Optional[Iterable[str]] = None,
 ) -> logging.Logger:
+    ensure_utf8_stdio()
     logger = logging.getLogger(name)
     logger.setLevel(level)
     logger.propagate = False

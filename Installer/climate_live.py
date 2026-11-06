@@ -24,6 +24,11 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+try:
+    from quiet_logging import ensure_utf8_stdio
+except ImportError:
+    from Installer.quiet_logging import ensure_utf8_stdio
+
 
 CONFIG_FILE = Path("/var/www/html/data/e3dc_v4.json")
 RAMDISK_FILE = Path("/var/www/html/ramdisk/climate_load.json")
@@ -1456,6 +1461,7 @@ def _handle_signal(_signum: int, _frame: Any) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
+    ensure_utf8_stdio()
     parser = argparse.ArgumentParser(description="Read-only Klimaanlagen-Verbrauch per lokalem Shelly-Zähler lesen.")
     parser.add_argument("--once", action="store_true", help="Nur einen Zyklus ausführen.")
     parser.add_argument("--config", default=str(CONFIG_FILE), help="Pfad zur e3dc_v4.json.")

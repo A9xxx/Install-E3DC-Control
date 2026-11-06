@@ -6,6 +6,7 @@
  */
 if (session_status() === PHP_SESSION_NONE) session_start();
 require_once __DIR__ . '/helpers.php';
+require_once __DIR__ . '/wallbox_transaction.php';
 header('Content-Type: application/json');
 requireWebAuth(true);
 
@@ -70,6 +71,15 @@ if (!$storageEnabled) {
     http_response_code(409);
     echo json_encode(['ok' => false, 'msg' => 'Speicherregelung ist aus oder die Konfiguration ist nicht lesbar. Zum manuellen Laden oder Entladen zuerst die Speicherregelung aktivieren.']);
     exit;
+}
+
+if ($action === 'charge') {
+    $problem = e3dcHouseFuseProblem(is_array($storageConfig) ? $storageConfig : []);
+    if ($problem !== '') {
+        http_response_code(409);
+        echo json_encode(['ok' => false, 'code' => $problem, 'msg' => e3dcHouseFuseMessage($problem)], JSON_UNESCAPED_UNICODE);
+        exit;
+    }
 }
 
 $target_soc = intval($_POST['target_soc'] ?? ($action === 'charge' ? 100 : 10));

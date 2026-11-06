@@ -187,9 +187,8 @@ def stop_display(reason):
         "user_off": ("Nutzer-Aus: Ladung angehalten", "protection"),
         "manual_pause": ("Ladung manuell pausiert", "protection"),
         "emergency_stop": ("Not-Aus: Ladung bleibt gesperrt", "protection"),
-        "reserve": ("Notstromreserve: Ladung beenden", "protection"),
         "electrical_limit": ("Hausanschluss oder Gerätegrenze: Ladung beenden", "protection"),
-        "data_timeout": ("Gültige Messdaten fehlen: Ladung beenden", "protection"),
+        "data_timeout": ("Messdaten oder Ladebudget fehlen: Ladung beenden", "protection"),
         "budget_timeout": ("Gültiges Ladebudget fehlt: Ladung beenden", "protection"),
         "soc_unknown": ("Ladezustand nicht lesbar: Ladung beenden", "protection"),
         "no_vehicle": ("Kein Fahrzeug verbunden", "idle"),
@@ -339,8 +338,6 @@ def decide(snapshot, state, now, previous_snapshot=None):
     # Sicherheitsnetz für Schranke 1; der Pausenpfad quittiert Nutzer-Aus zuerst.
     if s.get("user_off") is True:
         return stop("user_off")
-    if s.get("reserve_veto") is True:
-        return stop("reserve")
     if s.get("departure_blocked") is True:
         return stop("departure_window")
     if s.get("window_ended") is True or s.get("target_reached") is True:

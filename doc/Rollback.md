@@ -16,6 +16,33 @@ export E3DC_INSTALL_PATH="/absoluter/pfad/zur/installation"
 test -f "$E3DC_INSTALL_PATH/e3dc-setup"
 ```
 
+## Rückfall von 5.5.7 auf 5.5.6
+
+**Docker:** Auf dem Host in `.env` `E3DC_IMAGE_TAG=v5.5.6` setzen und
+`sudo docker compose up -d` ausführen; die vorhandenen Daten-Volumes bleiben
+erhalten.
+
+**Bare Metal:** Der Rückweg ist das beim Update angelegte verifizierte Backup
+(siehe „Betriebsdaten wiederherstellen“). Nach dem Update geänderte
+Einstellungen und hinzugekommene Statistik- und Diagnosedaten sind darin nicht
+enthalten und vorher gesondert zu sichern.
+
+**Hausabsicherung:** 5.5.6 verwendet den im E3DC hinterlegten Systemwert nicht.
+Nach dem Rückfall den Eintrag unter „Wallbox & Fahrzeug“ prüfen und bei Bedarf
+die tatsächliche Absicherung eintragen. Die Bestätigung „Systemwert
+überschreiben“ und die „Betriebsart für Beobachten“ wertet 5.5.6 nicht aus.
+
+**Pause, Not-Aus und Ladepunktsperre:** Nach dem Rückfall den Zustand jedes
+Ladepunkts auf der Seite „Wallbox“ prüfen. Eine Pause an einer leeren Box wird
+unter 5.5.6 wieder sofort aufgehoben.
+
+**Sofort bis Preislimit:** Unter 5.5.7 entfernte 99-Stunden-Sofortpläne kommen
+nicht zurück. Die Betriebsart folgt wieder den bisherigen Regeln von 5.5.6.
+
+**Daten und Dienste:** 5.5.7 ändert keine Datenbankstruktur und führt keine neuen
+Dienste ein. Die in 5.5.7 entfernten wirkungslosen Einstellfelder bleiben,
+soweit gespeichert, ohne Wirkung in der Konfiguration.
+
 ## Rückfall von 5.5.6 auf 5.5.5c
 
 **Docker:** Auf dem Host in `.env` `E3DC_IMAGE_TAG=v5.5.5c` setzen und
@@ -518,7 +545,7 @@ oder einen Prozessabbruch außerhalb des erkannten Fehlerpfads.
 
 ## Programmstand zurücksetzen
 
-Der aktuelle Stable-Stand ist `v5.5.6`.
+Der aktuelle Stable-Stand ist `v5.5.7`.
 
 Beim Rücklauf wird der tatsächliche Dateisystemzustand einer Unit weiterhin
 streng gegen reguläre Unit-Datei, kanonische `/dev/null`-Maske, unerwarteten

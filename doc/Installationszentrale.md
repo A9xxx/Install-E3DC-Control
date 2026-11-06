@@ -155,6 +155,8 @@ Ausgangswechsel bleiben auch bei eingeschränkter Datenqualität sichtbar.
 
 ## Diagnosepaket
 
+Das gewählte Zeitfenster gilt für Manifest und Ereignisverlauf. Große Speicherpläne und weitere große einzeilige JSON-Dateien werden als bereinigte JSON-Auszüge mit höchstens 150 KB exportiert. Bei erfolgreichem Auszug umfassen erkannte Zeitreihen das Fenster Exportzeit −4 h bis +48 h. Überschreiten die Zeitreihen auch ohne Zusatzdetails die Größengrenze, enthält der Fehlerauszug `excerpt_size_limit`. Größe und ausgelassene Felder stehen im Manifest.
+
 ### Paket für Supportfälle
 
 Das Diagnosepaket wird lokal erzeugt und enthält nur technische Hilfsdaten:

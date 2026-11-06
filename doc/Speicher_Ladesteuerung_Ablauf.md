@@ -147,6 +147,14 @@ Expliziter E3DC-Autobetrieb und Betrieb ohne gültiges Kurvenziel behalten ihre
 bisherige Freigabe. Reservierte Kurvenladeleistung steht nicht zugleich als
 zusätzliches Verbraucherbudget bereit.
 
+Markt-Netzladen hat als vollständiger Ladeauftrag Vorrang vor dem Wallbox-Entladungsschutz.
+Eine gültige Markt-Entladesperre begrenzt dort nur die Entladung auf 0 W;
+die Ladung aus PV bleibt wie bisher. Ist der Preisplan kurz nicht lesbar,
+gilt nach einem bereits aktiven Wallbox-Entladungsschutz bis zum nächsten
+gültigen Plan wieder die normale Entladefreigabe für Haus und Wärmepumpe.
+Beim ersten Übergang von der Preissteuerung zum Wallbox-Entladungsschutz
+überbrückt noch die bestehende kurze Karenz den fehlenden Folgeplan.
+
 ## Speicherregelung ausschalten
 
 In der Konfiguration steht oben der Schalter **Speicherregelung aktiv**, in
@@ -231,7 +239,7 @@ Sperre besteht. Rückweg: Ursache beheben und die Sperre als Root zurücksetzen
 neu starten. Ein Neustart des E3DC setzt die Akkugrenzen auf die
 Grundeinstellung.
 
-> **Stand:** v5.5.6
+> **Stand:** v5.5.7
 >
 > **Dateien:** `Installer/storage_simulator.py`,
 > `Installer/storage_manager.py`, `Installer/storage_parallel_regulator.py`
@@ -617,10 +625,22 @@ Schieflast-, Hausanschluss- und Deckelgrenzen setzt der Wallbox-Manager
 anschließend je Ladepunkt; den einphasigen Deckel mit Schieflast-Wächter
 gibt es dabei nur an der openWB Pro.
 
-Die Leistung einer externen Wallbox und der E3DC-Hauswert stammen aus
-verschiedenen Abfragen; der Hauswert enthält die externe Wallbox. Aus beiden
-bildet der Speicherregler den Hausanteil ohne Wallbox und vergleicht ihn mit
-dem letzten schlüssigen Probenpaar. Meldet die Wallbox in einer einzelnen
+Die Hausbasis ohne Wallbox bildet der Speicherregler aus dem E3DC-Hauswert,
+indem er die frisch gemessene Leistung der externen Ladepunkte (openWB, go-e)
+abzieht. Den Typ eines Ladepunkts übernimmt er aus der Konfiguration, bei
+leerem oder fehlendem Eintrag aus der Veröffentlichung des Wallbox-Managers
+(auch für eine automatisch erkannte zweite openWB). E3DC-Wallboxen haben einen
+eigenen Messpunkt und werden nie vom Hauswert abgezogen, auch nicht bei mehreren
+Boxen, vertauschten Plätzen oder einem aussetzenden E3DC-Wert. Eine Differenz
+zwischen zwei Messwerten ersetzt keine Einzelmessung. Ist der Typ eines ladenden
+Ladepunkts unbekannt oder die Messung eines externen Ladepunkts ungültig, wird
+nichts abgezogen: Die Ladeleistung zählt dann zum Hausverbrauch, und der
+Hausakku kann sie wie Hauslast decken, auch unterhalb von `wbminsoc`. Ein nicht
+erkannter Ladepunkt ohne Ladung ändert nichts. Der Speicherzustand zeigt den
+abgezogenen Anteil und den Grund.
+
+Der Speicherregler vergleicht den Hausanteil ohne Wallbox mit dem letzten
+schlüssigen Probenpaar. Meldet die Wallbox in einer einzelnen
 Probe weniger Leistung je Ampere oder weniger genutzte Phasen, ohne dass der
 Hauswert um denselben Betrag fällt, hält die Budgetbildung den vom Hauswert
 nicht bestätigten Teil bis zur Folgeprobe; das Wallbox-Budget sinkt erst,
@@ -720,9 +740,14 @@ nächsten Messrahmen aus dem Hauswert herausrechnet. Das Startfenster des
 Wallbox-Managers hält das Stromangebot der openWB Pro über solche Einbrüche
 hinweg (kein 0 A aus Budgetgründen im Fenster).
 
-Fehlt `grid_max_amps` oder ist der Wert leer, gelten 35 A je Phase. Der
-Standard 35 A gilt nur für den Skalarpfad (3p-Gruppenbudget); die einphasige
-Freigabe > 20 A an einer openWB Pro verlangt eine ausdrücklich eingetragene Hausabsicherung.
+Die Hausabsicherung stammt aus dem E3DC oder aus der Nutzereingabe. Ein
+niedrigerer Nutzerwert gilt unmittelbar; ein höherer Wert überschreibt den
+E3DC-Wert erst nach ausdrücklicher Bestätigung. Fehlen beide Werte, ist
+Netzladen nicht möglich. Für PV-Laden der Wallbox bleiben 35 A je Phase als
+Ersatzrahmen; dieser gibt einphasiges Laden über 20 A nicht frei. Auch ohne
+Nachladen bleibt die Notstromreserve gegen Entladung geschützt. Ein fehlender
+oder ungültiger Netzwert verhindert Netzladen; eine Abweichung zwischen
+Netzwert und Zählersumme bleibt ein Hinweis ohne Regelwirkung.
 Mehrere Ladepunkte teilen diesen Phasenrahmen ohne pauschale Gleichteilung. Ein
 gebundenes einphasiges Fahrzeugprofil bestimmt die reale Lastphase; ohne
 Fahrzeugbeleg bleibt die feste Wallboxtopologie maßgeblich.

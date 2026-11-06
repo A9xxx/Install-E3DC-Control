@@ -13,6 +13,11 @@ import time
 from typing import Any
 
 try:
+    from quiet_logging import ensure_utf8_stdio
+except ImportError:
+    from Installer.quiet_logging import ensure_utf8_stdio
+
+try:
     from Forecast.pv_forecast_evidence import (
         EVIDENCE_DB_PATH,
         EVIDENCE_LOCK_PATH,
@@ -379,6 +384,7 @@ def run_cycle(
 
 
 def main() -> int:
+    ensure_utf8_stdio()
     parser = argparse.ArgumentParser(
         description="Read-only Sidecar für die PV-Prognosediagnose"
     )

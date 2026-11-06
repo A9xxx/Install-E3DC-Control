@@ -1142,6 +1142,7 @@ if (isset($_POST['save_wb_status_ajax'])) {
     $txOptions = [
         'operation' => isset($newMode) ? ($newMode === '0' ? 'clear' : 'plan') : 'preserve',
         'emergency_flag' => $removeEmergency ? 'remove' : 'preserve',
+        'reject_emergency_release' => $removeEmergency && ($_POST['wb_lock_surface'] ?? '') === 'simple',
     ];
     if (isset($newMode, $oldMode)) {
         $txOptions['mode_transition'] = [
@@ -1167,6 +1168,9 @@ if (isset($_POST['save_wb_status_ajax'])) {
     $tx = e3dcWallboxPlanTransaction($updates, $txOptions);
     if (!empty($tx['success'])) {
         echo "OK";
+    } elseif (($tx['code'] ?? '') === 'emergency_release_requires_advanced') {
+        http_response_code(409);
+        echo e3dcWallboxEmergencyHint();
     } else {
         e3dcWbTxRecordFailure($tx, 'save_wb_status_ajax', $wbId);
         header("HTTP/1.1 500 Internal Server Error");
@@ -1216,7 +1220,7 @@ function wallboxForceStartAction($wbId, $wallboxConfig) {
             'configuration_committed' => false, 'request_confirmed' => false,
             'message' => $emergencyActive
                 ? e3dcWallboxEmergencyHint()
-                : 'Ladepunkt gesperrt. Zum Freigeben in der erweiterten Ansicht auf der Seite „Wallbox“ beim jeweiligen Ladepunkt den Schalter mit dem Power-Symbol einschalten.',
+                : 'Ladepunkt gesperrt. Zum Freigeben beim jeweiligen Ladepunkt den Schalter mit dem Power-Symbol einschalten.',
         ];
     }
     $startMode = normalizeWallboxModeValue($wallboxConfig["wb{$wbId}_mode"]
@@ -1236,7 +1240,7 @@ function wallboxForceStartAction($wbId, $wallboxConfig) {
         // Der explizite Sofortstart ist ein sitzungsgebundener Managerauftrag
         // und keine neue Tarif-/Zeitplanung. Bestehende Pläne bleiben deshalb
         // byteidentisch; insbesondere darf WB2 keinen globalen Legacy-Plan
-        // für WB1 mit `wbhour=99` erzwingen.
+        // für WB1 erzwingen.
         'operation' => 'preserve',
         // Das Bestandsflag pausiert beide automatischen SoC-Planungen.
         // Der Einzelstart ist davon unabhängig und lässt es erhalten.
@@ -1345,7 +1349,8 @@ if (isset($_POST['save_simple_wallbox_mode_ajax'])) {
 
     $newMode = simpleWallboxNativeMode($energyMode, $chargeIntent);
     $oldMode = normalizeWallboxModeValue($confData['config']["wb{$wbId}_mode"] ?? '0');
-    $planHours = ($chargeIntent === 'instant' && $energyMode === 'grid_price') ? '99' : '0';
+    $instantPrice = $chargeIntent === 'instant' && $energyMode === 'grid_price';
+    $planHours = '0';
     $observeStoragePolicy = simpleWallboxObserveStoragePolicy($energyMode, $chargeIntent);
     $reserveSoc = sanitizeWallboxHouseReserveValue($_POST['simple_house_reserve'] ?? ($confData['config']['wbminsoc'] ?? '70'), 70);
     $priceLimit = normalizeWallboxPriceLimitValue($_POST['simple_price_limit'] ?? ($confData['config']['dvcarlimit'] ?? '0.0'), 0.0);
@@ -1366,12 +1371,12 @@ if (isset($_POST['save_simple_wallbox_mode_ajax'])) {
     if ($wbId === 1) {
         $updates['smart_wbhour_enable'] = '0';
         $updates['wbhour'] = $planHours;
-        $updates['wb_sofort'] = ($planHours === '99') ? '1' : '0';
+        $updates['wb_sofort'] = '0';
     }
 
     $tx = e3dcWallboxPlanTransaction($updates, [
-        'operation' => $planHours === '0' ? 'clear' : 'plan',
-        'abort_flag' => $planHours === '0' ? 'create' : 'remove',
+        'operation' => $instantPrice ? 'plan' : 'clear',
+        'abort_flag' => $instantPrice ? 'remove' : 'create',
         // Schnelle Folgeklicks warten auf die laufende Transaktion, statt in
         // die 2-s-Sperre zu laufen (Planer-Unterprozess braucht 2–4 s).
         'lock_timeout' => 6.0,
@@ -1436,7 +1441,8 @@ if (isset($_POST['save_simple_wallbox'])) {
     $capacity = sanitizeWallboxKwhValue($_POST['simple_capacity'] ?? ($confData['config']["wb{$wbId}_capacity"] ?? $confData['config']['car_capacity'] ?? '72.0'), 72.0);
     $chargePower = sanitizeWallboxKwValue($_POST['simple_charge_power'] ?? ($confData['config']["wb{$wbId}_charge_power"] ?? $confData['config']['car_charge_power'] ?? '11.0'), 11.0);
     $smartEnabled = ($chargeIntent === 'scheduled' && $energyMode === 'grid_price') ? '1' : '0';
-    $planHours = ($chargeIntent === 'instant' && $energyMode === 'grid_price') ? '99' : '0';
+    $instantPrice = $chargeIntent === 'instant' && $energyMode === 'grid_price';
+    $planHours = '0';
     $observeStoragePolicy = simpleWallboxObserveStoragePolicy($energyMode, $chargeIntent);
 
     $updates = [
@@ -1473,7 +1479,7 @@ if (isset($_POST['save_simple_wallbox'])) {
         $updates['wbvon'] = 'now';
         $updates['smart_wbhour_enable'] = $smartEnabled;
         $updates['wbhour'] = $planHours;
-        $updates['wb_sofort'] = ($planHours === '99') ? '1' : '0';
+        $updates['wb_sofort'] = '0';
     }
 
     $manualSoc = [];
@@ -1483,8 +1489,8 @@ if (isset($_POST['save_simple_wallbox'])) {
     }
 
     $tx = e3dcWallboxPlanTransaction($updates, [
-        'operation' => $planHours === '0' && $smartEnabled !== '1' ? 'clear' : 'plan',
-        'abort_flag' => $planHours === '0' && $smartEnabled !== '1' ? 'create' : 'remove',
+        'operation' => $instantPrice || $smartEnabled === '1' ? 'plan' : 'clear',
+        'abort_flag' => $instantPrice || $smartEnabled === '1' ? 'remove' : 'create',
         'manual_soc' => $manualSoc,
         'mode_transition' => [
             'wb_id' => $wbId,
@@ -3088,7 +3094,8 @@ $simpleReadyTime = function(int $wb) use ($wallboxConfig) {
 };
 $simplePlanHours = function(int $wb) use ($wallboxConfig) {
     $legacy = ($wb === 1) ? ($wallboxConfig['wbhour'] ?? '0') : '0';
-    return max(0, min(99, (int)($wallboxConfig["wb{$wb}_plan_hours"] ?? $legacy)));
+    $hours = (int)($wallboxConfig["wb{$wb}_plan_hours"] ?? $legacy);
+    return $hours >= 99 ? 0 : max(0, $hours);
 };
 $simpleSmartPlanEnabled = function(int $wb) use ($wallboxConfig) {
     $legacy = ($wb === 1) ? ($wallboxConfig['smart_wbhour_enable'] ?? '0') : '0';
@@ -3098,7 +3105,6 @@ $simpleIntentFromState = function($mode, $planHours, $smartPlanEnabled) {
     $mode = normalizeWallboxModeValue($mode);
     if ($mode === '0') return 'off';
     if ($mode === '5') {
-        if ((int)$planHours >= 99) return 'instant';
         return $smartPlanEnabled ? 'scheduled' : 'instant';
     }
     if ($mode === '12') return 'scheduled';
@@ -3137,7 +3143,7 @@ $simpleRuleText = function($mode, $energy, $intent, $ready, $price, $reserve, $p
     }
     if ($intent === 'instant') {
         if ($energy === 'grid_price') {
-            return 'Betriebsart: Sofort · Netz bis ' . $price . ' ct/kWh';
+            return 'Betriebsart: Sofort · Netz bis ' . str_replace('.', ',', (string)$price) . ' ct/kWh';
         }
         if ($energy === 'pv_battery') {
             return 'Betriebsart: Sofort · PV + Akku bis ' . $reserve . '% Hausakku-Reserve, Netz bleibt aus';
@@ -3173,7 +3179,7 @@ $simpleValuesText = function($intent, $energy, $unit, $target, $targetKwh, $read
         return 'Unterhalb ' . $reserve . '% stützt der Akku nur Hausverbrauch und Wärmepumpe';
     }
     if ($intent === 'instant') {
-        return $energy === 'grid_price' ? 'Sofortlimit: Netz bis ' . $price . ' ct/kWh' : '';
+        return $energy === 'grid_price' ? 'Sofortlimit: Netz bis ' . str_replace('.', ',', (string)$price) . ' ct/kWh' : '';
     }
     $targetText = $unit === 'kwh'
         ? 'Lademenge ' . $targetKwh . ' kWh'
@@ -3431,6 +3437,14 @@ if ($hasWb2) {
                                 </div>
                             </div>
                             <div class="d-flex align-items-center gap-2 flex-shrink-0">
+                                <div class="form-check form-switch fs-5 m-0 border rounded-pill pe-2" title="Ladepunkt komplett sperren – stoppt eine laufende Ladung sofort; Freigabe nur über diesen Schalter">
+                                    <input class="form-check-input" type="checkbox" role="switch" id="wb<?= (int)$simpleWb ?>SimpleLockSwitch"
+                                           data-wallbox-lock-switch data-wallbox-lock-simple data-wb-id="<?= (int)$simpleWb ?>"
+                                           data-saved-free="<?= !wallboxTruthy($wallboxConfig["wb{$simpleWb}_locked"] ?? '0') ? '1' : '0' ?>"
+                                           onchange="toggleWbMode(<?= (int)$simpleWb ?>, true, this.checked, 'simple')"
+                                           <?= !wallboxTruthy($wallboxConfig["wb{$simpleWb}_locked"] ?? '0') ? 'checked' : '' ?> <?= $wallboxEmergencyActive ? 'disabled' : '' ?>/>
+                                    <label class="form-check-label fs-6 ms-1" for="wb<?= (int)$simpleWb ?>SimpleLockSwitch" style="cursor:pointer;"><i class="fas fa-power-off opacity-75"></i></label>
+                                </div>
                                 <button type="button"
                                         class="btn btn-sm <?= !empty($simplePanel['manual_pause']) ? 'btn-warning' : 'btn-outline-secondary' ?> rounded-circle wallbox-pause-btn"
                                         <?= $wallboxEmergencyActive ? 'disabled' : '' ?>
@@ -3448,8 +3462,7 @@ if ($hasWb2) {
                         </div>
 
                         <div class="small text-body-secondary mb-3" data-wallbox-lock-notice data-wallbox-locked="<?= wallboxTruthy($wallboxConfig["wb{$simpleWb}_locked"] ?? '0') ? '1' : '0' ?>" <?= (wallboxTruthy($wallboxConfig["wb{$simpleWb}_locked"] ?? '0') && !e3dcWallboxEmergencyFlagActive()) ? '' : 'hidden' ?>>
-                            Ladepunkt gesperrt – Freigabe in der erweiterten Ansicht über den Schalter mit dem Power-Symbol
-                            <button type="button" class="btn btn-sm btn-outline-secondary ms-2" data-wallbox-view-toggle="advanced">Erweiterte Ansicht</button>
+                            Ladepunkt gesperrt – zum Freigeben den Schalter mit dem Power-Symbol einschalten.
                         </div>
                         <?php wallboxRenderSimpleCoreControl($simpleWb, $wallboxConfig, count($simpleWallboxPanels) > 1, true); ?>
                         <label class="form-label small fw-bold text-muted mb-1">Energie</label>
@@ -3796,7 +3809,8 @@ if ($hasWb2) {
     $planInfo = function(int $wb) use ($wallboxConfig) {
         $legacyHours = ($wb === 1) ? ($wallboxConfig['wbhour'] ?? 0) : 0;
         $hoursRaw = (int)($wallboxConfig["wb{$wb}_plan_hours"] ?? $legacyHours);
-        $hoursLabel = ($hoursRaw >= 99) ? 'dauerhaft' : ($hoursRaw . ' h');
+        if ($hoursRaw >= 99) $hoursRaw = 0;
+        $hoursLabel = $hoursRaw . ' h';
         $from = $wallboxConfig["wb{$wb}_wbvon"] ?? (($wb === 1) ? ($wallboxConfig['wbvon'] ?? '00:00') : '00:00');
         $to = $wallboxConfig["wb{$wb}_wbbis"] ?? (($wb === 1) ? ($wallboxConfig['wbbis'] ?? '07:00') : '07:00');
         $fromIsNow = in_array(strtolower(trim((string)$from)), ['now', 'jetzt'], true);
@@ -3898,7 +3912,7 @@ if ($hasWb2) {
                                 <i class="fas <?= $wb1ManualPause ? 'fa-play' : 'fa-pause' ?>"></i>
                             </button>
                             <div class="form-check form-switch fs-5 m-0 border rounded-pill pe-2" title="Ladepunkt komplett sperren – stoppt eine laufende Ladung sofort; Freigabe nur über diesen Schalter">
-                                <input class="form-check-input" type="checkbox" role="switch" id="wb1LockSwitch" onchange="toggleWbMode(1, true)" <?= (isset($wallboxConfig['wb1_locked']) && $wallboxConfig['wb1_locked'] === '0') ? 'checked' : '' ?>>
+                                <input class="form-check-input" type="checkbox" role="switch" id="wb1LockSwitch" data-wallbox-lock-switch data-wb-id="1" data-saved-free="<?= !wallboxTruthy($wallboxConfig['wb1_locked'] ?? '0') ? '1' : '0' ?>" onchange="toggleWbMode(1, true, this.checked)" <?= !wallboxTruthy($wallboxConfig['wb1_locked'] ?? '0') ? 'checked' : '' ?>>
                                 <label class="form-check-label fs-6 ms-1" for="wb1LockSwitch" style="cursor:pointer;"><i class="fas fa-power-off opacity-75"></i></label>
                             </div>
                         </div>
@@ -4003,7 +4017,7 @@ if ($hasWb2) {
                                 <i class="fas <?= $wb2ManualPause ? 'fa-play' : 'fa-pause' ?>"></i>
                             </button>
                             <div class="form-check form-switch fs-5 m-0 border rounded-pill pe-2" title="Ladepunkt komplett sperren – stoppt eine laufende Ladung sofort; Freigabe nur über diesen Schalter">
-                                <input class="form-check-input" type="checkbox" role="switch" id="wb2LockSwitch" onchange="toggleWbMode(2, true)" <?= (isset($wallboxConfig['wb2_locked']) && $wallboxConfig['wb2_locked'] === '0') ? 'checked' : '' ?>>
+                                <input class="form-check-input" type="checkbox" role="switch" id="wb2LockSwitch" data-wallbox-lock-switch data-wb-id="2" data-saved-free="<?= !wallboxTruthy($wallboxConfig['wb2_locked'] ?? '0') ? '1' : '0' ?>" onchange="toggleWbMode(2, true, this.checked)" <?= !wallboxTruthy($wallboxConfig['wb2_locked'] ?? '0') ? 'checked' : '' ?>>
                                 <label class="form-check-label fs-6 ms-1" for="wb2LockSwitch" style="cursor:pointer;"><i class="fas fa-power-off opacity-75"></i></label>
                             </div>
                         </div>
@@ -4718,6 +4732,7 @@ if ($hasWb2) {
                                    value="<?= htmlspecialchars(number_format($wallboxPriceLimit, 1, '.', '')) ?>">
                             <span class="input-group-text rounded-end-pill">ct/kWh</span>
                         </div>
+                        <span data-wallbox-price-save-status class="badge bg-success-subtle text-success border border-success-subtle rounded-pill" role="status" aria-live="polite">Gespeichert</span>
                         <div id="wallboxPriceLimitGuard" data-price-limit-guard class="form-text small mt-1" aria-live="polite"></div>
                     </div>
                     <div class="col-12 col-md-8 small text-muted">
@@ -5440,10 +5455,36 @@ function wallboxPost(formData) {
     });
 }
 
+<?php if (isset($tx) && in_array($tx['code'] ?? '', ['house_fuse_missing', 'house_fuse_invalid'], true)): ?>
+document.addEventListener('DOMContentLoaded', function () { wallboxShowHouseFuseProblem(<?= json_encode($tx['code']) ?>); });
+<?php endif; ?>
+function wallboxShowHouseFuseProblem(text) {
+    const code = String(text || '').includes('house_fuse_invalid') ? 'house_fuse_invalid'
+        : String(text || '').includes('house_fuse_missing') ? 'house_fuse_missing' : '';
+    if (!code) return;
+    let notice = document.getElementById('wallbox-house-fuse-notice');
+    if (!notice) {
+        notice = document.createElement('div');
+        notice.id = 'wallbox-house-fuse-notice';
+        notice.className = 'alert alert-danger';
+        notice.setAttribute('role', 'alert');
+        document.querySelector('.wallbox-simple-card, .container, main, body').prepend(notice);
+    }
+    notice.textContent = code === 'house_fuse_invalid'
+        ? <?= json_encode(e3dcHouseFuseMessage('house_fuse_invalid'), JSON_UNESCAPED_UNICODE) ?>
+        : <?= json_encode(e3dcHouseFuseMessage(), JSON_UNESCAPED_UNICODE) ?>;
+    const link = document.createElement('a');
+    link.href = <?= json_encode(e3dcHouseFuseLink()) ?>;
+    link.textContent = 'Sicherungsstärke eintragen';
+    notice.append(document.createTextNode(' '), link);
+    notice.scrollIntoView({block: 'center'});
+}
+
 async function wallboxRequireConfirmedText(response, allowedValues = ['OK']) {
     const text = await response.text();
     const normalized = text.trim();
     if (!response.ok || !allowedValues.includes(normalized)) {
+        wallboxShowHouseFuseProblem(normalized);
         throw new Error(normalized || ('HTTP ' + response.status));
     }
     return normalized;
@@ -5453,6 +5494,7 @@ async function wallboxRequireConfirmedJson(response) {
     let payload = null;
     try { payload = await response.json(); } catch (_) { payload = null; }
     if (!response.ok || !payload || payload.ok !== true) {
+        wallboxShowHouseFuseProblem(payload ? (payload.code || '') : '');
         throw new Error(payload && payload.message ? String(payload.message) : ('HTTP ' + response.status));
     }
     return payload;
@@ -5516,6 +5558,8 @@ function initSimpleWallboxTargetControls() {
     const globalReserve = document.querySelector('[data-simple-global-reserve]');
     const globalPrice = document.querySelector('[data-simple-global-price]');
     let globalSaveTimer = null;
+    let globalSaveRequest = 0;
+    let globalPriceSaved = globalPriceValue();
 
     function selectedUnit(form) {
         return form.querySelector('[name="simple_target_unit"]:checked')?.value === 'kwh' ? 'kwh' : 'soc';
@@ -5577,10 +5621,12 @@ function initSimpleWallboxTargetControls() {
         setBadgeState(form.querySelector('[data-simple-mode-state]'), text, variant);
     }
 
-    function setGlobalStatus(text, variant = 'success') {
-        const status = document.querySelector('[data-simple-global-status]');
-        setBadgeState(status, text, variant);
-        if (status) status.classList.add('px-3', 'py-2');
+    function setGlobalStatus(text, variant = 'success', request = globalSaveRequest) {
+        if (request !== globalSaveRequest) return;
+        document.querySelectorAll('[data-simple-global-status], [data-wallbox-price-save-status]').forEach(status => {
+            setBadgeState(status, text, variant);
+            status.classList.add('px-3', 'py-2');
+        });
     }
 
     function updatePanels(form) {
@@ -5613,7 +5659,7 @@ function initSimpleWallboxTargetControls() {
             }
         } else if (intent === 'instant') {
             if (energy === 'grid_price') {
-                ruleText = `Betriebsart: Sofort · Netz bis ${price} ct/kWh`;
+                ruleText = `Betriebsart: Sofort · Netz bis ${String(price).replace('.', ',')} ct/kWh`;
             } else if (energy === 'pv_battery') {
                 ruleText = `Betriebsart: Sofort · PV + Akku bis ${reserve}% Hausakku-Reserve, Netz bleibt aus`;
             } else {
@@ -5648,7 +5694,7 @@ function initSimpleWallboxTargetControls() {
         } else if (intent === 'scheduled') {
             valuesText = `Planwerte: ${targetText} bis ${ready}`;
         } else if (intent === 'instant' && energy === 'grid_price') {
-            valuesText = `Sofortlimit: Netz bis ${price} ct/kWh`;
+            valuesText = `Sofortlimit: Netz bis ${String(price).replace('.', ',')} ct/kWh`;
         }
         const ruleEl = status.querySelector('[data-simple-rule-text]');
         const valuesEl = status.querySelector('[data-simple-values-text]');
@@ -5957,6 +6003,7 @@ function initSimpleWallboxTargetControls() {
     }
 
     function saveSimpleGlobalLimits(delay = 500) {
+        const request = ++globalSaveRequest;
         if (globalSaveTimer) window.clearTimeout(globalSaveTimer);
         setGlobalStatus('Speichert...', 'warning');
         globalSaveTimer = window.setTimeout(() => {
@@ -5964,12 +6011,15 @@ function initSimpleWallboxTargetControls() {
             const formData = new FormData();
             formData.append('save_simple_wallbox_limits_ajax', '1');
             formData.append('simple_house_reserve', globalReserveValue(true));
-            formData.append('simple_price_limit', globalPriceValue());
+            const price = globalPriceValue();
+            formData.append('simple_price_limit', price);
             wallboxPost(formData).then(res => wallboxRequireConfirmedText(res)).then(() => {
-            setGlobalStatus('Gespeichert', 'success');
+            if (request !== globalSaveRequest) return;
+            globalPriceSaved = price;
+            setGlobalStatus('Gespeichert', 'success', request);
             if (window.e3dcSimpleWallboxSync) window.e3dcSimpleWallboxSync.globalsFromSimple();
         }).catch(() => {
-                setGlobalStatus('Fehler beim Speichern', 'danger');
+                setGlobalStatus('Fehler beim Speichern', 'danger', request);
             });
         }, delay);
     }
@@ -6038,9 +6088,11 @@ function initSimpleWallboxTargetControls() {
         priceInput.addEventListener('input', () => {
             if (globalPrice) globalPrice.value = priceInput.value;
             updateAllStatus();
-            saveSimpleGlobalLimits(650);
+            setGlobalStatus('Nicht gespeichert', 'warning');
         });
         priceInput.addEventListener('change', () => {
+            // Ein geleertes Feld ist keine Eingabe: Der gespeicherte Wert bleibt stehen.
+            if (fmt(priceInput.value) === '') priceInput.value = globalPriceSaved;
             if (globalPrice) globalPrice.value = priceInput.value;
             updateAllStatus();
             saveSimpleGlobalLimits(0);
@@ -6358,7 +6410,7 @@ if (document.readyState === 'loading') {
 
 // Globale Variablen für Fahrzeug-Daten
 let availableVehicles = [];
-const wallboxSavedVehicleOptions = <?= json_encode($vehicleSelectBrowserOptions, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) ?>;
+const wallboxSavedVehicleOptions = <?= json_encode($vehicleSelectBrowserOptions, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT) ?>;
 const wb1CarSaved = <?= json_encode(canonicalWallboxVehicleSelection($wallboxConfig['wb1_car_id'] ?: '__none', $saved_cars)) ?>;
 const wb2CarSaved = <?= json_encode(canonicalWallboxVehicleSelection($wallboxConfig['wb2_car_id'] ?: '__none', $saved_cars)) ?>;
 
@@ -6708,20 +6760,22 @@ document.querySelectorAll('[data-wallbox-pause-button]').forEach(button => {
     });
 });
 
-function toggleWbMode(wbIdx, lockAction = false) {
-    const lockSwitch = document.getElementById('wb' + wbIdx + 'LockSwitch');
+function toggleWbMode(wbIdx, lockAction = false, targetFree = null, surface = '') {
+    const lockSwitches = Array.from(document.querySelectorAll('[data-wallbox-lock-switch][data-wb-id="' + wbIdx + '"]'));
+    const previousFree = lockSwitches.length ? lockSwitches[0].dataset.savedFree === '1' : true;
+    const free = lockAction ? targetFree === true : previousFree;
     const modeSelect = document.getElementById('wb' + wbIdx + 'ModeSelect');
     const observeSelect = document.getElementById('wb' + wbIdx + 'ObserveStoragePolicy');
     updateWbModeHelp(wbIdx);
 
     // Checkbox checked = AN = not locked. Checkbox unchecked = AUS = locked!
-    const isLocked = lockSwitch.checked ? '0' : '1';
+    const isLocked = free ? '0' : '1';
     const mode = modeSelect.value;
     const previousMode = String(modeSelect.dataset.savedMode || '');
     const observePolicy = observeSelect ? (observeSelect.value || 'curve') : 'curve';
 
     // UI-Rückmeldung aktualisieren und Bedienung während des Speicherns sperren
-    lockSwitch.disabled = true;
+    lockSwitches.forEach(input => { input.dataset.wallboxPending = '1'; input.disabled = true; });
     modeSelect.disabled = true;
     if (observeSelect) observeSelect.disabled = true;
 
@@ -6730,6 +6784,7 @@ function toggleWbMode(wbIdx, lockAction = false) {
     formData.append('wb_id', wbIdx);
     if (lockAction) {
         formData.append('wb_lock_action', isLocked === '1' ? 'lock' : 'release');
+        if (surface === 'simple') formData.append('wb_lock_surface', 'simple');
     } else {
         formData.append('wb_mode', mode);
         formData.append('wb_observe_storage_policy', observePolicy);
@@ -6745,6 +6800,10 @@ function toggleWbMode(wbIdx, lockAction = false) {
 
     wallboxPost(formData).then(res => wallboxRequireConfirmedText(res)).then(() => {
         if (lockAction) {
+            lockSwitches.forEach(input => {
+                input.checked = free;
+                input.dataset.savedFree = free ? '1' : '0';
+            });
             document.querySelectorAll('.wallbox-simple-card').forEach(form => {
                 if (String(form.querySelector('[name="simple_wb_id"]')?.value) !== String(wbIdx)) return;
                 const notice = form.querySelector('[data-wallbox-lock-notice]');
@@ -6755,13 +6814,19 @@ function toggleWbMode(wbIdx, lockAction = false) {
             });
         }
         if (!lockAction && previousMode !== String(mode)) setWallboxPauseUi(wbIdx, false, false);
-        modeSelect.dataset.savedMode = String(mode);
-        if (observeSelect) observeSelect.dataset.savedPolicy = observePolicy;
-        if (window.e3dcSimpleWallboxSync) window.e3dcSimpleWallboxSync.modeFromAdvanced(wbIdx, mode);
+        if (!lockAction) {
+            modeSelect.dataset.savedMode = String(mode);
+            if (observeSelect) observeSelect.dataset.savedPolicy = observePolicy;
+            if (window.e3dcSimpleWallboxSync) window.e3dcSimpleWallboxSync.modeFromAdvanced(wbIdx, mode);
+        }
     }).catch(err => {
-        alert('Fehler beim Speichern der Wallbox-Einstellungen!');
+        lockSwitches.forEach(input => { input.checked = previousFree; });
+        alert(err?.message || 'Fehler beim Speichern der Wallbox-Einstellungen!');
     }).finally(() => {
-        lockSwitch.disabled = false;
+        lockSwitches.forEach(input => {
+            input.dataset.wallboxPending = '0';
+            input.disabled = input.hasAttribute('data-wallbox-lock-simple') && window.E3DC_WALLBOX_EMERGENCY_STOP === true;
+        });
         modeSelect.disabled = false;
         if (observeSelect) observeSelect.disabled = false;
     });

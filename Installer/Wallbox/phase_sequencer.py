@@ -326,6 +326,9 @@ class PhaseSwitchSequencer:
     ) -> Dict[str, Any]:
         """Übernehme einen vorgeschlagenen Schritt nach dessen Ausführung.
 
+        ``config`` bleibt für die Aufrufer kompatibel; die Phasensperre
+        hat eine feste Dauer und ignoriert Konfigurationswerte dafür.
+
         ``success`` bezeichnet ausschließlich den Erfolg eines vorhandenen
         Treiberkommandos. ``send_zero`` und ``send_phase`` schreiten nur nach
         erfolgreicher Treiberbestätigung fort. Damit kann
@@ -422,16 +425,12 @@ class PhaseSwitchSequencer:
                 sequence.update(deepcopy(patch))
             self._state["_openwb_pro_phase_sequence"] = sequence
             phase_sent_ts = _safe_float(sequence.get("phase_sent_ts"), 0.0)
-            phase_wait_config = dict(cfg)
-            phase_wait_patch = contract.get("phase_wait_config")
-            if isinstance(phase_wait_patch, dict):
-                phase_wait_config.update(phase_wait_patch)
             openwb_pro_session.mark_phase_wait(
                 self._state,
                 target,
                 current_amp=sequence.get("hold_amp", 0),
                 now_ts=phase_sent_ts,
-                config=phase_wait_config,
+                config=cfg,
                 charger_max_amp=max_amp,
             )
             current_allowed_after = _safe_float(
@@ -460,16 +459,12 @@ class PhaseSwitchSequencer:
                 sequence.update(deepcopy(patch))
             self._state["_openwb_pro_phase_sequence"] = sequence
             phase_sent_ts = _safe_float(sequence.get("phase_sent_ts"), 0.0)
-            phase_wait_config = dict(cfg)
-            phase_wait_patch = contract.get("phase_wait_config")
-            if isinstance(phase_wait_patch, dict):
-                phase_wait_config.update(phase_wait_patch)
             openwb_pro_session.mark_phase_wait(
                 self._state,
                 target,
                 current_amp=sequence.get("hold_amp", 0),
                 now_ts=phase_sent_ts,
-                config=phase_wait_config,
+                config=cfg,
                 charger_max_amp=max_amp,
             )
             self._state["_openwb_pro_phase_change_block_until"] = max(

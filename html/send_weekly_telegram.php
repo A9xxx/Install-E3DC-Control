@@ -56,19 +56,22 @@ try { $db->exec("ALTER TABLE daily_stats ADD COLUMN climate_consumption REAL DEF
 $startDateStr = date('Y-m-d', strtotime('-6 days'));
 $endDateStr = date('Y-m-d');
 
+$display = e3dcArchiveDisplaySelection($db);
 $query = "SELECT 
             SUM(pv_yield) as pv_yield,
-            SUM(home_consumption) as home,
+            SUM({$display['home_consumption']}) as home,
+            SUM({$display['energy_split']}) as split_days,
+            SUM(1 - {$display['energy_split']}) as unsplit_days,
             SUM(grid_in) as grid_in,
             SUM(grid_out) as grid_out,
 	            SUM(bat_out) as bat_out,
-	            SUM(wb_consumption) as wb,
+	            SUM({$display['wb_consumption']} + {$display['wb2_consumption']}) as wb,
 	            SUM(wp_consumption) as wp,
 	            SUM(climate_consumption) as climate,
                 COUNT(*) as days,
-                COUNT(pv_yield) as pv_days, COUNT(home_consumption) as home_days,
+                COUNT(pv_yield) as pv_days, COUNT({$display['home_consumption']}) as home_days,
                 COUNT(grid_in) as grid_in_days, COUNT(grid_out) as grid_out_days,
-                COUNT(bat_out) as bat_out_days, COUNT(wb_consumption) as wb_days,
+                COUNT(bat_out) as bat_out_days, COUNT({$display['wb_consumption']} + {$display['wb2_consumption']}) as wb_days,
                 COUNT(wp_consumption) as wp_days, COUNT(climate_consumption) as climate_days
 		          FROM daily_stats
           WHERE date >= ? AND date <= ?";
@@ -101,6 +104,7 @@ foreach ($missingLabels as $key => $label) {
     $missing = (int)$row['days'] - (int)$row[$key . '_days'];
     if ($missing > 0) $missingNotes[] = $label . ': ' . $missing . ' Tage ohne Wert';
 }
+if ((int)$row['split_days'] > 0 && (int)$row['unsplit_days'] > 0) $missingNotes[] = 'Haus enthält an ' . (int)$row['unsplit_days'] . ' Tagen die Wallbox';
 $msg = "📅 *$deviceName Wochenrückblick ($startDateFmt - $endDateFmt)*\n\n";
 if ($missingNotes) $msg .= "Unvollständig: " . implode("; ", $missingNotes) . "\n\n";
 $msg .= "☀️ *PV Ertrag:* " . telegramWeeklyNumber($row['pv_yield'], 2) . " kWh\n";

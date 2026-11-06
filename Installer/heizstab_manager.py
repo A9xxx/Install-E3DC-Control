@@ -65,6 +65,11 @@ import urllib.request
 import urllib.error
 
 try:
+    from quiet_logging import ensure_utf8_stdio
+except ImportError:
+    from Installer.quiet_logging import ensure_utf8_stdio
+
+try:
     from Installer.control_time import system_boot_id
     from Installer.shelly_relay_owner import shelly_relay_conflict, SHELLY_OWNER_WARNING
 except ModuleNotFoundError:
@@ -3146,6 +3151,7 @@ def save_to_ramdisk(data):
 # ---------------------------------------------------------------------------
 
 def main():
+    ensure_utf8_stdio()
     print(f"[{time.strftime('%H:%M:%S')}] heizstab_manager.py gestartet")
 
     cfg = load_config()

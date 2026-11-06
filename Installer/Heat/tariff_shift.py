@@ -193,7 +193,7 @@ def decide(config, evidence, state, *, now):
         'daily_state_unknown': consumed is None,
         'duration_config_invalid': minimum is None or minimum < 10 or maximum is None or maximum <= 0,
     }
-    for name in ('data_fresh', 'reserve_free', 'emergency_free', 'storage_free',
+    for name in ('data_fresh', 'emergency_free', 'storage_free',
                  'device_free', 'source_free', 'holiday_free', 'restart_free', 'user_free'):
         gates[name + '_missing_or_blocked'] = evidence.get(name) is not True
     blockers.extend(k for k, blocked in gates.items() if blocked)

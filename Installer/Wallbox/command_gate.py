@@ -774,8 +774,8 @@ def _storage_hard_block_allows_unplug_offer(charger, action, payload):
         return False
     if getattr(charger, _STORAGE_HARD_BLOCK_REASON_ATTR, "") not in (
         "authorized_wallbox_budget_below_minimum", "wallbox_budget_unknown",
-        # Der Manager lässt diesen Grund nur bei freigegebener Netzquelle,
-        # offenem Reservetor und tatsächlich ruhendem Akku passieren.
+        # Der Manager lässt diesen Budgetgrund bei freigegebener Netzquelle
+        # passieren; die Akkuentladung begrenzt der Speicherregler.
         "emergency_reserve",
     ):
         return False
@@ -812,6 +812,24 @@ def native_pause_release_allowed(charger):
         and sample.get('abort_fresh') is True and sample.get('abort_active') is True)
 
 
+def native_default_handoff_allowed(charger: Any, action: str, payload: Any) -> bool:
+    """Bindet die erlaubte Betriebsart an die bewusste einmalige Freigabe."""
+    data = payload if isinstance(payload, dict) else {}
+    context = getattr(charger, "_command_gate_context", None) or {}
+    return bool(
+        is_default_release_allowed(charger)
+        and getattr(charger, "_command_gate_release_type", "") == _USER_OFF_RELEASE_TYPE
+        and getattr(charger, "_command_gate_release_reason", "") == "mode0_user_switch"
+        and context.get("mode") == 0
+        and not context.get("locked")
+        and action in {"e3dc_set_extern", "e3dc_set_extern_wire", "e3dc_multi_send_command"}
+        and data.get("mode") in (1, 2)
+        and data.get("toggle") == 0
+        and data.get("force_state") is None
+        and data.get("heartbeat") is False
+    )
+
+
 def _storage_hard_block_allows_output(
     *,
     charger: Any,
@@ -831,15 +849,20 @@ def _storage_hard_block_allows_output(
     # Die beobachtete Primary braucht kein Strombudget für die belegte
     # Rückgabe an ihre eigene PV-Regelung. Unbekannte Budgets und harte
     # Schutzsperren bleiben auch für diesen einzelnen Modusbefehl wirksam.
+    pv_handoff_budget_allowed = bool(
+        getattr(charger, _STORAGE_HARD_BLOCK_REASON_ATTR, "")
+            in ("manual_pause", "authorized_wallbox_budget_below_minimum")
+        and not getattr(charger, "_storage_power_budget_pending", False)
+    )
+    if pv_handoff_budget_allowed and native_default_handoff_allowed(charger, name, data):
+        return True
     primary_pv_handoff = bool(
         default_release
         and getattr(charger, "primary_mode_enabled", False)
         and (getattr(charger, "_command_gate_context", None) or {}).get("observe_only")
         and getattr(charger, "_command_gate_release_reason", "")
             in ("openwb_primary_pv_mode", "mode2_user_switch_pv")
-        and getattr(charger, _STORAGE_HARD_BLOCK_REASON_ATTR, "")
-            in ("manual_pause", "authorized_wallbox_budget_below_minimum")
-        and not getattr(charger, "_storage_power_budget_pending", False)
+        and pv_handoff_budget_allowed
     )
     if primary_pv_handoff and name == "openwb_set_pv_mode":
         return True

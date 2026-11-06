@@ -821,10 +821,11 @@ for lock_file in \
     fi
 done
 
-# Logs-Ordner: www-data + Python-Prozesse muessen schreiben duerfen
+# Logverzeichnis: Webdienst und Python-Prozesse müssen schreiben dürfen
 mkdir -p /var/www/html/logs
 chown -R www-data:www-data /var/www/html/logs
 chmod -R 775 /var/www/html/logs
+chmod 2775 /var/www/html/logs
 if [ "$(stat -c '%u:%g:%a' -- /var/www/html)" != "0:${WWW_DATA_GID}:755" ]; then
     echo "-> FEHLER: Webroot schützt den RAM-Disk-Namensraum nicht dauerhaft."
     exit 1
@@ -1084,6 +1085,12 @@ fi
 
 echo "-> Starte Apache Webserver als überwachten Vordergrundprozess..."
 configure_apache_web_port
+# Apache verwendet denselben PID-Pfad aus seiner Paketumgebung.
+# Beim Containerstart kann die Datei noch zum vorigen Lauf gehören.
+(
+    . "${APACHE_ENVVARS:-${APACHE_CONFDIR:-/etc/apache2}/envvars}"
+    rm -f -- "$APACHE_PID_FILE"
+)
 apache2ctl -D FOREGROUND > /proc/1/fd/1 2>&1 &
 APACHE_PID=$!
 

@@ -301,9 +301,8 @@ def start_hold_active(
 
 
 def phase_wait_s(config: Optional[Dict[str, Any]] = None) -> float:
-    cfg = config or {}
-    value = _safe_float(cfg.get("openwb_pro_phase_wait_s", 480), 480.0)
-    return max(480.0, value)
+    """Feste Phasensperre; ``config`` bleibt kompatibel und wird ignoriert."""
+    return 480.0
 
 
 def phase_zero_settle_s(config: Optional[Dict[str, Any]] = None) -> float:
@@ -1906,7 +1905,6 @@ def phase_sequence_step_contract(
         "command": None,
         "sequence": None,
         "sequence_patch": {},
-        "phase_wait_config": {},
         "phase_cooldown_s": float(phase_cooldown_seconds),
         "zero_settle_s": float(zero_settle_seconds),
         "target_settle_s": float(target_settle_seconds),
@@ -1968,9 +1966,6 @@ def phase_sequence_step_contract(
             "action": "send_zero",
             "stage": "zero_wait",
             "sequence": next_sequence,
-            "phase_wait_config": {
-                "openwb_pro_phase_wait_s": phase_cooldown_seconds,
-            },
             "command": {
                 "method": "set_amp_and_state",
                 "amp": 0,
@@ -2036,12 +2031,6 @@ def phase_sequence_step_contract(
             **base,
             "action": "send_phase",
             "stage": "restart_delay",
-            "phase_wait_config": {
-                "openwb_pro_phase_wait_s": _safe_float(
-                    seq.get("phase_cooldown_s"),
-                    phase_cooldown_seconds,
-                ),
-            },
             "sequence_patch": {
                 "stage": "restart_delay",
                 **(
@@ -5367,7 +5356,7 @@ def mark_phase_wait(
     config: Optional[Dict[str, Any]] = None,
     charger_max_amp: Any = 16,
 ) -> None:
-    """Remember that openWB Pro is settling after a phasetarget command."""
+    """Merke die Phasensperre; ``config`` beeinflusst ihre feste Dauer nicht."""
 
     if not isinstance(state, dict):
         return

@@ -245,10 +245,6 @@ V4_BLOCK_STORAGE = {
     'netz_laden_price_limit',     # Max. Endkundenpreis ct/kWh für Günstig-Trigger (Standard 20.0)
     'netz_entladen_price_limit',  # Min. Endkundenpreis ct/kWh für Teuer-Trigger (Standard 35.0)
     'grid_max_reserve_amp',       # Reserve am Hausanschluss für echtes Preis-Netzladen
-    # PV-Überschussboden (Ladekurvenhysterese)
-    'storage_pv_floor_ratio',       # 0.0=aus, 0.15=15 % des Überschusses
-    'storage_pv_floor_threshold_w', # Erst ab diesem Überschuss aktiv (W)
-    'storage_pv_floor_max_w',       # Obere Grenze des Floors (W)
     # Firmware-Quirk Workaround (E3DC P10_2026_02 ignoriert SET_MAX_CHARGE_POWER)
     'storage_ems_charge_quirk',     # 1 = EMS_CHARGE statt set_limit() oberhalb der Kurve
     # Trajectory-Clamping (Ladekurve aus target_timeline aktiv verfolgen)
@@ -259,7 +255,6 @@ V4_BLOCK_STORAGE = {
     'tl_autodump_enable', 'tl_autodump_start_pct',
     'tl_autodump_release_pct', 'tl_autodump_horizon_h',
     'tl_autodump_min_w',
-    'tl_enable',           # 1 = Clamping aktiv (default), 0 = reines Eba-Verhalten
     'tl_tolerance_pct',    # % SOC Toleranzband oberhalb der Kurve bevor Bremse greift (default 3.0)
     'tl_emergency_tolerance_pct', # Mindest-Toleranz für harte TL-Notbremse (Standard 30.0)
     'tl_lookahead_h',      # Stunden Vorausschau für iFc-Zwischenziel (Standard 2.0)
@@ -340,12 +335,13 @@ V4_BLOCK_WALLBOX = {
     'wb_e3dc_direct_phase_control_enable', 'wb1_e3dc_direct_phase_control_enable',
     'wb2_e3dc_direct_phase_control_enable',
     'wb1_e3dc_device_family', 'wb2_e3dc_device_family',
+    'wb_e3dc_observe_mode',
     'wb_native_mode', 'wb_native_eco', 'wbmaxladestrom',
     'wb1_max_amp', 'wb2_max_amp',
     'wb1_current_step_amp', 'wb2_current_step_amp',
     'wb_surplus_target_grid_w', 'wb_surplus_noise_w',
     'phase_transition_safety_margin_w', 'heatpump_start_settle_s',
-    'grid_max_amps', 'grid_max_amps_l1', 'grid_max_amps_l2',
+    'grid_max_amps', 'grid_max_amps_confirmed', 'grid_max_amps_l1', 'grid_max_amps_l2',
     'grid_max_amps_l3', 'grid_wallbox_reserve_amps',
     'grid_wallbox_reserve_amps_l1', 'grid_wallbox_reserve_amps_l2',
     'grid_wallbox_reserve_amps_l3', 'dvcarlimit',
@@ -395,7 +391,7 @@ V4_BLOCK_WALLBOX = {
     # cleanup_v4_config() sie.
     'wb_curve_floor_support_wh', 'wb_curve_forecast_stop_shortfall_wh',
     'wb_curve_relief_after_fast_hold_s',
-    'openwb_pro_phase_wait_s', 'openwb_pro_phase_cp_interrupt_duration_s',
+    'openwb_pro_phase_cp_interrupt_duration_s',
     'openwb_pro_phase_restart_delay_s', 'openwb_pro_start_wakeup_delay_s',
     'openwb_pro_automatic_start_cp_enable', 'openwb_pro_start_cp_grace_s',
     # Startfenster/Wiederholzyklus; bisher unsichtbare Startschlüssel ins Inventar.
@@ -637,6 +633,8 @@ V4_TXT_IMPORT_SKIP_KEYS = frozenset({
 
 # Schlüssel, die NIEMALS in e3dc_v4.json gespeichert werden dürfen
 V4_BLACKLIST = {
+    # Altlast ohne Wirkung; nach zwei Releases entfernbar.
+    'tl_enable', 'storage_pv_floor_ratio', 'storage_pv_floor_threshold_w', 'storage_pv_floor_max_w',
     # Laufzeitzustände (gehören in die Ramdisk)
     'wbhour', 'wb_sofort', 'wb_locked', 'wbbis', 'wbvon', 'wbmode',
     # Lokale Installationspfade sind gültige Metadaten. Import/Rollback schützt sie

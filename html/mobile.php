@@ -8,7 +8,7 @@ handleWebLogin();
 if (function_exists('e3dcGuardMqttHeatpumpRequest')) {
     e3dcGuardMqttHeatpumpRequest();
 }
-$seite = $_GET['seite'] ?? 'live';
+$seite = e3dcRequestedPage('live');
 // Die Anmeldung ist bereits gültig: direkt zur Startseite weiterleiten.
 if ($seite === 'lock' && isWebAuthenticated()) {
     header('Location: mobile.php');
@@ -481,7 +481,7 @@ if ($wpvAjaxRequest && $seite === 'waermepumpe_vorschau') {
             font-weight: 750;
         }
         .mobile-storage-chip.curve { color: #38bdf8; border-color: rgba(56, 189, 248, 0.35); }
-        .mobile-storage-chip.ifc { color: #c4b5fd; border-color: rgba(167, 139, 250, 0.35); }
+        .mobile-storage-chip.ifc { color: #c4b5fd; border-color: rgba(167, 139, 250, 0.35); white-space: normal; border-radius: 12px; }
         .mobile-storage-chip.ems { color: #86efac; border-color: rgba(34, 197, 94, 0.32); }
         [data-theme="light"] .mobile-storage-kicker { color: #5b21b6; }
         [data-theme="light"] .mobile-storage-state-pill {
@@ -1333,30 +1333,6 @@ if ($wpvAjaxRequest && $seite === 'waermepumpe_vorschau') {
             </div>
         </div>
         <div id="forecast-kwh-summary" class="text-center text-info small fw-bold mb-2" style="display:none; letter-spacing: 0.02em;"></div>
-        <div id="pv-forecast-diagnostic-card" class="dashboard-card px-3 py-2 mb-2 small" hidden>
-            <div class="d-flex flex-wrap align-items-center justify-content-between gap-2">
-                <span class="fw-bold"><i class="fas fa-chart-bar text-info me-1"></i>PV-Prognosediagnose</span>
-                <span id="pv-forecast-diagnostic-status" class="badge text-bg-secondary">Noch keine Auswertung</span>
-            </div>
-            <div class="d-grid gap-1 mt-2 text-body">
-                <span title="Mittlerer absoluter Fehler je Ertragsfenster: Ist oder Prognose mindestens 25 Wh">Trefferabweichung: <strong id="pv-forecast-diagnostic-hit">–</strong></span>
-                <span title="Positiv bedeutet im Mittel mehr, negativ weniger Ertrag als vorhergesagt">Richtungsversatz: <strong id="pv-forecast-diagnostic-direction">–</strong></span>
-                <span title="Quadratische Fehlerwurzel; gewichtet größere Prognosefehler stärker">RMSE: <strong id="pv-forecast-diagnostic-rmse">–</strong></span>
-                <span title="Positiv ist besser als der zuletzt vor Ausgabe bekannte Ertrag desselben UTC-Zeitfensters am Vortag">Skill gegen Tagespersistenz: <strong id="pv-forecast-diagnostic-skill">–</strong></span>
-                <span title="Gesamtabweichung, gewichtet nach der tatsächlich erzeugten Energie">Energieabweichung: <strong id="pv-forecast-diagnostic-energy">–</strong></span>
-                <span title="Anteil der archivierten Prognosefenster mit gültigem Messwert">Abdeckung: <strong id="pv-forecast-diagnostic-coverage">–</strong></span>
-            </div>
-            <div class="mt-2 text-muted">
-                <div id="pv-forecast-diagnostic-sample">Noch keine vergleichbaren Fenster</div>
-                <div>Nur Diagnose – ändert keine Regelung und wählt kein Modell aus.</div>
-            </div>
-            <div id="pv-forecast-diagnostic-contract" class="mt-1 text-warning">
-                Punktprognose – kein belegtes P50.
-            </div>
-            <div id="pv-forecast-diagnostic-horizons" class="mt-1 text-muted">
-                Erfassungs-Vorlauf: noch keine revisionsgebundenen Stichproben.
-            </div>
-        </div>
         <div class="dashboard-card" style="height: calc(100vh - 180px); min-height: 400px; display: flex; flex-direction: column; position: relative;">
             <div id="primaryChartSurface" style="flex: 1; border-radius: 20px; overflow: hidden; position: relative;">
                 <!-- Live JS Chart Overlay -->
@@ -1583,7 +1559,6 @@ if ($wpvAjaxRequest && $seite === 'waermepumpe_vorschau') {
 
 <script src="assets/vendor/jquery/jquery-3.6.0.min.js"></script>
 <script src="assets/vendor/bootstrap/js/bootstrap.bundle.min.js"></script>
-    <script src="<?= getAssetUrl('pv_forecast_diagnostics.js') ?>" defer></script>
     <script src="<?= getAssetUrl('update_status.js') ?>" defer></script>
     <script src="<?= getAssetUrl('solar.js') ?>" defer></script>
 <script>
@@ -1737,6 +1712,7 @@ function invalidateMobileLiveFetch() {
 }
 
 function updateDashboard() {
+    if (new URLSearchParams(window.location.search).get('seite') === 'config') return Promise.resolve(null);
     if (typeof e3dcLiveAuthBlocked === 'function' && e3dcLiveAuthBlocked()) return Promise.resolve(null);
     if (mobileLiveFetchPromise) return mobileLiveFetchPromise;
 

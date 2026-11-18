@@ -9,6 +9,8 @@ Die lokale Prognose liefert ausschließlich Eingabedaten für Pre-Dump und die
 zentrale, ownergebundene Energieentscheidung. Sie setzt weder Sollwerte noch
 Hardwarebefehle und ändert keine Reserve- oder Gerätegrenze.
 
+Die Statusanzeige in Installationszentrale und Config-Editor nennt Quelle, erfasste Trainingswochentage und gegebenenfalls den Zeitraum des Historienprofils; „Modelldatei geprüft“ bezeichnet nur die Integrität, während fehlende, unbekannte oder über 180 Minuten alte Prognosen entsprechend gekennzeichnet sind.
+
 ## Betrieb und Datenschutz
 
 - Trainings- und Prognosedaten bleiben auf der Installation.

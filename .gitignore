@@ -69,6 +69,8 @@
 !/Installer/Storage/backup_hold.py
 !/Installer/Storage/charge_curve.py
 !/Installer/Storage/common.py
+!/Installer/Storage/kern.py
+!/Installer/Storage/kern_budget.py
 !/Installer/Storage/power_limits.py
 !/Installer/Storage/peak_shaving.py
 !/Installer/Storage/predump.py
@@ -453,3 +455,16 @@
 !/Installer/module_installer.py
 !/html/module_install_jobs.php
 !/Installer/shelly_relay_owner.py
+
+!/Installer/Storage/befehl_werte.py
+!/Installer/Storage/handauftrag_leser.py
+!/Installer/Storage/quellenrahmen.py
+!/Installer/Storage/kern_adapter.py
+!/Installer/Storage/vorab_leser.py
+!/Installer/Storage/kern_projektion.py
+!/Installer/Storage/schatten.py
+!/Installer/Storage/kern_uebergabe.py
+!/Installer/Storage/kurvenleser.py
+!/Installer/Storage/ladepunkt_leser.py
+!/Installer/Storage/leistungsleser.py
+!/Installer/Storage/zyklus_leser.py

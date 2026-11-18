@@ -103,10 +103,12 @@ Preisfenster berücksichtigen, wenn alle Bedingungen passen:
 Bei Tariftypen mit festem Zeitfenster (z. B. Octopus Heat) ist das konfigurierte
 Tarifzeitfenster die Regelgröße, nicht der Börsenpreis. Ein preisbasierter
 Netzladevertrag des Speichers gilt bis zum Ende des günstigen Fensters, nicht
-nur bis zum Ende des laufenden 15-Minuten-Slots. Über die gewählten günstigen
-Slots verteilt der Speicher die nötige Energie gleichmäßig. PV-Überschuss
-lädt ungedrosselt; das Netz ergänzt bei Bedarf die sanfte Laderate. Ist das Ziel
-erreicht (Hysterese 1 SoC-Punkt, `market_target_hysteresis_pct`; kleinere Werte
+nur bis zum Ende des laufenden 15-Minuten-Slots.
+Im günstigen Fenster lädt E3DC-Control zuerst ein Drittel des anfänglichen Energiebedarfs
+mit voller zulässiger Leistung. Danach hält der Speicher und PV lädt frei.
+Den Rest lädt E3DC-Control zum berechneten spätesten Start als Hauptblock.
+Der Speicher nimmt PV-Überschuss dabei ungedrosselt auf; nur fehlende Leistung
+ergänzt E3DC-Control aus dem Netz. Ist das Ziel erreicht (Hysterese 1 SoC-Punkt, `market_target_hysteresis_pct`; kleinere Werte
 werden auf 1 angehoben), wird im selben Fenster nicht erneut aus dem Netz
 geladen: Der Speicher bleibt bis zum Fensterende entladegesperrt, PV lädt
 weiter. Für den Marktpfad freigegebene Verbraucher (Wallbox über
@@ -122,8 +124,12 @@ einschließlich Mindestabstand und Mindestmarge günstiger sind als der aktuelle
 Bezug. Der Speicher wird dann nur so lange gehalten, bis Bestand und rechtzeitig
 nachweisbares Nachladen den teuren Bedarf decken. Das gilt auch für die Profile
 „Wirtschaftlich“ und „Ausgeglichen“ bei Börsentarifen mit Preisunterschieden sowie
-für „Komfort“. Der Teil eines Netzladeauftrags, der den Puffer lädt, zählt nicht
-als Nachladen; im Komfort gibt es keinen Puffer. Beispiel: Bei 85 % Wirkungsgrad,
+für „Komfort“.
+Bei der Anrechnung späterer Nachladungen nimmt E3DC-Control den Sollbestandspuffer aus;
+im Komfortprofil zieht es dafür keinen Sollbestandspuffer ab. Dieser
+Sollbestandspuffer unterscheidet sich vom anfänglichen Drittel-Puffer: Der Ablauf
+mit Drittel-Puffer, Halten und Hauptblock gilt auch im Komfortprofil.
+Beispiel: Bei 85 % Wirkungsgrad,
 4 ct/kWh Akkukosten und 24,91 ct/kWh im günstigen Fenster kostet nachgeladene
 Energie rund 33,3 ct/kWh; liegt der aktuelle Bezugspreis darunter, wird das
 Nachladen nicht angerechnet. Eine negative Sicherheitskorrektur senkt diese
@@ -138,11 +144,20 @@ nutzbaren günstigen Preisfenster (gleicher Tarifpreis oder höchstens um die
 Mindestmarge teurer); was dieses Fenster physisch liefern kann, wird
 angerechnet. Die für das laufende Fenster erwartete PV-Erzeugung wird zuerst
 berücksichtigt; aus dem Netz wird nur der Rest geladen, der zum Fensterende
-noch fehlt, gedeckelt auf den freien Raum bis zum Ladeziel. Das Netzladen
-verteilt sich über das gewählte Fenster, mit einem Ziel etwa 30 Minuten vor
-Fensterende. PV deckt die Laderate zuerst; überschreitet der Überschuss die
-Rate, lädt PV den Speicher im Automatikmodus ungedrosselt. Ladeziel und
-Netzladejob leiten sich aus dem Sollbestand am
+noch fehlt, gedeckelt auf den freien Raum bis zum Ladeziel.
+Für das Netzladen verwendet E3DC-Control einen gemeinsamen Ablauf: Der Speicher lädt ein Drittel des bei
+Auftragsbeginn gebundenen Energiebedarfs mit voller zulässiger Leistung.
+E3DC-Control behält den einmal bestimmten Drittel-Puffer bei sinkendem Restbedarf bei und
+rechnet auch den Energiezuwachs aus PV darauf an. Anschließend verhindert es die Entladung
+und PV lädt frei. Den Rest lädt der Speicher zum spätesten Start als
+Hauptblock mit voller zulässiger Leistung; ein begonnener Hauptblock
+kehrt nicht wieder in die Wartephase zurück. Für den spätesten Start plant E3DC-Control die
+prognostizierte Restladezeit und zehn Minuten Hochlaufreserve vor der Zielzeit
+ein. Die Zielzeit liegt 30 Minuten vor Fensterende; bei Fenstern unter
+einer Stunde gilt stattdessen die halbe Fensterdauer als Zeitpuffer.
+Der Speicher nutzt PV zuerst und lädt bei Überschuss oberhalb der zulässigen Netzladerate
+ungedrosselt im Automatikmodus. Bei bereits erreichtem spätestem Start
+beginnt direkt der Hauptblock. Ladeziel und Netzladejob leiten sich aus dem Sollbestand am
 Fensterende ab: dem Bedarf bis zum nächsten nutzbaren Fenster zuzüglich der
 Puffer. Beide bleiben während des Fensters stabil, auch wenn der Speicher
 zwischenzeitlich aus PV oder Netz lädt; deckt der erwartete Bestand den
@@ -155,15 +170,18 @@ Unterlieferung senken die Prognose nicht. Mindestens 300 W weniger als
 angefordert oder eine Akkuantwort oberhalb der bisherigen Prognose liefern
 neue Erkenntnisse über die Ladefähigkeit. Die gelernte Ladeleistung bleibt
 bei einem Neustart des Dienstes erhalten und verfällt nach sieben Tagen.
-Nach einem Neustart des Geräts beginnt die Prognose wieder mit den Startwerten. Im günstigen Fenster lädt der Speicher gleichmäßig mit der
-nötigen Leistung und erreicht das Ziel etwa 30 Minuten vor Fensterende. Bei
-Fenstern unter einer Stunde bleibt die halbe verfügbare Zeit als Puffer.
-Die Planung lernt die tatsächliche Ladeleistung je Ladezustand, auch die
-Drosselung des Speichers kurz vor voll. Liegt das Laden zurück, steigt die
-Leistung bis zur Gerätegrenze. PV-Überschuss wird nie gedrosselt; vor dem
-Netzladestart bleibt die Entladung für den Hochtarif zurückgehalten.
-Gerätegrenze, „Max. Laden“, Hausanschluss und die übrigen harten Grenzen bleiben
-wirksam. Es zählt nur die Fehlmenge, deren späterer Bezugspreis
+Nach einem Neustart des Geräts rechnet E3DC-Control wieder mit den Startwerten der Ladeprognose.
+Für die Restladezeit berücksichtigt es die gelernte Ladeleistung je Ladezustand einschließlich der
+Drosselung kurz vor voll. Die
+Prognose stellt Drittel-Puffer, Warten und Hauptblock dar.
+Gerätegrenze, „Max. Laden“, Markt-Ladelimit und
+Hausanschluss begrenzen die Ladeleistung. E3DC-Control löst die eigene gemessene
+Akkuleistung und frisch gemessene geregelte Fahrzeuganteile jeweils einmal aus
+den Phasenwerten. Die höchste verbleibende Grundlastphase begrenzt das
+Akku-Netzladen; der ausführbare Akkuauftrag erhält Vorrang vor den Fahrzeugen.
+Andere bereits enthaltene Verbraucher zieht E3DC-Control nicht erneut ab. Ohne gültige frische
+Phasenwerte gibt E3DC-Control keinen Netzladestart frei.
+Es zählt nur die Fehlmenge, deren späterer Bezugspreis
 mindestens die effektiven Ladekosten erreicht (mittlerer Preis des Fensters
 durch Wirkungsgrad plus Akkukosten plus Sicherheitskorrektur); als günstiges
 Folgefenster gelten nur vom Ladeprofil erkannte, ausführbare Ladefenster, deren
@@ -307,8 +325,8 @@ Wirksame Schlüssel:
 | `market_safety_correction_ct_per_kwh` | Sicherheitskorrektur (vom Profil gesetzt, frei bei Eigene Einstellungen) |
 | `market_autarky_horizon_buffer_wh` | Prognosepuffer im Sollbestand am Fensterende und in der Autarkieprüfung (Standard 500 Wh) |
 | `market_target_hysteresis_pct` | Zielhysterese, mindestens 1 SoC-Punkt |
-| `market_late_fill_safety_min` | Zeitabzug für die lieferbare Energie neuer Jobs und die Zukunftsgutschrift (Standard 15 min), zusätzlich zum 30-min-Zielpuffer; verschiebt die Zielzeit nicht nochmals |
-| `market_late_fill_buffer_pct` | Puffer im Sollbestand am Fensterende, in Prozent der Speicherkapazität (Standard 3 %) |
+| `market_late_fill_safety_min` | E3DC-Control kürzt für neue Aufträge und die Anrechnung späterer Nachladungen die verfügbare Zeit vor Fensterende (Standard 15 min, mindestens 0); das begrenzt die lieferbare Energie. Bei einem bereits laufenden Auftrag im selben Fenster entfällt dieser Abzug. Der Wert stellt weder den Zielzeitpuffer von bis zu 30 min noch die zehn Minuten Hochlaufreserve ein. |
+| `market_late_fill_buffer_pct` | E3DC-Control berücksichtigt einen zusätzlichen Sollbestandspuffer in Prozent der Speicherkapazität (Standard 3 %, begrenzt auf 0–20 %), zusammen mit `market_autarky_horizon_buffer_wh`. Dieser Puffer zählt im Sollbestand und wird nicht nochmals auf den Auftrag aufgeschlagen. Der Wert stellt nicht den anfänglichen Drittel-Puffer ein. Im Komfortprofil verwendet E3DC-Control stattdessen den freien Raum bis zum Komfortziel als Auftrag. |
 | `maximumladeleistung` / `market_battery_max_w` | Obergrenze für den Ladebefehl; die Planung berücksichtigt die gelernte Ladefähigkeit je Ladezustand und holt bei Bedarf bis zur Grenze auf |
 
 Netzladen wird also nicht durch den Morgenpuffer allein ausgelöst. Der
@@ -393,4 +411,4 @@ tatsächlich aktive Steuerung werden getrennt angezeigt.
 
 Die Standard-SoC-Prognose rechnet ohne Halten und ohne Nachladen und endet an der wirksamen Notstromreserve. Liegt der gemessene Startwert bereits unter der Reserve, bleibt die Linie mindestens beim Startwert; eine Reserve-Rückgewinnung durch Netzladung wird hier nicht prognostiziert. Ist keine gültige Reserve im Plan enthalten, bleibt der prognostizierte Verlauf sichtbar.
 
-Die SoC-Prognose mit Marktplan übernimmt die vollständige gültige Halteplanung bis zur letzten geplanten Akkuentnahme. Haltefenster entstehen nur, solange tatsächlich Energie oberhalb der Reserve zurückgehalten wird. PV-Überschüsse laden wie im Standardverlauf; anschließend folgt die Prognose wieder dem Standardverlauf mit Reserveboden. Netzladen wird nur für einen ausgewählten Ladeauftrag berücksichtigt. Die Linie ist geplant, wird jede Viertelstunde neu bestätigt und ist keine Zusage eines durchgehenden Betriebszustands. Ohne gültige Halteplanung, oder wenn die Marktplanung das aktuelle Halten verworfen oder eine andere Aktion gewählt hat, gilt die bisherige Anzeige ausgewählter Marktaktionen.
+Die SoC-Prognose mit Marktplan übernimmt die vollständige gültige Halteplanung bis zur letzten geplanten Akkuentnahme. E3DC-Control erzeugt ein zusätzliches Haltefenster aus dem reinen Haltehorizont nur bei mehr als 0,5 Wh oberhalb der Notstromreserve. Die Wartephase eines ausgewählten Netzladeauftrags bleibt davon getrennt. PV-Überschüsse laden wie im Standardverlauf; anschließend folgt die Prognose wieder dem Standardverlauf mit Reserveboden. Netzladen zeigt die Linie für den laufenden Ladeauftrag und für jedes spätere Ladefenster mit belegtem Ladeauftrag, jeweils bis zum Ziel des Auftrags. Zeigen Prognose und Hybrid diese Linie, stammen auch Batterie- und Netzleistung aus dem Marktplan, einschließlich Ladeverlust beim Netzladen. Die gestrichelte Linie „Planungsende“ markiert das Ende des Planungszeitraums; Ladefenster, die danach enden, plant E3DC-Control erst ein, sobald sie im Planungszeitraum liegen. Die Linie ist geplant, wird jede Viertelstunde neu bestätigt und ist keine Zusage eines durchgehenden Betriebszustands. Ohne gültige Halteplanung, oder wenn die Marktplanung das aktuelle Halten verworfen oder eine andere Aktion gewählt hat, gilt die bisherige Anzeige ausgewählter Marktaktionen.

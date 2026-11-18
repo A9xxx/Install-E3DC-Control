@@ -42,8 +42,8 @@ except ImportError:
 LIVE_DATA_PATH = "/var/www/html/ramdisk/live_data_py.json"
 LIVE_LAST_VALID_PATH = "/var/www/html/ramdisk/live_data_last_valid.json"
 LIVE_DECISION_STABILITY_PATH = "/var/www/html/ramdisk/live_decision_stability.json"
-LIVE_GRID_POWER_FILTER_STATE_PATH = "/var/www/html/ramdisk/live_grid_power_filter_state.json"
 LIVE_GRID_PM_DELTA_STATE_PATH = "/var/www/html/ramdisk/live_grid_pm_delta_state.json"
+LIVE_GRID_POWER_FILTER_STATE_PATH = "/var/www/html/ramdisk/live_grid_power_filter_state.json"
 LIVE_PLAUSIBILITY_LOG_DIR = "/var/www/html/logs"
 LIVE_PLAUSIBILITY_LOG_PREFIX = "live_plausibility_glitches"
 LIVE_PLAUSIBILITY_LOG_MAX_RECORDS = 480
@@ -111,7 +111,6 @@ LIVE_PLAUSIBILITY_CLOCK_TOLERANCE_S = 5.0
 POWER_SNAPSHOT_TIMING_KEY = "_power_snapshot_timing"
 LIVE_LAST_VALID_HEARTBEAT_S = 30.0
 LIVE_GRID_POWER_FILTER_ALPHA = 0.03
-PM_AUTO_PROBE_LAST_INDEX = 7
 POWER_DECISION_SIGNALS = (
     "PV_Power",
     "Grid_Power",
@@ -199,10 +198,11 @@ def _safe_int_config_value(value, default):
         return int(default)
 
 
-def persistent_acquisition_sections(cfg, fuse_reader=None):
+def persistent_acquisition_sections(cfg, fuse_reader=None, roles_reader=None):
     """Definiert Poll-Gruppen und den gelegentlich gelesenen Systemeintrag."""
     fuse_reader = fuse_reader if fuse_reader is not None else HouseFuseReader(cfg)
 
+    roles_reader = roles_reader if roles_reader is not None else PmRolesReader(cfg)
     history_poll_s = max(30.0, _safe_float_config_value(cfg.get("e3dc_live_history_poll_s", 60), 60))
     system_poll_s = max(
         300.0,
@@ -212,7 +212,7 @@ def persistent_acquisition_sections(cfg, fuse_reader=None):
         ),
     )
     return [
-        ("Power Snapshot", lambda conn: get_power_snapshot(conn, cfg), 0.0, True),
+        ("Power Snapshot", lambda conn: get_power_snapshot(conn, cfg, roles_reader), 0.0, True),
         ("PVI DC/AC", lambda conn: get_pvi(conn), 0.0, False),
         ("Batterie", lambda conn: get_bat(conn, cfg), 0.0, False),
         ("Wallbox", lambda conn: get_wb(conn, cfg), 0.0, False),
@@ -223,6 +223,7 @@ def persistent_acquisition_sections(cfg, fuse_reader=None):
         ("Hausabsicherung", fuse_reader.read_persistent, fuse_reader.poll_s, False),
         ("DB-History (kWh)", lambda conn: get_db_history(conn), history_poll_s, False),
         ("System-Info", lambda conn: get_system_info(conn), system_poll_s, False),
+        ("PM-Rollen", roles_reader.read, 0.0, False),
     ]
 
 # ---------------------------------------------------------------------------
@@ -417,37 +418,34 @@ def _container(tag, children):
     return {'tag': tag, 'type': RscpType.Container, 'value': children}
 
 def _fv(resp, tag, default=0.0):
-    """Float-Wert aus Antwort lesen, None-sicher. Container werden ignoriert."""
-    v = find_tag_value(resp, tag)
-    if v is None or isinstance(v, (list, dict)):
-        return default
-    try:
-        return float(v)
-    except (TypeError, ValueError):
-        return default
+    """Diagnosewert mit explizitem Standard, niemals einen Fehlercode lesen."""
+    value, source = _optional_float(resp, tag)
+    return value if source == "rscp" else default
 
 def _optional_float(resp, tag):
-    """Liest einen Float-Wert mit Verfügbarkeitsstatus aus der Antwort."""
+    """Liest ausschließlich endliche RSCP-Zahlwerte; Fehler bleiben Quellen."""
     item = find_tag(resp, tag)
     if item is None:
         return None, "rscp_missing"
-    v = item.get('value')
-    if v is None or isinstance(v, (list, dict)):
+    if item.get("type") == RscpType.Error:
+        # Die lokale RSCP-Liste enthält keine Fehlernamen; Code als Quelle.
+        return None, "rscp_error_%s" % item.get("value")
+    numeric_types = (RscpType.Char8, RscpType.UChar8, RscpType.Int16,
+        RscpType.Uint16, RscpType.Int32, RscpType.Uint32, RscpType.Int64,
+        RscpType.Uint64, RscpType.Float32, RscpType.Double64)
+    value = item.get("value")
+    if item.get("type") not in numeric_types or type(value) not in (int, float):
         return None, "rscp_invalid"
     try:
-        return float(v), "rscp"
-    except (TypeError, ValueError):
+        value = float(value)
+    except (TypeError, ValueError, OverflowError):
         return None, "rscp_invalid"
+    return (value, "rscp") if math.isfinite(value) else (None, "rscp_invalid")
 
 def _iv(resp, tag, default=0):
-    """Int-Wert aus Antwort lesen, None-sicher. Container werden ignoriert."""
-    v = find_tag_value(resp, tag)
-    if v is None or isinstance(v, (list, dict)):
-        return default
-    try:
-        return int(v)
-    except (TypeError, ValueError):
-        return default
+    """Ganzzahliger Diagnosewert mit explizitem Standard."""
+    value, source = _optional_float(resp, tag)
+    return int(value) if source == "rscp" else default
 
 
 def _typed_int_tag(resp, tag, expected_type=None):
@@ -480,9 +478,11 @@ def _optional_float_in_container(item):
             continue
         if sub.get("type") not in (RscpType.Float32, RscpType.Double64):
             continue
+        if type(sub.get("value")) not in (int, float):
+            return None
         try:
             value = float(sub.get("value"))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             return None
         return value if math.isfinite(value) else None
     return None
@@ -522,21 +522,34 @@ def _decode_ems_live_response(resp):
                       and derating_item.get("type") == RscpType.Bool
                       and type(derating_item.get("value")) is bool)
     derating = derating_item["value"] if derating_valid else None
-    pv   = _iv(resp, RscpTag.EMS_POWER_PV)
-    bat  = _iv(resp, RscpTag.EMS_POWER_BAT)
-    home = _iv(resp, RscpTag.EMS_POWER_HOME)
-    grid = _fv(resp, RscpTag.EMS_POWER_GRID)
-    add_item = find_tag(resp, RscpTag.EMS_POWER_ADD)
-    add_value = add_item.get("value") if isinstance(add_item, dict) else None
-    add_valid = bool(
-        isinstance(add_item, dict)
-        and add_item.get("type") not in {RscpType.Nil, RscpType.Container, RscpType.Error}
-        and not isinstance(add_value, bool)
-        and isinstance(add_value, int)
-    )
-    add_raw = int(add_value) if add_valid else 0
-    wb   = _iv(resp, RscpTag.EMS_POWER_WB_ALL)
-    soc  = _fv(resp, RscpTag.EMS_BAT_SOC)
+    fields = {}
+    for field, tag in (
+        ("PV_Power", RscpTag.EMS_POWER_PV),
+        ("Battery_Power", RscpTag.EMS_POWER_BAT),
+        ("Home_Power", RscpTag.EMS_POWER_HOME),
+        ("Grid_Power", RscpTag.EMS_POWER_GRID),
+        ("Wallbox_Power", RscpTag.EMS_POWER_WB_ALL),
+        ("SOC", RscpTag.EMS_BAT_SOC),
+        ("ems_emergency_power_status", RscpTag.EMS_EMERGENCY_POWER_STATUS),
+    ):
+        value, source = _optional_float(resp, tag)
+        if field == "SOC" and value is not None and not 0 <= value <= 100:
+            value, source = None, "rscp_out_of_range"
+        if field == "ems_emergency_power_status" and value is not None:
+            if value not in (0, 1, 2, 3, 4):
+                value, source = None, "rscp_out_of_range"
+            else:
+                value = int(value)
+        valid_suffix = "_valid" if field == "ems_emergency_power_status" else "_Valid"
+        source_suffix = "_source" if field == "ems_emergency_power_status" else "_Source"
+        fields.update({field: value, field + valid_suffix: value is not None,
+            field + source_suffix: source})
+    pv, bat, home, grid = (fields[key] for key in
+        ("PV_Power", "Battery_Power", "Home_Power", "Grid_Power"))
+    add_value, add_source = _optional_float(resp, RscpTag.EMS_POWER_ADD)
+    add_valid = add_value is not None
+    add_raw = add_value if add_valid else None
+    wb, soc = fields["Wallbox_Power"], fields["SOC"]
     remaining_charge_w, remaining_charge_valid = _typed_int_tag(
         resp,
         RscpTag.EMS_REMAINING_BAT_CHARGE_POWER,
@@ -551,19 +564,19 @@ def _decode_ems_live_response(resp):
     heizstab = 0
     if add_valid and add_raw < 0:
         ext_pv = abs(add_raw)
-        pv += ext_pv   # Gesamte PV-Leistung analog zu E3DC-Control "PV + Ext = Total"
+        if pv is not None:
+            pv += ext_pv   # Gesamte PV-Leistung analog zu E3DC-Control "PV + Ext = Total"
     elif add_valid and add_raw > 0:
         heizstab = add_raw
 
-    print(f"     PV={pv}W (davon Ext={ext_pv}W)  Bat={bat:+d}W  Home={home}W  Grid={grid:+.0f}W  WB={wb}W  Heizstab={heizstab}W  SOC={soc:.0f}%")
+    print(f"     PV={pv}W (davon Ext={ext_pv}W)  Bat={bat}W  Home={home}W  Grid={grid}W  WB={wb}W  Heizstab={heizstab}W  SOC={soc}%")
     print(f"     Autarkie={_fv(resp,RscpTag.EMS_AUTARKY):.1f}%  Eigenverbrauch={_fv(resp,RscpTag.EMS_SELF_CONSUMPTION):.1f}%  "
           f"PV-Drosselung={derating if derating_valid else 'nicht belegt'}")
     remaining_charge_text = f"{remaining_charge_w}W" if remaining_charge_valid else "nicht verfügbar"
     remaining_discharge_text = f"{remaining_discharge_w}W" if remaining_discharge_valid else "nicht verfügbar"
     print(f"     Verbl.Lade={remaining_charge_text}  Verbl.Entlade={remaining_discharge_text}")
     # EMS_STATUS Bitfeld-Dekodierung (aus E3DC RSCP-Doku)
-    status_raw = find_tag_value(resp, RscpTag.EMS_STATUS)
-    status_val = None if isinstance(status_raw, (list, dict)) else status_raw
+    status_val, status_valid = _typed_int_tag(resp, RscpTag.EMS_STATUS)
     status_bits = {}
     if isinstance(status_val, int):
         sv = status_val
@@ -578,15 +591,15 @@ def _decode_ems_live_response(resp):
         }
         active = [k for k, v in status_bits.items() if v]
         print(f"     EMS-Status={sv} ({', '.join(active) if active else 'Normalbetrieb'})")
-    ep_status_raw = find_tag_value(resp, RscpTag.EMS_EMERGENCY_POWER_STATUS)
-    ep_status = None if isinstance(ep_status_raw, (list, dict)) else ep_status_raw
+    ep_status = fields["ems_emergency_power_status"]
     ep_names = {0: 'NOT_POSSIBLE', 1: 'ACTIVE', 2: 'NOT_ACTIVE', 3: 'NOT_AVAILABLE'}
     if ep_status is not None:
         print(f"     Notstrom-Status={ep_status} ({ep_names.get(ep_status, '?')})")
     return {
+        **fields,
         "PV_Power": pv, "Ext_PV_Power": ext_pv,
         "Ext_PV_Power_Valid": add_valid,
-        "Ext_PV_Power_Source": "e3dc_add_power" if add_valid else "rscp_missing_or_invalid",
+        "Ext_PV_Power_Source": "e3dc_add_power" if add_valid else add_source,
         "Ext_PV_Power_Age_S": 0.0 if add_valid else None,
         "Battery_Power": bat, "Home_Power": home,
         "Grid_Power": grid, "Wallbox_Power": wb, "heizstab_power": heizstab,
@@ -1132,7 +1145,17 @@ def get_pvi(conn):
         dc_count = int(dc_count_tag.get('value') or 2)
 
     ac_count_tag = find_tag(pd, RscpTag.PVI_AC_MAX_PHASE_COUNT)
-    ac_count = int(ac_count_tag.get('value') or 3) if ac_count_tag else 3
+    ac_phase_count = (_finite_optional_float(ac_count_tag.get('value'))
+        if ac_count_tag and ac_count_tag.get('type') != RscpType.Error
+        and not isinstance(ac_count_tag.get('value'), bool) else None)
+    ac_phase_valid = ac_phase_count in (1.0, 2.0, 3.0)
+    result["pvi_ac_max_phase_count"] = int(ac_phase_count) if ac_phase_valid else None
+    result["pvi_ac_max_phase_count_valid"] = ac_phase_valid
+    result["pvi_ac_max_phase_count_source"] = (
+        "rscp_pvi_ac_max_phase_count_index_0" if ac_phase_valid
+        else "rscp_pvi_ac_max_phase_count_missing_or_invalid")
+    # Die Abfrageschleife behält ihren bisherigen Umfang bei unbekannter Zahl.
+    ac_count = int(ac_phase_count) if ac_phase_valid else 3
 
     temp_tag = find_tag(pd, RscpTag.PVI_TEMPERATURE)
     temperature = _float_in_container(temp_tag)
@@ -1238,23 +1261,9 @@ def get_pvi(conn):
     return result
 
 
-def _cfg_int(cfg, key, default=0):
-    try:
-        return int(float(str((cfg or {}).get(key, default) or default).replace(",", ".")))
-    except Exception:
-        return int(default)
-
-
-def _pm_candidates(cfg=None):
-    raw_configured_index = _cfg_int(cfg, "wurzelzaehler", 0)
-    configured_index = raw_configured_index if 0 <= raw_configured_index <= 65535 else 0
-    candidates = []
-    if configured_index > 0:
-        candidates.append(configured_index)
-    for idx in range(0, PM_AUTO_PROBE_LAST_INDEX + 1):
-        if idx not in candidates:
-            candidates.append(idx)
-    return raw_configured_index, configured_index, candidates
+def _pm_configured_index(cfg=None):
+    raw = _safe_float_config_value((cfg or {}).get("wurzelzaehler", 0), 0)
+    return int(raw) if 0 < raw <= 65535 else 0
 
 
 def _pm_request_item(idx):
@@ -1266,68 +1275,115 @@ def _pm_request_item(idx):
     ])
 
 
+def _decode_pm_type(resp):
+    item = find_tag(resp, RscpTag.PM_TYPE)
+    role, valid = _typed_int_tag(resp, RscpTag.PM_TYPE, RscpType.Uint16)
+    if valid and 0 <= role <= 65535:
+        return role, "rscp"
+    if item is None:
+        return None, "rscp_missing"
+    if item.get("type") == RscpType.Error:
+        return None, "rscp_error_%s" % item.get("value")
+    return None, "rscp_invalid"
+
+
+PM_ROLE_RETRY_S = 60.0
+
+
+class PmRolesReader:
+    """Liest höchstens alle 60 s bis zur eindeutigen Wurzelrolle, dann bis Neustart nicht mehr."""
+
+    def __init__(self, cfg, now_fn=None):
+        self.now_fn = now_fn or time.monotonic
+        self.last_attempt = None
+        self.roles = {}
+        self.sources = {}
+        self.config_warning_printed = False
+
+    def snapshot(self):
+        return dict(pm_roles=dict(self.roles), pm_role_sources=dict(self.sources))
+
+    def read(self, conn):
+        if len(self._root_indices()) == 1:
+            return self.snapshot()
+        now = self.now_fn()
+        if self.last_attempt is not None and 0 <= now - self.last_attempt < PM_ROLE_RETRY_S:
+            return self.snapshot()
+        self.last_attempt = now
+        transport_failed = False
+        roles, sources = {}, {}
+        for idx in range(8):
+            try:
+                response = conn.request([_container(RscpTag.PM_REQ_DATA, [
+                    _uint16(RscpTag.PM_INDEX, idx), _nil(RscpTag.PM_REQ_TYPE)])])
+                container = find_tag(response, RscpTag.PM_DATA)
+                if not (container and container.get("type") == RscpType.Container
+                        and isinstance(container.get("value"), list)):
+                    sources[idx] = ("rscp_error_%s" % container.get("value")
+                        if container and container.get("type") == RscpType.Error else "rscp_invalid")
+                    continue
+                role, source = _decode_pm_type(container["value"])
+                sources[idx] = source
+                # Leerer Rollenwert bei sonst vorhandenem Index ist in den
+                # lesenden Aufnahmen belegt; er behauptet keine ROOT-Rolle.
+                if role is not None:
+                    roles[idx] = role
+            except Exception as exc:
+                sources[idx] = "rscp_exception_%s" % type(exc).__name__
+                transport_failed = True
+                break
+        if not transport_failed:
+            self.roles = roles
+        self.sources.update(sources)
+        return self.snapshot()
+
+    def _root_indices(self):
+        return [idx for idx, role in self.roles.items() if role == 1]
+
+    def select(self, cfg):
+        raw = _safe_float_config_value((cfg or {}).get("wurzelzaehler", 0), 0)
+        configured = _pm_configured_index(cfg)
+        if raw > 65535 and not self.config_warning_printed:
+            print("     Wurzelzähler ist kein gültiger PM-Index (1..65535); nutze die Rolle aus dem Gerät.")
+            self.config_warning_printed = True
+        if configured:
+            return configured, "configured_wurzelzaehler"
+        roots = self._root_indices()
+        if len(roots) == 1:
+            return roots[0], "pm_type_root"
+        return None, "ambiguous_root" if roots else "no_root_meter"
+
+
 def _decode_pm_response(resp, idx, configured_index):
     pm_data = find_tag(resp, RscpTag.PM_DATA)
-    if not (pm_data and isinstance(pm_data.get('value'), list)):
-        return {}
-    pd = pm_data['value']
-    p1 = round(float(find_tag_value(pd, RscpTag.PM_POWER_L1) or 0), 1)
-    p2 = round(float(find_tag_value(pd, RscpTag.PM_POWER_L2) or 0), 1)
-    p3 = round(float(find_tag_value(pd, RscpTag.PM_POWER_L3) or 0), 1)
-    available = abs(p1) + abs(p2) + abs(p3) > 0.1
-    phase_values = (p1, p2, p3) if available else (None, None, None)
-    return {
-        "grid_p1": phase_values[0],
-        "grid_p2": phase_values[1],
-        "grid_p3": phase_values[2],
-        "grid_pm_index": idx,
-        "grid_pm_configured_index": configured_index,
-        "grid_pm_sum_w": round(p1 + p2 + p3, 1) if available else None,
-        "grid_pm_available": available,
-        "grid_pm_source": "configured_wurzelzaehler" if idx == configured_index and configured_index > 0 else f"pm_index_{idx}",
-    }
+    pd = (pm_data["value"] if pm_data and pm_data.get("type") == RscpType.Container
+          and isinstance(pm_data.get("value"), list) else [])
+    phases = [_optional_float(pd, tag) for tag in
+              (RscpTag.PM_POWER_L1, RscpTag.PM_POWER_L2, RscpTag.PM_POWER_L3)]
+    values = [round(value, 1) if value is not None else None for value, _ in phases]
+    available = all(value is not None for value in values)
+    return dict(grid_p1=values[0], grid_p2=values[1], grid_p3=values[2],
+        grid_pm_index=idx, grid_pm_configured_index=configured_index,
+        grid_pm_sum_w=round(sum(values), 1) if available else None,
+        grid_pm_available=available,
+        grid_pm_phase_sources=[source for _, source in phases],
+        grid_pm_source="configured_wurzelzaehler" if configured_index else "pm_type_root")
+
+
+def _pm_unknown(cfg, source):
+    return dict(grid_p1=None, grid_p2=None, grid_p3=None, grid_pm_index=None,
+        grid_pm_configured_index=_pm_configured_index(cfg), grid_pm_sum_w=None,
+        grid_pm_available=False, grid_pm_type=None, grid_pm_type_source="rscp_missing",
+        grid_pm_phase_sources=["rscp_missing"] * 3, grid_pm_source=source)
 
 
 def _print_pm_summary(best):
-    if not best:
-        return
-    if not best.get("grid_pm_available"):
-        print(
-            f"     PM-Index {best['grid_pm_index']} ohne plausible Phasenwerte "
-            "(Diagnose inaktiv; Regelung nutzt EMS Grid_Power)"
-        )
-        return
-    print(
-        f"     PM-Index {best['grid_pm_index']} "
-        f"L1={best['grid_p1']:+.0f}W  L2={best['grid_p2']:+.0f}W  L3={best['grid_p3']:+.0f}W "
-        "(Diagnose; Regelung nutzt EMS Grid_Power)"
-    )
-
-
-def get_pm(conn, cfg=None):
-    """Netzphasen L1/L2/L3 als Diagnose; die Regelung nutzt EMS Grid_Power."""
-    print("  -> PM Netzphasen ...")
-    raw_configured_index, configured_index, candidates = _pm_candidates(cfg)
-    if raw_configured_index > 65535:
-        print(
-            f"     Wurzelzähler {raw_configured_index} ist eine Seriennummer, kein PM-Index; "
-            f"nutze Auto-Suche 0..{PM_AUTO_PROBE_LAST_INDEX}."
-        )
-    best = {}
-    for idx in candidates:
-        try:
-            resp = conn.request([_pm_request_item(idx)])
-        except Exception as exc:
-            print(f"     PM-Index {idx} fehlgeschlagen: {exc}")
-            continue
-        candidate = _decode_pm_response(resp, idx, configured_index)
-        if not candidate:
-            continue
-        best = candidate
-        if best["grid_pm_available"] or idx == candidates[-1]:
-            break
-    _print_pm_summary(best)
-    return best
+    if best.get("grid_pm_available"):
+        print(f"     PM-Index {best['grid_pm_index']} "
+              f"L1={best['grid_p1']:+.0f}W  L2={best['grid_p2']:+.0f}W  L3={best['grid_p3']:+.0f}W "
+              "(Regelung nutzt EMS Grid_Power)")
+    else:
+        print(f"     Keine Phasenwerte vom E3DC-Leistungsmesser ({best.get('grid_pm_source')})")
 
 
 def get_wp_pm(conn, cfg=None):
@@ -1344,9 +1400,9 @@ def get_wp_pm(conn, cfg=None):
         pm_data = find_tag(resp, RscpTag.PM_DATA)
         if pm_data and isinstance(pm_data.get('value'), list):
             pd = pm_data['value']
-            p1 = find_tag_value(pd, RscpTag.PM_POWER_L1)
-            p2 = find_tag_value(pd, RscpTag.PM_POWER_L2)
-            p3 = find_tag_value(pd, RscpTag.PM_POWER_L3)
+            p1, _ = _optional_float(pd, RscpTag.PM_POWER_L1)
+            p2, _ = _optional_float(pd, RscpTag.PM_POWER_L2)
+            p3, _ = _optional_float(pd, RscpTag.PM_POWER_L3)
             # Alle 3 Phasen müssen numerisch vorhanden sein (keine Teilphasen, keine Booleans, keine Null-Imputation)
             if (
                 p1 is not None and p2 is not None and p3 is not None
@@ -1358,32 +1414,19 @@ def get_wp_pm(conn, cfg=None):
                 p3_val = round(float(p3), 1)
                 p_sum = round(p1_val + p2_val + p3_val, 1)
 
-                # Ein Verbraucher (Wärmepumpe) speist niemals ein. Summe < 0 oder signifikant negative Phase ist Erzeuger/Rückspeisung.
+                # Das Vorzeichen ist nur ein Hinweis, keine Rollen- oder Gültigkeitsentscheidung.
                 is_producer = bool(p_sum < 0.0 or p1_val < -10.0 or p2_val < -10.0 or p3_val < -10.0)
-                if is_producer:
-                    return {
-                        "WP_Power": None,
-                        "Heatpump_Power": None,
-                        "WP_Power_Valid": False,
-                        "WP_Power_Source": f"e3dc_pm_{wp_pm_idx}_producer_rejected",
-                        "wp_p1": p1_val,
-                        "wp_p2": p2_val,
-                        "wp_p3": p3_val,
-                        "wp_pm_index": wp_pm_idx,
-                        "wp_producer_detected": True,
-                    }
-
                 wp_power_val = int(round(p_sum))
                 return {
                     "WP_Power": wp_power_val,
                     "Heatpump_Power": wp_power_val,
                     "WP_Power_Valid": True,
+                    "wp_producer_detected": is_producer,
                     "WP_Power_Source": f"e3dc_pm_{wp_pm_idx}",
                     "wp_p1": p1_val,
                     "wp_p2": p2_val,
                     "wp_p3": p3_val,
                     "wp_pm_index": wp_pm_idx,
-                    "wp_producer_detected": False,
                 }
     except Exception:
         pass
@@ -1413,7 +1456,7 @@ def _snapshot_request_timing(request_started_s):
 
 
 def _power_snapshot_timing(started_s, request_timing, joint_attempts, pm_joint):
-    """Akquisezeiten der gemeinsamen EMS+PM-Anfrage, nur für die Zusatzdiagnose."""
+    """Akquisezeiten und Messzeit der gemeinsamen EMS+PM-Anfrage."""
     request_s, observed_at_s = request_timing
     finished_s = _snapshot_clock()
     return {
@@ -1437,70 +1480,27 @@ def _attach_power_snapshot_timing(data, started_s, request_timing, joint_attempt
     return data
 
 
-def get_power_snapshot(conn, cfg=None):
-    """Liest EMS-Liveleistungen und Wurzelzählerphasen möglichst in einer RSCP-Anfrage."""
-    print("  -> EMS Live-Leistungen + PM Netzphasen ...")
-    started_s = _snapshot_clock()
-    joint_attempts = 0
-    raw_configured_index, configured_index, candidates = _pm_candidates(cfg)
-    if raw_configured_index > 65535:
-        print(
-            f"     Wurzelzähler {raw_configured_index} ist eine Seriennummer, kein PM-Index; "
-            f"nutze Auto-Suche 0..{PM_AUTO_PROBE_LAST_INDEX}."
-        )
-    last_response = None
-    last_timing = (None, None)
-    best_pm = {}
-    best_response = None
-    best_timing = (None, None)
-    for idx in candidates:
-        joint_attempts += 1
-        request_started_s = _snapshot_clock()
-        try:
-            resp = conn.request(_ems_live_request_items() + [_pm_request_item(idx)])
-        except Exception as exc:
-            print(f"     Gemeinsamer Snapshot PM-Index {idx} fehlgeschlagen: {exc}")
-            continue
-        request_timing = _snapshot_request_timing(request_started_s)
-        last_response = resp
-        last_timing = request_timing
-        pm = _decode_pm_response(resp, idx, configured_index)
-        if pm:
-            best_pm = pm
-            best_response = resp
-            best_timing = request_timing
-        if pm and (pm["grid_pm_available"] or idx == candidates[-1]):
-            data = _decode_ems_live_response(resp)
-            _print_pm_summary(pm)
-            data.update(pm)
-            data["power_snapshot_source"] = "joint_ems_pm"
-            _attach_power_snapshot_timing(data, started_s, request_timing, joint_attempts, True)
-            return data
-
-    if best_pm and best_response is not None:
-        data = _decode_ems_live_response(best_response)
-        _print_pm_summary(best_pm)
-        data.update(best_pm)
-        data["power_snapshot_source"] = "joint_ems_pm_unavailable"
-        _attach_power_snapshot_timing(data, started_s, best_timing, joint_attempts, True)
-        return data
-
-    if last_response is not None:
-        data = _decode_ems_live_response(last_response)
-        try:
-            pm = get_pm(conn, cfg)
-        except Exception as exc:
-            print(f"     Separater PM-Fallback fehlgeschlagen: {exc}")
-            pm = {}
-        data.update(pm)
-        data["power_snapshot_source"] = "joint_ems_separate_pm" if pm else "joint_ems_only"
-        _attach_power_snapshot_timing(data, started_s, last_timing, joint_attempts, False)
-        return data
-
-    data = get_ems_live(conn)
-    data.update(get_pm(conn, cfg))
-    data["power_snapshot_source"] = "fallback_separate"
-    _attach_power_snapshot_timing(data, started_s, (None, None), joint_attempts, False)
+def get_power_snapshot(conn, cfg, roles_reader):
+    """Eine Leistungsprobe; ausschließlich der gewählte PM-Index wird mitgelesen."""
+    started = _snapshot_clock()
+    reader = roles_reader
+    idx, source = reader.select(cfg)
+    pm = _pm_unknown(cfg, source)
+    request_started = _snapshot_clock()
+    # Kein PM-Fehler darf einen zweiten EMS-Abruf oder einen Probenfehler
+    # erzeugen. Echte Transportfehler dieser Leistungsprobe bleiben wirksam.
+    response = conn.request(_ems_live_request_items() + ([_pm_request_item(idx)] if idx is not None else []))
+    timing = _snapshot_request_timing(request_started)
+    data = _decode_ems_live_response(response)
+    if idx is not None:
+        pm = _decode_pm_response(response, idx, _pm_configured_index(cfg))
+    pm["grid_pm_type"] = reader.roles.get(idx)
+    pm["grid_pm_type_source"] = reader.sources.get(idx, "rscp_missing")
+    data.update(pm)
+    data.update(reader.snapshot())
+    data["power_snapshot_source"] = "joint_ems_pm" if idx is not None else "joint_ems_only"
+    _attach_power_snapshot_timing(data, started, timing, 1, idx is not None)
+    _print_pm_summary(data)
     return data
 
 
@@ -1960,46 +1960,6 @@ class KwhRetterState:
         }
 
 
-def apply_pv_zero_glitch_filter(clean, live_path="/var/www/html/ramdisk/live_data_py.json"):
-    """
-    Kurze RSCP/PVI-Aussetzer abfangen.
-
-    Einige E3DC melden für wenige Sekunden PV=0 W und PVI AC/DC=0 W, obwohl
-    die Stringspannung weiter hoch ist. Ohne Filter interpretiert die Regelung
-    das als echten PV-Einbruch und verlässt die Ladekurve. Wir halten nur den
-    letzten plausiblen PV-Wert und nur für ein enges Zeitfenster.
-    """
-    try:
-        raw_pv = float(clean.get("PV_Power", 0) or 0)
-        if raw_pv > 50:
-            return clean
-
-        dc_v_high = any(float(clean.get(f"dc{i}_v", 0) or 0) > 150 for i in range(4))
-        ac_power_sum = sum(abs(float(clean.get(f"ac{i}_w", 0) or 0)) for i in range(3))
-        grid_w = float(clean.get("Grid_Power", 0) or 0)
-        home_w = float(clean.get("Home_Power", 0) or 0)
-
-        if not (dc_v_high and ac_power_sum < 80 and grid_w > 150 and home_w > 150):
-            return clean
-        if not os.path.exists(live_path):
-            return clean
-
-        with open(live_path, "r", encoding="utf-8") as f:
-            prev = json.load(f)
-
-        prev_ts = float(prev.get("_ts", 0) or 0)
-        prev_pv = float(prev.get("PV_Power", 0) or 0)
-        if time.time() - prev_ts > 120 or prev_pv < 500:
-            return clean
-
-        clean["PV_Power"] = int(prev_pv)
-        clean["_pv_glitch_filtered"] = True
-        clean["_pv_glitch_raw_w"] = int(raw_pv)
-        clean["_pv_glitch_reason"] = "PV=0 bei hoher Stringspannung, Vorwert kurz gehalten"
-        print(f"  [PV-Filter] PV=0W verworfen, halte kurz {prev_pv:.0f}W (DC-Spannung hoch)")
-    except Exception as e:
-        print(f"  [PV-Filter] Fehler: {e}")
-    return clean
 
 
 def _finite_float(value, default=0.0):
@@ -2074,271 +2034,116 @@ GRID_PM_CONTINUITY_MAX_GAP_S = 30.0
 
 
 def _grid_pm_delta_status(delta_w, cfg=None, *, state_path=None, now_s=None):
-    """Klassifiziert die EMS-/PM-Abweichung als rein diagnostisch oder regelwirksam."""
-    cfg_present = isinstance(cfg, dict)
-    soft_threshold_w = max(0.0, _cfg_number(cfg, "live_grid_pm_delta_soft_threshold_w", 250.0))
-    hard_threshold_w = max(
-        soft_threshold_w,
-        _cfg_number(cfg, "live_grid_pm_delta_hard_threshold_w", 2000.0),
-    )
-    persist_count = max(1, int(round(_cfg_number(cfg, "live_grid_pm_delta_persist_count", 2.0))))
-    persist_window_s = max(0.0, _cfg_number(cfg, "live_grid_pm_delta_persist_window_s", 20.0))
-    debounce_enabled = bool(cfg_present and _cfg_flag(cfg, "live_grid_pm_delta_debounce_enable", True))
+    """Diagnose der Abweichung mit durchgehender Dauer für die Anzeige."""
+    threshold = max(0.0, _cfg_number(cfg, "live_grid_pm_delta_soft_threshold_w", 250.0))
     now = _finite_float(now_s if now_s is not None else time.time(), time.time())
-    delta_abs_w = abs(float(delta_w))
-    diagnostic_high = delta_abs_w > soft_threshold_w
-
-    observations = []
+    high = abs(float(delta_w)) > threshold
     high_since = None
-    if debounce_enabled and state_path:
+    if state_path:
         state = _read_json_file(state_path)
         previous_ts = _finite_optional_float(state.get("ts")) if isinstance(state, dict) else None
-        if (diagnostic_high and previous_ts is not None
+        if (high and previous_ts is not None
                 and 0.0 <= now - previous_ts <= GRID_PM_CONTINUITY_MAX_GAP_S):
             high_since = _finite_optional_float(state.get("high_since_ts"))
-        raw_observations = state.get("observations", []) if isinstance(state, dict) else []
-        if isinstance(raw_observations, list):
-            for item in raw_observations:
-                if not isinstance(item, dict):
-                    continue
-                ts = _finite_optional_float(item.get("ts"))
-                if ts is None:
-                    continue
-                if persist_window_s > 0.0 and now - ts > persist_window_s:
-                    continue
-                observations.append({
-                    "ts": int(round(ts)),
-                    "delta_w": int(round(_finite_float(item.get("delta_w"), 0.0))),
-                    "delta_abs_w": int(round(abs(_finite_float(item.get("delta_abs_w"), 0.0)))),
-                })
-
-    if diagnostic_high:
-        observations.append({
-            "ts": int(round(now)),
-            "delta_w": int(round(delta_w)),
-            "delta_abs_w": int(round(delta_abs_w)),
-        })
-        if persist_window_s <= 0.0:
-            observations = observations[-persist_count:]
-    else:
-        observations = []
-    if diagnostic_high and high_since is None:
+    if high and (high_since is None or high_since > now):
         high_since = now
-    # Durchgehende Dauer für den Hinweis; ein Treffer innerhalb der Schwelle setzt sie zurück.
-    high_for_s = max(0.0, now - high_since) if diagnostic_high else 0.0
-
-    if diagnostic_high and not debounce_enabled:
-        effective = True
-        mode = "legacy_immediate" if not cfg_present else "debounce_disabled"
-    elif diagnostic_high and delta_abs_w >= hard_threshold_w:
-        effective = True
-        mode = "hard_threshold"
-    elif diagnostic_high and len(observations) >= persist_count:
-        effective = True
-        mode = "persistent"
-    elif diagnostic_high:
-        effective = False
-        mode = "diagnostic_hold"
-    else:
-        effective = False
-        mode = "within_threshold"
-
-    status = {
-        "diagnostic_high": bool(diagnostic_high),
-        "rule_effective": bool(effective),
-        "mode": mode,
-        "debounce_enabled": bool(debounce_enabled),
-        "soft_threshold_w": int(round(soft_threshold_w)),
-        "hard_threshold_w": int(round(hard_threshold_w)),
-        "persist_count": int(persist_count),
-        "persist_window_s": int(round(persist_window_s)),
-        "observed_count": int(len(observations)),
-        "high_for_s": int(round(high_for_s)),
-    }
-
-    if debounce_enabled and state_path:
+    status = {"diagnostic_high": high, "soft_threshold_w": int(round(threshold)),
+        "high_for_s": int(round(max(0.0, now - high_since))) if high else 0}
+    if state_path:
         try:
             _atomic_write_json(state_path, {
                 "schema_version": "live_grid_pm_delta_state_v1",
-                "ts": int(round(now)),
-                "high_since_ts": high_since,
-                "observations": observations,
-                "latest": {
-                    "delta_w": int(round(delta_w)),
-                    "delta_abs_w": int(round(delta_abs_w)),
-                    "diagnostic_high": bool(diagnostic_high),
-                    "rule_effective": bool(effective),
-                    "mode": mode,
-                },
-                "config": {
-                    "soft_threshold_w": status["soft_threshold_w"],
-                    "hard_threshold_w": status["hard_threshold_w"],
-                    "persist_count": status["persist_count"],
-                    "persist_window_s": status["persist_window_s"],
-                },
+                "ts": int(round(now)), "high_since_ts": high_since if high else None,
+                "latest": {"delta_w": int(round(delta_w)),
+                    "delta_abs_w": int(round(abs(delta_w))), "diagnostic_high": high},
+                "config": {"soft_threshold_w": status["soft_threshold_w"]},
             })
         except Exception as exc:
             status["state_write_error"] = str(exc)
-
     return status
 
 
-def apply_power_plausibility(
-    clean,
-    errors=None,
-    cfg=None,
-    *,
-    grid_pm_state_path=None,
-    now_s=None,
-):
-    """Ergänzt Echtzeit-Plausibilitätsdaten, ohne Liveleistungswerte zu verändern."""
+def apply_power_plausibility(clean, errors=None, cfg=None, *, grid_pm_state_path=None, now_s=None):
+    """Einzelwerte und Probenfehler getrennt halten; Kreuzprüfungen sind Hinweise."""
     if not isinstance(clean, dict):
         return clean
-    errors = errors or []
-    reasons = []
-    diagnostic_reasons = []
-    effective_reasons = reasons
-
-    pv_w = _finite_float(clean.get("PV_Power"), 0.0)
-    grid_w = _finite_float(clean.get("Grid_Power"), 0.0)
-    bat_w = _finite_float(clean.get("Battery_Power"), 0.0)
-    home_w = _finite_float(clean.get("Home_Power"), 0.0)
-    wb_w = abs(_finite_float(clean.get("Wallbox_Power"), 0.0))
-    heizstab_w = max(0.0, _finite_float(clean.get("heizstab_power"), 0.0))
-
-    raw_sources = {
-        "PV_Power_Raw": _finite_float(clean.get("_pv_glitch_raw_w", pv_w), pv_w),
-        "Grid_Power_Raw": grid_w,
-        "Battery_Power_Raw": bat_w,
-        "Home_Power_Raw": home_w,
-        "Wallbox_Power_Raw": wb_w,
-    }
-    for key, value in raw_sources.items():
-        clean.setdefault(key, int(round(value)) if abs(value - round(value)) < 0.001 else round(value, 3))
-
-    # Von diesem Dienst verwendete E3DC-EMS-Vorzeichen:
-    # Grid > 0 Bezug, Grid < 0 Einspeisung; Battery > 0 Laden, Battery < 0 Entladen.
-    home_balance_w = max(0.0, pv_w + grid_w - bat_w - wb_w - heizstab_w)
-    home_delta_w = home_w - home_balance_w
-    clean["Home_Power_Balance"] = int(round(home_balance_w))
-    clean["Home_Power_Delta"] = int(round(home_delta_w))
-
-    source = "rscp_direct"
-    home_valid = True
-    if abs(home_delta_w) <= 80.0:
-        source = "ems_balance_like"
-    if home_w <= 1.0 and home_balance_w >= 300.0:
-        source = "invalid_zero_glitch"
-        home_valid = False
-        reasons.append("home_zero_but_balance_nonzero")
-        diagnostic_reasons.append("home_zero_but_balance_nonzero")
-    if home_w < -100.0:
-        source = "invalid_negative_home"
-        home_valid = False
-        reasons.append("home_negative")
-        diagnostic_reasons.append("home_negative")
-    clean["Home_Power_Source"] = source
-    clean["Home_Power_Valid"] = bool(home_valid)
-    clean["Home_Power_Independent"] = bool(source == "rscp_direct")
-
-    if "grid_pm_sum_w" in clean:
-        pm_available = _finite_bool(clean.get("grid_pm_available"), True)
-        clean["Grid_PM_Available"] = bool(pm_available)
-        pm_sum_w = _finite_float(clean.get("grid_pm_sum_w"), 0.0)
-        grid_pm_delta_w = grid_w - pm_sum_w
-        clean["Grid_PM_Delta"] = int(round(grid_pm_delta_w))
-        clean["Grid_PM_Delta_Abs"] = int(round(abs(grid_pm_delta_w)))
-        if pm_available:
-            grid_pm_state_path = (
-                grid_pm_state_path
-                if grid_pm_state_path is not None
-                else (LIVE_GRID_PM_DELTA_STATE_PATH if isinstance(cfg, dict) else None)
-            )
-            grid_pm_status = _grid_pm_delta_status(
-                grid_pm_delta_w,
-                cfg,
-                state_path=grid_pm_state_path,
-                now_s=now_s if now_s is not None else clean.get("_ts"),
-            )
-        else:
-            grid_pm_status = {
-                "diagnostic_high": False,
-                "rule_effective": False,
-                "mode": "pm_unavailable",
-                "debounce_enabled": bool(isinstance(cfg, dict) and _cfg_flag(cfg, "live_grid_pm_delta_debounce_enable", True)),
-                "soft_threshold_w": int(round(_cfg_number(cfg, "live_grid_pm_delta_soft_threshold_w", 250.0))),
-                "hard_threshold_w": int(round(_cfg_number(cfg, "live_grid_pm_delta_hard_threshold_w", 2000.0))),
-                "persist_count": max(1, int(round(_cfg_number(cfg, "live_grid_pm_delta_persist_count", 2.0)))),
-                "persist_window_s": int(round(max(0.0, _cfg_number(cfg, "live_grid_pm_delta_persist_window_s", 20.0)))),
-                "observed_count": 0,
-            }
-        grid_diagnostic_valid = (not pm_available) or not grid_pm_status["diagnostic_high"]
-        # Der Zählervergleich ist Diagnose; echte Datenfehler verwerfen die Probe.
-        grid_valid = True
-        clean["Grid_Power_Diagnostic_Valid"] = bool(grid_diagnostic_valid)
-        clean["Grid_Power_Valid"] = bool(grid_valid)
-        clean["Grid_PM_Delta_Rule_Effective"] = bool(pm_available and grid_pm_status["rule_effective"])
-        clean["Grid_PM_Delta_Status"] = grid_pm_status
-        if pm_available and grid_pm_status["diagnostic_high"]:
-            diagnostic_reasons.append("grid_pm_delta_high")
-    else:
-        clean.setdefault("Grid_Power_Valid", True)
-        clean.setdefault("Grid_Power_Diagnostic_Valid", clean["Grid_Power_Valid"])
-
-    error_class = _rscp_error_class(errors)
-    if error_class:
-        reasons.append(error_class)
-        diagnostic_reasons.append(error_class)
-    core_values = {
-        key: _finite_optional_float(clean.get(key))
-        for key in ("PV_Power", "Grid_Power", "Battery_Power", "Home_Power")
-    }
-    core_values_complete = all(value is not None for value in core_values.values())
-    core_values_zero = bool(
-        core_values_complete
-        and all(abs(float(value)) <= 1.0 for value in core_values.values())
-    )
-    if core_values_zero and errors:
+    errors = list(errors or [])
+    values = {}
+    for key in ("PV_Power", "Grid_Power", "Battery_Power", "Home_Power", "Wallbox_Power"):
+        value = _finite_optional_float(clean.get(key))
+        valid = value is not None and clean.get(key + "_Valid", True) is True
+        values[key] = value if valid else None
+        clean[key] = values[key]
+        clean[key + "_Valid"] = valid
+        clean.setdefault(key + "_Source", "rscp" if valid else "rscp_missing_or_invalid")
+        clean[key + "_Raw"] = values[key]
+    pv, grid, bat, home, wb = (values[key] for key in
+        ("PV_Power", "Grid_Power", "Battery_Power", "Home_Power", "Wallbox_Power"))
+    heater = _finite_optional_float(clean.get("heizstab_power"))
+    balance = (max(0.0, pv + grid - bat - abs(wb) - max(0.0, heater))
+        if all(v is not None for v in (pv, grid, bat, wb, heater)) else None)
+    delta = home - balance if home is not None and balance is not None else None
+    clean["Home_Power_Balance"] = _power_round(balance) if balance is not None else None
+    clean["Home_Power_Delta"] = _power_round(delta) if delta is not None else None
+    diagnostic = []
+    if home is not None and home <= 1 and balance is not None and balance >= 300:
+        diagnostic.append("home_zero_but_balance_nonzero")
+    if home is not None and home < -100:
+        clean.update(Home_Power=None, Home_Power_Valid=False, Home_Power_Source="invalid_negative_home")
+        diagnostic.append("home_negative")
+    clean["Home_Power_Independent"] = True
+    if pv is not None and pv <= 50 and any(
+            (_finite_optional_float(clean.get("dc%d_v" % i)) or 0) > 150 for i in range(4)):
+        diagnostic.append("pv_zero_at_string_voltage")
+    pm = _finite_optional_float(clean.get("grid_pm_sum_w"))
+    pm_available = pm is not None and clean.get("grid_pm_available", True) is True
+    clean["Grid_PM_Available"] = pm_available
+    pm_delta = grid - pm if grid is not None and pm_available else None
+    clean["Grid_PM_Delta"] = _power_round(pm_delta) if pm_delta is not None else None
+    clean["Grid_PM_Delta_Abs"] = _power_round(abs(pm_delta)) if pm_delta is not None else None
+    status = (_grid_pm_delta_status(pm_delta, cfg,
+        state_path=grid_pm_state_path if grid_pm_state_path is not None else LIVE_GRID_PM_DELTA_STATE_PATH,
+        now_s=now_s if now_s is not None else clean.get("_ts")) if pm_delta is not None else
+        {"diagnostic_high": False, "soft_threshold_w": int(round(_cfg_number(cfg, "live_grid_pm_delta_soft_threshold_w", 250)))})
+    clean["Grid_PM_Delta_Status"] = status
+    if status["diagnostic_high"]:
+        diagnostic.append("grid_pm_delta_high")
+    # Abschnittspräfixe stammen aus beiden Akquisepfaden. Unpräfixierte
+    # Fehler entstehen im äußeren Verbindungsfehlerpfad.
+    diagnostic_sections = ("PVI DC/AC:", "Batterie:", "Wallbox:", "Wärmepumpe (E3DC PM):",
+        "EMS Anlagendata:", "Hausabsicherung:", "DB-History (kWh):", "System-Info:", "PM-Rollen:")
+    control_errors = [error for error in errors if not str(error).startswith(diagnostic_sections)]
+    error_class = _rscp_error_class(control_errors)
+    reasons = [error_class] if error_class else []
+    for error in errors:
+        hint = _rscp_error_class([error])
+        if hint:
+            diagnostic.append(hint)
+    core = (pv, grid, bat, home)
+    complete = all(value is not None for value in core)
+    zero = complete and all(abs(value) <= 1 for value in core)
+    if zero and control_errors:
         reasons.append("all_core_powers_zero_with_errors")
-        diagnostic_reasons.append("all_core_powers_zero_with_errors")
-
-    effective_reasons = sorted(set(effective_reasons))
-    diagnostic_reasons = sorted(set(diagnostic_reasons or effective_reasons))
-    clean["RSCP_Glitch_Reasons"] = effective_reasons
-    clean["RSCP_Diagnostic_Reasons"] = diagnostic_reasons
-    clean["RSCP_Sample_Valid"] = bool(not effective_reasons)
-    clean["RSCP_Diagnostic_Only"] = bool(diagnostic_reasons and not effective_reasons)
+    diagnostic = sorted(set(diagnostic + reasons))
+    clean["RSCP_Glitch_Reasons"] = sorted(set(reasons))
+    clean["RSCP_Diagnostic_Reasons"] = diagnostic
+    clean["RSCP_Sample_Valid"] = not reasons
+    clean["RSCP_Diagnostic_Only"] = bool(diagnostic and not reasons)
     clean["Power_Plausibility"] = {
-        "home_source": clean["Home_Power_Source"],
-        "home_valid": clean["Home_Power_Valid"],
-        "home_independent": clean["Home_Power_Independent"],
-        "home_balance_w": clean["Home_Power_Balance"],
-        "home_delta_w": clean["Home_Power_Delta"],
-        "grid_pm_available": clean.get("Grid_PM_Available"),
-        "grid_pm_delta_w": clean.get("Grid_PM_Delta"),
-        "grid_pm_delta_abs_w": clean.get("Grid_PM_Delta_Abs"),
-        "grid_pm_delta_diagnostic": not bool(clean.get("Grid_Power_Diagnostic_Valid", True)),
-        "grid_pm_delta_rule_effective": bool(clean.get("Grid_PM_Delta_Rule_Effective", False)),
-        "grid_pm_delta_status": clean.get("Grid_PM_Delta_Status"),
-        "grid_pm_sum_w": clean.get("grid_pm_sum_w"),
-        "grid_pm_index": clean.get("grid_pm_index"),
-        "grid_pm_source": clean.get("grid_pm_source"),
-        "grid_valid": clean.get("Grid_Power_Valid", True),
-        "grid_diagnostic_valid": clean.get("Grid_Power_Diagnostic_Valid", True),
-        "rscp_error_class": error_class or None,
-        "rscp_core_values_complete": bool(core_values_complete),
-        "rscp_core_values_zero": bool(core_values_zero),
-        "grid_phase_w": [
-            clean.get("grid_p1"),
-            clean.get("grid_p2"),
-            clean.get("grid_p3"),
-        ],
+        "home_source": clean["Home_Power_Source"], "home_valid": clean["Home_Power_Valid"],
+        "home_independent": True, "home_balance_w": clean["Home_Power_Balance"],
+        "home_delta_w": clean["Home_Power_Delta"], "grid_valid": clean["Grid_Power_Valid"],
+        "grid_pm_available": pm_available, "grid_pm_delta_w": clean["Grid_PM_Delta"],
+        "grid_pm_delta_abs_w": clean["Grid_PM_Delta_Abs"], "grid_pm_delta_status": status,
+        "grid_pm_delta_diagnostic": status["diagnostic_high"],
+        "grid_pm_sum_w": pm, "grid_pm_index": clean.get("grid_pm_index"),
+        "grid_pm_source": clean.get("grid_pm_source"), "rscp_error_class": error_class or None,
+        "rscp_core_values_complete": complete, "rscp_core_values_zero": bool(zero),
+        "grid_phase_w": [clean.get("grid_p%d" % i) for i in (1, 2, 3)],
         "power_snapshot_source": clean.get("power_snapshot_source"),
-        "sample_valid": clean["RSCP_Sample_Valid"],
-        "reasons": clean["RSCP_Glitch_Reasons"],
+        "sample_valid": not reasons, "reasons": clean["RSCP_Glitch_Reasons"],
         "effective_reasons": clean["RSCP_Glitch_Reasons"],
-        "diagnostic_reasons": clean["RSCP_Diagnostic_Reasons"],
-        "diagnostic_only": clean["RSCP_Diagnostic_Only"],
+        "diagnostic_reasons": diagnostic, "diagnostic_only": clean["RSCP_Diagnostic_Only"],
     }
     return clean
 
@@ -2362,21 +2167,27 @@ def apply_grid_power_filtered(
     *,
     state_path=LIVE_GRID_POWER_FILTER_STATE_PATH,
     now_s=None,
+    previous_state=None,
 ):
     """Erzeuge ein gedämpftes Netzpunkt-Signal für langsame Budgetentscheidungen."""
     if not isinstance(clean, dict):
         return clean
     cfg = cfg or {}
-    now = _finite_float(now_s if now_s is not None else clean.get("_ts", time.time()), time.time())
+    now = float(now_s) if now_s is not None else _finite_float(clean.get("_ts"), time.time())
     alpha = max(
         0.001,
         min(1.0, _cfg_float(cfg, "live_grid_power_filter_alpha", LIVE_GRID_POWER_FILTER_ALPHA)),
     )
     max_age_s = max(5.0, _cfg_float(cfg, "live_grid_power_filter_state_max_age_s", 120.0))
-    raw = _finite_float(clean.get("Grid_Power"), 0.0)
+    raw = _finite_optional_float(clean.get("Grid_Power"))
+    if raw is None or clean.get("Grid_Power_Valid", True) is not True:
+        clean.update(Grid_Power_Filtered=None, Grid_Power_Filtered_Valid=False,
+            Grid_Power_Filter={"status": "invalid_signal", "sample_valid": False,
+                "raw_w": None, "filtered_w": None})
+        return clean
     sample_valid = bool(clean.get("RSCP_Sample_Valid", True) and clean.get("Grid_Power_Valid", True))
 
-    previous = _read_json_file(state_path) if state_path else None
+    previous = previous_state if previous_state is not None else (_read_json_file(state_path) if state_path else None)
     previous_ts = _finite_float((previous or {}).get("ts"), 0.0) if isinstance(previous, dict) else 0.0
     previous_filtered = _finite_optional_float((previous or {}).get("filtered_w")) if isinstance(previous, dict) else None
     previous_age_s = max(0.0, now - previous_ts) if previous_ts > 0.0 else None
@@ -2429,18 +2240,19 @@ def apply_power_decision_stability(
     *,
     state_path=LIVE_DECISION_STABILITY_PATH,
     now_s=None,
+    previous_state=None,
 ):
     """Exportiert diagnostische EWMA-/Totbandwerte, ohne Live-Rohwerte zu verändern."""
     if not isinstance(clean, dict):
         return clean
     cfg = cfg or {}
-    now = _finite_float(now_s if now_s is not None else clean.get("_ts", time.time()), time.time())
+    now = float(now_s) if now_s is not None else _finite_float(clean.get("_ts"), time.time())
     alpha = max(0.05, min(1.0, _cfg_float(cfg, "live_power_decision_ewma_alpha", 0.35)))
     deadband_w = max(0.0, _cfg_float(cfg, "live_power_decision_deadband_w", 120.0))
     max_age_s = max(5.0, _cfg_float(cfg, "live_power_decision_state_max_age_s", 90.0))
     sample_valid = bool(clean.get("RSCP_Sample_Valid", True))
 
-    previous = _read_json_file(state_path) if state_path else None
+    previous = previous_state if previous_state is not None else (_read_json_file(state_path) if state_path else None)
     previous_ts = _finite_float((previous or {}).get("ts"), 0.0) if isinstance(previous, dict) else 0.0
     previous_age_s = max(0.0, now - previous_ts) if previous_ts > 0.0 else None
     previous_stale = previous_age_s is None or previous_age_s > max_age_s
@@ -2455,7 +2267,13 @@ def apply_power_decision_stability(
     any_invalid_hold = False
 
     for signal in POWER_DECISION_SIGNALS:
-        raw = _finite_float(clean.get(signal), 0.0)
+        raw = _finite_optional_float(clean.get(signal))
+        if raw is None or clean.get(signal + "_Valid", True) is not True:
+            clean[signal + "_EWMA"] = None
+            clean[signal + "_Decision"] = None
+            clean[signal + "_Decision_Valid"] = False
+            signals[signal] = {"raw_w": None, "ewma_w": None, "decision_w": None, "valid": False}
+            continue
         previous_signal = previous_signals.get(signal) if isinstance(previous_signals.get(signal), dict) else {}
         has_previous_signal = bool(previous_signal) and not previous_stale
         prev_ewma = _finite_float(previous_signal.get("ewma_w"), raw)
@@ -2537,7 +2355,7 @@ def apply_power_decision_stability(
         "signals": signals,
     }
 
-    if state_path and sample_valid:
+    if state_path and sample_valid and state_signals:
         try:
             _atomic_write_json(state_path, {
                 "schema_version": "power_decision_stability_state_v1",
@@ -2560,6 +2378,30 @@ def _round_or_none(value, digits=3):
     if abs(number - round(number)) < 0.001:
         return int(round(number))
     return round(number, digits)
+
+
+def build_live_frame(data, errors, cfg, *, now_s, elapsed_s=0.0,
+        acquisition=None, grid_state=None, decision_state=None):
+    """Erzeugt einen JSON-Rahmen ausschließlich aus übergebenen Daten."""
+    clean = {key: value for key, value in data.items() if not key.startswith("_")}
+    # Auch ein ganz ausgefallener PVI-Abschnitt veröffentlicht unbekannt explizit.
+    clean.setdefault("pvi_ac_max_phase_count", None)
+    clean.setdefault("pvi_ac_max_phase_count_valid", False)
+    clean.setdefault("pvi_ac_max_phase_count_source", "rscp_pvi_ac_max_phase_count_missing_or_invalid")
+    timing = data.get(POWER_SNAPSHOT_TIMING_KEY)
+    measured_s = _finite_optional_float(timing.get("observed_at_s")) if isinstance(timing, dict) else None
+    if any(str(error).startswith("Power Snapshot:") for error in errors):
+        measured_s = None
+    clean.update(_source="python_rscp", _ts=int(now_s if measured_s is None else measured_s), _elapsed=round(elapsed_s, 3),
+        RSCP_Acquisition=acquisition)
+    if errors:
+        clean["_errors"] = list(errors)
+    clean = apply_power_plausibility(clean, errors, cfg, now_s=now_s)
+    clean = apply_grid_power_filtered(clean, cfg, state_path=None, now_s=now_s,
+        previous_state=grid_state)
+    clean = apply_power_decision_stability(clean, cfg, state_path=None, now_s=now_s,
+        previous_state=decision_state)
+    return sanitize_for_json(clean)
 
 
 def compact_live_plausibility_frame(clean):
@@ -2596,7 +2438,6 @@ def compact_live_plausibility_frame(clean):
         "grid_pm_sum_w": _round_or_none(clean.get("grid_pm_sum_w", plausibility.get("grid_pm_sum_w"))),
         "grid_pm_delta_w": _round_or_none(clean.get("Grid_PM_Delta", plausibility.get("grid_pm_delta_w"))),
         "grid_pm_delta_abs_w": _round_or_none(clean.get("Grid_PM_Delta_Abs", plausibility.get("grid_pm_delta_abs_w"))),
-        "grid_pm_delta_rule_effective": bool(clean.get("Grid_PM_Delta_Rule_Effective", plausibility.get("grid_pm_delta_rule_effective", False))),
         "grid_pm_delta_status": clean.get("Grid_PM_Delta_Status", plausibility.get("grid_pm_delta_status")),
         "grid_pm_available": clean.get("Grid_PM_Available", plausibility.get("grid_pm_available")),
         "grid_pm_index": clean.get("grid_pm_index", plausibility.get("grid_pm_index")),
@@ -4333,6 +4174,7 @@ def run_test(host, port, user, pw, aes_pw, cfg, loops=1, interval=2, write=False
     """
     run = 0
     fuse_reader = HouseFuseReader(cfg)
+    roles_reader = PmRolesReader(cfg)
     kwh_retter = KwhRetterState()
     external_pv_topology = ExternalPvTopologyEvidenceTracker()
     daemon_quiet = bool(write and loops == 0)
@@ -4375,7 +4217,7 @@ def run_test(host, port, user, pw, aes_pw, cfg, loops=1, interval=2, write=False
         errors = []
         acquisition_diagnostics = {"schema_version": "rscp_acquisition_v1", "mode": "legacy_per_cycle"}
         if persistent_session is not None:
-            sections = persistent_acquisition_sections(cfg, fuse_reader)
+            sections = persistent_acquisition_sections(cfg, fuse_reader, roles_reader)
             output_context = contextlib.redirect_stdout(io.StringIO()) if daemon_quiet else contextlib.nullcontext()
             with output_context:
                 data, errors, acquisition_diagnostics = persistent_session.acquire(sections)
@@ -4400,7 +4242,7 @@ def run_test(host, port, user, pw, aes_pw, cfg, loops=1, interval=2, write=False
                     print("[OK] Authentifiziert\n")
 
                 sections = [
-                    ("Power Snapshot",   lambda: get_power_snapshot(conn, cfg)),
+                    ("Power Snapshot",   lambda: get_power_snapshot(conn, cfg, roles_reader)),
                     ("EMS Anlagendata",  lambda: get_ems_config(conn, include_house_fuse=False)),
                     ("Hausabsicherung", lambda: fuse_reader.read(conn)),
                     ("DB-History (kWh)", lambda: get_db_history(conn)),
@@ -4409,6 +4251,7 @@ def run_test(host, port, user, pw, aes_pw, cfg, loops=1, interval=2, write=False
                     ("Wallbox",          lambda: get_wb(conn, cfg)),
                     ("Wärmepumpe (E3DC PM)", lambda: get_wp_pm(conn, cfg)),
                     ("System-Info",      lambda: get_system_info(conn)),
+                    ("PM-Rollen",        lambda: roles_reader.read(conn)),
                 ]
 
                 for name, fn in sections:
@@ -4460,39 +4303,47 @@ def run_test(host, port, user, pw, aes_pw, cfg, loops=1, interval=2, write=False
                   f"Verluste={loss_kwh:.3f}kWh ({loss_pct}%){rte_str}")
 
         # kWh-Retter ausführen
-        pv_p = data.get("PV_Power", 0)
+        pv_p = _finite_optional_float(data.get("PV_Power"))
         derate_lim = data.get("derate_at_power_w", 0)
         inv_lim = data.get("ac_power_limit_w", 0)
 
-        kwh_retter.add_sample(pv_p, derate_lim, inv_lim)
+        if pv_p is not None and data.get("PV_Power_Valid", True) is True:
+            kwh_retter.add_sample(pv_p, derate_lim, inv_lim)
         retter_stats = kwh_retter.get_stats()
         data.update(retter_stats)
 
         # Gebe die Retter-Stats noch im Print aus
-        if pv_p > 0 and not daemon_quiet:
+        if pv_p is not None and pv_p > 0 and not daemon_quiet:
             print(f"  -> kWh-Retter: Heute {retter_stats['saved_derating_today_kwh']:.2f} kWh (Abregelung) / {retter_stats['saved_inverter_today_kwh']:.2f} kWh (AC-Limit) gerettet")
 
         elapsed = time.monotonic() - t_start
 
-        # Sauberes JSON (interne _ Keys rausfiltern)
-        clean = {k: v for k, v in data.items() if not k.startswith("_")}
-        clean["_source"]  = "python_rscp"   # PHP prüft auf diesen Wert
-        clean["_ts"]      = int(time.time())
-        clean["_elapsed"] = round(elapsed, 3)
-        clean["RSCP_Acquisition"] = acquisition_diagnostics
-        # Letzter Stand des Zusatzwechselrichters (Block ext_inverter + flache ext_pv_*-Felder).
-        clean.update(ext_inverter_cycle_fields(ext_inverter_cfg, ext_inverter_poller))
-        if errors:
-            clean["_errors"] = errors
-
-        clean = apply_pv_zero_glitch_filter(clean)
-        clean = apply_power_plausibility(clean, errors, cfg)
-        clean = apply_grid_power_filtered(clean, cfg)
-        clean = apply_power_decision_stability(clean, cfg)
-        clean = sanitize_for_json(clean)
+        data.update(ext_inverter_cycle_fields(ext_inverter_cfg, ext_inverter_poller))
+        frame_now = time.time()
+        clean = build_live_frame(data, errors, cfg, now_s=frame_now, elapsed_s=elapsed,
+            acquisition=acquisition_diagnostics,
+            grid_state=_read_json_file(LIVE_GRID_POWER_FILTER_STATE_PATH),
+            decision_state=_read_json_file(LIVE_DECISION_STABILITY_PATH))
+        # Persistenz außerhalb des reinen Rahmen-Erzeugers.
+        if clean.get("RSCP_Sample_Valid"):
+            try:
+                if clean.get("Grid_Power_Filtered_Valid"):
+                    _atomic_write_json(LIVE_GRID_POWER_FILTER_STATE_PATH, {
+                        "schema_version": "grid_power_filter_state_v1", "ts": int(frame_now),
+                        "raw_w": clean["Grid_Power"], "filtered_w": clean["Grid_Power_Filtered"],
+                        "alpha": clean["Grid_Power_Filter"].get("alpha")})
+                stability = clean["Power_Decision_Stability"]
+                if any(row.get("valid") for row in stability["signals"].values()):
+                    _atomic_write_json(LIVE_DECISION_STABILITY_PATH, {
+                    "schema_version": "power_decision_stability_state_v1", "ts": int(frame_now),
+                    "signals": {key: {"raw_w": row.get("raw_w"), "ewma_w": row.get("ewma_w"),
+                        "decision_w": row.get("decision_w"), "valid": row.get("valid")}
+                        for key, row in stability["signals"].items() if row.get("valid")}})
+            except Exception as exc:
+                logger.warning("Diagnostischer Filterzustand konnte nicht gespeichert werden: %s", exc)
         try:
             topology = (
-                external_pv_topology.observe(clean, now_s=clean.get("_ts"))
+                external_pv_topology.observe(clean, now_s=frame_now)
                 if write
                 else {**read_external_pv_topology(external_pv_topology.state_path), "write_performed": False}
             )

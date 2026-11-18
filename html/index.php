@@ -74,6 +74,11 @@ if (isset($_POST['save_lux_global'])) {
         );
         exit;
     }
+    if (!empty($restart['restart_queued'])) {
+        echo '<script>window.alert(' . json_encode($restart['message'], JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT)
+            . ');window.location.href=' . json_encode('index.php?seite=config') . ';</script>';
+        exit;
+    }
     header("Location: index.php?seite=config");
     exit;
 }
@@ -1307,6 +1312,7 @@ $climateEnabled = cfgBool($dashCfg['climate_enable'] ?? '0', false);
 $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
 ?>
 <body class="frontend-<?= htmlspecialchars($frontendVariant ?? 'classic', ENT_QUOTES) ?> detail-<?= htmlspecialchars($frontendDetailMode ?? 'normal', ENT_QUOTES) ?>" data-frontend="<?= htmlspecialchars($frontendVariant ?? 'classic', ENT_QUOTES) ?>" data-detail-mode="<?= htmlspecialchars($frontendDetailMode ?? 'normal', ENT_QUOTES) ?>">
+    <?= e3dcHostPinNoticeHtml() ?>
     <nav class="navbar navbar-expand-lg bg-body-tertiary border-bottom border-secondary mb-3 py-1 e3dc-topbar">
         <div class="container-fluid px-3">
             <a class="navbar-brand e3dc-app-brand" href="index.php" title="Dashboard" aria-label="Dashboard">
@@ -4475,8 +4481,10 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                 const bestAmpPrecision = (rows) => rows.some(wb => wb.precision > 0 && wb.displaySetAmp > 0) ? 1 : 0;
                 const wbAmpRows = wbDetails.map(wb => {
                     const id = parseInt(wb.id, 10) || 0;
+                    const rawDisplaySetAmp = parseFloat(wb.display_set_amp);
                     const rawSetAmp = parseFloat(wb.current_set_amp);
-                    const setAmp = (!isNaN(rawSetAmp) && rawSetAmp > 0) ? rawSetAmp : (parseFloat(wb.target_amp || wb.amp || 0) || 0);
+                    const setAmp = (Number.isFinite(rawDisplaySetAmp) && rawDisplaySetAmp >= 0) ? rawDisplaySetAmp
+                        : ((!isNaN(rawSetAmp) && rawSetAmp > 0) ? rawSetAmp : (parseFloat(wb.target_amp || wb.amp || 0) || 0));
                     const rawCapAmp = parseFloat(wb.cap_amp);
                     const capAmp = (!isNaN(rawCapAmp) && rawCapAmp > 0) ? rawCapAmp : (parseFloat(wb.target_amp || wb.amp || 0) || 0);
                     const statusAmp = parseFloat(wb.status_amp || wb.amp || 0) || 0;

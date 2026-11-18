@@ -221,9 +221,9 @@ WEATHER_ALERT_TTL_S = 5 * 60
 ML_PREDICTION_MAX_AGE_S = 90 * 60
 SOLCAST_DEFAULT_CALLS_PER_DAY = 10
 SOLCAST_MIN_TTL_S = 60 * 60
-SOLCAST_CACHE_SCHEMA_VERSION = 3
+SOLCAST_CACHE_SCHEMA_VERSION = 4
 SOLCAST_SIGNATURE_SCHEMA = "solcast_sites_v3"
-MODEL_RESOURCE_SCHEMA = "neutral_fc_contributions_v1"
+MODEL_RESOURCE_SCHEMA = "neutral_fc_contributions_v2"
 PV_PHYSICAL_PEAK_MARGIN = 1.03
 PV_CLOUD_EDGE_PEAK_MARGIN = 1.15
 PV_DAILY_SANITY_HISTORY_DAYS = 730
@@ -932,6 +932,10 @@ def _mark_displayed_forecast_slots(slots):
         marked.append(slot)
     return marked
 
+class ForecastLocationUnreadable(ValueError):
+    """Nicht lesbare Standortdaten ohne Werte in der Fehlermeldung."""
+
+
 class EnsemblePVForecaster:
     def __init__(self, *, force_resource_refresh=False):
         # Ausschließlich der explizite Einmallauf darf einen bereits belegten
@@ -947,8 +951,11 @@ class EnsemblePVForecaster:
         self.pv_topology_explicit = has_explicit_topology_config(self.v4_config)
 
         # Favorisiere v4_config für Standortdaten
-        self.lat = float(self.v4_config.get('hoehe', self.config.get('hoehe', DEFAULT_LATITUDE)))
-        self.lon = float(self.v4_config.get('laenge', self.config.get('laenge', DEFAULT_LONGITUDE)))
+        try:
+            self.lat = float(self.v4_config.get('hoehe', self.config.get('hoehe', DEFAULT_LATITUDE)))
+            self.lon = float(self.v4_config.get('laenge', self.config.get('laenge', DEFAULT_LONGITUDE)))
+        except (TypeError, ValueError):
+            raise ForecastLocationUnreadable('Standort nicht lesbar') from None
         def configured_coordinate_present(source, key):
             return bool(
                 key in source
@@ -1649,44 +1656,51 @@ class EnsemblePVForecaster:
         return True, f"{model_id}_resource_cache_compatible"
 
     def _local_model_refresh_backoff_active(self, model_id: str, cached) -> bool:
-        """Verhindert API-Loops nach einem belegten Fehlversuch mit Totalfallback."""
+        """Wendet den vorhandenen Abrufabstand auch auf belegte Fehlversuche an."""
 
         import time as _t
 
-        if model_id not in {"m1", "m2"} or not isinstance(cached, dict):
+        if model_id not in {"m1", "m2", "m3"} or not isinstance(cached, dict):
             return False
-        if not isinstance(cached.get("data"), dict) or not cached.get("data"):
+        if model_id != "m3" and (not isinstance(cached.get("data"), dict) or not cached.get("data")):
             return False
-        current_revision = self._pv_topology_contract_or_unbound().get("revision")
+        current_revision = (getattr(self, "solcast_signature", "") if model_id == "m3"
+                            else self._pv_topology_contract_or_unbound().get("revision"))
+        attempt_schema = SOLCAST_CACHE_SCHEMA_VERSION if model_id == "m3" else MODEL_RESOURCE_SCHEMA
         if cached.get("resource_refresh_attempt_revision") != current_revision:
             return False
-        if cached.get("resource_refresh_attempt_schema") != MODEL_RESOURCE_SCHEMA:
+        if cached.get("resource_refresh_attempt_schema") != attempt_schema:
             return False
         try:
             age = _t.time() - float(cached.get("resource_refresh_attempt_ts"))
         except (TypeError, ValueError):
             return False
-        return 0.0 <= age < float(MODEL_TTL.get(model_id, 3600))
+        ttl = (getattr(self, "solcast_ttl_s", MODEL_TTL["m3"]) if model_id == "m3"
+               else MODEL_TTL.get(model_id, 3600))
+        return 0.0 <= age < float(ttl)
 
     def _mark_local_model_refresh_failure(self, model_id: str, reason: str):
-        """Behält die letzte erfolgreiche Lieferung samt Aufteilung und Abruf-Backoff."""
+        """Vermerkt Fehlversuche, ohne erfolgreiche Daten oder deren Zeitbasis umzudeuten."""
 
         import time as _t
 
-        if model_id not in {"m1", "m2"}:
+        if model_id not in {"m1", "m2", "m3"}:
             return
         cached = self._model_cache.get(model_id, {})
         if not isinstance(cached, dict):
-            return
+            cached = {}
         data = cached.get("data")
-        if not isinstance(data, dict) or not data:
+        if model_id != "m3" and (not isinstance(data, dict) or not data):
             return
         entry = dict(cached)
         entry["resource_refresh_attempt_ts"] = _t.time()
         entry["resource_refresh_attempt_revision"] = (
-            self._pv_topology_contract_or_unbound().get("revision")
+            getattr(self, "solcast_signature", "") if model_id == "m3"
+            else self._pv_topology_contract_or_unbound().get("revision")
         )
-        entry["resource_refresh_attempt_schema"] = MODEL_RESOURCE_SCHEMA
+        entry["resource_refresh_attempt_schema"] = (
+            SOLCAST_CACHE_SCHEMA_VERSION if model_id == "m3" else MODEL_RESOURCE_SCHEMA
+        )
         entry["resource_refresh_attempt_result"] = str(reason or "fetch_failed")
         self._model_cache[model_id] = entry
         self._save_model_cache()
@@ -1702,6 +1716,12 @@ class EnsemblePVForecaster:
                 return False
             if getattr(self, "solcast_mapping_blocked", False):
                 return True
+            # Der Fehlversuchsvermerk braucht keine vertrauenswürdigen Daten.
+            # Die Datenfreigabe bleibt ausschließlich beim gebundenen Cacheleser.
+            if self._local_model_refresh_backoff_active(model_id, cached):
+                if self._trusted_solcast_cache_entry() is not None:
+                    self.solcast_status = self._solcast_status("stale_complete_fallback")
+                return False
             cached = self._trusted_solcast_cache_entry()
             if cached is None:
                 logger.info("Modell m3: Kein vollständig gebundener Solcast-Cache; Abruf erforderlich.")
@@ -1712,6 +1732,8 @@ class EnsemblePVForecaster:
                 cached,
             )
             if not compatible:
+                # Alte Zeitbasen hält _get_model_data fern; die Abrufsperre nach
+                # einem Fehlversuch gilt deshalb auch bei altem Cache-Schema.
                 refresh_reason = resource_reason
         last_ts = cached.get('ts', 0)
         ttl = getattr(self, "solcast_ttl_s", MODEL_TTL.get(model_id, 3600)) if model_id == "m3" else MODEL_TTL.get(model_id, 3600)
@@ -1797,7 +1819,10 @@ class EnsemblePVForecaster:
         if model_id == "m3":
             cached = self._trusted_solcast_cache_entry()
             return dict(cached.get("data", {})) if cached else {}
-        return self._model_cache.get(model_id, {}).get('data', {})
+        cached = self._model_cache.get(model_id, {})
+        if cached.get("resource_schema") != MODEL_RESOURCE_SCHEMA:
+            return {}
+        return cached.get('data', {})
 
     def _pv_topology_contract_or_unbound(self):
         """Liefert den Vertrag ohne ihn an Fallback-Teilobjekten zu erfinden."""
@@ -1856,7 +1881,7 @@ class EnsemblePVForecaster:
         """Speichert Modell-Daten in den Cache."""
         import time as _t
         if data:  # Nur bei echten Daten cachen, nicht bei leeren Ergebnissen
-            entry = {'ts': _t.time(), 'data': data}
+            entry = {'ts': _t.time(), 'data': data, 'resource_schema': MODEL_RESOURCE_SCHEMA}
             diagnostic = getattr(self, '_diagnostic_entity_data', {}).get(model_id)
             if diagnostic is not None:
                 entry['diagnostic_entities'] = diagnostic
@@ -1866,7 +1891,6 @@ class EnsemblePVForecaster:
             )
             if resource_compatible:
                 entry["resource_data"] = resource_data
-                entry["resource_schema"] = MODEL_RESOURCE_SCHEMA
                 entry["topology_revision"] = self._pv_topology_contract_or_unbound().get("revision")
             elif model_id in {"m1", "m2"}:
                 entry["resource_refresh_attempt_ts"] = _t.time()
@@ -2284,6 +2308,26 @@ class EnsemblePVForecaster:
                 )
         raise RuntimeError("provider_transport_retry_exhausted")
 
+    @staticmethod
+    def _provider_local_timestamps(stamps, pattern):
+        """Löst Prozess-Ortszeit auf; Lücken und unbestimmbare Folds sind ungültig."""
+        paths = [()]
+        for stamp in stamps:
+            dt = datetime.strptime(stamp, pattern)
+            fields = (dt.year, dt.month, dt.day, dt.hour, dt.minute, dt.second)
+            candidates = set()
+            for is_dst in (-1, 0, 1):
+                value = int(time.mktime((*fields, -1, -1, is_dst)))
+                if time.localtime(value)[:6] == fields:
+                    candidates.add(value)
+            paths = [(*path, value) for path in paths for value in sorted(candidates)
+                     if not path or value > path[-1]]
+            if not paths:
+                raise ValueError("forecast_timestamp_invalid")
+        if len(paths) != 1:
+            raise ValueError("forecast_timestamp_invalid")
+        return paths[0]
+
     def fetch_model_1_forecast_solar(self):
         """Holt Prognose von Forecast.Solar (Standard in der PV Community)"""
         parsed_model_total = {}
@@ -2308,21 +2352,34 @@ class EnsemblePVForecaster:
                 with self._urlopen_with_bounded_transport_retry(url) as response:
                     data = json.loads(response.read().decode())
 
-                    # Format: {"result": {"watts": {"2024-10-10 08:00:00": 1500, ...}}}
-                    hourly_watts = data.get('result', {}).get('watts', {})
-
-                    for time_str, watts in hourly_watts.items():
-                        # Parse "YYYY-MM-DD HH:MM:SS" -> datetime object
-                        dt = datetime.strptime(time_str, "%Y-%m-%d %H:%M:%S")
-                        unix_h = int(dt.replace(minute=0, second=0).timestamp())
-                        # Speichere als kWh fuer diese Stunde (Key IMMER int!)
-                        kwh = float(watts) / 1000.0
+                    # Periodenenergie gehört vom vorigen Tagesstempel bis zum Endstempel.
+                    periods = data.get('result', {}).get('watt_hours_period')
+                    if not isinstance(periods, dict) or not periods:
+                        raise ValueError('forecast_period_missing')
+                    stamps = sorted(periods)
+                    values = []
+                    for stamp in stamps:
+                        value = periods[stamp]
+                        try:
+                            energy = float(value)
+                        except (TypeError, ValueError, OverflowError):
+                            raise ValueError('forecast_period_missing') from None
+                        if isinstance(value, bool) or not math.isfinite(energy) or energy < 0:
+                            raise ValueError('forecast_period_missing')
+                        values.append(energy / 1000.0)
+                    epochs = self._provider_local_timestamps(stamps, "%Y-%m-%d %H:%M:%S")
+                    surface_hours = {}
+                    for i in range(1, len(epochs)):
+                        start, end = epochs[i - 1], epochs[i]
+                        if datetime.fromtimestamp(start).date() != datetime.fromtimestamp(end).date():
+                            continue
+                        for unix_h in range(start // 3600 * 3600, end, 3600):
+                            seconds = min(end, unix_h + 3600) - max(start, unix_h)
+                            surface_hours[unix_h] = surface_hours.get(unix_h, 0.0) + values[i] * seconds / (end - start)
+                    for unix_h, kwh in surface_hours.items():
                         self._diagnostic_operation("m1", entity_archive.capture_value, entity, unix_h, kwh)
-                        if unix_h in parsed_model_total:
-                            parsed_model_total[unix_h] += kwh
-                        else:
-                            parsed_model_total[unix_h] = kwh
                         parsed_resource[unix_h] = parsed_resource.get(unix_h, 0.0) + kwh
+                        parsed_model_total[unix_h] = parsed_model_total.get(unix_h, 0.0) + kwh
                     successful_fetches += 1
             except Exception as e:
                 failure_classes.append(self._provider_failure_class(e))
@@ -2369,12 +2426,15 @@ class EnsemblePVForecaster:
             # Sued=0, West=90, Ost=-90
             om_azimuth = roof['azimuth']
 
+            # Open-Meteo stempelt das Stundenende. Die letzte Planstunde (Tag 3,
+            # 23-24 Uhr) trägt den Stempel 00:00 des Folgetags, deshalb fünf
+            # Kalendertage; den Horizont begrenzt der 96-h-Schnitt im Ensemble.
             url = (
                 f"https://api.open-meteo.com/v1/forecast"
                 f"?latitude={self.lat}&longitude={self.lon}"
                 f"&hourly=global_tilted_irradiance,temperature_2m,shortwave_radiation"
                 f"&tilt={roof['tilt']}&azimuth={om_azimuth}"
-                f"&timezone=Europe%2FBerlin&models=best_match,icon_d2,ecmwf_ifs025&forecast_days=4"
+                f"&timezone=Europe%2FBerlin&models=best_match,icon_d2,ecmwf_ifs025&forecast_days=5"
             )
             logger.info(f"Hole Model 2 Dach {idx+1} (Open-Meteo Ensemble)")
 
@@ -2398,9 +2458,9 @@ class EnsemblePVForecaster:
                     # Temp fuer ML (nur 1x pro Zeitslot noetig, egal welches Dach)
                     temp_2m = data['hourly'].get('temperature_2m_best_match', data['hourly'].get('temperature_2m', []))
 
-                    for i, time_str in enumerate(times):
-                        dt = datetime.strptime(time_str, "%Y-%m-%dT%H:%M")
-                        unix_h = int(dt.timestamp())
+                    epochs = self._provider_local_timestamps(times, "%Y-%m-%dT%H:%M")
+                    for i, stamp in enumerate(epochs):
+                        unix_h = stamp - 3600
 
                         # Kombiniere die Modelle zu einem internen Ensemble (50% ICON, 30% ECMWF, 20% Best)
                         # ICON-D2 reicht nur 48h weit
@@ -2428,9 +2488,10 @@ class EnsemblePVForecaster:
                             parsed_model_total[unix_h] = est_kwh
                         parsed_resource[unix_h] = parsed_resource.get(unix_h, 0.0) + est_kwh
 
-                        # Temperatur im ML Cache speichern
+                        # Wettervertrag unverändert bei t: Temperatur am Stempel,
+                        # radiation_wm2 als Mittel der Stunde bis t.
                         if idx == 0 and i < len(temp_2m) and temp_2m[i] is not None:
-                            weather_by_ts[unix_h] = {
+                            weather_by_ts[stamp] = {
                                 "temp_c": round(float(temp_2m[i]), 1),
                                 "radiation_wm2": round(float(blended_rad), 1)
                             }
@@ -2525,7 +2586,11 @@ class EnsemblePVForecaster:
                             raise ValueError("forecast_entry_invalid")
                         time_str = entry['period_end'].replace('Z', '+00:00')
                         dt = datetime.fromisoformat(time_str)
-                        unix_h = int(dt.replace(minute=0, second=0).timestamp())
+                        if (entry.get('period', 'PT30M') != 'PT30M'
+                                or dt.tzinfo is None or dt.utcoffset() is None
+                                or dt.minute not in (0, 30) or dt.second or dt.microsecond):
+                            raise ValueError('forecast_period_invalid')
+                        unix_h = (int(dt.timestamp()) - 1800) // 3600 * 3600
 
                         est_kw = float(entry['pv_estimate'])
                         if not math.isfinite(est_kw) or est_kw < 0.0:
@@ -2606,6 +2671,7 @@ class EnsemblePVForecaster:
         if self.solcast_status.get("state") == "complete_fresh":
             self._set_model_data("m3", fresh)
             return fresh
+        self._mark_local_model_refresh_failure("m3", "fetch_failed")
         if stale_complete:
             refresh_status = dict(self.solcast_status)
             self.solcast_status = self._solcast_status(
@@ -4376,6 +4442,9 @@ def _refresh_weather_alerts_only():
         app = EnsemblePVForecaster()
         app.update_weather_alerts()
         return True
+    except ForecastLocationUnreadable:
+        logger.warning("Standort nicht lesbar")
+        return False
     except Exception as exc:
         logger.warning("Wetterwarnungen konnten nicht separat aktualisiert werden: %s", exc)
         return False
@@ -4401,6 +4470,8 @@ if __name__ == "__main__":
             )
             app.generate_ensemble()
             _run_ml_predict_if_ready(force=_once)
+        except ForecastLocationUnreadable:
+            logger.warning("Standort nicht lesbar")
         except Exception as e:
             logger.error(f"Unerwarteter Fehler im Forecast-Loop: {e}", exc_info=True)
 

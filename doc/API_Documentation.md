@@ -81,6 +81,17 @@ Bei nativer Wallboxregelung sind fehlende, ungültige oder veraltete Messwerte `
 ---
 
 ### 2.2. Prognose- und Strompreis-Schnittstelle (`get_forecast_data.php`)
+
+E3DC-Control liefert hier den vollständigen `market_plan` einschließlich
+`contracts`, `forecast` mit Halteplan und `active_contract.forecast`.
+Im häufigen Liveabruf über `get_live_json.php` fehlen diese Reihen;
+dort bleiben Status, Bindung, Zeitstempel und die Kurzform erhalten.
+Die Slotreihe `heat_price_boost_forecast.slots` entfällt im Liveabruf.
+Die Wärmedienste lesen ihre Prognose direkt aus `storage_plan.json`.
+Bei `market_soc_trajectory.slots` liefert der Liveabruf nur
+Zeitgrenzen, Ladestandsverlauf, Aktion und Herkunft; der Prognoseabruf
+enthält die vollständigen Slotfelder.
+
 Liefert die PV-Ertragsprognosen der nächsten Tage (Forecast.Solar, Open-Meteo, Solcast) sowie den EPEX/Awattar-Strompreisverlauf für die Lade- und Heizplanung.
 
 *   **URL:** `https://dein-tunnel.de/get_forecast_data.php`
@@ -108,5 +119,7 @@ Liefert aggregierte historische Energiewerte zur Visualisierung des Tages- oder 
 Moderne Web-App-Frameworks (React, Vue, Angular) senden vor einer HTTP-Anfrage mit Custom-Headern eine `OPTIONS`-Preflight-Anfrage (CORS). 
 
 Deine API beantwortet solche `OPTIONS`-Anfragen mit HTTP `403` und gibt keine CORS-Freigabe zurück. Browser-Apps, die von einer anderen Adresse (fremdem Origin) aus auf die API zugreifen, werden damit bewusst abgewiesen. Die Web-PIN ist keine Freigabeliste für fremde Webseiten.
+
+Ohne Web-PIN sind IP-Adressen, einteilige Namen, der eigene Hostname und Namen unter `.local`, `.lan`, `.home`, `.internal`, `.home.arpa`, `.localdomain`, `.fritz.box` und `.ts.net` erreichbar. Andere Hostnamen erhalten HTTP `421` mit einem Hinweis: Über die IP-Adresse oder einen lokalen Namen den Config-Editor öffnen und eine Web-PIN setzen. Mit gesetzter Web-PIN bleibt der bisherige Zugriff einschließlich `X-API-PIN` unverändert.
 
 Widgets, Apps, Home-Assistant-REST-Sensoren und Skripte, die ihre Anfrage selbst senden, sind davon nicht betroffen: Sie senden keinen Preflight und authentifizieren sich wie in Abschnitt 1 beschrieben.

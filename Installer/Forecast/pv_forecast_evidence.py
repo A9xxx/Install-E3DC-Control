@@ -1639,7 +1639,7 @@ def _evidence_continuity(
         merged_into_current_metrics=bool(connected),
         merged_method_revisions=connected,
         merged_topology_revision=current_topology if connected else None,
-        method_family_revision=FORECAST_METHOD_REVISION if connected else None,
+        method_family_revision=family[0] if connected else None,
         equivalence_proof_revision=EQUIVALENCE_PROOF_REVISION if connected else None,
         current_method_since_utc_s=connection.execute(
             """SELECT MIN(producer_issued_at_utc_s) FROM forecast_issue_contracts
@@ -1829,7 +1829,7 @@ def _sanitized_evidence_continuity(
         "merged_into_current_metrics": merged,
         "merged_method_revisions": raw["merged_method_revisions"] if merged else [],
         "merged_topology_revision": topology_revision if merged else None,
-        "method_family_revision": FORECAST_METHOD_REVISION if merged else None,
+        "method_family_revision": evaluation_method_revisions(current_method)[0] if merged else None,
         "equivalence_proof_revision": EQUIVALENCE_PROOF_REVISION if merged else None,
         "current_method_since_utc_s": _nonnegative_int(raw.get("current_method_since_utc_s")),
         "previous_report": previous_report,

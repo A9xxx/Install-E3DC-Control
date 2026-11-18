@@ -146,3 +146,23 @@ Der Modus wird anhand der **10-Minuten-Mitteltemperatur** aus `waermepumpe.json`
 
 ### Falsche Werte?
 Stelle sicher, dass in der IDM-Regelung Modbus TCP aktiviert ist und die Liste der Standard-Register (Navigator 2.0) verwendet wird.
+
+### Automatik ausschalten
+
+E3DC-Control beendet den Auftrag sofort. Ein belegter laufender Verdichter behält
+seine allgemeine Mindestlaufzeit, auch nach einem Pre-Dump-Auftrag. Die Restfrist
+kann durch eine Verringerung der Mindestlaufzeit kürzer werden. Eine Erhöhung,
+ein erneutes Aus oder ein Dienstneustart verlängert sie nicht.
+
+Danach nimmt E3DC-Control ausschließlich seinen eigenen bestätigten positiven
+PV-Überschusswert in Register 74 über den vorhandenen Schreibweg auf 0 kW zurück.
+Die bestehende Schreibquittierung bleibt maßgeblich. Bei unbestätigtem Schreiben
+zeigt der Export `null` mit dem Grund `write_unconfirmed`.
+
+Je Ausgang erfolgen höchstens drei Rücknahmeversuche mit mindestens 60 Sekunden
+Abstand. Bleibt die Rücknahme unbestätigt oder ist sie 900 Sekunden nicht
+ausführbar, erscheint einmal eine Warnung. Für die flüchtige PV-Vorgabe in Register 74
+folgt anschließend höchstens alle 15 Minuten ein leiser weiterer Versuch, bis die
+Rücknahme bestätigt ist oder eine neue eigene Freigabe die Episode ersetzt.
+Beim administrativen Dienstende gibt E3DC-Control keine Gerätebefehle aus,
+auch nicht auf Register 74 oder 1710–1712. Ein Dienstende ist kein Nutzer-Aus.

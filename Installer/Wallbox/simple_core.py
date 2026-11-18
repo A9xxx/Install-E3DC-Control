@@ -37,6 +37,9 @@ def support_authorized(snapshot):
     """Speicher-Veto vor Kurvenklasse; keine Freigabe aus fehlendem SoC."""
     if snapshot.get("battery_support_authorized") is False:
         return False
+    if snapshot.get("predump_active") is True:
+        return (snapshot.get("battery_support_authorized") is True
+                and snapshot.get("soc_valid") is True and snapshot.get("floor_open") is True)
     mode = snapshot.get("mode")
     curve = snapshot.get("curve_support") or {}
     if mode in (4, 5, 12):
@@ -60,7 +63,7 @@ def energy_source(snapshot):
         return None
     if snapshot.get("local_grid_allowed") is True:
         return "grid"
-    if (snapshot.get("mode") in (4, 5, 12)
+    if ((snapshot.get("mode") in (4, 5, 12) or snapshot.get("predump_active") is True)
             and snapshot.get("soc_valid") is True
             and snapshot.get("floor_open") is True
             and snapshot.get("battery_support_authorized") is True):
@@ -398,7 +401,8 @@ def decide(snapshot, state, now, previous_snapshot=None):
         return result(reason="no_vehicle", sentence="Kein Fahrzeug verbunden")
     if data_invalid:
         phase_missing = s.get("house_phase_source") == "phases_missing"
-        phase_sentence = "Keine Phasenwerte vom E3DC-Leistungsmesser – Zuordnung des Wurzelzählers prüfen"
+        phase_sentence = ("Keine Phasenwerte vom E3DC-Leistungsmesser – Quelle: " + str(s.get("grid_pm_source") or "unbekannt")
+                          + ". Im Config-Editor die Zuordnung unter „Wurzelzähler / PM-Index“ prüfen. Eine Änderung wirkt nach einem Neustart des Live-Dienstes.")
         state.pop("rest_since", None)
         state.pop("start_since", None)
         state.pop("phase_since", None)
@@ -460,6 +464,15 @@ def decide(snapshot, state, now, previous_snapshot=None):
             state.pop("under_since", None)
         # Ein neuer Start benötigt die vorhandenen 60 s Budgetqualifizierung;
         # eine zusätzliche Wiederanlaufsperre entfällt.
+    # Kurze Fahrzeugpausen gehören zur selben Ladeepisode.
+    # Ein ausstehender Stopp eröffnet keine neue Mindestladezeit.
+    if (s.get("charging") is True and not state.get("stop_acknowledged")
+            and not state.get("stop_reason")):
+        state.setdefault("charge_seen_ts", now)
+    # Eine Fahrzeugpause unterbricht eine laufende Unterdeckung nicht; ohne aktive
+    # Ladung bleibt die Uhr unberührt (der Stopp setzt eine aktive Ladung voraus).
+    under_age = _since(state, "under_since", now, share < need or (
+        s.get("charging") is not True and number(state.get("under_since")) is not None)) if active else 0.0
     if active:
         # Die bestehenden Schutz- und Sequenzpfade bleiben vor der Phasenwahl.
         if s.get("phase_in_progress") is True:
@@ -467,6 +480,11 @@ def decide(snapshot, state, now, previous_snapshot=None):
         if s.get("charging") is True:
             state.pop("phase_resume_pending", None)
             state.pop("phase_resume_target", None)
+    started = number(state.get("charge_seen_ts"))
+    if started is None:
+        started = number(state.get("last_start_ts"))
+    stop_due = (active and share < need and under_age >= 180 and started is not None
+        and now-started >= minimum_time and not phase_hold)
     if not active:
         qualified = _since(state, "start_since", now, share >= target_need
             and (ceiling >= minimum or target_phases != phases)
@@ -480,7 +498,10 @@ def decide(snapshot, state, now, previous_snapshot=None):
         # Reservierung ab der ersten Qualifizierungsprobe, keine zweite Uhr.
         state["reserve_phases"] = phase_target
         if (qualified >= 60 if not active else age >= 60) and s.get("phase_ready") is True and (phase_target == 1 or s.get("phase_grant") is True):
-            return result("set_phases", minimum, "phase_qualified", "Phasenwechsel qualifiziert", "charging", phase_target)
+            # Der vollständig qualifizierte, erneut angebotene Phasenwunsch
+            # verdrängt den bereits fälligen Unterdeckungsstopp nicht.
+            return (stop("simple_core_stop", False) if stop_due else
+                result("set_phases", minimum, "phase_qualified", "Phasenwechsel qualifiziert", "charging", phase_target))
     else:
         state.pop("phase_since", None)
         state.pop("phase_target", None)
@@ -495,18 +516,7 @@ def decide(snapshot, state, now, previous_snapshot=None):
         return result("start", min(ceiling, max(minimum, _floor(share/watts_per_amp, step))),
                       "start_qualified", "Start mit Netzfreigabe" if s.get("source") == "grid" else "Start nach 60 s Budgetfreigabe", "start_wait")
 
-    # Kurze Fahrzeugpausen gehören zur selben Ladeepisode.
-    # Ein ausstehender Stopp eröffnet keine neue Mindestladezeit.
-    if (s.get("charging") is True and not state.get("stop_acknowledged")
-            and not state.get("stop_reason")):
-        state.setdefault("charge_seen_ts", now)
-    # Eine Fahrzeugpause unterbricht eine laufende Unterdeckung nicht.
-    under_age = _since(state, "under_since", now, share < need or (
-        s.get("charging") is not True and number(state.get("under_since")) is not None))
     if share < need:
-        started = number(state.get("charge_seen_ts"))
-        if started is None:
-            started = number(state.get("last_start_ts"))
         if (under_age >= 60 and phases == 3 and target_phases == 1
                 and s.get("phase_capable") is True and s.get("phase_ready") is True
                 and not invalid and share >= one_phase_need):
@@ -514,7 +524,7 @@ def decide(snapshot, state, now, previous_snapshot=None):
             # Das Phasenziel stammt weiterhin aus der gemeinsamen Verteilung.
             state["phase_target"] = state["reserve_phases"] = 1
             return result("set_phases", minimum, "phase_qualified", "Phasenwechsel qualifiziert", "charging", 1)
-        if under_age >= 180 and started is not None and now-started >= minimum_time and not phase_hold:
+        if stop_due:
             return stop("simple_core_stop", False)
         target = minimum
         state_name = "hold" if support or phase_hold else "stop_wait"
@@ -523,7 +533,10 @@ def decide(snapshot, state, now, previous_snapshot=None):
             else "Mindesthaltezeit nach Phasenwechsel: Mindeststrom halten" if phase_hold
             else "Mindeststrom bis zum qualifizierten Abstieg oder Unterdeckungsstopp halten")
     else:
-        target = min(ceiling, max(minimum, _floor(share/watts_per_amp, step)))
+        # Der gemeinsame Haltezonenrahmen wird auf ganze Ampere abgerundet;
+        # elektrische Deckel und Gerätegrenzen bleiben unverändert vorrangig.
+        target = min(ceiling, max(minimum, _floor(share/watts_per_amp,
+            max(1.0, step) if s.get("battery_support_reason") == "wbminsoc_hold_zone" else step)))
         state_name, reason = "charging", "budget"
         sentence = "Budget %.0f W → %g A (%dp)" % (share, target, phases)
 

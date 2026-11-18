@@ -43,7 +43,7 @@ Das Altgerät regelt in diesem Abschnitt weiter.
    id
    ```
    Auf dem neuen Gerät dieselbe Version installieren.
-2. **Web-PIN setzen.** Der „Raw Download“ der Konfiguration ist nur mit gesetzter Web-PIN verfügbar; ohne PIN zeigt die Karte „Raw Download gesperrt“. Die PIN gilt nach dem Import auch auf dem neuen Gerät.
+2. **Web-PIN setzen.** Der „Raw Download“ der Konfiguration ist nur mit gesetzter Web-PIN verfügbar; ohne PIN zeigt die Karte „Raw Download gesperrt“. Die PIN gilt nach dem Import auch auf dem neuen Gerät. Ihr gespeicherter Wert erscheint nicht im Editor; leer lassen erhält ihn.
 3. **Ladepunkte notieren.** Auf der Seite „Wallbox“ je Ladepunkt Modus, Pause, Ladepunktsperre und Not-Aus notieren. Laufende Ladungen beenden und alle Fahrzeuge abstecken. Sie bleiben abgesteckt, bis auf dem neuen Gerät Pause, Sperre und Not-Aus wieder wie notiert stehen (A8).
 4. **Vollbackup als Rückweg anlegen:** `bash "$E3DC_INSTALL_PATH/e3dc-setup"` → „6) Backup erstellen / verwalten“ → „1 = Vollständiges Backup erstellen“. Das Backup bleibt auf dem Altgerät.
 5. **Kennzahlen notieren** (als Installationsbenutzer):
@@ -55,7 +55,7 @@ Das Altgerät regelt in diesem Abschnitt weiter.
    PY
    ls /var/www/html/data/history_backups | wc -l
    ```
-6. **Konfiguration herunterladen:** Config-Editor → „System-Werkzeuge“ → „Konfigurationssicherung“ → „Raw Download“. Die Datei nur auf einem privaten Datenträger ablegen. „Einstellungen ohne Zugangsdaten“ eignet sich nicht für den Umzug.
+6. **Konfiguration herunterladen:** Config-Editor → „System-Werkzeuge“ → „Konfigurationssicherung“ → „Raw Download“ und die Bestätigung annehmen. Die Datei nur auf einem privaten Datenträger ablegen. „Einstellungen ohne Zugangsdaten“ eignet sich nicht für den Umzug.
 
 ## A2. Neues Gerät installieren
 

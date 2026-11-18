@@ -26,6 +26,24 @@ bestätigte Erzeugung ausgegeben.
 Eine Prognosequelle gilt als veraltet, wenn ihre letzte erfolgreiche Lieferung älter ist als zwei planmäßige Abrufabstände; ein einzelner fehlgeschlagener Abruf wird so überbrückt (Forecast.Solar und Open-Meteo tagsüber nach 2 h, nachts nach 4 h, Solcast nach dem doppelten Abrufabstand aus seinem Tageskontingent).
 Fällt eine Quelle aus oder ist sie veraltet, rechnet E3DC-Control mit den übrigen frischen Quellen weiter; ohne frische Quelle gilt die Prognose als veraltet.
 
+Bei nicht lesbaren Standortangaben erstellt E3DC-Control keine neue Prognose
+mit Ersatzkoordinaten; das Protokoll nennt ausschließlich „Standort nicht lesbar“.
+Vollständig fehlende Standortangaben sind davon zu unterscheiden: Für sie
+verwendet E3DC-Control weiterhin die neutralen Vorgaben.
+
+## Zeitbasis der Anbieterprognosen
+
+Die Werte von Forecast.Solar, Open-Meteo und Solcast gelten für die Stunde,
+in der die Energie erzeugt wird. Ladekurve, Netzladeplan und Verbraucherplanung
+verwenden diese Zeitlage. Forecast.Solar wird aus der gemeldeten Energie je
+Zeitraum berechnet, nicht aus Augenblickswerten; dadurch kann sich die
+Tagessumme leicht ändern.
+
+Nach dem Update auf diese Zeitbasis verwirft E3DC-Control einmalig die alten
+zwischengespeicherten Anbieterwerte. Bei Solcast benötigt das je eingetragener
+Site einen Abruf aus dem Tageskontingent. Die Prognosediagnose bewertet die
+neue Zeitlage getrennt von der bisherigen.
+
 ## PV-Flächen und Wechselrichtergruppen
 
 Im Config-Editor „Erweiterte Ansicht“ → „Standort & PV-Prognose“ →

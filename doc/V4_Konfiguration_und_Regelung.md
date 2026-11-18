@@ -130,6 +130,19 @@ Slots, frische Quellen, der erforderliche Energiehorizont und der lückenlose
 Preisvergleich für die gewählte Aktion bleiben Voraussetzung. Interne
 Preislücken werden nicht durch angenommene Preise geschlossen.
 
+E3DC-Control berechnet laufende und künftige günstige Fenster nach derselben
+Bedarfsregel. Ein Fenster lädt den Bedarf bis zur nächsten bekannten, innerhalb
+der eingestellten Preistoleranz mindestens so günstigen Lademöglichkeit. Die
+Ladefähigkeit des späteren Fensters zählt mit Leistung im festen Anschlussrahmen
+abzüglich Ampere-Reserve, verfügbarer Dauer, Wirkungsgrad und freiem Speicherraum.
+Einen verbleibenden Bedarf übernimmt das frühere Fenster. Feste Zeittarife zählen
+innerhalb des Planhorizonts, Börsenpreise nur bis zum Ende der veröffentlichten
+Preisdaten. Neue Preise und Prognosen führen ebenso wie der regelmäßige Planlauf
+zu einer neuen Lagebeurteilung. Jedes Fenster muss weiterhin die eingestellte
+Wirtschaftlichkeit und Mindestmenge erfüllen; ein später entfallendes Fenster
+kann zusätzlichen Netzbezug verursachen. Die momentane Phasenlast begrenzt die
+tatsächliche Ladung, nicht die vorausberechnete Ladefähigkeit.
+
 Das Ladeprofil bestimmt die Menge: Wirtschaftlich berücksichtigt Bedarf,
 PV-Prognose und Mindestmarge, Ausgeglichen den Bedarf ohne Margenaufschlag.
 Komfort lädt im günstigen Preisfenster bis zum eingestellten Ziel, auch wenn
@@ -137,6 +150,28 @@ am Folgetag viel PV erwartet wird. Eigene Einstellungen verwenden die
 gespeicherten Profilwerte. Haus und enthaltene Verbraucher zählen genau einmal.
 Der Hausanschluss geht vor; im gemeinsamen Rahmen erhält der Hausspeicher
 seine Ladeleistung vor den Fahrzeugen.
+
+E3DC-Control löst die eigene gemessene Akkuleistung und frisch gemessene,
+selbst geregelte Fahrzeuganteile jeweils einmal aus den Phasenwerten des
+E3DC-Leistungsmessers. Die höchste verbleibende Grundlastphase bestimmt den
+gemeinsamen Netzladerahmen; der ausführbare Akkuauftrag erhält Vorrang vor den Fahrzeugen.
+Für einen dreiphasigen Speicher gilt je Phase
+`Grundlast in W = Phasenleistung in W − Akkuleistung in W / 3 − geregelter Fahrzeuganteil dieser Phase in W`.
+Der Rahmen beträgt `max(0, 3 × (230 V × (Hausanschluss − Reserve) − max(0, höchste Grundlast in W)))`.
+Nur wenn die gemeldete maximale AC-Phasenzahl des PVI gültig und gleich 1 ist,
+gilt dieselbe Rechnung mit dem Faktor 1 und der gesamten Akkuleistung statt einem Drittel je Phase. Fehlt die Phasenzahl oder ist sie ungültig,
+bleibt die dreiphasige Rechnung bestehen. Für einphasige Speicher ohne gültig
+gemeldete Phasenzahl ist die dreiphasige Rechnung kein Nachweis eines passenden
+Netzladerahmens. Die Live-Daten nennen Wert, Gültigkeit
+und Quelle; ein unbekannter Wert wird nicht durch eine Phasenzahl ersetzt.
+Enthaltene Verbraucher werden nicht zusätzlich abgezogen. Ohne vollständige,
+gültige und höchstens zehn Sekunden alte Phasenwerte beginnt kein Netzladen.
+Bei ungültiger Akku- oder Netzleistung geht ein laufender Marktauftrag in AUTO,
+PV lädt frei und die Entladung bleibt gesperrt. Im ersten gültigen Takt darf der
+gebundene Auftrag wieder Netzladen; die Modusuhr wird durch den Datenstopp nicht
+neu gestartet. Die Neuberechnung erfolgt im Managertakt. Ein Lastsprung darf bis
+zum nächsten Takt plus Messfrist und Gerätewirkzeit überschreiten; der schnelle
+Phasenschutz der Wallboxen bleibt bestehen.
 
 Die Linie „SoC-Prognose mit Marktplan“ stellt ein nachgewiesenes späteres
 Nachladen mit der gesamten Akkuladeleistung einschließlich PV und dem Ziel dar.
@@ -186,7 +221,9 @@ Ein neuer Plan beginnt beim dann gemessenen SoC.
   Ist ein externer AC-Wechselrichter nicht eingetragen und läuft er im Inselbetrieb nicht,
   kann die Gesamtprognose die morgendliche Deckung rechnerisch zu früh anzeigen.
   Freigabe nach prognostizierter Übernahme verlangt zusätzlich 120 s lückenlose
-  gemessene PV-Deckung des Hauses. Ein Wh-Puffer aus 1 % Kapazitätsauflösung
+  gemessene PV-Deckung des Hauses und der angenommenen Ersatzlast: Die PV muss
+  mindestens den größeren dieser beiden Werte decken. Beide Messwerte müssen gültig
+  sein; 0 W Hausverbrauch bei 0 W PV bestätigt keine Übernahme. Ein Wh-Puffer aus 1 % Kapazitätsauflösung
   und 35 s maximaler Entladung sowie ein eigener Wh-Abstand beruhigen Übergänge.
   Diese Reaktionszeit ist eine konservative Regelannahme, kein Feldnachweis.
   Der bestehende Speicherregler begrenzt flüchtig die Entladung und erhält den
@@ -332,14 +369,20 @@ Ein neuer Plan beginnt beim dann gemessenen SoC.
      der Haltezone nicht in den freien Automatikbetrieb. Oberhalb der Haltezone darf der
      Speicher die Wallbox bei Akku-Bezug unabhängig von der Kurvenlage bis
      `wbminsoc` stützen. In der Haltezone direkt über `wbminsoc` bekommt die
-     Wallbox nur den batterieneutralen PV-Rahmen (Akkustützung, Punkt 5).
+     Wallbox den batterieneutralen PV-Rahmen ohne erneuten Abzug des
+     Speicher-Ladebedarfs (Akkustützung, Punkt 5). Der veröffentlichte PV-Anteil
+     ist dieser Rahmen; im Band gibt es keinen vorrangigen Kurvenbedarf.
+     Die Wallbox folgt im bestehenden 10-s-Takt. Der Akku deckt Übergänge und
+     bei Unterdeckung bis zum bestehenden Unterdeckungsstopp; die Haltezone
+     setzt keine eigene Entladekappe und führt kein Wh-Konto.
      Unterhalb von `wbminsoc` verhält sich der Modus wie `PV-Kurve ruhig`; an
      der Untergrenze senkt beziehungsweise stoppt der Wallbox Manager die
      Ladung. Bei Akkustützung bleibt die Ladegrenze der Ladekurve auch bei
      ausgeschalteter zentraler PV-Aufteilung erhalten; nur die Entladeseite
      wird im zulässigen Rahmen freigegeben. Nötige Ladung zur Vermeidung von
      Abregelung hat weiterhin Vorrang. Eine geregelte Wallbox wird zuerst
-     abgesenkt, und das Akku-Wh-Konto (Akkustützung, Punkt 4) schaltet sie bei
+     abgesenkt, und unterhalb der Untergrenze schaltet das Akku-Wh-Konto
+     (Akkustützung, Punkt 4) sie bei
      Überschreiten seines Budgets ab. Die Notstromreserve bleibt vorrangig.
 
 ### Zentrale PV-Aufteilung Akku/Wallbox (experimentell)
@@ -451,9 +494,11 @@ Datenwächter behalten Vorrang.
 ### Akkustützung der Wallbox in `PV-Kurve ruhig` nach Korridorlage
 
 1. **Grundsatz.** In `PV-Kurve ruhig` lädt die Wallbox aus PV-Überschuss. Der
-   Hausspeicher ist keine Ladequelle für das Fahrzeug. Er darf die Wallbox nur
-   im Rahmen eines kleinen, benannten Wolken-Kontingents stützen; ob und wie
-   viel, entscheidet die Speicher-Ladekurve, nicht ein fester SoC-Wert.
+   Hausspeicher ist keine Ladequelle für das Fahrzeug und gibt der Wallbox
+   keine Akkuquelle für Anhebungen. Ob und wie viel er Wolken überbrückt,
+   entscheidet die Speicher-Ladekurve, nicht ein fester SoC-Wert; nur
+   unterhalb des Kurvenkorridors begrenzt E3DC-Control diese Stützung durch
+   das Wolkenkontingent (Punkt 4).
    Akkuladen des Fahrzeugs bis zu einer Untergrenze gibt es ausschließlich in
    `PV + Akku bis Untergrenze` (Untergrenze `wbminsoc`). Auch bei dieser
    Akkustützung bleibt die Ladegrenze der Ladekurve bestehen; freigegeben
@@ -468,8 +513,9 @@ Datenwächter behalten Vorrang.
    dieser Ladeanspruch 0 W. Keine Momentanbilanz der Akkuleistung vergrößert
    den PV-Anteil. Eine PV-Box erhält nur den verbleibenden PV-Anteil nach
    den Akkuboxen. Die Korridorlage gibt ihr keine Akkuquelle für Anhebungen.
-4. **Kurzes Halten.** Das vorhandene Wolken-Kontingent
-   `wb_curve_floor_support_wh` beträgt automatisch 0,5 % der Kapazität,
+4. **Kurzes Halten.** Das Wolken-Kontingent gilt nur in der PV-Kurve unter dem
+   Korridor. Es heißt
+   `wb_curve_floor_support_wh` und beträgt automatisch 0,5 % der Kapazität,
    mindestens 50 Wh; ein Handwert gilt absolut, ebenfalls mindestens 50 Wh.
    Es zählt nur den tatsächlich aus dem Akku gestützten Anteil der PV-Boxen.
    Die Akkuquelle einer anderen Box hebt die Kontingentgrenze nicht auf.
@@ -496,7 +542,8 @@ Datenwächter behalten Vorrang.
    darunter nur den PV-Anteil. „Grundladung stabil“ hält Mindeststrom nur,
    solange seine bestehende Grundladungsbedingung gilt. Keine fehlende
    SoC-Messung öffnet eine Akkuquelle.
-6. **Ein Entscheider.** Ob und wie viel Stützung erlaubt ist, entscheidet der
+6. **Ein Entscheider.** Der Haltezonenvertrag führt keine Brücke. Ob und wie viel
+   Stützung erlaubt ist, entscheidet der
    Storage Manager je Zyklus auf Basis des Wallbox-Intents. Der Wallbox-Intent
    meldet die Kurvenklasse der Wallbox (`battery_support_authorized`,
    `battery_support_reason` mit den Werten `curve_above_target`,
@@ -713,14 +760,14 @@ Datenwächter behalten Vorrang.
   begrenzen. Bei fehlendem oder veraltetem Beleg und bei Vorrang der
   Lastspitzenkappung wirkt der SoC-Schutz sofort.
   
-  Nutzer-Aus nimmt auch Tarif-Aufträge zurück. Bei Luxtronik-Direktanbindung
-  behält ein laufender Verdichter für Warmwasser und Heizung seine Mindestlaufzeit,
-  auch nach dem durch „AUTO AUS“ ausgelösten Dienstneustart. Fehlt der aktuelle
+  Nutzer-Aus beendet manuelle Aufträge, Preis-, Pre-Dump-, PV- und Tarif-Aufträge sofort. Bei allen gesteuerten WP-Ausgängen
+  behält ein passend belegter laufender Verdichter für Warmwasser und Heizung seine allgemeine Mindestlaufzeit.
+  „AUTO AUS“ wird ohne Dienstneustart im laufenden Dienst eingelesen. Fehlt der aktuelle
   Gerätestatus oder die Verdichterbeobachtung, bleibt der Mindestlaufhalt für
-  PV- und Tarif-Aufträge höchstens 60 Sekunden ab der letzten gültigen Beobachtung
+  eigene positive Aufträge höchstens 60 Sekunden ab der letzten gültigen Beobachtung
   bestehen. Wiederholte Abfragen verlängern die Frist nicht; eine neue gültige Probe
   erneuert den Beleg. Danach wird der Auftrag zurückgenommen. Gerätefehler,
-  EVU-Sperre, Inselbetrieb, Hausanschlussgrenze und Uhrfehler wirken weiterhin sofort.
+  EVU-Sperre, Inselbetrieb, Hausanschlussgrenze, eine zu kalte Wärmequelle und Uhrfehler wirken weiterhin sofort.
   Es gelten die
   gerätespezifischen elektrischen Leistungsprofile, keine erfundenen
   Solltemperaturen.
@@ -776,7 +823,7 @@ Aktueller Stand:
 - Pre-Dump kann freigegebene Verbraucher über ein gemeinsames Budget nutzen,
 - Wärmepumpenleistung wird als eigener Verbraucher geführt und nicht doppelt im
   Hausverbrauch gezählt,
-- der Manager führt die Kurve weich über `iFc`, Kontroll-SoC und geglätteten
+- der Manager führt die Kurve weich über `iFc`, gemeldeten SoC und geglätteten
   Aufholbedarf,
 - abends wird nicht mehr zwanghaft auf die Kurve entladen, weil das Haus den
   Speicher ohnehin natürlich nutzt.
@@ -808,9 +855,9 @@ Hysterese. Die sichtbaren Nutzer-Modi sind bewusst klein gehalten:
 | UI-Modus | Bedeutung |
 |---|---|
 | `Beobachten` (intern `Aus`) | E3DC-Control beobachtet, die Wallbox bzw. der E3DC regelt selbst. Beim bewussten Wechsel und beim Fortsetzen einer Pause in diesem Modus wird einmalig die Grundeinstellung freigegeben. Pause und Not-Aus stoppen weiterhin sofort. Geplantes Netzladen bleibt gesperrt. |
-| `PV-Kurve ruhig` | Laden aus PV-Überschuss entlang der Speicher-Ladekurve mit Hysterese; über oder im Kurvenkorridor stützt der Hausspeicher nur im Rahmen des Wolken-Kontingents. Unter dem Korridor erhält die Wallbox bei ausgeschalteter zentraler PV-Aufteilung den reinen PV-Überschuss. Mit experimenteller zentraler PV-Aufteilung wird der Kurvenbedarf zuerst vom absoluten Wallboxrahmen abgezogen (Abschnitt „Akkustützung der Wallbox in `PV-Kurve ruhig` nach Korridorlage“). |
+| `PV-Kurve ruhig` | E3DC-Control lädt aus PV-Überschuss entlang der Speicher-Ladekurve mit Hysterese. Das Wolkenkontingent gilt nur unterhalb des Kurvenkorridors. Unter dem Korridor erhält die Wallbox bei ausgeschalteter zentraler PV-Aufteilung den reinen PV-Überschuss. Mit experimenteller zentraler PV-Aufteilung wird der Kurvenbedarf zuerst vom absoluten Wallboxrahmen abgezogen (Abschnitt „Akkustützung der Wallbox in `PV-Kurve ruhig` nach Korridorlage“). |
 | `Grundladung stabil` | Wie PV-Kurve ruhig, aber mit stabiler 1p/3p-Grundladung, solange `wbminSoc` laut Planung erreichbar bleibt. |
-| `PV + Akku bis Untergrenze` | Das Auto darf PV plus Hausspeicher oberhalb der Hausakku-Untergrenze nutzen. Oberhalb der Haltezone ist die Entladestützung freigegeben; die Ladegrenze folgt weiter der Ladekurve, einschließlich nötiger Ladung zur Vermeidung von Abregelung. Mit experimenteller zentraler PV-Aufteilung führt unterhalb der Haltezone bei geschlossenem Tor der Kurvenbedarf den Akkuanteil. Unterhalb der Grenze lädt das Auto wie in `PV-Kurve ruhig` nur aus PV-Überschuss, der Speicher stützt nur Hausverbrauch und Wärmepumpe, Netz bleibt außen vor. |
+| `PV + Akku bis Untergrenze` | Das Auto darf PV plus Hausspeicher oberhalb der Hausakku-Untergrenze nutzen. In der Haltezone direkt über der Untergrenze folgt die Wallbox dem PV-Rahmen des Speichers; der Akku überbrückt bis zum normalen Unterdeckungsstopp ohne eigenes Energiekonto. Oberhalb der Haltezone ist die Entladestützung freigegeben; die Ladegrenze folgt weiter der Ladekurve, einschließlich nötiger Ladung zur Vermeidung von Abregelung. Mit experimenteller zentraler PV-Aufteilung führt unterhalb der Haltezone bei geschlossenem Tor der Kurvenbedarf den Akkuanteil. Unterhalb der Grenze lädt das Auto wie in `PV-Kurve ruhig` nur aus PV-Überschuss, der Speicher stützt nur Hausverbrauch und Wärmepumpe, Netz bleibt außen vor. |
 | `Sofort bis Preislimit` | Netzladen im freigegebenen Preisfenster mit zulässigem Höchststrom, Start ohne Wartezeit; außerhalb des Fensters wie „PV + Akku bis Untergrenze“. Das Fenster endet mit Stopp; ein späterer Start aus PV oder Akku benötigt erneut 60 Sekunden ausreichenden Anteil. |
 | `Akku bis Abfahrt` | Lädt im Freigabefenster vor der Abfahrtszeit aus PV und Hausspeicher bis zur Hausakku-Untergrenze `wbminsoc`; Netzladen bleibt gesperrt. Außerhalb des Fensters, zur Abfahrtszeit und bei erreichtem Fahrzeugziel wird gestoppt; an der Untergrenze kann mit ausreichendem PV-Anteil weitergeladen werden (`wb<n>_battery_departure_time`, `wb<n>_battery_departure_window_h`). |
 
@@ -823,7 +870,9 @@ Wichtige Schutzlogik:
 - Schwellen wie `wbminsoc` arbeiten mit Hysterese.
 - Die Netzbremse prüft Netzpunkt minus frisch gemessene Netzboxleistung.
   Zwei Regeltakte über 300 W senken den Strom bis zum Mindeststrom.
-  Nach Start, Anhebung oder Phasenwechsel gilt die bestehende 20-s-Frist;
+  Nach Start, Anhebung oder Phasenwechsel wartet sie auf eine frische
+  Messquittung: Annäherung an den neuen Sollwert, spätestens nach 30 Sekunden.
+  Eine erneute Anhebung braucht nach der Gegenkorrektur 30 Sekunden unter 300 W.
   Netzboxen haben keine Netzbremse. Hausanschlussgrenzen wirken sofort.
   Details: `doc/Native_Wallbox.md`, „Netzbezug beim Laden: direkte Regelung
   und Netzbremse“.
@@ -838,17 +887,74 @@ Wichtige Schutzlogik:
   PV-Überschuss und Hausakku“, Feld „Reserve unter der Kurve“). Die Wallboxen
   erhalten dann nur echten PV-Überschuss; die Reserve fängt Lastsprünge bis zum
   nächsten Heartbeat ab.
+- Fehlende, nicht endliche oder mit einem RSCP-Tagfehler gemeldete Kernwerte
+  erscheinen in den Live-Daten als `null`, mit Gültigkeit und Quelle. Ein frischer
+  Messwert von 0 W bleibt ein Messwert. Ein Hauswert unter −100 W ist ungültig.
+  Abweichungen zwischen Haus und Leistungsbilanz oder zwischen Netz und
+  Phasensumme sowie 0 W PV bei hoher Stringspannung sind Hinweise und ändern
+  die Messwerte nicht. Abschnittsfehler außerhalb des Leistungsabrufs entwerten
+  nicht die gesamte Probe. Fehlt PV oder Haus, stellt der Speicher für Verbraucher
+  0 W mit dem Grund `pv_or_home_missing` bereit; daraus entsteht kein Akkuangebot.
+  Die bestehenden Speichergrenzen und die Netzladeentscheidung werden dadurch
+  nicht pauschal freigegeben. Die Notstromreserve bleibt wirksam.
+- Für die Speicherregelung gilt eine Messfrist von zehn Sekunden ab der
+  Messzeit `_ts`. Diese gemeinsame Frist gilt auch für den kanonischen
+  POWER_SETTINGS-Readback und dessen Bestätigungsnachweis. Bestätigungsstatus,
+  Werteprüfung und Befehlsvertrag bleiben erforderlich.
+  Die Abrufdauer zählt zum Messalter: Bei dauerhaft langsamen Abrufen kann
+  die Probe bereits vor der nächsten Veröffentlichung veralten. Bei Abrufdauer
+  D und Veröffentlichungsabstand I gilt ideal D + I > 10 Sekunden;
+  Leserzeitpunkt und Zeitstempelrundung können die Grenze vorziehen. Das Alter der Live-Daten zählt ab der Messung der
+  Leistungsprobe, auch wenn spätere Abrufe die Veröffentlichung verzögern.
+  Eine fehlende Live-Datei, fehlende oder ungültige Messzeit
+  sowie ältere Messwerte benutzen denselben Fehlerausgang wie ein echter
+  RSCP-Fehler des Leistungsabrufs, ein ungültiger Ladestand oder ein fehlender
+  bzw. ungültiger Notstrom-Status: Netzladen endet, das Verbraucherbudget ist
+  0 W und aktive Speichergrenzen werden einmal freigegeben. Bis zur ersten
+  gültigen Probe entsteht keine neue aktive Vorgabe; anschließend stellt der
+  vorhandene Readback-Abgleich die benötigten Grenzen wieder her.
+  Die Statuswerte 0 (nicht möglich) und 3 (nicht verfügbar) sind gültig.
+  Gültiger Inselbetrieb (1 oder 4) hat Vorrang und sperrt externe Budgets.
+  Fehlende PV- oder Hausmessung allein ist kein Auslöser dieses Ausgangs.
+  Wechseln gültige und ungültige Proben im Zwei-Sekunden-Takt, können
+  Freigabe und Wiederherstellung in jedem Zyklus einen flüchtigen
+  POWER_SETTINGS-Vertrag schreiben. In einer 120-Sekunden-Modellfolge
+  entstehen 61 Schreibvorgänge. Diese erklärte Ausnahme folgt aus der
+  sofortigen Rückgabe und Rückkehr; es gibt keine zusätzliche Entprellung.
+  Zusammenhängende Ausfälle geben dagegen nur einmal frei. Wie häufig
+  solche Wechsel im Feld auftreten, ist noch nicht gemessen.
+- Ohne vorherige Reservesperre übernimmt bei Messausfall die E3DC-eigene
+  Reserve. Eine bereits aktive Reservesperre bleibt erhalten. Ein Sprung des
+  Ladestands nach oben hebt sie erst nach der vorhandenen Erholungsbedingung
+  auf: mindestens Reserve + 1,5 Prozentpunkte, mindestens 30 Sekunden und
+  mindestens drei frische gültige Proben.
+  Die Reserve sperrt ausschließlich die Akkuentladung. Laden aus Netz
+  und PV bleibt bei gültigen Daten nach den bestehenden Regeln möglich.
+- Kurve und Reserve rechnen mit dem vom E3DC gemeldeten Ladestand.
+  SoC-Sprünge erscheinen nur als Hinweis „vermutete Kalibrierung“ und lösen
+  weder ein Veto noch einen eigenen Regel-Ladestand aus. Alte Einstellungen
+  zur Messfrist, Sprungprüfung und zum Regel-Ladestand werden nicht mehr
+  ausgewertet; der Konfigurationsvalidator weist darauf hin.
+- Eine gemeldete PV von 0 W ist ein Messwert; die Speicherregelung kann für
+  einige Sekunden ihre Ladegrenze anpassen. Bei einer zehn Sekunden langen
+  echten PV-Null trotz Stringspannung kann sie kurz von Kurvenhaltung zu
+  AUTO wechseln und den Ladedeckel beispielsweise von 0 auf 1000 und zurück
+  auf 0 W ändern. Daraus folgt kein Wallbox-Stopp oder Phasenbefehl.
 - Ob die Wärmepumpenleistung im E3DC-Hauswert steckt, legt
-  `storage_home_wp_split` fest (Config-Editor, Wallbox → „Regelung:
-  PV-Überschuss und Hausakku“, Auswahl „Wärmepumpe im Hauswert“): `auto`
-  (Standard) entscheidet je Messung – die Wärmepumpe gilt als enthalten, wenn
-  der rohe Hauswert mindestens max(500 W, 55 % der WP-Leistung) erreicht;
-  `include` rechnet die gemeldete WP-Leistung immer aus dem Hauswert heraus
-  (Haus = max(0, Hauswert − WP), typisch ohne separaten Wurzelzähler);
-  `separate` zählt die getrennt gemessene Wärmepumpe zusätzlich zum Hauswert.
-  Die Automatik kann bei kleiner Rohhauslast (Verdichterstopp) springen; wer
-  seine Messanordnung kennt, wählt fest `include` oder `separate`. Der
-  Validator meldet unbekannte Werte (wirken wie `auto`).
+  `storage_home_wp_split` fest (Config-Editor unter „Speicher & Konfiguration“,
+  Feld „Wärmepumpe im Hauswert“): `include` bedeutet im Hausverbrauch enthalten,
+  `separate` bedeutet eigener Zähler außerhalb des Hauswerts. Altwert `auto`,
+  leere und unbekannte Angaben gelten beim Lesen als `include`; eine
+  automatische Schreibmigration findet nicht statt. Bei bekannter WP-Leistung
+  wird diese für die getrennte Darstellung aus dem Hauswert herausgerechnet.
+  Ohne Einzelmessung bleibt der Hauswert einschließlich Wärmepumpe erhalten.
+  In Budget und Bilanz zählt jede Leistung genau einmal.
+- Die Netzphasen stammen aus dem eindeutigen Leistungsmesser mit ROOT-Rolle
+  (`PM_TYPE = 1`). `wurzelzaehler` von 1 bis 65535 übersteuert die Rolle;
+  0 und ungültige Einträge verwenden die Gerätezuordnung. Ohne eindeutigen
+  ROOT bleiben die Phasen unbekannt. Gültige 0 W bleiben Messwerte. Der
+  Speicher verwendet weiterhin den EMS-Netzwert. Rollen werden nach Dienststart höchstens alle 60 Sekunden gelesen,
+  bis genau ein Wurzelzähler feststeht; danach erst beim nächsten Dienststart.
 - Einphasiges Laden an einer openWB Pro darf über 20 A hinaus nur nach
   Messung freigegeben werden: `wb_pcc_phase_basis` (Standard
   `e3dc_pm_active_power` = Netzbezug je Phase vom E3DC-Wurzelzähler ÷
@@ -1025,14 +1131,14 @@ im aktuellen Zyklus nachweislich die Entladung um die gemessene WP-Leistung
 begrenzen. Bei fehlendem oder veraltetem Beleg und bei Vorrang der
 Lastspitzenkappung wirkt der SoC-Schutz sofort.
 
-Nutzer-Aus nimmt auch Tarif-Aufträge zurück. Bei Luxtronik-Direktanbindung
-behält ein laufender Verdichter für Warmwasser und Heizung seine Mindestlaufzeit,
-auch nach dem durch „AUTO AUS“ ausgelösten Dienstneustart. Fehlt der aktuelle
+Nutzer-Aus beendet manuelle Aufträge, Preis-, Pre-Dump-, PV- und Tarif-Aufträge sofort. Bei allen gesteuerten WP-Ausgängen
+behält ein passend belegter laufender Verdichter für Warmwasser und Heizung seine allgemeine Mindestlaufzeit.
+„AUTO AUS“ wird ohne Dienstneustart im laufenden Dienst eingelesen. Fehlt der aktuelle
 Gerätestatus oder die Verdichterbeobachtung, bleibt der Mindestlaufhalt für
-PV- und Tarif-Aufträge höchstens 60 Sekunden ab der letzten gültigen Beobachtung
+eigene positive Aufträge höchstens 60 Sekunden ab der letzten gültigen Beobachtung
 bestehen. Wiederholte Abfragen verlängern die Frist nicht; eine neue gültige Probe
 erneuert den Beleg. Danach wird der Auftrag zurückgenommen. Gerätefehler,
-EVU-Sperre, Inselbetrieb, Hausanschlussgrenze und Uhrfehler wirken weiterhin sofort.
+EVU-Sperre, Inselbetrieb, Hausanschlussgrenze, eine zu kalte Wärmequelle und Uhrfehler wirken weiterhin sofort.
 
 Im Inselbetrieb werden alle Kanalbesitzer sofort zurückgenommen, auch Preis- und
 Prognosepausen; die Wärmepumpe übernimmt wieder ihre eigene Regelung.
@@ -1586,3 +1692,118 @@ Ein Uhrversatz zur Steuerung entwertet die Messung nicht. Bleibt die Box-Uhr
 die Messung als ungültig. Angezeigter Angebotsstrom ist die Rücklesung der
 Wallbox; ein gesendeter Sollstrom bestätigt weder seine Übernahme noch die
 physische Ladeleistung des Fahrzeugs.
+
+Die Rollenaufnahme läuft am Zyklusende. Die erste Leistungsprobe nach einem
+Dienstneustart enthält ohne eingetragenen Wurzelzähler noch keine Netzphasen
+(Quelle `no_root_meter`). Neue Wallboxstarts warten auf vollständige Phasen;
+laufende Ladungen verwenden die bestehende Datenfrist. Rollen werden nicht
+über einen Dienstneustart gespeichert.
+
+Nach dem Dienststart liest E3DC-Control die Rollen höchstens alle 60 Sekunden,
+bis genau ein Wurzelzähler feststeht, und danach nicht mehr bis zum nächsten
+Dienststart. Ein eingetragener Wurzelzähler ändert diese Regel nicht.
+Ein Transportfehler beendet die Aufnahme sofort; Fehlerantworten bedeuten
+an diesem Index keine Rolle. Die Phasenmessung erfolgt weiterhin frisch am
+zugeordneten Index. Fehler stehen in `pm_role_sources`.
+
+Eine Änderung der Zählerzuordnung im E3DC wirkt nach einem Neustart des
+Live-Dienstes; jedes Update startet ihn neu. Auch ein geänderter Eintrag unter
+„Wurzelzähler / PM-Index“ wird beim Start des Live-Dienstes geladen und benötigt
+dessen Neustart. Liefert der bisherige Index keine Phasen mehr, bleiben diese
+unbekannt: Neue Wallboxstarts warten, laufende Ladungen nutzen die bestehende
+Datenfrist. Die Zuordnung lässt sich im Config-Editor unter
+„Wurzelzähler / PM-Index“ prüfen. Liefert der bisherige Index andere Zählerwerte,
+werden diese bis zum Neustart weiter verwendet.
+
+### Gemeinsame Messfrist der Verbraucher
+
+Für Wallbox, Wärmepumpe und Heizstab gilt dieselbe Messfrist wie für die
+Speicherregelung (Abschnitt „Speicher und Ladekurve“). Eine frische Datei ersetzt
+keinen fehlenden oder alten Messzeitstempel. Die alten Fristparameter bleiben
+lesbar, haben aber keine Wirkung. Rücklesungen der Geräte, Budgetverträge und
+Watchdogs behalten ihre eigenen Fristen.
+
+Unbekannte Kernmesswerte bleiben `null`. Ohne gültigen Ladestand gibt es keine
+Akkustützung oder Entscheidung an der Wallbox-Untergrenze und keine automatische
+Wärmefreigabe. Fehlt PV oder Haus, stammt das Wallboxbudget ausschließlich aus dem
+Speichervertrag; ein eigener Überschuss wird nicht errechnet. Ohne Netzwert zählt
+kein Netzanteil; die Phasenmessung begrenzt weiterhin den Hausanschluss.
+Bei einer einzelnen Messlücke kann der bestehende Datenentzug Ausgänge zurücknehmen;
+eine gültige Probe erlaubt die Rückkehr über die bestehenden Verträge.
+Im Inselbetrieb (gültiger Notstromstatus 1 oder 4) gibt es kein Netz. Außerhalb der
+Insel sperrt das Notstromreserve-Veto ausschließlich die Akkuentladung.
+
+### Netzladen: Energiepuffer und spätester Start
+
+Zu Beginn eines Netzladeauftrags wird ein Drittel des anfänglichen speicherseitigen Energiebedarfs als fester Puffer gebunden. Bei 2 kWh Bedarf sind das rund 667 Wh, bei 6 kWh genau 2 kWh. Die Phase endet nach diesem Energiezuwachs im Akku, unabhängig von Leistung und Hochlauf. Deckt PV inzwischen den ganzen Auftrag, ist kein weiteres Netzladen nötig.
+
+Danach hält der Speicher ohne Entladung; PV lädt frei. Der Rest lädt mit voller aktuell zulässiger Leistung: Gerätegrenze beziehungsweise „Max. Laden“, Hausanschlussrahmen und „Speicher max.“ begrenzen gemeinsam. Das gelernte Profil je SoC-Band bestimmt die Ladedauer. Ziel bleiben 30 Minuten vor Fensterende (bei kurzen Fenstern höchstens das halbe Fenster), zusätzlich werden zehn Minuten Hochlauf eingeplant. PV senkt den Restbedarf und verschiebt den spätesten Start nach hinten; weniger zulässige Leistung zieht ihn vor. Ein begonnener Hauptblock kehrt nicht ins Warten zurück. Nutzer-Aus, Notstromreserve, Messwertgültigkeit und Hausanschluss wirken weiter unmittelbar.
+
+### Rücknahme nach Nutzer-Aus
+
+Für alle gesteuerten Wärmepumpen gilt nach Nutzer-Aus derselbe Restlaufvertrag.
+Nur ein passender Laufbeleg erhält die allgemeine Mindestlaufzeit. Beim Pro3EM
+belegen nur gemeinsam gespeicherter eigener Besitz, Einschaltzeit und Boot-Kennung
+den Relaisstart, keinen gemessenen Verdichterstart. Ohne vollständigen eigenen
+Eintrag schaltet Nutzer-Aus ein eingeschaltetes Pro3EM-Relais sicherheitshalber aus,
+auch bei möglicher Handschaltung. Im Normalbetrieb wird ein fremd eingeschaltetes
+Relais nicht übernommen. Nach einem Reboot wird die Restfrist aus der gespeicherten
+Startzeit weitergerechnet, solange die verstrichene Wandzeit zwischen null und der
+Mindestlaufzeit liegt; sie wächst nie über den gespeicherten Rest. Für E3DC- und Gerätedaten gilt jeweils dieselbe Grenze von
+60 Sekunden ab der letzten gültigen Quellenprobe. Wiederlesen derselben Datei
+verlängert diese Grenze nicht. Ein Heizstab wird sofort zurückgenommen und hat
+keinen Mindestlauf nach Aus. Seine Schalt-Hysterese im Normalbetrieb bleibt erhalten.
+
+Je Ausgang gibt es höchstens drei Rücknahmeversuche mit mindestens 60 Sekunden
+Abstand. Bei erschöpftem Budget oder nach 900 Sekunden ohne ausführbare Rücknahme
+erscheint einmal eine Warnung. Der Zustand bleibt unbestätigt. Nur bei belegt
+flüchtigen Zielen wie Register 74 und Relais folgt höchstens alle 15 Minuten ein
+weiterer Versuch. Bei nichtflüchtigen oder unbelegten Zielen gibt es nach der
+Warnung keine zyklischen Schreibvorgänge. Zeigt eine frische Rücklesung bei
+Gerätewiederkehr den eigenen Wert noch gesetzt, folgt genau ein weiterer Versuch
+je Wiederkehr. Danach bleibt die Rücknahme gegebenenfalls unbestätigt. Eine echte
+Bestätigung schließt die Episode ab; eine neue eigene Freigabe beendet den alten
+Aus-Resthalt ohne erzwungenen Stopp.
+
+Ein selbst eingeschaltetes Pro3EM-Relais behält seinen dauerhaft gesicherten Startbeleg über einen Neustart und wird nach der regulären Mindestlaufzeit wieder ausgeschaltet, wenn keine Freigabe mehr besteht; eine Aus-Rücklesung verwirft den Beleg.
+
+
+### Neue Speicherregelung im Vergleichsbetrieb
+
+E3DC-Control berechnet auf jeder Anlage parallel zur bestehenden Speicherregelung
+einen Vorschlag mit denselben eingefrorenen Zykluseingängen. Die neue Regelung
+steuert keine Geräte. Die bestehende Regelung sendet weiterhin sämtliche Befehle
+und versorgt Wallbox und Wärme mit ihren bisherigen Budgets.
+
+Der Vergleich betrachtet Speichermodus, Lade- und Entladegrenze, Netzladesoll,
+Verbraucherbudget sowie gesendete und hypothetische Teilvorgaben. Die Klassen
+bedeuten:
+
+- **gleich:** Die verglichenen Werte liegen innerhalb der Toleranz.
+- **U:** Der Zyklus ist mit genanntem Grund unvergleichbar, etwa bei Neustart,
+  fehlender Funktionsabdeckung, Datenfehler im Vergleich oder verbrauchtem Zeitbudget.
+- **A0:** Eine vorab benannte gewollte Abweichung trifft zu, etwa das gröbere Zeitraster.
+- **A1:** Eine geringe Abweichung oder ein strengerer Vorschlag liegt vor.
+- **A2:** Eine funktionale oder länger andauernde Abweichung liegt vor.
+- **A3:** Der Vorschlag enthält einen Schrankenkonflikt.
+- **A4:** Der Vergleich erkennt einen tatsächlichen Schreibweg und legt sich bis
+  zum Dienstneustart still.
+
+Die Installationszentrale zeigt Stand, letzten Vergleich, Tagesanteile,
+Schrankenkonflikte und Schreibwege, Funktionsabdeckung und Laufzeit. E3DC-Control
+speichert den Vergleichszustand ausschließlich in der Ramdisk. Ein Bootwechsel
+beginnt ohne altes Reservegedächtnis. Stunden- und Tageswerte bleiben höchstens
+vierzehn Tage erhalten. Feste Stundenzeilen enthalten Klassen, Abdeckung,
+Laufzeit und unerklärte Episoden; Zähler ersetzen einzelne Ereignisse.
+Die Diagnose enthält keine dauerhafte Aufzeichnung einzelner Regelzyklen.
+
+Für eine Rückmeldung das Diagnosepaket erstellen und zusätzlich die wählbare
+Datei `speicherkern_schatten_aggregate.json` aufnehmen. „Forum kompakt“ enthält
+bereits `speicherkern_schatten.json`. Beide Dateien gemeinsam weitergeben.
+
+Der Vergleich beschreibt Entscheidungen und keine gemessene Wirkung der neuen
+Regelung. Nicht abgedeckte Anforderungen bleiben sichtbar unvergleichbar.
+Verbraucherzuteilung, Netzfallback und Gerätewirkung benötigen weitere Abnahme;
+eine Umschaltung erfolgt durch den Vergleich nicht. Die Wirkzeit am Anschluss
+ist noch ungemessen. Überschreitet die Berechnung das Zeitbudget, verwirft E3DC-Control das Vergleichsergebnis. Die Berechnung läuft im Speicherdienst und kann dessen nächsten Zyklus verzögern.
+

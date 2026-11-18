@@ -1,11 +1,13 @@
 """Treiberstatusprüfung und ausfallsichere Behandlung veralteter Daten."""
 
+try:
+    from Installer.data_models import published_measurement_valid, STATUS_STALE_DEFAULT_S
+except ModuleNotFoundError:
+    from data_models import published_measurement_valid, STATUS_STALE_DEFAULT_S
+
+
 import math
 import time
-
-
-# Vorhandene Datenfrist des Statusdienstes, auch für den Quellenfortschritt.
-STATUS_STALE_DEFAULT_S = 45.0
 
 
 def status_stale_guard_s(config):
@@ -16,22 +18,6 @@ def status_stale_guard_s(config):
         return STATUS_STALE_DEFAULT_S
 
 
-def published_measurement_valid(status, now_s, max_age_s=STATUS_STALE_DEFAULT_S):
-    """Veröffentlichter Ablauf und engere Leserfrist müssen beide gültig sein."""
-    observation = status.get("observation") if isinstance(status, dict) else None
-    if not isinstance(observation, dict) or "valid_until_ts" not in observation:
-        return None  # Bestandsformat ohne veröffentlichten Ablauf.
-    deadline = observation.get("valid_until_ts")
-    sample = observation.get("sample_ts")
-    guard = observation.get("valid_for_s", STATUS_STALE_DEFAULT_S)
-    return bool(observation.get("valid") is True
-                and type(deadline) in (int, float) and math.isfinite(deadline)
-                and type(sample) in (int, float) and math.isfinite(sample) and sample > 0
-                and math.isfinite(now_s) and math.isfinite(max_age_s) and max_age_s > 0
-                and -2 <= now_s - sample <= max_age_s
-                and type(guard) in (int, float) and math.isfinite(guard) and 0 < guard <= 300
-                and now_s <= deadline <= sample + guard + 1
-                and deadline - now_s <= guard + 2)
 
 
 STATUS_DIAGNOSTIC_KEYS = (

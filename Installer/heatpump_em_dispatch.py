@@ -6,6 +6,7 @@ erst hier entschieden; Modus 0 schreibt niemals ein Temperaturregister.
 
 import copy
 import math
+import logging
 import uuid
 from datetime import datetime
 
@@ -14,6 +15,7 @@ try:
     from .Heat.price_boost import heating_boost_allowed, boost_outdoor_temperature
     from .heatpump_channel_owner import (
         CHANNELS, READBACK_AGE_S, advance, migrate_legacy, note_transport, raw_mode,
+        user_stop_plan, user_stop_transport, user_stop_grant,
         resume_checkpoint, validate_checkpoint, suspend_ineffective_withdrawal,
     )
     from .heatpump_pv_state import (
@@ -24,6 +26,7 @@ except ImportError:
     from Heat.price_boost import heating_boost_allowed, boost_outdoor_temperature
     from heatpump_channel_owner import (
         CHANNELS, READBACK_AGE_S, advance, migrate_legacy, note_transport, raw_mode,
+        user_stop_plan, user_stop_transport, user_stop_grant,
         resume_checkpoint, validate_checkpoint, suspend_ineffective_withdrawal,
     )
     from heatpump_pv_state import (
@@ -40,7 +43,7 @@ def number(value):
 # halten fünf Minuten, budgetgebundene Automatik (PV, Preis, Pre-Dump) so lange
 # wie die Speicherzusage. Während der Lücke gibt es keinen neuen Start und
 # keine Anhebung. Hardware-/Quellenschutz und Uhrstörung wirken sofort.
-# Bei PV-/Tarif-Aufträgen schützt der Mindestlauf auch bei Nutzer-Aus; eine
+# Bei eigenen positiven Aufträgen gilt der Mindestlauf auch bei Nutzer-Aus; eine
 # Luxtronik-Beobachtungslücke erhält diesen Halt höchstens 60 Sekunden.
 E3DC_GAP_USER_TOLERANCE_S = 300.0
 E3DC_GAP_AUTO_TOLERANCE_S = 45.0
@@ -729,6 +732,7 @@ class LuxtronikChannelController:
                 and (number(ww_state.get("started_ts")) or 0.0) > (state["prepared_ts"] or 0.0))
             manual_owned = bool(user_channel_pending and observed_mode in (1, 2)
                                 and external_manual_evidence)
+            requested_grant = desired[name] is not None
             own_signal_hold = bool(state["sent_ts"] is not None and now - state["sent_ts"] < 600.0)
             stop_allowed = not (physical_hold or signal_hold or own_signal_hold
                                 or bool(ctx.get("heatpump_signal_manufacturer_cycle_hold"))
@@ -758,6 +762,8 @@ class LuxtronikChannelController:
             # Der WW-Grundwert gilt wie ein eingebauter Timer unabhängig vom
             # Boost. Nur dessen eigene, physisch belegte Laufzeit schützt eine
             # Rücknahme; ein bloßes Signal oder ein alter Startzeitpunkt nicht.
+            # Nutzer-Aus verwendet denselben Restlauf ohne Besitzerfilter.
+            # Normale Quellen- und Zyklusrücknahmen behalten ihre vorhandene Auswahl.
             runtime_owned = bool(state["possible_effect"] and (
                 name == "ww" and (state["owner"] in ("pv", "tariff") or wp_holiday)
                 or name == "hz" and state["owner"] == "tariff"
@@ -784,14 +790,14 @@ class LuxtronikChannelController:
                 configured_runtimes={"predump": ctx.get("PREDUMP_HEATPUMP_MIN_RUNTIME_MIN"),
                                      "general": ctx.get("WP_MIN_RUNTIME_MIN")})
             episodes[name] = episode
-            # Nur das SoC-Ende verwendet die ursprüngliche Episodenfrist;
-            # andere Rücknahmen behalten ihre bisherige Laufzeitsemantik.
+            # Nach Nutzer-Aus gilt wie bei direkten Geräten ausschließlich die
+            # allgemeine Verdichter-Mindestlaufzeit, nie die Pre-Dump-Haltefrist.
             channel_minimum_run = (episode.get("min_runtime_min", minimum_run / 60.0) * 60.0
-                                   if soc_low else minimum_run)
+                                   if soc_low and automatic and not user_off else minimum_run)
             boost_left_s = 0.0
             # Die Laufzeit entscheidet erst bei entfallener Voraussetzung
             # über die Rücknahme, nicht während eines weiter gültigen Angebots.
-            if runtime_owned and (soc_low or channel_hard or desired[name] is None
+            if not (user_off or not automatic) and runtime_owned and (soc_low or channel_hard or desired[name] is None
                     or any(desired[name][key] != state[key] for key in ("owner", "target_c"))):
                 sent = number(state.get("sent_ts"))
                 started = (number(self.runtime_observation.get("started")) if runtime_gap_hold
@@ -810,6 +816,9 @@ class LuxtronikChannelController:
                             "device_free_missing_or_blocked", "source_free_missing_or_blocked",
                             "emergency_free_missing_or_blocked"))))
                     or blocks.intersection({"manual_source_temperature_stop"})
+                    or (number(ctx.get("wq_aus")) is not None
+                        and number(ctx.get("WQ_MIN_TEMP")) is not None
+                        and number(ctx.get("wq_aus")) < number(ctx.get("WQ_MIN_TEMP")))
                     or ctx.get("heatpump_grid_safety_stop") is True
                     or (blocks.intersection({
                         "pre_control_independent_safety_stop", "independent_safety_stop"})))
@@ -850,7 +859,7 @@ class LuxtronikChannelController:
                 desired[name] = None
                 hold[name] = {"reason": "automatic_soc_start_blocked", "until_ts": None}
             soc_withdrawal = False
-            if soc_low and state["possible_effect"] and (ctx.get("WP_TAKT_PROTECT") or soc > 0):
+            if automatic and not user_off and soc_low and state["possible_effect"] and (ctx.get("WP_TAKT_PROTECT") or soc > 0):
                 soc_start = started if runtime_owned else last_start
                 soc_running = bool(runtime_current and ctx.get("wp_compressor_running_now") is True or runtime_gap_hold)
                 soc_runtime_left = (max(0.0, channel_minimum_run - (now - soc_start))
@@ -901,15 +910,57 @@ class LuxtronikChannelController:
                 if baseline is None:
                     hold[name] = {"reason": "ww_boost_return_target_missing", "until_ts": None}
                     continue
+            stopping = bool(user_off or not automatic)
+            # Eine neue gewünschte Freigabe beendet den Aus-Resthalt nahtlos.
+            if (not stopping and requested_grant and desired[name] is not None
+                    and observations[name]["valid"] and observed_mode == 1
+                    and observed_target == desired[name]["target_c"]):
+                state["user_stop"] = user_stop_grant(state["user_stop"])
+            stop_owned = bool(state["possible_effect"] or name == "ww" and observations[name]["valid"]
+                and (observed_mode != 1 or observed_target != baseline))
+            prior_stop = state["user_stop"]
+            if stopping and not prior_stop.get("active") and state["withdraw_requested_ts"] is not None:
+                prior_stop = dict(prior_stop, active=True, attempts=state["attempts"], warned=state["alarm"],
+                    remaining_s=0.0, minimum_s=minimum_run, age_s=max(0.0, now - state["withdraw_requested_ts"]),
+                    revoke_age_s=0.0, wait_s=max(0.0, state["next_attempt_ts"] - now))
+            user_protection = bool(island_veto or operating_mode == 3 or self.clock_fault
+                or ctx.get("heatpump_signal_typed_protection_stop")
+                or ctx.get("heatpump_grid_safety_stop")
+                or blocks.intersection({"pre_control_independent_safety_stop", "independent_safety_stop",
+                                       "manual_source_temperature_stop"})
+                or number(ctx.get("wq_aus")) is not None and number(ctx.get("WQ_MIN_TEMP")) is not None
+                   and number(ctx.get("wq_aus")) < number(ctx.get("WQ_MIN_TEMP")))
+            state["user_stop"], stop_plan = user_stop_plan(prior_stop, clock=self.clock,
+                stopping=stopping, owned=stop_owned,
+                started_ts=ctx.get("wp_compressor_last_start_ts"),
+                minimum_s=minimum_run if ctx.get("WP_TAKT_PROTECT") else 0.0,
+                running=ctx.get("wp_compressor_running_now") if runtime_current else None,
+                device_ts=source_ts if runtime_current else None,
+                e3dc_ts=(ctx.get("_grid_live") or {}).get("_ts") if ctx.get("e3dc_valid") else None,
+                protection=user_protection, volatile=False,
+                readback=True if observations[name]["valid"] and observed_mode == 1 else None)
+            pending_stop = stop_plan["action"] != "abgeschlossen"
+            if stopping or pending_stop:
+                desired[name] = None
+                boost_left_s = stop_plan["remaining_s"]
+                stop_allowed = boost_left_s <= 0.0
+                channel_hard = user_protection
+                if boost_left_s > 0.0:
+                    hold[name] = {"reason": "boost_min_runtime_hold", "until_ts": now + boost_left_s,
+                                  "remaining_s": boost_left_s}
+                if stop_plan["warn"]:
+                    self._persist()
+                    logging.getLogger(__name__).warning("Eigene Wärmepumpen-Rücknahme nicht bestätigt.")
             old = copy.deepcopy(self.checkpoint)
             self.checkpoint, action = advance(
                 self.checkpoint, name, now_s=now, observation=observations[name],
                 desired=desired[name], stop_allowed=bool(stop_allowed),
-                automatic_enabled=bool((automatic and not user_off) or boost_left_s > 0), protection=bool(channel_hard),
+                automatic_enabled=bool((automatic and not stopping) or boost_left_s > 0), protection=bool(channel_hard),
                 user_hold_s=0.0 if timer_idle else restart_hold, signal_hold_s=600.0,
-                manual_owned=bool(manual_owned and automatic and not user_off and not channel_hard),
+                manual_owned=bool(manual_owned and automatic and not stopping and not channel_hard),
                 baseline_target_c=baseline,
                 release_on_baseline_readback=bool(wp_holiday and name == "ww"),
+                user_stop=stop_plan if stopping or pending_stop else None,
                 stop_reason=(None if boost_left_s > 0 else "user_off" if user_off else (protection_reason or "hard_protection")
                              if (hard or channel_hard and protection_reason == "emergency_reserve") else
                              "soc_below_stop_threshold" if soc_withdrawal else
@@ -926,13 +977,24 @@ class LuxtronikChannelController:
             self.persisted = self._persist()
             if action is None:
                 continue
-            if (action["kind"] == "start" or timer_idle) and not self.persisted:
+            if (action["kind"] == "start" or timer_idle or stopping) and not self.persisted:
                 # Kein IO, also weder Transportnote noch behauptete mögliche
                 # neue Wirkung. Ein Folgelauf muss den Intent erneut sichern.
                 self.checkpoint = old
                 actions.append({"action": action, "outcome": "intent_not_durable"})
                 continue
-            outcome = wp.dispatch_channel_action(action)
+            def transport(begin):
+                if hasattr(wp, "request_channel"):
+                    wp.user_stop_begin = begin
+                elif not begin():
+                    return "connect_failed"
+                try:
+                    return wp.dispatch_channel_action(action)
+                finally:
+                    wp.user_stop_begin = None
+            outcome = (user_stop_transport(self.checkpoint["channels"][name]["user_stop"],
+                stop_plan, self._persist, transport) if (stopping or pending_stop) and action["kind"] == "withdraw"
+                else wp.dispatch_channel_action(action))
             if (e3dc_gap and name == "ww" and not old["channels"][name]["possible_effect"]
                     and action["kind"] == "withdraw" and outcome == "written"):
                 ww_baseline_written_in_gap = True

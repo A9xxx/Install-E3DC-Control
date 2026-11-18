@@ -1072,7 +1072,7 @@ function wpv_render(array $s): string
       <?php if ($s['auto_mode'] === 0): ?>
       <button type="submit" name="toggle_auto_mode" value="1" class="act muted" title="PV-Überschuss-Automatik einschalten">⏸ Automatik aus</button>
       <?php else: ?>
-      <button type="submit" name="toggle_auto_mode" value="0" class="act ok" title="Klick schaltet die Automatik sofort aus. Bei Luxtronik-Direktanbindung läuft ein gerade laufender Verdichter bei PV- und Tarif-Aufträgen zum Schutz der Wärmepumpe seine Mindestlaufzeit zu Ende.">✓ Automatik</button>
+      <button type="submit" name="toggle_auto_mode" value="0" class="act ok" title="Automatik und Auftrag sofort beenden. Ein laufender Verdichter läuft seine Mindestlaufzeit zu Ende.">✓ Automatik</button>
       <?php endif; ?>
     </form>
   </div>

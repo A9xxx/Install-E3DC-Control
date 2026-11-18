@@ -3,6 +3,46 @@
 header('Content-Type: application/json');
 require_once 'helpers.php';
 
+
+// Kleine Testnaht: Tests ersetzen ausschließlich die DNS-Auflösung, nie die Regel.
+if (!function_exists('e3dcPushResolveAddresses')) {
+    function e3dcPushResolveAddresses($host) {
+        $records = @dns_get_record($host, DNS_A | DNS_AAAA);
+        if (!is_array($records)) return [];
+        $addresses = [];
+        foreach ($records as $record) {
+            if (isset($record['ip'])) $addresses[] = $record['ip'];
+            if (isset($record['ipv6'])) $addresses[] = $record['ipv6'];
+        }
+        return $addresses;
+    }
+}
+
+function e3dcPushEndpointIsPublic($endpoint) {
+    if (!filter_var($endpoint, FILTER_VALIDATE_URL)) return false;
+    $parts = parse_url($endpoint);
+    $host = strtolower((string)($parts['host'] ?? ''));
+    if (strtolower((string)($parts['scheme'] ?? '')) !== 'https' || isset($parts['user']) || isset($parts['pass'])
+        || !str_contains(rtrim($host, '.'), '.') || filter_var(trim($host, '[]'), FILTER_VALIDATE_IP)) return false;
+    $addresses = e3dcPushResolveAddresses($host);
+    if (!$addresses) return false;
+    foreach ($addresses as $address) {
+        $packed = @inet_pton($address);
+        if ($packed === false) return false;
+        // IPv4-gemappte IPv6-Adressen nach denselben IPv4-Grenzen behandeln.
+        if (strlen($packed) === 16 && substr($packed, 0, 12) === str_repeat("\0", 10) . "\xff\xff") $packed = substr($packed, 12);
+        $bytes = array_values(unpack('C*', $packed));
+        $a = $bytes[0]; $b = $bytes[1];
+        if (strlen($packed) === 4) {
+            if ($a === 0 || $a === 10 || $a === 127 || ($a === 169 && $b === 254)
+                || ($a === 172 && $b >= 16 && $b <= 31) || ($a === 192 && $b === 168)
+                || ($a === 100 && $b >= 64 && $b <= 127) || ($a >= 224 && $a <= 239)) return false;
+        } elseif ($packed === str_repeat("\0", 16) || $packed === str_repeat("\0", 15) . "\1"
+            || ($a === 0xfe && ($b & 0xc0) === 0x80) || ($a & 0xfe) === 0xfc || $a === 0xff) return false;
+    }
+    return true;
+}
+
 $action = $_GET['action'] ?? $_POST['action'] ?? '';
 if (in_array($action, ['get_vapid', 'subscribe', 'test_push'], true)) {
     e3dcRequirePostMutation(true);
@@ -69,10 +109,16 @@ if ($action === 'subscribe') {
     $endpoint = is_array($data) ? trim((string)($data['endpoint'] ?? '')) : '';
     $p256dh = is_array($data) ? trim((string)($data['keys']['p256dh'] ?? '')) : '';
     $auth = is_array($data) ? trim((string)($data['keys']['auth'] ?? '')) : '';
-    if (!is_array($data) || !filter_var($endpoint, FILTER_VALIDATE_URL)
-        || !str_starts_with(strtolower($endpoint), 'https://') || $p256dh === '' || $auth === '') {
+    if (!is_array($data)
+        || $p256dh === '' || $auth === '') {
         http_response_code(400);
         echo json_encode(['success' => false, 'error' => 'Push-Abonnement ist unvollständig oder ungültig.']);
+        exit;
+    }
+
+    if (!e3dcPushEndpointIsPublic($endpoint)) {
+        http_response_code(400);
+        echo json_encode(['success' => false, 'error' => 'Push-Endpunkt muss ein öffentlicher Dienst sein']);
         exit;
     }
 

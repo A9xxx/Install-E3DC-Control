@@ -256,6 +256,9 @@ def slot_payload(service, current, adjacent, a, start):
         sm = solar_model(start+450, service.lat, service.lon) if result['solar_model'] else None
         for model in ('m1', 'm2', 'm3'):
             cache = getattr(service, '_model_cache', {}).get(model, {})
+            # Dieselbe Cache-Freigabe wie im Producer: alte Zeitbasen bleiben auch hier fehlend.
+            if not service._get_model_data(model):
+                cache = {}
             data = cache.get('diagnostic_entities')
             if isinstance(data, dict) and data.get('reason') == 'diagnostic_error':
                 result['status'] = 'diagnostic_error'

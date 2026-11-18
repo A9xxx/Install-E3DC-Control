@@ -51,7 +51,7 @@ def _channel():
         "generation": 0, "inflight": None, "diagnostic": None,
         "stop_reason": None, "baseline_target_c": None, "pre_boost_target_c": None,
         "start_attempts": 0, "start_attempt_ts": None, "alarm": False,
-        "protection_counted": False,
+        "protection_counted": False, "user_stop": {},
     }
 
 
@@ -124,7 +124,7 @@ def validate_checkpoint(value):
     if daily["blocked"] != any(count >= 2 for count in daily["counts"].values()):
         return {}
     additions = {"baseline_target_c": None, "pre_boost_target_c": None, "start_attempts": 0,
-                 "start_attempt_ts": None, "alarm": False, "protection_counted": False}
+                 "start_attempt_ts": None, "alarm": False, "protection_counted": False, "user_stop": {}}
     for channel, state in value["channels"].items():
         if isinstance(state, dict):
             # Frühere Dateien enthielten den flüchtigen Ferienanker. Nur einen
@@ -159,6 +159,8 @@ def validate_checkpoint(value):
                   "withdraw_ack_ts", "foreign_ts", "abandoned_ts", "last_sample_ts")
     for name, state in value["channels"].items():
         if not isinstance(state, dict) or set(state) != set(_channel()):
+            return {}
+        if not isinstance(state["user_stop"], dict):
             return {}
         if state["state"] not in STATES:
             return {}
@@ -358,15 +360,15 @@ def _abandon(state, now_s, reason):
 def advance(checkpoint, channel, *, now_s, observation=None, desired=None,
             stop_reason=None, stop_allowed=True, automatic_enabled=True,
             protection=False, user_hold_s=0, signal_hold_s=600, manual_owned=False,
-            baseline_target_c=None, release_on_baseline_readback=False):
+            baseline_target_c=None, release_on_baseline_readback=False, user_stop=None):
     """Verarbeitet einen Kanal und liefert höchstens eine ausführbare Aktion.
 
     ``baseline_target_c`` ist die konfigurierte WW-Timer-Untergrenze.
-    Rücknahmen benötigen keinen Besitzbeleg; externe SHI-Schreiber werden
-    nicht unterstützt. ``desired`` enthält Besitzer, Auftragskennung, Revision, Temperatur sowie
+    HZ-Rücknahmen benötigen eigenen Besitz. Die konfigurierte WW-Grundstellung
+    gilt weiterhin unabhängig vom Boost. ``desired`` enthält Besitzer, Auftragskennung, Revision, Temperatur sowie
     ``valid=True`` und ``grant=True``. Kein Wunsch ist ein Versandbeleg. ``None``
     beendet einen Auftrag unter Beachtung von ``stop_allowed``. Ein expliziter
-    ``stop_reason`` oder Nutzer-Aus darf auch unbelegte Einstellungen zurücknehmen.
+    ``stop_reason`` oder Nutzer-Aus nimmt nur eigene HZ-Einstellungen zurück.
     ``stop_allowed`` kommt aus Mindestlaufzeit/Taktschutz der vorhandenen Policy;
     Nutzer-Aus und harter Schutz übergehen nur die Rücknahmeverzögerung.
     ``manual_owned`` ist ein bereits unabhängig vom SHI-Connect erhobener
@@ -426,7 +428,7 @@ def advance(checkpoint, channel, *, now_s, observation=None, desired=None,
                             and not state["alarm"]))
     if start_failed:
         stopping, reason = True, "start_unconfirmed"
-    explicit_stop = bool(not automatic_enabled or protection or stop_reason)
+    explicit_stop = bool(not automatic_enabled or protection or stop_reason or user_stop is not None)
     off_edge = was_enabled and not automatic_enabled
     # Eine bereits bestätigte WW-Grundstellung braucht auch bei Nutzer-Aus
     # keinen identischen Schreibbefehl. Ein eigener Boost wird weiter quittiert.
@@ -443,10 +445,29 @@ def advance(checkpoint, channel, *, now_s, observation=None, desired=None,
         _clear_effect(state, "boost_return_readback_confirmed")
         state["stop_reason"] = reason
         return result, None
-    withdrawal_needed = bool(state["possible_effect"] or (explicit_stop and not baseline_observed and (
+    withdrawal_needed = bool(state["possible_effect"] or (channel == "ww" and explicit_stop and not baseline_observed and (
         off_edge or state["state"] != "frei" or state["withdraw_ack_ts"] is None
         or (mode is not None and not _baseline_matches(
             state, channel, mode, (observation or {}).get("target_c"))))))
+    if user_stop is not None:
+        if not withdrawal_needed:
+            user_stop_confirm(state["user_stop"])
+            return result, None
+        if user_stop["action"] == "halten":
+            return result, None
+        if user_stop["action"] == "unbestätigt" and not user_stop["attempt"]:
+            _abandon(state, now_s, "withdrawal_unresolved")
+            return result, None
+        if state["state"] not in ("ruecknahme_offen", "ruecknahme_gesendet"):
+            if channel == "ww" and state["baseline_target_c"] is None:
+                _abandon(state, now_s, "withdrawal_baseline_missing")
+                state["alarm"] = True
+                return result, None
+            state.update(state="ruecknahme_offen", withdraw_requested_ts=now_s,
+                         withdraw_ack_ts=None, inflight=None, stop_reason="user_off")
+        if user_stop["attempt"] and state["inflight"] is None:
+            return result, _reserve(state, channel, "withdraw")
+        return result, None
     exhausted = state["state"] == "aufgegeben" and state["alarm"] and not off_edge
     if (withdrawal_needed and not exhausted and state["state"] not in (
             "ruecknahme_offen", "ruecknahme_gesendet")
@@ -484,7 +505,9 @@ def advance(checkpoint, channel, *, now_s, observation=None, desired=None,
         stop_until = state["stop_until"]
         sample_ts = state["last_sample_ts"]
         baseline_target = state["baseline_target_c"]
+        source_probes = user_stop_grant(state["user_stop"])
         state.update(_channel())
+        state["user_stop"] = source_probes
         state.update({key: desired[key] for key in ("owner", "request_id", "revision", "target_c")})
         state.update({"state": "vorbereitet", "prepared_ts": now_s,
                       "possible_effect": True, "transport_uncertain": True,
@@ -526,7 +549,9 @@ def note_transport(checkpoint, action, *, now_s, outcome):
             state["transport_uncertain"] = outcome != "written"
             state["diagnostic"] = None if outcome == "written" else "start_transport_uncertain"
     else:
-        if outcome in ("written", "write_failed"):
+        if state["user_stop"].get("active"):
+            state["attempts"] = state["user_stop"]["attempts"]
+        elif outcome in ("written", "write_failed"):
             state["attempts"] += 1
         if outcome == "written":
             if state["withdraw_ack_ts"] is None:
@@ -582,7 +607,8 @@ def resume_checkpoint(checkpoint, *, now_s):
             state["transport_uncertain"] = True
             state["diagnostic"] = "start_transport_uncertain_after_restart"
         else:
-            state["attempts"] = min(MAX_ATTEMPTS, state["attempts"] + 1)
+            state["attempts"] = (state["user_stop"]["attempts"] if state["user_stop"].get("active")
+                                 else min(MAX_ATTEMPTS, state["attempts"] + 1))
             state["diagnostic"] = "withdrawal_transport_uncertain_after_restart"
     return result
 
@@ -652,3 +678,151 @@ def migrate_legacy(command, *, now_s, observation=None):
                 # deshalb weder wiederbelebt noch als sicher erledigt versteckt.
                 _abandon(state, now_s, "legacy_closed_ownership_ambiguous")
     return result
+
+
+def user_stop_plan(previous, *, clock, stopping, owned, started_ts=None,
+                   minimum_s=0.0, running=None, device_ts=None, e3dc_ts=None,
+                   protection=False, volatile=False, readback=None):
+    """Gemeinsame Aus-Episode mit sinkender Restfrist und einem Rücknahmebudget.
+
+    Quellenzeiten stammen von den Erzeugern. Wiederlesen erneuert keine Probe.
+    Nach Bootwechsel zählt nur die plausible Wandzeit, höchstens der gespeicherte Rest.
+    Nur ein neuer bestätigter positiver Ausgang nach erneuter Freigabe darf den
+    Aufrufer veranlassen, die abgeschlossene Episode durch {} zu ersetzen.
+    """
+    allowed_keys = {"active", "attempts", "warned", "age_s", "wait_s", "remaining_s", "minimum_s",
+                    "revoke_age_s", "clock", "device", "e3dc", "running", "started_ts", "confirmed",
+                    "owned", "owned_kw", "owned_value", "endpoint", "recovery_seen", "recovery_pending"}
+    state = {key: copy.deepcopy(value) for key, value in previous.items() if key in allowed_keys} if isinstance(previous, dict) else {}
+    if state.get("active") and not (
+            type(state.get("attempts")) is int and 0 <= state["attempts"] <= MAX_ATTEMPTS
+            and type(state.get("warned")) is bool
+            and all(_number(state.get(key)) for key in ("remaining_s", "minimum_s", "age_s", "wait_s"))
+            and isinstance(state.get("clock", {}), dict)
+            and (state.get("revoke_age_s") is None or _number(state.get("revoke_age_s")))):
+        # Unlesbarer Bestand eröffnet kein neues Budget und keinen Restlauf.
+        state = dict(active=True, attempts=MAX_ATTEMPTS, warned=False,
+                     remaining_s=0.0, minimum_s=0.0, age_s=REVOKE_TIMEOUT_S,
+                     revoke_age_s=0.0, wait_s=0.0)
+    wall = clock.get("wall_ts")
+    mono = clock.get("monotonic_ts")
+    valid = bool(clock.get("valid") is True and _number(wall) and _number(mono))
+    old_clock = state.get("clock") if isinstance(state.get("clock"), dict) else {}
+    same_boot = bool(valid and old_clock.get("boot_id") == clock.get("boot_id")
+                     and _number(old_clock.get("monotonic_ts"))
+                     and mono >= old_clock["monotonic_ts"])
+    elapsed = mono - old_clock["monotonic_ts"] if same_boot else None
+    for key, stamp in (("device", device_ts), ("e3dc", e3dc_ts)):
+        probe = state.get(key) if isinstance(state.get(key), dict) else {}
+        if not (_number(probe.get("ts")) and _number(probe.get("mono"), minimum=-1e20)):
+            probe = {}
+        state[key] = probe
+        if valid and _number(stamp, minimum=0.000001) and stamp <= wall:
+            if not same_boot or stamp > (probe.get("ts") or 0.0):
+                probe = {"ts": stamp, "mono": mono - (wall - stamp), "boot_id": clock.get("boot_id")}
+                state[key] = probe
+    if running is not None and device_ts is not None:
+        state["running"] = running is True
+        if not state.get("active"):
+            state["started_ts"] = started_ts if _number(started_ts, minimum=0.000001) else None
+    # Eine fehlende Probe und die folgende frische eigene Rücklesung bilden
+    # eine Wiederkehr. Weitere frische Proben sind kein neues Ereignis.
+    recovery = bool(readback is True and state.get("recovery_seen") is False)
+    if state.get("warned"):
+        state["recovery_seen"] = readback is True
+    state["clock"] = copy.deepcopy(clock)
+    plan = {"action": "abgeschlossen", "remaining_s": 0.0, "attempt": False, "warn": False}
+    if not stopping and not state.get("active"):
+        return state, plan
+    if not state.get("active"):
+        state.update(active=True, attempts=0, warned=False, age_s=0.0, wait_s=0.0)
+        start = state.get("started_ts")
+        state["remaining_s"] = (max(0.0, minimum_s - (wall - start))
+            if valid and owned and state.get("running") is True
+            and _number(start, minimum=0.000001) and start <= wall else 0.0)
+        state["minimum_s"] = max(0.0, minimum_s)
+    else:
+        # Laufzeit und Wartezeit bleiben auch bei Wandzeitsprüngen monoton.
+        delta = elapsed if elapsed is not None else 0.0
+        start = state.get("started_ts")
+        reboot_left = (max(0.0, min(minimum_s, state.get("minimum_s", 0.0)) - (wall - start))
+            if valid and _number(start, minimum=0.000001) and 0 <= wall - start <= minimum_s else 0.0)
+        state["remaining_s"] = max(0.0, state.get("remaining_s", 0.0) - delta
+            - max(0.0, state.get("minimum_s", 0.0) - minimum_s)) if same_boot else min(state.get("remaining_s", 0.0), reboot_left)
+        state["minimum_s"] = min(state.get("minimum_s", 0.0), max(0.0, minimum_s))
+        state["age_s"] = state.get("age_s", 0.0) + delta
+        state["wait_s"] = max(0.0, state.get("wait_s", 0.0) - delta)
+    sources_ok = all(
+        valid and (state.get(key) or {}).get("boot_id") == clock.get("boot_id")
+        and _number((state.get(key) or {}).get("mono"), minimum=-1e20)
+        and 0 <= mono - state[key]["mono"] < 60.0
+        for key in ("device", "e3dc"))
+    if protection or not sources_ok or state.get("running") is False:
+        state["remaining_s"] = 0.0
+    if not owned:
+        state["remaining_s"] = 0.0
+        return state, plan
+    if state.get("confirmed"):
+        return state, plan
+    if state["remaining_s"] > 0:
+        plan.update(action="halten", remaining_s=state["remaining_s"])
+        return state, plan
+    if state.get("revoke_age_s") is None:
+        state["revoke_age_s"] = state["age_s"]
+    exhausted = state["attempts"] >= MAX_ATTEMPTS or state["age_s"] - state["revoke_age_s"] >= REVOKE_TIMEOUT_S
+    if exhausted and not state["warned"]:
+        state["warned"] = True
+        plan["warn"] = True
+        # Der dritte Versuch begann bereits vor 60 s. Der folgende darf
+        # frühestens 900 s nach dem letzten Transport beginnen.
+        state["wait_s"] = max(state["wait_s"], 900.0 - (RETRY_S - state["wait_s"]))
+    plan["action"] = "unbestätigt" if exhausted else "zurücknehmen"
+    if exhausted and not volatile and recovery:
+        state["recovery_pending"] = True
+    if state.get("warned") and readback is False:
+        user_stop_confirm(state)
+        plan["action"] = "abgeschlossen"
+        return state, plan
+    plan["attempt"] = bool(valid and state["wait_s"] <= 0.0
+        and (not exhausted or volatile or state.get("recovery_pending")))
+    return state, plan
+
+
+def user_stop_grant(state):
+    """Eine neue bestätigte Freigabe erhält die bereits gültigen Quellenproben."""
+    return {key: copy.deepcopy(state[key])
+            for key in ("device", "e3dc", "running", "started_ts", "clock", "endpoint", "owned_value") if key in state}
+
+
+def user_stop_attempt(state):
+    """Vor dem autorisierten Transport dauerhaft sichern, auch bei Connectfehlern."""
+    state["recovery_pending"] = False
+    state["attempts"] = min(MAX_ATTEMPTS, state["attempts"] + 1)
+    state["wait_s"] = 900.0 if state["warned"] else RETRY_S
+
+
+def user_stop_confirm(state):
+    """Nur der vorhandene Bestätigungsweg darf eine Rücknahme abschließen."""
+    state["confirmed"] = True
+    state["remaining_s"] = 0.0
+
+
+def user_stop_transport(state, plan, persist, operation):
+    """Ein Versuchsbuch für alle Adapter; Beginn erst nach deren Autorisierung."""
+    def begin():
+        previous = copy.deepcopy(state)
+        user_stop_attempt(state)
+        if persist():
+            return True
+        state.clear()
+        state.update(previous)
+        return False
+    if not plan["attempt"]:
+        return False
+    try:
+        result = operation(begin)
+        if result is True:
+            user_stop_confirm(state)
+        return result
+    finally:
+        persist()

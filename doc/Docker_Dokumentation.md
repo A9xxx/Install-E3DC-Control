@@ -2,8 +2,8 @@
 
 Veröffentlichte Images entstehen ausschließlich aus einem versionierten stabilen Release-Tag. `latest` verweist damit auf die zuletzt veröffentlichte stabile Version.
 
-Der aktuelle Stable-Stand ist `v5.5.7`. Die Tags `latest`, `v5.5.7` und
-`5.5.7` bezeichnen denselben Stable-Stand.
+Der aktuelle Stable-Stand ist `v5.5.8`. Die Tags `latest`, `v5.5.8` und
+`5.5.8` bezeichnen denselben Stable-Stand.
 
 **Updates im Überblick:** Der Knopf **System Update** in der Weboberfläche und
 das **Auto-Update** im Config-Editor geben dem optionalen Watchtower-Dienst das
@@ -131,14 +131,14 @@ installieren, anschließend das Ziel ausdrücklich wählen:
 
 ```bash
 curl -q -fsS --proto '=https' --tlsv1.2 \
-  -o ./docker_compose_update-5.5.7.py \
-  https://raw.githubusercontent.com/A9xxx/Install-E3DC-Control/v5.5.7/Installer/docker_compose_update.py
+  -o ./docker_compose_update-5.5.8.py \
+  https://raw.githubusercontent.com/A9xxx/Install-E3DC-Control/v5.5.8/Installer/docker_compose_update.py
 if [ ! -d ./Installer ]; then
   sudo install -d -m 0755 ./Installer
 fi
-sudo install -m 0644 ./docker_compose_update-5.5.7.py ./Installer/docker_compose_update.py
+sudo install -m 0644 ./docker_compose_update-5.5.8.py ./Installer/docker_compose_update.py
 sudo python3 ./Installer/docker_compose_update.py \
-  --compose-dir . --sudo --image-tag v5.5.7
+  --compose-dir . --sudo --image-tag v5.5.8
 ```
 
 Der aktuelle Helfer akzeptiert die gebundene gestoppte Altinstanz, ergänzt bei
@@ -693,7 +693,7 @@ Ohne ausdrücklichen Tag verwendet der Helfer das Image des ausgewählten Dienst
 Die mitgelieferte variable Zeile folgt ohne `E3DC_IMAGE_TAG` dem geprüften Stable-Tag
 `latest`. Ein vorhandener fester Tag bleibt absichtlich bestehen.
 
-`--image-tag v5.5.7` funktioniert auch bei einer fest eingetragenen OMV-Imagezeile.
+`--image-tag v5.5.8` funktioniert auch bei einer fest eingetragenen OMV-Imagezeile.
 Der Helfer schreibt diese Auswahl dauerhaft nur in das `image:`-Feld des
 Zieldienstes. Die `.env` und das Image anderer E3DC-Dienste bleiben unverändert.
 Bei einem gescheiterten Update wird die vorherige Zeile im Rahmen des verifizierten
@@ -715,7 +715,7 @@ sudo docker compose config --images e3dc-control
 
 Gezielte Rückfallversion:
 
-Den Stable-Container `v5.5.7` auf den veröffentlichten Rollback-Root
+Den Stable-Container `v5.5.8` auf den veröffentlichten Rollback-Root
 `v5.3.2b` zurücksetzen:
 
 ```bash
@@ -1000,7 +1000,7 @@ Port, etwa `E3DC_PUBLISH_BIND=192.0.2.20` und `E3DC_PUBLISH_PORT=8085`.
 Verwende denselben Compose-Ordner und Projektnamen. Sichere vorher die
 funktionierende `docker-compose.yml` als `docker-compose.host.bak`, die
 vorhandene `.env` und die persistenten Daten. Halte den aktuell eingesetzten
-versionierten Runtime-Image-Tag für den Rückweg fest, beispielsweise `v5.5.7`.
+versionierten Runtime-Image-Tag für den Rückweg fest, beispielsweise `v5.5.8`.
 Ein älterer Root-Tag eignet sich nicht für diesen ersten Netzwerk-Rückweg.
 Prüfe eine administrativ zugängliche Kopie der aktuellen
 Konfiguration, ohne ihren Inhalt auszugeben:
@@ -1065,9 +1065,12 @@ erfordert ebenfalls zuerst die Rückkehr zum Host-Betrieb.
 Wenn E3DC-Control in Docker läuft, verhält es sich intern etwas anders als bei einer "Bare-Metal" Installation auf dem Raspberry Pi.
 
 * **Keine Cronjobs:** Docker-Container haben von Haus aus keinen Aufgabenplaner (Cron). Diese Aufgabe übernimmt vollautomatisch der in Python geschriebene **Schedule & Notification Manager** (`notification_manager.py`). Er läuft im Hintergrund und triggert die Minutenspeicherung, Backups und Telegram-Nachrichten.
+  E3DC-Control verwendet die gemeinsame Sperrdatei der Hintergrundaufzeichnung
+  auch dann, wenn der Webserver sie zuerst angelegt hat.
 * **Web-Updates über Watchtower:** Ein Container ist „immutable" (unveränderlich); der Update-Knopf tauscht deshalb keine Dateien im Container, sondern gibt Watchtower das Signal, das neue Image zu laden und den Container neu zu erstellen. Ohne eingerichteten Watchtower zeigt der Knopf die Host-Befehle. Das Auto-Update im Config-Editor nutzt denselben Weg zur eingestellten Uhrzeit.
 * **Kein Systemd:** Befehle wie `systemctl restart e3dc` funktionieren im Container nicht. Wenn du den Dienst neu starten möchtest, startest du einfach den gesamten Container neu (siehe unten). Logs der Python-Dienste findest du unter `/var/www/html/logs/`.
 * **Auto-Start:** Du benötigst keine Watchdogs oder Crontab-Einträge mehr, damit E3DC nach einem Stromausfall hochfährt. Der Parameter `restart: unless-stopped` in der `docker-compose.yml` sorgt dafür, dass Docker das System immer am Leben hält.
+* **Optionaler Host-Watchdog:** Ein eingerichteter PiGuard erkennt den vorhandenen Container am festen Namen `e3dc-control`. Er startet ihn ausschließlich bei einem lesbar nachgewiesenen Hänger neu: Die konfigurierte Watchdog-Datei im Container ist über die bestehende Frist von etwa 18 Minuten veraltet oder die Livewerte stehen etwa 3 Minuten. Beide Datenquellen liest er mit kurzer Frist im laufenden Container. Alte Hostdateien lösen keinen Containerneustart aus. Fehlt der erkannte Container, ist er gestoppt oder sind seine Daten nicht lesbar, meldet er dies einmal je Ausfallepisode und startet nichts. Ein Neustartversuch erfolgt einmal je Hängerepisode; nur Exitcode 0 wird als „neu gestartet“ gemeldet. Abgestürzte Container behandelt die Docker-Policy `unless-stopped`, die einen bewussten Stopp respektiert.
 * **Fail-fast-Supervision:** PID 1 überwacht Apache als echten Vordergrundprozess sowie alle gestarteten Python-/Node-Worker. Endet einer dieser Dauerprozesse nach der Readiness, beendet sich der Container ungleich null; die Docker-Restart-Policy startet anschließend den vollständigen, konsistenten Dienstsatz neu.
 * **Web-Neustart:** Der Web-Endpunkt erzeugt ausschließlich ein inhaltlich und per Inode gebundenes Neustartflag. Der Notifier konsumiert genau dieses Flag und beendet sich ungleich null; `wait -n` in PID 1 beendet daraufhin den vollständigen Dienstsatz. Es gibt keinen wirkungslosen Prozessnamen- oder `systemctl`-Neustart im Container.
 * **Imagegebundener Healthcheck:** Das Image prüft Apache, alle Pflichtprozesse und exakt die beim Boot aus der Konfiguration projizierten Zusatzdienste. Es liest dafür nur den PID-Namensraum, die root-gebundene Boot-Projektion und die Apache-Konfiguration; RSCP, Geräte und Aktoren werden nicht angesprochen. Die Hostbefehle verlangen anschließend zwei identische Snapshots derselben Container-, Image- und Startgeneration mit unverändert grünem Healthstatus.
@@ -1343,7 +1346,7 @@ ihre Weboberfläche nennt höchstens die Host-Befehle.
    beschrieben: die unveränderte mitgelieferte Datei ersetzen; eine vom
    Installer erzeugte Datei mit `./data`- und `./logs`-Ordnern sowie OMV- und
    eigene Dateien nicht ersetzen, sondern die Änderungen übertragen.
-2. Einen festen Pin in `.env` gegebenenfalls bewusst auf `v5.5.7` ändern.
+2. Einen festen Pin in `.env` gegebenenfalls bewusst auf `v5.5.8` ändern.
    Wer noch kein Watchtower-Token hat (`grep -c '^E3DC_WATCHTOWER_API_TOKEN=.' .env`
    zählt nicht leere Einträge, ohne das Token auszugeben; `0` bedeutet kein Eintrag), trägt es jetzt mit dem zweiten Befehl aus
    „Watchtower einmalig freischalten“ in `.env` ein. Dann erstellt der

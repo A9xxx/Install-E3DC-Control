@@ -111,6 +111,20 @@ RUN find -P /app/pi/Install -xdev -type d -exec chmod 0755 -- {} + && \
     test -f /app/pi/Install/Installer/matter/package-lock.json && \
     test -f /app/pi/Install/Installer/Storage/backup_hold.py && \
     test -f /app/pi/Install/Installer/Storage/power_limits.py && \
+    test -f /app/pi/Install/Installer/Storage/befehl_werte.py && \
+    test -f /app/pi/Install/Installer/Storage/handauftrag_leser.py && \
+    test -f /app/pi/Install/Installer/Storage/quellenrahmen.py && \
+    test -f /app/pi/Install/Installer/Storage/kern.py && \
+    test -f /app/pi/Install/Installer/Storage/kern_adapter.py && \
+    test -f /app/pi/Install/Installer/Storage/vorab_leser.py && \
+    test -f /app/pi/Install/Installer/Storage/kern_budget.py && \
+    test -f /app/pi/Install/Installer/Storage/kern_projektion.py && \
+    test -f /app/pi/Install/Installer/Storage/schatten.py && \
+    test -f /app/pi/Install/Installer/Storage/kern_uebergabe.py && \
+    test -f /app/pi/Install/Installer/Storage/kurvenleser.py && \
+    test -f /app/pi/Install/Installer/Storage/ladepunkt_leser.py && \
+    test -f /app/pi/Install/Installer/Storage/leistungsleser.py && \
+    test -f /app/pi/Install/Installer/Storage/zyklus_leser.py && \
     test -f /app/pi/Install/Installer/apache/e3dc-control-security.conf && \
     test -f /app/pi/Install/Installer/apache/e3dc-control-access-log.conf && \
     test -f /app/pi/Install/Installer/Storage/process_singleton.py && \

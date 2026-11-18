@@ -7,7 +7,6 @@
 
 $paths = getInstallPaths();
 // Konfigurations-Pfad wird nicht mehr direkt gelesen — loadE3dcConfig() nutzt V4 JSON
-$historyFile = rtrim($paths['install_path'], '/') . '/live_history.txt';
 
 // 1. Config aus V4 JSON (Single Source of Truth via loadE3dcConfig)
 $wpMax = 5000;
@@ -103,9 +102,6 @@ for ($i = 1; $i <= 5; $i++) {
 }
 if (!empty($pvStrings)) { $pvMax = array_sum(array_column($pvStrings, 'power')); }
 
-
-// 2. 24h Mittelwerte berechnen (Cache 1 Std)
-$avgs = get24hAverages($historyFile);
 
 // 3. Strompreise & Prognose aus awattardebug.txt laden
 $priceHistory = [];

@@ -45,9 +45,9 @@ Aktor, Anti-Flattern, Akkustützung nach Korridorlage) stehen in
 | Modus | Zweck |
 |---|---|
 | `Aus` | NGNA: E3DC-Control beobachtet nur. Eine Standardfreigabe wird nur einmalig nach bewusstem Wechsel auf `Aus` in der WebUI gesendet. |
-| `PV-Kurve ruhig` | Lädt aus PV-Überschuss entlang der Speicher-Ladekurve mit Hysterese. Der Hausspeicher ist keine Ladequelle für das Fahrzeug; über oder im Kurvenkorridor stützt er nur im Rahmen des Wolken-Kontingents. Unter dem Korridor erhält die Wallbox bei ausgeschalteter zentraler PV-Aufteilung den reinen PV-Überschuss; mit der experimentellen zentralen PV-Aufteilung („Kurve zuerst“) wird der Kurvenbedarf des Speichers zuerst abgezogen. Details stehen in `V4_Konfiguration_und_Regelung.md`, Abschnitt „Akkustützung der Wallbox in `PV-Kurve ruhig` nach Korridorlage“. |
+| `PV-Kurve ruhig` | E3DC-Control lädt aus PV-Überschuss entlang der Speicher-Ladekurve mit Hysterese. Der Hausspeicher ist keine Ladequelle für das Fahrzeug. Das Wolkenkontingent gilt nur unterhalb des Kurvenkorridors. Unter dem Korridor erhält die Wallbox bei ausgeschalteter zentraler PV-Aufteilung den reinen PV-Überschuss; mit der experimentellen zentralen PV-Aufteilung („Kurve zuerst“) wird der Kurvenbedarf des Speichers zuerst abgezogen. Details stehen in `V4_Konfiguration_und_Regelung.md`, Abschnitt „Akkustützung der Wallbox in `PV-Kurve ruhig` nach Korridorlage“. |
 | `Grundladung stabil` | Hält eine ruhige Grundladung, solange das Speicherziel laut Planung erreichbar bleibt. |
-| `PV + Akku bis Untergrenze` | Nutzt PV und oberhalb der Hausakku-Untergrenze zusätzlich den Speicher. Reicht die PV unter den Speicher- und belegten Fahrzeug-Leistungsgrenzen nicht für Akku und geeignete Fahrzeuge, endet die heutige PV-Kurve bei wbminSoC, auch bei Prognose auf 100%. Bedarf 0 lässt das normale Ziel bestehen; unbekannter Bedarf zählt nach bestätigter Ladung weiter, nur am selben Kurventag und in derselben Steck-Episode; nach 60 Minuten unter 300 W bei ausreichendem PV- und Stromangebot endet dieser Beleg. Unterbrechungen bis zwei Minuten pausieren die Uhr; längere setzen sie zurück. Das gilt für alle Wallboxen (geregelt und beobachtet), in Aus nur mit „Nur beobachten, Speicher oberhalb Hausreserve freigegeben“. Zur normalen Kurve ab 110 %, zurück unter 100 %; jede Wahl hält etwa 15 Minuten. Bestätigtes Abstecken und Pause wirken ab dem nächsten Planlauf; relevante Änderungen lösen nach 60 Sekunden stabilem Zustand neu aus. Folgetage und Netzladeziele bleiben normal. Details stehen in `Ladekurve_Berechnung.md`, Abschnitt „Abendziel bei PV + Akku“. Die unten beschriebene begrenzte Phasenerkennung darf kurz Netzleistung überbrücken. Ist die Untergrenze erreicht und trägt das PV-Budget dieser Wallbox die Mindestleistung der aktuellen Phasenzahl nicht, wird eine laufende Ladung bei dieser Phasenzahl auf den Mindeststrom gesetzt (ohne PV sofort, bei noch anliegendem PV nach 20 s Bestätigung) und nach einem Durchlauf des Wh-Kontos gestoppt; eine dreiphasig ladende openWB Pro wechselt stattdessen auf 1p, wenn das PV-Budget das 1p-Minimum trägt. Laden mehrere Wallboxen, wird diese Wallbox ohne Netzbezug zuerst abgesenkt, sofern sie selbst über ihrer Zuteilung lädt; deckt ihre Zuteilung die tatsächliche Ladeleistung, lädt sie weiter. Netzbezug und ein laufender Phasenwechsel einer anderen Wallbox haben Vorrang. |
+| `PV + Akku bis Untergrenze` | Nutzt PV und oberhalb der Hausakku-Untergrenze zusätzlich den Speicher. In der Haltezone direkt über der Untergrenze folgt die Wallbox dem PV-Rahmen des Speichers; der Akku überbrückt bis zum normalen Unterdeckungsstopp ohne eigenes Energiekonto. Reicht die PV unter den Speicher- und belegten Fahrzeug-Leistungsgrenzen nicht für Akku und geeignete Fahrzeuge, endet die heutige PV-Kurve bei wbminSoC, auch bei Prognose auf 100%. Bedarf 0 lässt das normale Ziel bestehen; unbekannter Bedarf zählt nach bestätigter Ladung weiter, nur am selben Kurventag und in derselben Steck-Episode; nach 60 Minuten unter 300 W bei ausreichendem PV- und Stromangebot endet dieser Beleg. Unterbrechungen bis zwei Minuten pausieren die Uhr; längere setzen sie zurück. Das gilt für alle Wallboxen (geregelt und beobachtet), in Aus nur mit „Nur beobachten, Speicher oberhalb Hausreserve freigegeben“. Zur normalen Kurve ab 110 %, zurück unter 100 %; jede Wahl hält etwa 15 Minuten. Bestätigtes Abstecken und Pause wirken ab dem nächsten Planlauf; relevante Änderungen lösen nach 60 Sekunden stabilem Zustand neu aus. Folgetage und Netzladeziele bleiben normal. Details stehen in `Ladekurve_Berechnung.md`, Abschnitt „Abendziel bei PV + Akku“. Die unten beschriebene begrenzte Phasenerkennung darf kurz Netzleistung überbrücken. Ist die Untergrenze erreicht und trägt das PV-Budget dieser Wallbox die Mindestleistung der aktuellen Phasenzahl nicht, wird eine laufende Ladung bei dieser Phasenzahl auf den Mindeststrom gesetzt (ohne PV sofort, bei noch anliegendem PV nach 20 s Bestätigung) und nach einem Durchlauf des Wh-Kontos gestoppt; eine dreiphasig ladende openWB Pro wechselt stattdessen auf 1p, wenn das PV-Budget das 1p-Minimum trägt. Laden mehrere Wallboxen, wird diese Wallbox ohne Netzbezug zuerst abgesenkt, sofern sie selbst über ihrer Zuteilung lädt; deckt ihre Zuteilung die tatsächliche Ladeleistung, lädt sie weiter. Netzbezug und ein laufender Phasenwechsel einer anderen Wallbox haben Vorrang. |
 | `Sofort bis Preislimit` | Netzladen nur, wenn der aktuelle Preis unter dem Wallbox-Preislimit liegt. Ohne Preis- oder Netzfenster gilt an der Hausakku-Untergrenze dieselbe Absenkung wie in `PV + Akku bis Untergrenze`. |
 | `Akku bis Abfahrt` | Lädt im Freigabefenster vor der Abfahrtszeit aus PV und Hausspeicher bis zur Hausakku-Untergrenze `wbminsoc`; Netzladen bleibt gesperrt. Gestoppt wird bei erreichter Abfahrtszeit und bei vollem Fahrzeug; an der Untergrenze kann mit ausreichendem PV-Anteil weitergeladen werden. Abfahrtszeit `wb<n>_battery_departure_time` (Standard `06:30`), Fenster `wb<n>_battery_departure_window_h` (Standard 3 h, 1–36 h). |
 
@@ -183,8 +183,8 @@ Weichen Netzwert des E3DC und Summe des Netzzählers voneinander ab, bleibt die 
   der Wallbox).
 * Absenkungen auf einen Strom unter dem gehaltenen, aber mindestens auf den
   Mindeststrom der Wallbox, laufen während des Halts durch (kein Schütz):
-  etwa der Deckel des Hausanschlusses, der Grid-Wächter und die
-  Defizitkaskade. Der Heartbeat läuft weiter, bei der openWB als Secondary
+  etwa der Deckel des Hausanschlusses. Der Heartbeat läuft weiter, bei der
+  openWB als Secondary
   auch ihr Heartbeat über den PV-Modus-Befehl, der keinen Strom setzt.
 * Kommt vor Ablauf der 10 s wieder eine gültige Probe, regelt der Manager
   normal weiter. Endet der Halt ohne gültige Probe, gilt das bisherige
@@ -197,9 +197,13 @@ Weichen Netzwert des E3DC und Summe des Netzzählers voneinander ab, bleibt die 
 ## Haltezone an `wbminsoc`
 
 Der Speicher veröffentlicht den Rahmen der Haltezone als Budget. Der Kern
-liest daraus den PV-Anteil; das geschlossene wbminSoC-Tor verbietet nur die
-Akkustützung. Trägt PV die Mindestleistung, wird weitergeladen. Andernfalls
-endet die Stützung; der vorhandene Sitzungsautomat entscheidet über den Stopp.
+liest daraus den PV-Anteil ohne erneuten Abzug des Speicher-Ladebedarfs und
+schneidet den Strom auf ganze Ampere ab. Das geschlossene wbminSoC-Tor
+verbietet die dauerhafte Akkustützung. Die Box folgt dem Rahmen im bestehenden
+10-s-Takt. Der Akku deckt den Übergang und bei Unterdeckung bis zum bestehenden
+Unterdeckungsstopp; im Band gibt es keine eigene Entladekappe und kein Wh-Konto.
+Trägt PV die Mindestleistung, wird weitergeladen. Andernfalls entscheidet der
+vorhandene Sitzungsautomat über den Stopp.
 Strom und Phasen bleiben Entscheidungen des Wallbox Managers. Der
 Speicherregler führt weiter seine Kurve, Quellenfreigabe und Haltezone.
 Nutzer-Aus, Notstromreserve, Hausanschluss und Datenvalidität haben Vorrang.
@@ -759,6 +763,10 @@ am Netzpunkt berücksichtigt: Erst werden die gemessenen Boxleistungen
 abgezogen, danach erhält ausschließlich die verbleibende Hauslast die
 Marge über den Leistungsfaktor. Für den Hausanschluss zählen ausschließlich die drei frischen, gültigen Phasenwerte des E3DC-Leistungsmessers. Darin sind Haus, Akku, Wärmepumpe und Wallboxen bereits enthalten. Die eigenen gemessenen Wallboxanteile werden genau einmal abgezogen; auf die verbleibende Last wirkt die Leistungsfaktormarge. Die Reserve begrenzt nur die Wallboxsumme: Der Rahmen ist der kleinere Wert aus Anschluss minus Reserve minus unbekannten Boxanteilen und Anschluss minus positiver gehaltener Hauslast. Die eingetragene Netzphase gilt wie eingetragen; eine abweichende Messung erscheint als Hinweis. Netzwert und Phasensumme werden für diesen Rahmen nicht gegeneinander geprüft.
 
+Bei gleichzeitigem Akku-Netzladen und Fahrzeugladen verwendet E3DC-Control ein gemeinsames Phasenbudget mit Akkuvorrang. Aus den Phasenwerten werden der gemessene Akkuanteil und die frisch gemessenen, selbst geregelten Fahrzeuganteile jeweils einmal gelöst. Der ausführbare Netzladeauftrag erhält zuerst seinen Anteil innerhalb des Anschlussrahmens; die Wallboxen teilen sich den verbleibenden Raum. Die höchste belastete Phase bestimmt die Akkugrenze. Ohne Netzladeauftrag wird keine nominelle Akkuleistung vorgehalten.
+
+Im Wallboxrahmen ersetzt der Zielanteil den bereits enthaltenen Akku-Istanteil. Ein kleineres Ziel öffnet den schnellen gemessenen Deckel nicht. Die vorhandenen Reserven werden nicht addiert. Fehlt eine Einzelmessung, bleibt der betreffende Verbraucher im Gesamtwert enthalten. Fehlt der Akkuauftrag oder ist sein Laufzeitanteil ungültig beziehungsweise veraltet, gilt wieder der bisherige Rahmen mit dem gemessenen Akku. Mit dem Auftragsende entfällt der Zielanteil. Die schnelle elektrische Absenkung, Schutzstopps, die Quittungsbrücke und die Datenfrist bleiben wirksam.
+
 Ohne gültige Phasenwerte warten neue Starts, Sofortladen, Fortsetzen und Phasenwechsel. Eine laufende Ladung nutzt während der vorhandenen Datenfrist den letzten gemessenen Hauswert unverändert und hält sofort Mindeststrom; nach 300 Sekunden endet sie. Nach dem Nullsetzen einer Phasenfolge bleibt die Box ohne gültige Phasenwerte auf 0 A. Elektrische Grenzen und Nutzerstopps wirken weiterhin sofort. Falsche, aber frische und gültige Zählerwerte oder eine falsch eingetragene Netzphase können zu einer dauerhaften Überschreitung führen. Ein fremder Lastsprung in der Datenlücke bleibt bis zum Fristende unbemerkt.
 
 Meldet eine Wallbox keine Phasenströme, rechnet E3DC-Control ihren Strom aus der gemessenen Leistung mit derselben Sicherheitsmarge wie die übrige Hauslast. Die Stromschätzung gilt für U·cos φ ≥ 207 V (Spannung mal Leistungsfaktor, bei Marge 0,9). Wallboxen ohne eigene Phasenstrommessung behalten auch mit eingetragener Netzphase diesen Abstand. Derselbe Abstand gilt bereits bei der Verteilung des Zielstroms, damit der verfügbare Raum beim Start gleich bleibt. Steigt eine andere Last im Haus sprunghaft,
@@ -865,7 +873,7 @@ Rückmeldung der Box geprüft.
 
 Ohne phasenaufgelöste Strommessung am Netzpunkt bleibt einphasiges Laden an
 einer openWB Pro fest auf 20 A gedeckelt. Freigegebene Messbasis für einen
-höheren Deckel ist der Bezugsstrom je Netzphase aus dem E3DC-Wurzelzähler:
+höheren Deckel ist der Bezugsstrom je Netzphase aus dem Netzzähler des E3DC (Wurzelzähler):
 Wirkleistung je Phase (`grid_p1..3`, nur Bezug, Einspeisung zählt nie als
 Spielraum) geteilt durch die vom Wechselrichter gemessene Phasenspannung
 (`ac0..2_v`, plausibel 180–260 V und jünger als 10 s, sonst 230 V) plus der
@@ -1461,3 +1469,22 @@ gilt trotzdem die neue Antwort des E3DC; die Diagnose meldet den Speicherfehler.
 Antwortet der E3DC mit „nicht hinterlegt“, fragt die Regelung ebenfalls nur
 gelegentlich erneut. Zusatzsicherungen und Reserven für andere
 Hausverbraucher bleiben eigene Nutzereinstellungen.
+
+Die Netzphasen werden über die eindeutige ROOT-Rolle des E3DC-Leistungsmessers
+zugeordnet. Im Config-Editor unter „E3DC System-Verbindung“ wählt
+„Wurzelzähler / PM-Index“ (`wurzelzaehler`) mit 0 die Gerätezuordnung;
+ein gültiger Index von 1 bis 65535 übersteuert sie.
+Bei falschen Phasenwerten ist die Zuordnung unter „Wurzelzähler / PM-Index“
+maßgeblich.
+
+Fehlt eine Phase oder die eindeutige Rolle, meldet E3DC-Control
+„Keine Phasenwerte vom E3DC-Leistungsmesser“ mit der Quelle. Neue Starts,
+Fortsetzen und Phasenwechsel warten; eine laufende Ladung wird auf den
+Mindeststrom begrenzt und endet nach der Datenfrist von 300 Sekunden.
+Dann „Wurzelzähler / PM-Index“ prüfen; eine Änderung wirkt nach einem
+Neustart des Live-Dienstes.
+Aus Netzsaldo oder Hausverbrauch werden keine Phasenwerte ersetzt.
+Der Speicher regelt weiterhin mit dem EMS-Netzwert.
+
+Die Rollenaufnahme läuft am Zyklusende nach Dienststart höchstens alle 60 Sekunden, bis genau ein Wurzelzähler feststeht; danach erst beim nächsten Dienststart.
+Die vollständige Regel einschließlich Fehlerbehandlung steht in [Konfiguration und Regelung](V4_Konfiguration_und_Regelung.md).

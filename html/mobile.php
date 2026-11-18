@@ -74,6 +74,11 @@ if (isset($_POST['save_lux_global'])) {
         );
         exit;
     }
+    if (!empty($restart['restart_queued'])) {
+        echo '<script>window.alert(' . json_encode($restart['message'], JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT)
+            . ');window.location.href=' . json_encode('mobile.php?seite=config') . ';</script>';
+        exit;
+    }
     header("Location: mobile.php?seite=config");
     exit;
 }
@@ -837,6 +842,7 @@ if ($wpvAjaxRequest && $seite === 'waermepumpe_vorschau') {
 </head>
 <body class="mode-<?php echo VIEW_MODE; ?> frontend-<?= htmlspecialchars($frontendVariant ?? 'classic', ENT_QUOTES) ?> detail-<?= htmlspecialchars($frontendDetailMode ?? 'normal', ENT_QUOTES) ?>" data-theme="<?= $darkMode ? 'dark' : 'light' ?>" data-bs-theme="<?= $darkMode ? 'dark' : 'light' ?>" data-frontend="<?= htmlspecialchars($frontendVariant ?? 'classic', ENT_QUOTES) ?>" data-detail-mode="<?= htmlspecialchars($frontendDetailMode ?? 'normal', ENT_QUOTES) ?>">
 <div class="container py-3">
+    <?= e3dcHostPinNoticeHtml() ?>
     <div class="mobile-nav-header mb-3">
         <nav class="navbar bg-nav-custom px-3 py-2" style="border-radius: 20px; box-shadow: 0 4px 12px rgba(0,0,0,0.2);">
             <a class="navbar-brand mobile-app-brand shadow-none" href="mobile.php" title="Live Dashboard" aria-label="Live Dashboard">
@@ -1562,7 +1568,7 @@ if ($wpvAjaxRequest && $seite === 'waermepumpe_vorschau') {
     <script src="<?= getAssetUrl('update_status.js') ?>" defer></script>
     <script src="<?= getAssetUrl('solar.js') ?>" defer></script>
 <script>
-const PV_MAX = <?= $pvMax ?>; const WP_MAX = <?= $wpMax ?>; const BAT_MAX = <?= $maxBatPower ?>; const BAT_CAPACITY = <?= $batteryCapacity ?>; const AVGS = <?= json_encode($avgs) ?>;
+const PV_MAX = <?= $pvMax ?>; const WP_MAX = <?= $wpMax ?>; const BAT_MAX = <?= $maxBatPower ?>; const BAT_CAPACITY = <?= $batteryCapacity ?>;
 const PRICE_HISTORY = <?= json_encode($priceHistory) ?>;
 let FORECAST_DATA = <?= json_encode($forecastData) ?>;
 const LON = <?= json_encode($lon) ?>;

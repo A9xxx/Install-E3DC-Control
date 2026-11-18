@@ -919,6 +919,28 @@ function installCenterRedactText($text) {
         },
         $text
     );
+    // IPv6 vor IPv4 behandeln, damit auch eingebettete IPv4-Adressen ganz bleiben.
+    $text = preg_replace_callback(
+        '/(?<![A-Za-z0-9_])([A-Za-z0-9_]+\[|[A-Za-z_]*[G-Zg-z_][A-Za-z_]*(?=[0-9]))?((?:[0-9a-fA-F]*:){2,}[0-9a-fA-F.]*)(?![A-Za-z0-9_:])/',
+        function($match) {
+            $prefix = (string)($match[1] ?? '');
+            $candidate = (string)$match[2];
+            // Kurze numerische Slices lesbar lassen; echte Adressen nach Wort[ erfassen.
+            if (str_ends_with($prefix, '[') && !preg_match('/[a-f]/i', $candidate) && substr_count($candidate, ':') <= 2) return (string)$match[0];
+            $ip = rtrim($candidate, '.');
+            if (!filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV6)) $ip = rtrim($ip, ':');
+            if (!filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV6)) {
+                $withoutPort = preg_replace('/:\\d{1,5}$/', '', $ip);
+                if (filter_var($withoutPort, FILTER_VALIDATE_IP, FILTER_FLAG_IPV6)) $ip = $withoutPort;
+            }
+            $suffix = substr($candidate, strlen($ip));
+            if (!filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV6)) return (string)$match[0];
+            $packed = inet_pton($ip);
+            if ($packed === inet_pton('::') || $packed === inet_pton('::1') || (ord($packed[0]) === 0xfe && (ord($packed[1]) & 0xc0) === 0x80)) return (string)$match[0];
+            return $prefix . installCenterDiagnosticPseudonym('ip', inet_ntop($packed)) . $suffix;
+        },
+        $text
+    );
     $text = preg_replace_callback(
         '/\b(?:\d{1,3}\.){3}\d{1,3}\b/',
         function($match) {
@@ -1026,6 +1048,21 @@ function installCenterRedactText($text) {
         fn($match) => (string)$match[1] . installCenterDiagnosticPseudonymizeValue('ip', (string)$match[2]) . (string)$match[3],
         $text
     );
+    // Home-Pfade behalten ihren Aufbau; nur der Kontoname wird ersetzt.
+    $text = preg_replace_callback(
+        '~(/home/)([^/\s\"\'<>]+)~u',
+        fn($match) => $match[1] . installCenterDiagnosticPseudonym('account', $match[2]),
+        $text
+    );
+    static $installUser = null;
+    if ($installUser === null) $installUser = (string)(getInstallPaths()['install_user'] ?? '');
+    if ($installUser !== '' && !in_array($installUser, ['root', 'www-data'], true)) {
+        $text = preg_replace_callback(
+            '/(?<![A-Za-z0-9_.-])' . preg_quote($installUser, '/') . '(?![A-Za-z0-9_.-])/u',
+            fn($match) => installCenterDiagnosticPseudonym('account', $match[0]),
+            $text
+        ) ?? $text;
+    }
     // Eigener Hostname an jeder anderen Stelle, nur als ganzes Wort und in
     // exakter Schreibweise, damit Dienst- und Pfadnamen lesbar bleiben.
     $hostname = installCenterDiagnosticLocalHostname();
@@ -1171,6 +1208,7 @@ function installCenterDiagnosticPseudonymScope() {
 function installCenterDiagnosticIdentifierKind($key, $value = null) {
     $key = strtolower(trim((string)$key));
     if ($key === '') return null;
+    if ($key === 'install_user') return 'account';
     if ($key === 'wurzelzaehler') {
         // Werte bis 65535 sind PM-Indizes, größere Werte Zähler-Seriennummern.
         return (is_numeric($value) && (float)$value > 65535) ? 'serial' : null;
@@ -1281,22 +1319,7 @@ function installCenterIsPseudonymousDiagnosticKey($key) {
 }
 
 function installCenterIsSensitiveConfigKey($key) {
-    $key = (string)$key;
-    if (preg_match('/(?:^|[_-])(?:odometer|mileage|kilometerstand)$/i', $key)) return true;
-    if (preg_match('/^wb[12]_openwb_tls_/', $key)) return true;
-    // Umfasst die Muster von ha_manager.is_secret_config_key und dem
-    // Config-Editor: jede *_pin (web_pin ist zugleich API-Token), passwd, aes
-    // und private Schlüssel. Zusätzlich HTTP-/Web-Authentifizierung als ganzes
-    // Namensteil (Authorization, http_auth_*, WEB_AUTH_*); Regelwerte wie
-    // battery_support_authorized oder authorized_phases bleiben lesbar.
-    if (preg_match('/(password|passwort|passwd|pwd|(?:^|[_-])pass(?:$|[_-])|(?:^|[_-])pw(?:$|[_-])|(?:^|[_-])pin$|(?:^|[_-])aes(?:$|[_-])|(?:^|[_-])private(?:[_-]?key)?$|token|secret|api.?key|apikey|credential|(?:^|[_-])auth(?:$|[_-])|authorization$|(?:^|[_-])authentication(?:$|[_-])|bluelink_pin|bluelink_user)/iu', $key) === 1) {
-        return true; // Bluelink-PIN und Konto (E-Mail) redigiert
-    }
-    // Anmeldenamen von Geräte- und Dienstkonten sind Zugangsdaten.
-    if (preg_match('/^(?:e3dc_user|mqtt_hub_user|wb2?_user|stiebel_isg_web_user)$|(?:^|[_-])username$/iu', $key) === 1) {
-        return true;
-    }
-    return preg_match('/(password|passwort|pwd|token|secret|api.?key|apikey|mail|email|chat.?id|latitude|longitude|breitengrad|laenge|länge|laengengrad|längengrad|^lat$|^lon$|^lng$|^long$|[_-](?:lat|lon|lng)$|height|hoehe|höhe|elevation|altitude)/iu', (string)$key) === 1;
+    return e3dcIsSensitiveConfigKey($key);
 }
 
 require_once __DIR__ . '/pv_entity_projection.php';
@@ -1577,30 +1600,17 @@ function installCenterMlDockerStatus() {
     $predictionPath = '/var/www/html/ramdisk/ml_prediction.json';
     $cachePredictionPath = '/var/www/html/data/docker_ramdisk_cache/ml_prediction.json';
     $dbPath = '/var/www/html/data/e3dc_stats.db';
-    $predictionExists = is_file($predictionPath);
-    $cachePredictionExists = is_file($cachePredictionPath);
     $trainingRows = installCenterSqliteCount($dbPath, 'ml_training_data');
     $dailyRows = installCenterSqliteCount($dbPath, 'daily_stats');
 
-    $status = 'prediction_available';
-$message = 'ML-Prognosedatei vorhanden. Frische und Modellintegrität werden ausschließlich im Predictor über Manifest und Hash geprüft.';
-    if (!$predictionExists && $cachePredictionExists) {
-        $status = 'prediction_not_restored';
-$message = 'Aktuelle Ramdisk-Prognose fehlt, ein Warmstart-Cache ist vorhanden. Der Predictor muss ihn sicher wiederherstellen und das private Modell prüfen.';
-    } elseif (!$predictionExists) {
-        $status = 'no_prediction';
-        $message = 'Keine aktuelle ML-Prognose vorhanden. Der private Modellstatus wird aus dem Webprozess bewusst nicht abgefragt.';
-    }
-    if (!$predictionExists && $trainingRows !== null && $trainingRows < 50) {
-        $status = 'not_enough_training_data';
-        $message = 'Weniger als 50 ML-Trainingsdatensätze vorhanden. Bis zum sicheren Training bleibt der konservative Ersatzpfad aktiv.';
-    }
+    $forecastStatus = e3dcConsumptionForecastStatus($predictionPath);
 
     return [
         'created_at' => date('c'),
         'docker_detected' => is_file('/.dockerenv') || getenv('E3DC_WEB_PORT') !== false || getenv('E3DC_WEB_BIND') !== false,
-        'status' => $status,
-        'message' => $message,
+        'status' => $forecastStatus['status'],
+        'message' => $forecastStatus['message'],
+        'consumption_forecast' => $forecastStatus,
         'data_dir' => installCenterDirMeta('/var/www/html/data'),
         'ramdisk_dir' => installCenterDirMeta('/var/www/html/ramdisk'),
         'docker_ramdisk_cache_dir' => installCenterDirMeta('/var/www/html/data/docker_ramdisk_cache'),
@@ -2355,6 +2365,57 @@ function installCenterDirectMarketingConfigSubset() {
     ];
 }
 
+function installCenterStorageComparisonCard() {
+    $state = json_decode(@file_get_contents('/var/www/html/ramdisk/speicherkern_schatten.json'), true);
+    $aggregate = json_decode(@file_get_contents('/var/www/html/ramdisk/speicherkern_schatten_aggregate.json'), true);
+    $state = is_array($state) && ($state['schema'] ?? '') === 'speicherkern_schatten_v1' ? $state : [];
+    $aggregate = is_array($aggregate) && ($aggregate['schema'] ?? '') === 'speicherkern_schatten_aggregate_v1' ? $aggregate : [];
+    $fresh = isset($state['ts']) && is_numeric($state['ts']) && time() - $state['ts'] >= 0 && time() - $state['ts'] < 60;
+    $status = !empty($state['gesperrt']) ? 'Stillgelegt: Schreibweg erkannt' : ($fresh ? 'Vergleich aktiv' : 'Keine aktuellen Daten');
+    $last = is_array($state['vergleich_letzter_zyklus'] ?? null) ? $state['vergleich_letzter_zyklus'] : [];
+    $class = in_array($last['klasse'] ?? '', ['gleich', 'U', 'A0', 'A1', 'A2', 'A3', 'A4'], true) ? $last['klasse'] : 'unbekannt';
+    $pair = preg_match('/^(FREI|KURVE|HALTEN|NETZLADEN|SONDER)×(FREI|KURVE|HALTEN|NETZLADEN|SONDER)$/u', (string)($last['moduspaar'] ?? '')) ? $last['moduspaar'] : 'unbekannt';
+    $today = is_array($state['heute'] ?? null) && ($state['heute']['tag'] ?? 0) == (int)date('Ymd') ? $state['heute'] : [];
+    $counts = $today['klassen'] ?? array_fill(0, 7, 0);
+    $comparable = (int)($today['vergleichbar'] ?? 0);
+    $cycles = (int)($today['zyklen'] ?? 0);
+    $rate = static function ($n, $total) { return $total > 0 ? number_format(100 * $n / $total, 2, ',', '.') . ' %' : 'unbekannt'; };
+    $shares = $rate($comparable, $cycles) . ' vergleichbar; A0 ' . $rate($counts[1] ?? 0, $comparable) . ', A1 ' . $rate($counts[2] ?? 0, $comparable) . ', A2 ' . $rate($counts[3] ?? 0, $comparable);
+    $totalsKnown = is_array($state['heute'] ?? null) || is_array($aggregate['stunden'] ?? null);
+    $a3 = $a4 = 0;
+    foreach (($aggregate['stunden'] ?? []) as $hour) {
+        if (($hour[1] ?? 0) == ($today['tag'] ?? -1)) continue;
+        $a3 += (int)($hour[4][4] ?? 0); $a4 += (int)($hour[4][5] ?? 0);
+    }
+    $a3 += (int)($counts[4] ?? 0); $a4 += (int)($counts[5] ?? 0);
+    $coverage = [];
+    $coverageKnown = true;
+    $names = ['Pre-Dump', 'Unwetter', 'Wärme-Tarif', 'Lastspitzen', 'Direktvermarktung', 'Preis-Boost', 'Vorhaltung'];
+    foreach ($names as $i => $name) {
+        $coverageKnown = $coverageKnown && is_bool($state['funktionsstatus'][$name]['konfiguriert'] ?? null);
+        if (($state['funktionsstatus'][$name]['konfiguriert'] ?? false) === true) {
+            $row = $today['abdeckung'][$i] ?? [];
+            $coverage[] = $name . ': ' . (int)($row[1] ?? 0) . '/' . (int)($row[0] ?? 0);
+        }
+    }
+    $p95 = $today['laufzeit_ms'][1] ?? null;
+    $values = [
+        'Stand' => $status,
+        'Letzter Vergleich' => $class . ' · ' . $pair,
+        'Heute' => $shares,
+        'Schrankenkonflikte / Schreibweg' => $totalsKnown ? 'A3 ' . $a3 . ' / A4 ' . $a4 : 'unbekannt',
+        'Abdeckung / angefordert' => $coverage ? implode('; ', $coverage) : ($coverageKnown ? 'Keine Sonderfunktion konfiguriert' : 'unbekannt'),
+        'Laufzeit p95' => is_numeric($p95) ? number_format($p95, 1, ',', '.') . ' ms' : 'unbekannt',
+    ];
+    $html = '<section id="storageComparisonCard" class="installer-status mb-3"><strong>Neue Speicherregelung im Vergleichsbetrieb</strong><div class="small text-secondary">E3DC-Control vergleicht Vorschläge. Die neue Regelung steuert keine Geräte.</div><dl class="row small mt-2 mb-0">';
+    foreach ($values as $label => $value) {
+        $red = $label === 'Schrankenkonflikte / Schreibweg' && ($a3 + $a4) > 0 ? ' text-danger' : '';
+        $html .= '<dt class="col-sm-4">' . htmlspecialchars($label, ENT_QUOTES, 'UTF-8') . '</dt><dd class="col-sm-8' . $red . '">' . htmlspecialchars($value, ENT_QUOTES, 'UTF-8') . '</dd>';
+    }
+    return $html . '</dl></section>';
+}
+
+
 function installCenterDirectMarketingCompactWindow($window) {
     if (!is_array($window)) return null;
     $keys = [
@@ -2958,6 +3019,8 @@ function installCenterDiagnosticCandidates() {
         'live_data_last_valid.json',
         'storage_plan.json',
         'storage_manager_state.json',
+        'speicherkern_schatten.json',
+        'speicherkern_schatten_aggregate.json',
         'storage_decision_latest.json',
         'ems_decision_latest.json',
         'direct_marketing_daily_report.json',
@@ -3007,7 +3070,7 @@ function installCenterDiagnosticCandidates() {
             'path' => $path,
             'size' => @filesize($path) ?: 0,
             'bundle_size' => min(@filesize($path) ?: 0, 250000),
-            'default' => in_array($base, ['storage_plan.json', 'storage_manager_state.json', 'storage_decision_latest.json', 'ems_decision_latest.json', 'live_decision_stability.json', 'config_validation.json', 'web_install_status.json'], true),
+            'default' => in_array($base, ['storage_plan.json', 'storage_manager_state.json', 'speicherkern_schatten.json', 'storage_decision_latest.json', 'ems_decision_latest.json', 'live_decision_stability.json', 'config_validation.json', 'web_install_status.json'], true),
             'privacy' => 'Live-/Planungsdaten, Text wird bereinigt; Seriennummern und Gerätekennungen werden pseudonymisiert.'
         ];
     }
@@ -3151,7 +3214,9 @@ function installCenterDiagnosticPresets($items) {
         'log:e3dc_live.log',
         'log:storage_manager.log',
         'log:wallbox_manager.log',
+        'log:pv_forecast.log',
         'ramdisk:storage_manager_state.json',
+        'ramdisk:speicherkern_schatten.json',
         'ramdisk:wb_pv_budget.json',
     ];
     $powerDecisionPreset = array_merge([
@@ -3467,6 +3532,51 @@ function installCenterDiagnosticJsonExcerpt($value, $startTs, $endTs) {
     return $value;
 }
 
+function installCenterStorageComparisonExport($data) {
+    // Ausschließlich fachliche Zahlen und feste Produktcodes passieren den Export.
+    $out = ['stunden_spalten'=>['beginn','tag','zyklen','vergleichbar','klassen','codes','abweichung_laengste_s','a3_a4','abdeckung','laufzeit_ms','betriebsfaelle'],
+        'klassen_spalten'=>['gleich','A0','A1','A2','A3','A4','U'],
+        'codes_spalten'=>['GLEICH','MODUS','DAUER','LEISTUNG','FLATTERN','BUDGETFREIGABE','SCHUTZ_FEHLT','STRENGER','RESERVE','ANSCHLUSS','AUS','INSEL','LADESP','RESERVE_BUDGET','DATEN','NETZRAHMEN_UNBEKANNT','SCHREIBWEG','A0','U'],
+        'abdeckung_spalten'=>['Pre-Dump','Unwetter','Wärme-Tarif','Lastspitzen','Direktvermarktung','Preis-Boost','Vorhaltung']];
+    $number = static fn($v) => is_int($v) || is_float($v) ? (is_finite((float)$v) ? $v : null) : null;
+    foreach (['ts', 'version'] as $key) $out[$key] = $number($data[$key] ?? null);
+    $out['gesperrt'] = ($data['gesperrt'] ?? null) === 'SCHREIBWEG';
+    $last = $data['vergleich_letzter_zyklus'] ?? [];
+    $out['vergleich_letzter_zyklus'] = [
+        'klasse' => in_array($last['klasse'] ?? null, ['gleich','A0','A1','A2','A3','A4','U'], true) ? $last['klasse'] : null,
+        'code' => in_array($last['code'] ?? null, ['GLEICH','MODUS','DAUER','LEISTUNG','FLATTERN','BUDGETFREIGABE','SCHUTZ_FEHLT','STRENGER','RESERVE','ANSCHLUSS','AUS','INSEL','LADESP','RESERVE_BUDGET','DATEN','NETZRAHMEN_UNBEKANNT','SCHREIBWEG'], true) ? $last['code'] : null,
+        'dauer_s' => $number($last['dauer_s'] ?? null),
+        'laufzeit_ms' => $number($last['laufzeit_ms'] ?? null)];
+    $pair = static fn($v) => is_string($v) && preg_match('/^(FREI|KURVE|HALTEN|NETZLADEN|SONDER)×(FREI|KURVE|HALTEN|NETZLADEN|SONDER)$/u', $v) ? $v : null;
+    $out['vergleich_letzter_zyklus']['moduspaar'] = $pair($last['moduspaar'] ?? null);
+    $vector = static function($v, $n) use ($number) {
+        $v = is_array($v) && array_is_list($v) ? $v : [];
+        return array_map($number, array_slice(array_pad($v, $n, null), 0, $n));
+    };
+    $out['heute'] = [];
+    foreach (['tag','zyklen','vergleichbar','abweichung_laengste_s','a3_a4'] as $key) $out['heute'][$key] = $number($data['heute'][$key] ?? null);
+    foreach (['klassen'=>7, 'laufzeit_ms'=>4] as $key=>$n) $out['heute'][$key] = $vector($data['heute'][$key] ?? [], $n);
+    $out['heute']['abdeckung'] = [];
+    for ($i=0; $i<7; $i++) $out['heute']['abdeckung'][] = $vector($data['heute']['abdeckung'][$i] ?? [], 2);
+    $out['stunden'] = [];
+    // Format 1 wird nicht weitergegeben; Format 2 hat feste Spalten.
+    if (($data['version'] ?? null) === 2) foreach (array_slice($data['stunden'] ?? [], -336) as $row) {
+        if (!is_array($row) || !array_is_list($row) || count($row) !== 11) continue;
+        $r = []; foreach ([0,1,2,3] as $i) $r[] = $number($row[$i]);
+        $r[] = $vector($row[4], 7);
+        $codes = []; for ($i=0; $i<19; $i++) if (isset($row[5][(string)$i])) $codes[(string)$i] = $number($row[5][(string)$i]);
+        $r[] = $codes;
+        $r[] = $number($row[6]); $r[] = $number($row[7]);
+        $coverage = []; for ($i=0; $i<7; $i++) $coverage[] = $vector($row[8][(string)$i] ?? [], 2);
+        $r[] = $coverage; $r[] = $vector($row[9], 2);
+        $cases = []; foreach (($row[10] ?? []) as $key => $value) if ($pair($key)) $cases[$key] = $vector($value, 4);
+        $r[] = $cases; $out['stunden'][] = $r;
+    }
+    $out['zeitraum'] = $vector($data['zeitraum'] ?? [], 2);
+    return $out;
+}
+
+
 function installCenterReadDiagnosticJsonExcerpt($path, $archiveName, $sourceSize, $maxBytes, $jsonText) {
     // JSON immer vollständig parsen und vor jeder Auswahl strukturiert bereinigen.
     $decoded = json_decode((string)$jsonText, true);
@@ -3476,6 +3586,9 @@ function installCenterReadDiagnosticJsonExcerpt($path, $archiveName, $sourceSize
     $excerpt = $valid
         ? installCenterDiagnosticJsonExcerpt(installCenterRedactConfigValue('', $decoded), $now - 4 * 3600, $now + 48 * 3600)
         : ['error' => 'invalid_json'];
+    if (in_array(basename((string)$archiveName), ['speicherkern_schatten.json', 'speicherkern_schatten_aggregate.json'], true)) {
+        $excerpt = $valid ? installCenterStorageComparisonExport($decoded) : ['error' => 'invalid_json'];
+    }
     // Der Kopf bleibt erhalten; große Zusatzdetails werden ausdrücklich als ausgelassen markiert.
     $omitted = [];
     $encode = static fn($value) => json_encode($value, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) . "\n";
@@ -3549,6 +3662,9 @@ function installCenterReadDiagnosticFile($path, $archiveName, $maxBytes = 90000)
     }
     $sourceSize = @filesize($path);
     $sourceSize = is_numeric($sourceSize) ? (int)$sourceSize : null;
+    if (in_array(basename((string)$path), ['speicherkern_schatten.json', 'speicherkern_schatten_aggregate.json'], true)) {
+        return installCenterReadDiagnosticJsonExcerpt($path, $archiveName, $sourceSize, $maxBytes, @file_get_contents($path));
+    }
     $sourceCompressed = str_ends_with((string)$path, '.gz');
     $sourceFormat = installCenterDiagnosticContentFormat($path);
     if (!$sourceCompressed && $sourceFormat === 'json' && $sourceSize > $maxBytes) {
@@ -4744,6 +4860,17 @@ if (isset($_GET['action']) && $_GET['action'] === 'check_runtime_permissions_rep
         <div class="text-secondary">Lade Installer-Status...</div>
     </div>
 
+    <?php $consumptionForecastStatus = e3dcConsumptionForecastStatus(); ?>
+    <div id="consumptionForecastStatus" class="installer-status mb-3" role="status">
+        <strong>Verbrauchsprognose:</strong>
+        <?= htmlspecialchars($consumptionForecastStatus['message'], ENT_QUOTES, 'UTF-8') ?>
+        <?php if ($consumptionForecastStatus['integrity'] !== null): ?>
+        <span class="text-secondary small"><?= htmlspecialchars($consumptionForecastStatus['integrity'], ENT_QUOTES, 'UTF-8') ?></span>
+        <?php endif; ?>
+    </div>
+
+    <?= installCenterStorageComparisonCard() ?>
+
     <!-- PV-Prognosediagnose (Verschoben von der Hauptseite) -->
     <section id="pvForecastDiagnosticBox" class="installer-status mb-4" aria-labelledby="pvForecastDiagnosticTitle">
         <div class="d-flex justify-content-between align-items-center mb-2">
@@ -5098,7 +5225,8 @@ function renderConfigInput(field) {
     const inputType = type === 'password' ? 'password' : (type === 'time' ? 'time' : (type === 'number' ? 'number' : 'text'));
     const step = type === 'number' ? ' step="any"' : '';
     const current = field.secret ? '' : value;
-    return `<input class="form-control" type="${inputType}"${step} name="values[${esc(key)}]" value="${esc(current)}" placeholder="${esc(placeholder)}">`;
+    const autocomplete = (field.secret || inputType === 'password') ? ' autocomplete="new-password"' : '';
+    return `<input class="form-control" type="${inputType}"${step}${autocomplete} name="values[${esc(key)}]" value="${esc(current)}" placeholder="${esc(placeholder)}">`;
 }
 
 function renderConfigEditor(payload) {
@@ -6841,6 +6969,10 @@ function renderServiceControlResult(data, service, action) {
             `;
         }
         return `<div class="result-title"><i class="fas fa-circle-xmark bad"></i>Dienstaktion fehlgeschlagen</div><div>${esc(data && (data.error || data.message) || 'Unbekannter Fehler')}</div>${renderRawDetails(data || {})}`;
+    }
+    if (data.restart_queued) {
+        return `<div class="result-title"><i class="fas fa-circle-info warn"></i>Containerneustart angefordert</div>
+            <div>${esc(data.message || 'Neustart des gesamten Docker-Containers angefordert. Alle Dienste laufen kurz neu an.')}</div>`;
     }
     const output = data.output ? `<pre class="raw-json">${esc(data.output)}</pre>` : '';
     const noop = data.noop ? `<div class="mt-2 text-secondary">${esc(data.message || 'Keine Änderung nötig.')}</div>` : '';

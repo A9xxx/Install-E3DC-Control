@@ -17,7 +17,6 @@ from typing import Any, Dict, Iterable, Mapping, Optional, Tuple
 TOPOLOGY_SCHEMA = "pv_forecast_topology_v2"
 SLOT_TOPOLOGY_SCHEMA = "pv_forecast_slot_topology_v1"
 HEADROOM_SCHEMA = "pv_headroom_pressure_v1"
-PCC_LIMIT_SCHEMA = "pcc_headroom_limit_v1"
 COUPLING_E3DC_DC = "E3DC_DC"
 COUPLING_EXTERNAL_AC = "EXTERNAL_AC"
 VALID_COUPLINGS = {COUPLING_E3DC_DC, COUPLING_EXTERNAL_AC}
@@ -445,57 +444,10 @@ def _provider_binding_identity_digest(
     })
 
 
-def resolve_buffered_pcc_limit(
-    configured_limit_w: Any,
-    live_readback_limit_w: Any,
-    buffer_w: Any,
-) -> Dict[str, Any]:
-    """Materialisiert den PCC-Grenzvertrag des Storage-Reglers.
-
-    Nur positive Konfigurations-/Readbackwerte sind aktive Quellen. Ein daraus
-    resultierendes ``limit_w == 0`` bleibt durch ``active == True`` eindeutig
-    von fehlenden Quellen unterschieden. Der Puffer wird exakt einmal nach der
-    Auswahl des kleineren harten Limits abgezogen.
-    """
-
-    configured = max(0.0, _safe_float(configured_limit_w, 0.0) or 0.0)
-    live = max(0.0, _safe_float(live_readback_limit_w, 0.0) or 0.0)
-    buffer_value = max(0.0, _safe_float(buffer_w, 0.0) or 0.0)
-    configured_active = configured > 0.0
-    live_active = live > 0.0
-
-    if configured_active and live_active:
-        hard_limit = min(configured, live)
-        source = "config_below_rscp_buffered" if configured < live - 50.0 else "rscp_buffered"
-    elif live_active:
-        hard_limit = live
-        source = "rscp_buffered"
-    elif configured_active:
-        hard_limit = configured
-        source = "config_buffered"
-    else:
-        hard_limit = 0.0
-        source = "none"
-
-    active = configured_active or live_active
-    effective_limit = max(0.0, hard_limit - buffer_value) if active else 0.0
-    return {
-        "schema_version": PCC_LIMIT_SCHEMA,
-        "active": active,
-        "limit_w": round(effective_limit, 3) if active else None,
-        "hard_limit_w": round(hard_limit, 3) if active else None,
-        "buffer_w": round(buffer_value, 3),
-        "source": source,
-        "configured": {
-            "active": configured_active,
-            "limit_w": round(configured, 3) if configured_active else None,
-        },
-        "live_readback": {
-            "active": live_active,
-            "limit_w": round(live, 3) if live_active else None,
-        },
-        "zero_semantics": "ACTIVE_ZERO_ONLY_WHEN_SOURCE_PRESENT_AND_BUFFERED",
-    }
+try:
+    from Installer.Storage.quellenrahmen import resolve_buffered_pcc_limit
+except ModuleNotFoundError:
+    from Storage.quellenrahmen import resolve_buffered_pcc_limit
 
 
 def build_pv_forecast_topology(config: Optional[Mapping[str, Any]]) -> Dict[str, Any]:

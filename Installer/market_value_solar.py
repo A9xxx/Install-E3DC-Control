@@ -10,6 +10,7 @@ diagnostics only; it must never create a control owner or storage command.
 import csv
 import io
 import json
+import math
 import os
 import re
 import time
@@ -45,7 +46,8 @@ def _safe_float(value, default=None):
             text = text.replace(".", "").replace(",", ".")
         else:
             text = text.replace(",", ".")
-        return float(text)
+        number = float(text)
+        return number if math.isfinite(number) else default
     except Exception:
         return default
 
@@ -182,23 +184,37 @@ def _row_value(row, keys):
 
 def _extract_start_end_ms(row):
     date_hint = _row_value(row, ("date", "datum", "tag"))
-    start = (
-        _row_value(row, ("start_timestamp", "startts", "timestamp", "zeitstempel", "start", "beginn", "von"))
-        or _row_value(row, ("datefrom", "gueltigvon", "zeit"))
-    )
-    if start is None and date_hint is not None:
-        time_part = _row_value(row, ("uhrzeit", "zeit", "von", "beginn"))
-        if time_part is not None:
-            start = f"{date_hint} {time_part}"
-    start_ms = _parse_datetime_ms(start, date_hint=date_hint)
 
+    def parse_time(value, zone, next_day=False):
+        if date_hint and re.fullmatch(r"\d{1,2}:\d{2}(?::\d{2})?", str(value or "")):
+            try:
+                day = datetime.strptime(str(date_hint), "%d.%m.%Y") if "." in str(date_hint) else datetime.fromisoformat(str(date_hint))
+                parts = [int(part) for part in str(value).split(":")]
+                hour, minute = parts[:2]
+                second = parts[2] if len(parts) > 2 else 0
+                if hour > 24 or minute > 59 or second > 59 or (hour == 24 and (minute or second)):
+                    return None
+                day += timedelta(hours=hour, minutes=minute, seconds=second)
+                if next_day:
+                    day += timedelta(days=1)
+            except ValueError:
+                return None
+            value = day.isoformat()
+            offsets = {"UTC": "+00:00", "MEZ": "+01:00", "CET": "+01:00", "MESZ": "+02:00", "CEST": "+02:00"}
+            if zone:
+                offset = offsets.get(str(zone).strip().upper())
+                if offset is None:
+                    return None
+                value += offset
+        return _parse_datetime_ms(value, date_hint=date_hint)
+
+    start = _row_value(row, ("start_timestamp", "startts", "timestamp", "zeitstempel", "start", "beginn", "von", "datefrom", "gueltigvon", "zeit", "uhrzeit"))
     end = _row_value(row, ("end_timestamp", "endts", "end", "ende", "bis", "dateto", "gueltigbis"))
-    if end is None and date_hint is not None:
-        time_part = _row_value(row, ("bis", "ende"))
-        if time_part is not None:
-            end = f"{date_hint} {time_part}"
-    end_ms = _parse_datetime_ms(end, date_hint=date_hint)
-    if start_ms is not None and (end_ms is None or end_ms <= start_ms):
+    start_ms = parse_time(start, _row_value(row, ("Zeitzone von",)))
+    end_ms = parse_time(end, _row_value(row, ("Zeitzone bis",)))
+    if start_ms is not None and end_ms is not None and end_ms <= start_ms and date_hint and re.fullmatch(r"\d{1,2}:\d{2}(?::\d{2})?", str(end or "")):
+        end_ms = parse_time(end, _row_value(row, ("Zeitzone bis",)), next_day=True)
+    if start_ms is not None and end is None:
         end_ms = start_ms + SLOT_MS
     return start_ms, end_ms
 
@@ -300,7 +316,7 @@ def normalise_solar_slots(solar_data):
         if not isinstance(raw, dict):
             continue
         start_ms, end_ms = _extract_start_end_ms(raw)
-        if start_ms is None or end_ms is None or end_ms <= start_ms:
+        if start_ms is None or end_ms is None or end_ms - start_ms != SLOT_MS:
             continue
         energy_mwh = _extract_energy_mwh(raw)
         power_mw = _extract_solar_power_mw(raw)
@@ -317,49 +333,25 @@ def normalise_solar_slots(solar_data):
     return [by_start[key] for key in sorted(by_start)]
 
 
-def _price_ct_from_slot(slot):
-    if not isinstance(slot, dict):
-        return None, "missing"
-    for key in ("direct_marketing_market_price_ct", "spot_market_price_ct", "market_price_ct", "price_ct", "market_ct"):
-        number = _safe_float(slot.get(key), None)
-        if number is not None:
-            return number, key
-    for key in ("direct_marketing_marketprice", "spot_marketprice", "marketprice"):
-        number = _safe_float(slot.get(key), None)
-        if number is not None:
-            return number / 10.0, key
-    return None, "missing"
-
-
 def normalise_price_slots(price_data):
-    if not isinstance(price_data, list):
-        return {}
+    """SMARD-Viertelstunden [UTC-ms, €/MWh] in ct/kWh umrechnen."""
     slots = {}
-    for raw in price_data:
-        if not isinstance(raw, dict):
+    for raw in price_data if isinstance(price_data, list) else []:
+        if not isinstance(raw, (list, tuple)) or len(raw) < 2:
             continue
-        start = _safe_int(raw.get("start_timestamp"), None)
-        end = _safe_int(raw.get("end_timestamp"), None)
-        if start is None or start <= 0:
+        start = _safe_int(raw[0])
+        price = _safe_float(raw[1])
+        if start is None or price is None or start % SLOT_MS:
             continue
-        if end is None or end <= start:
-            end = start + SLOT_MS
-        price_ct, price_key = _price_ct_from_slot(raw)
-        if price_ct is None:
-            continue
-        source = str(raw.get("direct_marketing_price_source") or raw.get("price_source") or raw.get("tariff_provider") or "unknown")
-        slots[int(start)] = {
-            "start_timestamp": int(start),
-            "end_timestamp": int(end),
-            "price_ct_per_kwh": float(price_ct),
-            "price_key": price_key,
-            "source": source,
-            "may_be_billing_price": source.lower() == "tibber" and price_key == "marketprice",
+        slots[start] = {
+            "start_timestamp": start,
+            "end_timestamp": start + SLOT_MS,
+            "price_ct_per_kwh": price / 10.0,
         }
     return slots
 
 
-def _base_report(enabled, status, now_ms=None, warnings=None, error=None):
+def _base_report(enabled, status, now_ms=None):
     now_ms = int(now_ms if now_ms is not None else time.time() * 1000)
     return {
         "schema_version": SCHEMA_VERSION,
@@ -373,17 +365,18 @@ def _base_report(enabled, status, now_ms=None, warnings=None, error=None):
         "owner": "none",
         "source": NETZTRANSPARENZ_SOURCE,
         "unit": "ct/kWh",
-        "warnings": list(warnings or []),
-        "error": str(error) if error else None,
+        "error": None,
+        "solar_weighted_market_value_ct": None,
+        "price_source": "smard_day_ahead_de_lu",
         "method": "sum(solar_energy_mwh * spot_price_ct_per_kwh) / sum(solar_energy_mwh)",
         "preliminary": True,
     }
 
 
-def build_market_value_solar_report(price_data, solar_data, now_ms=None, enabled=True, source=NETZTRANSPARENZ_SOURCE, warnings=None):
+def build_market_value_solar_report(price_data, solar_data, now_ms=None, enabled=True, source=NETZTRANSPARENZ_SOURCE):
     now_ms = int(now_ms if now_ms is not None else time.time() * 1000)
     month_start_ms, month_end_ms, month_label = _month_bounds_ms(now_ms)
-    report = _base_report(enabled, "preliminary", now_ms=now_ms, warnings=warnings)
+    report = _base_report(enabled, "preliminary", now_ms=now_ms)
     report["source"] = source
     report["month"] = month_label
 
@@ -394,40 +387,12 @@ def build_market_value_solar_report(price_data, solar_data, now_ms=None, enabled
         and int(slot["start_timestamp"]) <= now_ms
     ]
 
-    if not solar_slots:
-        report.update({
-            "status": "no_solar_data",
-            "solar_weighted_market_value_ct": None,
-            "matched_solar_energy_mwh": 0.0,
-            "slots": {
-                "solar": 0,
-                "price": len(price_slots),
-                "matched": 0,
-                "missing_price": 0,
-            },
-        })
-        return report
-    if not price_slots:
-        report.update({
-            "status": "no_price_data",
-            "solar_weighted_market_value_ct": None,
-            "matched_solar_energy_mwh": 0.0,
-            "slots": {
-                "solar": len(solar_slots),
-                "price": 0,
-                "matched": 0,
-                "missing_price": len(solar_slots),
-            },
-        })
-        return report
-
     matched = 0
     missing_price = 0
     solar_energy_total = 0.0
     matched_energy = 0.0
     weighted_sum = 0.0
     simple_price_sum = 0.0
-    billing_warning = False
     first_ms = None
     last_ms = None
 
@@ -444,40 +409,28 @@ def build_market_value_solar_report(price_data, solar_data, now_ms=None, enabled
         matched_energy += energy_mwh
         weighted_sum += energy_mwh * price_ct
         simple_price_sum += price_ct
-        billing_warning = billing_warning or bool(price.get("may_be_billing_price"))
         first_ms = start if first_ms is None else min(first_ms, start)
         last_ms = start if last_ms is None else max(last_ms, start)
 
-    if matched <= 0 or matched_energy <= 0.0:
-        report.update({
-            "status": "no_price_matches",
-            "solar_weighted_market_value_ct": None,
-            "matched_solar_energy_mwh": round(matched_energy, 6),
-            "solar_energy_mwh": round(solar_energy_total, 6),
-            "slots": {
-                "solar": len(solar_slots),
-                "price": len(price_slots),
-                "matched": matched,
-                "missing_price": missing_price,
-            },
-        })
-        return report
-
-    weighted_value = weighted_sum / matched_energy
-    simple_avg = simple_price_sum / matched
-    completeness_pct = (matched / len(solar_slots)) * 100.0 if solar_slots else 0.0
-    if billing_warning:
-        report["warnings"].append("price_source_may_be_customer_billing_price")
-    if completeness_pct < 95.0:
-        report["warnings"].append("incomplete_month_to_date_matching")
+    completeness_pct = (matched / len(solar_slots)) * 100.0 if solar_slots else None
+    reason = None
+    if not solar_slots:
+        reason = "no_solar_data"
+    elif missing_price:
+        reason = "incomplete_spot_prices"
+    elif matched_energy <= 0.0:
+        reason = "no_solar_energy"
+    weighted_value = weighted_sum / matched_energy if reason is None else None
+    simple_avg = simple_price_sum / matched if reason is None else None
 
     report.update({
-        "status": "preliminary",
-        "solar_weighted_market_value_ct": round(weighted_value, 5),
-        "simple_avg_price_ct": round(simple_avg, 5),
-        "solar_capture_delta_ct": round(weighted_value - simple_avg, 5),
-        "matched_solar_energy_mwh": round(matched_energy, 6),
-        "solar_energy_mwh": round(solar_energy_total, 6),
+        "status": "unavailable" if reason else "preliminary",
+        "error": reason,
+        "solar_weighted_market_value_ct": None if weighted_value is None else round(weighted_value, 5),
+        "simple_avg_price_ct": None if simple_avg is None else round(simple_avg, 5),
+        "solar_capture_delta_ct": None if reason else round(weighted_value - simple_avg, 5),
+        "matched_solar_energy_mwh": round(matched_energy, 6) if solar_slots else None,
+        "solar_energy_mwh": round(solar_energy_total, 6) if solar_slots else None,
         "slots": {
             "solar": len(solar_slots),
             "price": len(price_slots),
@@ -485,12 +438,12 @@ def build_market_value_solar_report(price_data, solar_data, now_ms=None, enabled
             "missing_price": missing_price,
         },
         "quality": {
-            "completeness_pct": round(completeness_pct, 2),
+            "completeness_pct": round(completeness_pct, 2) if completeness_pct is not None else None,
             "preliminary": True,
             "official_month_value": False,
             "first_matched_slot": _iso_from_ms(first_ms),
             "last_matched_slot": _iso_from_ms(last_ms),
-            "solar_slots_until": _iso_from_ms(max(int(slot["start_timestamp"]) for slot in solar_slots)),
+            "solar_slots_until": _iso_from_ms(max((int(slot["start_timestamp"]) for slot in solar_slots), default=None)),
         },
     })
     return report
@@ -520,9 +473,8 @@ def fetch_netztransparenz_access_token(client_id, client_secret, timeout=15):
     return token
 
 
-def fetch_netztransparenz_solar_data(client_id, client_secret, date_from, date_to, timeout=20):
-    token = fetch_netztransparenz_access_token(client_id, client_secret, timeout=timeout)
-    url = NETZTRANSPARENZ_DATA_URL.format(
+def _fetch_netztransparenz_data(token, url_template, date_from, date_to, timeout):
+    url = url_template.format(
         date_from=urllib.parse.quote(str(date_from)),
         date_to=urllib.parse.quote(str(date_to)),
     )
@@ -538,19 +490,22 @@ def fetch_netztransparenz_solar_data(client_id, client_secret, date_from, date_t
     with urllib.request.urlopen(request, timeout=timeout) as response:
         content_type = str(response.headers.get("Content-Type") or "").lower()
         data = response.read().decode("utf-8-sig")
-    if "json" in content_type:
-        return json.loads(data)
-    return data
+    return json.loads(data) if "json" in content_type else data
 
 
-def _read_json_file(path):
-    if not path or not os.path.isfile(path):
-        return None
+class _FetchError(RuntimeError):
+    """Fester Fehlergrund ohne fremden Antwort- oder Ausnahmeinhalt."""
+
+
+def fetch_netztransparenz_solar_data(client_id, client_secret, date_from, date_to, timeout=20):
     try:
-        with open(path, "r", encoding="utf-8") as handle:
-            return json.load(handle)
+        token = fetch_netztransparenz_access_token(client_id, client_secret, timeout=timeout)
     except Exception:
-        return None
+        raise _FetchError("netztransparenz_token_failed") from None
+    try:
+        return _fetch_netztransparenz_data(token, NETZTRANSPARENZ_DATA_URL, date_from, date_to, timeout)
+    except Exception:
+        raise _FetchError("netztransparenz_solar_failed") from None
 
 
 def _write_json(path, payload, writer=None, indent=2):
@@ -566,88 +521,54 @@ def _write_json(path, payload, writer=None, indent=2):
     os.replace(tmp, path)
 
 
-def _cache_payload(solar_slots, now_ms):
-    return {
-        "schema_version": "market_value_solar_cache_v1",
-        "created_at": _iso_from_ms(now_ms),
-        "source": NETZTRANSPARENZ_SOURCE,
-        "slots": solar_slots,
-    }
-
-
-def _fetch_month_solar_slots(config, now_ms, fetcher=None):
-    month_start_ms, _month_end_ms, _month_label = _month_bounds_ms(now_ms)
-    start_dt = datetime.fromtimestamp(month_start_ms / 1000.0, tz=_berlin_tz()).date()
-    end_dt = datetime.fromtimestamp(now_ms / 1000.0, tz=_berlin_tz()).date() + timedelta(days=1)
-    client_id = str((config or {}).get("netztransparenz_client_id") or "").strip()
-    client_secret = str((config or {}).get("netztransparenz_client_secret") or "").strip()
-    if not client_id or not client_secret:
-        raise ValueError("missing_netztransparenz_credentials")
-    if fetcher is None:
-        fetcher = fetch_netztransparenz_solar_data
-    raw = fetcher(client_id, client_secret, start_dt.isoformat(), end_dt.isoformat())
-    slots = normalise_solar_slots(raw)
-    if not slots:
-        raise RuntimeError("no_parseable_solar_slots")
-    return slots
-
-
-def update_market_value_solar_report(config, price_data, output_file, cache_file, write_json_atomic=None, logger=None, now_s=None, fetcher=None):
+def update_market_value_solar_report(config, output_file, smard_fetcher, write_json_atomic=None, logger=None, now_s=None, fetcher=None):
     now_ms = int((now_s if now_s is not None else time.time()) * 1000)
     enabled = _config_bool(config, "direct_marketing_market_value_solar_enable", False)
-
-    def log_warning(message):
-        if logger is not None:
-            try:
-                logger.warning(message)
-            except Exception:
-                pass
-
     if not enabled:
         report = _base_report(False, "disabled", now_ms=now_ms)
         _write_json(output_file, report, writer=write_json_atomic, indent=2)
         return report
 
-    warnings = ["preliminary_trend_not_official_monthly_market_value"]
-    cache = _read_json_file(cache_file)
-    solar_slots = None
-    cache_used = False
+    solar_slots, prices = [], []
     fetch_error = None
-    try:
-        solar_slots = _fetch_month_solar_slots(config, now_ms, fetcher=fetcher)
-        _write_json(cache_file, _cache_payload(solar_slots, now_ms), writer=write_json_atomic, indent=2)
-    except Exception as exc:
-        fetch_error = str(exc)
-        log_warning(f"Marktwert Solar: Netztransparenz-Abruf nicht nutzbar: {exc}")
-        if isinstance(cache, dict) and isinstance(cache.get("slots"), list):
-            solar_slots = cache.get("slots")
-            cache_used = True
-            warnings.append("using_cached_solar_extrapolation")
-        else:
-            status = "missing_credentials" if fetch_error == "missing_netztransparenz_credentials" else "unavailable"
-            report = _base_report(True, status, now_ms=now_ms, warnings=warnings, error=fetch_error)
-            report["quality"] = {
-                "preliminary": True,
-                "official_month_value": False,
-                "cache_used": False,
-            }
-            _write_json(output_file, report, writer=write_json_atomic, indent=2)
-            return report
+    missing_credentials = not all(str((config or {}).get(key) or "").strip() for key in (
+        "netztransparenz_client_id", "netztransparenz_client_secret"))
+    if missing_credentials:
+        fetch_error = "missing_netztransparenz_credentials"
+    else:
+        start_ms, _, _ = _month_bounds_ms(now_ms)
+        today = datetime.fromtimestamp(now_ms / 1000.0, tz=_berlin_tz())
+        try:
+            raw = (fetcher or fetch_netztransparenz_solar_data)(
+                str(config["netztransparenz_client_id"]).strip(), str(config["netztransparenz_client_secret"]).strip(),
+                datetime.fromtimestamp(start_ms / 1000.0, tz=_berlin_tz()).date().isoformat(),
+                (today + timedelta(days=1)).date().isoformat())
+            solar_slots = normalise_solar_slots(raw)
+            if not solar_slots:
+                fetch_error = "no_parseable_solar_slots"
+        except _FetchError as exc:
+            fetch_error = str(exc)
+        except Exception:
+            fetch_error = "netztransparenz_solar_failed"
+        if fetch_error is None:
+            try:
+                prices = smard_fetcher("quarterhour", start_ms=start_ms, end_ms=now_ms)
+                if not normalise_price_slots(prices):
+                    fetch_error = "no_parseable_smard_prices"
+            except Exception:
+                fetch_error = "smard_fetch_failed"
 
-    report = build_market_value_solar_report(
-        price_data,
-        solar_slots,
-        now_ms=now_ms,
-        enabled=True,
-        source=NETZTRANSPARENZ_SOURCE,
-        warnings=warnings,
-    )
-    if cache_used:
-        report["status"] = "cached_" + str(report.get("status") or "preliminary")
+    report = build_market_value_solar_report(prices, solar_slots, now_ms=now_ms)
+    if fetch_error:
+        report["status"] = "missing_credentials" if missing_credentials else "unavailable"
         report["error"] = fetch_error
-    report.setdefault("quality", {})
-    if isinstance(report["quality"], dict):
-        report["quality"]["cache_used"] = bool(cache_used)
-        report["quality"]["official_month_value"] = False
+        report["quality"]["completeness_pct"] = None
+        report["matched_solar_energy_mwh"] = None
+        if fetch_error in ("smard_fetch_failed", "no_parseable_smard_prices"):
+            report["slots"].update(price=None, matched=None, missing_price=None)
+        else:
+            report["slots"] = None
+        if logger is not None and not missing_credentials:
+            logger.warning("Marktwert Solar: %s", fetch_error)
     _write_json(output_file, report, writer=write_json_atomic, indent=2)
     return report

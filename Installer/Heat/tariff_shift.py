@@ -81,6 +81,27 @@ def tariff_window(config, now):
     return {**result, 'reason': 'outside_cheap_window'}
 
 
+def grid_boost_active(config, signal, now):
+    """Aktiven Netzboost aus dem frischen Entscheidungsdatensatz übernehmen."""
+    signal = signal if isinstance(signal, dict) else {}
+    decision = signal.get('decision')
+    decision = decision if isinstance(decision, dict) else {}
+    policy = decision.get('heat_policy')
+    policy = policy if isinstance(policy, dict) else {}
+    ts = number(signal.get('ts'))
+    # Der Policy-Besitzer und der aktive Marktauftrag sind getrennte Felder.
+    # Eine bloße Preisabsicht oder Heizstab-Freigabe besitzt den WP-Halt nicht.
+    return bool(enabled(config.get('price_boost_enable'))
+                and ts is not None and 0 <= now - ts <= 45
+                and decision.get('price_action') == 'BOOST'
+                and decision.get('price_boost_active') is True
+                and decision.get('market_plan_heatpump_active') is True
+                and decision.get('heatpump_boost_owner') == 'market_plan_heatpump'
+                and policy.get('owner') == 'heatpump_grid_boost'
+                and policy.get('target_state') == 'BOOST'
+                and policy.get('runtime_enabled') is True)
+
+
 def forecast_contract(live, now, horizon_end, *, max_absorption_w=None):
     """Integriert kanonische Slotwerte lückenlos, ohne Lasten doppelt abzuziehen."""
     base = {'valid': False, 'reason': 'forecast_missing', 'need_kwh': None,

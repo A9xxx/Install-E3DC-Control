@@ -30,7 +30,6 @@ WEB_CONFIG_START_DEFAULTS = {
     "e3dc_password": "",
     "aes_password": "",
     "wurzelzaehler": "0",
-    "wurzelzaehler_invertiert": "0",
     "frontend_variant": "classic",
     "frontend_detail_mode": "normal",
     "config_secret_protection_mode": "standard",

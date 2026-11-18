@@ -164,11 +164,15 @@ Das Diagnosepaket wird lokal erzeugt und enthält nur technische Hilfsdaten:
 - maskierte Konfiguration ohne Passwörter, PINs, Tokens, E-Mail-Adressen und
   Standortwerte,
 - Installer-Status, Moduldiagnose und Jobstatus,
-- ausgewählte Logs,
+- ausgewählte Logs; das Paket „Forum kompakt“ enthält auch den bereinigten
+  Auszug des PV-Prognose-Logs aus höchstens etwa 90 kB Quelldaten,
 - ausgewählte Ramdisk-Dateien wie Live-Daten, Speicherplan und Modulstatus.
 
 Kontonamen von Geräte- und Dienstkonten sowie Fahrzeugpositionen werden
-maskiert. IP-Adressen, der Hostname, MQTT-Topics, Fahrzeugnamen und
+maskiert. Der Installationsbenutzer (auch im Lauftext; die Systemkonten `root` und `www-data` sowie Namen direkt an `.`, `-` oder `_`, etwa `pi.service`, bleiben dort lesbar) und jeder Name unter
+`/home/` werden durch Kontopseudonyme ersetzt. IPv6-Adressen erhalten wie
+IPv4-Adressen ein IP-Pseudonym; unbestimmte IPv6-Adressen, Loopback und
+Link-local bleiben lesbar. IP-Adressen, der Hostname, MQTT-Topics, Fahrzeugnamen und
 Gerätekennungen werden pseudonymisiert: Seriennummern von Speicher, Wallbox und
 Zähler, MAC-Adressen, RFID-Tags, Fahrzeug-IDs und FIN, Klimageräte-IDs sowie
 Anlagen-IDs von Tarif- und Prognosediensten. Ein Pseudonym nennt die Art der Kennung und eine Prüfsumme,
@@ -223,3 +227,12 @@ Für einen zusätzlichen Heizstab reichen dagegen **Heizstab aktiv** oder eine
 Heizstab-/Shelly-Adresse; WP-/Verbrauchslogging ist dafür keine Voraussetzung.
 Im Docker-Betrieb entstehen keine systemd-Services; die passenden Prozesse
 starten beim nächsten Containerstart über die Container-Startlogik.
+
+### Neue Speicherregelung im Vergleichsbetrieb
+
+Die Diagnosekarte zeigt den Stand des Vergleichs, die letzte Klasse mit Moduspaar,
+heutige Anteile, Schrankenkonflikte und Schreibwege, die Funktionsabdeckung sowie
+die Laufzeit p95. E3DC-Control vergleicht Vorschläge; die neue Regelung steuert
+keine Geräte. „Forum kompakt“ enthält `speicherkern_schatten.json`.
+Für Rückmeldungen zusätzlich `speicherkern_schatten_aggregate.json` im
+Diagnosepaket auswählen und beide Dateien gemeinsam weitergeben.

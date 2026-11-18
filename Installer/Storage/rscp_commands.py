@@ -15,7 +15,7 @@ except ModuleNotFoundError:
     from rscp_client import RscpConnection, RscpTag, RscpType, find_tag  # type: ignore
 
 try:
-    from Installer.storage_parallel_regulator import (
+    from Installer.Storage.befehl_werte import (
         EMS_POWER_SETTINGS_NONZERO_MIN_W,
         MODE_AUTO,
         MODE_CHRG,
@@ -24,7 +24,7 @@ try:
         MODE_IDLE,
     )
 except ModuleNotFoundError:
-    from storage_parallel_regulator import (  # type: ignore
+    from Storage.befehl_werte import (  # type: ignore
         EMS_POWER_SETTINGS_NONZERO_MIN_W,
         MODE_AUTO,
         MODE_CHRG,
@@ -37,6 +37,12 @@ try:
     from Installer.Storage.common import mode_label, safe_int
 except ModuleNotFoundError:
     from Storage.common import mode_label, safe_int  # type: ignore
+
+
+try:
+    from Installer.data_models import LIVE_SAMPLE_MAX_AGE_S
+except ModuleNotFoundError:
+    from data_models import LIVE_SAMPLE_MAX_AGE_S
 
 
 ACTIVE_REFRESH_MODES = {MODE_DISCH, MODE_CHRG, MODE_GRID}
@@ -987,7 +993,7 @@ class BattCtrl:
         if readback_cycle_ts > 100_000_000_000.0:
             readback_cycle_ts /= 1000.0
         readback_age_s = reconcile_time_s - readback_cycle_ts
-        if not math.isfinite(readback_age_s) or not 0.0 <= readback_age_s <= 5.0:
+        if not math.isfinite(readback_age_s) or not 0.0 <= readback_age_s <= LIVE_SAMPLE_MAX_AGE_S:
             return False
         readback = {
             "limits_used": limits_used,

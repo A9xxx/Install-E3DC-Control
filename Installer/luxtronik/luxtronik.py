@@ -108,9 +108,8 @@ class LuxtronikModbus:
                 if resp_func >= 0x80:
                     err_code = self._recv_exact(1)
                     code = err_code[0] if err_code else "unbekannt"
-                    logging.getLogger("EnergyManager").error(
-                        f"Modbus Exception {code} bei FC {func_code} Register {addr}"
-                    )
+                    logger = logging.getLogger("EnergyManager")
+                    logger.error(f"Modbus Exception {code} bei FC {func_code} Register {addr}")
                     return False
 
                 if resp_func != func_code:

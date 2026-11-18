@@ -170,7 +170,31 @@ def _post_takeover(pv, candidate_ms, horizon_ms, load_w):
     return result
 
 
-def grid_diagnostic(config, plan, now_ms, deadline_ms, need_wh, charge_w, efficiency):
+def tarif_preise(config, plan, now_ms, deadline_ms):
+    """Nur verwendete Preise und Tarifstatus, ohne Rohkonfiguration."""
+    cfg = config
+    try:
+        from ..tariff_schedule import (recurring_tariff_slots, recurring_tariff_stages,
+            uses_recurring_tariff_axis, STATIC_TARIFF_TYPES, tariff_type)
+    except ImportError:
+        from tariff_schedule import (recurring_tariff_slots, recurring_tariff_stages,
+            uses_recurring_tariff_axis, STATIC_TARIFF_TYPES, tariff_type)
+    if uses_recurring_tariff_axis(cfg):
+        stages = recurring_tariff_stages(cfg)
+        if (stages is not None and not stages['valid']) or (
+                tariff_type(cfg) in STATIC_TARIFF_TYPES and number(cfg.get('strompreis_basis')) is None):
+            return dict(reason='tariff_stages_missing_or_invalid', prices=[])
+        prices = [dict(row, fresh=True) for row in recurring_tariff_slots(
+            cfg, now_ms=now_ms, lookback_ms=0, horizon_ms=max(SLOT_MS, deadline_ms - now_ms))]
+    else:
+        prices = [dict(start_timestamp=s['start_ts_ms'], end_timestamp=s['end_ts_ms'],
+            billing_price_ct=(s.get('prices_ct_kwh') or {}).get('buy'),
+            fresh=(s.get('prices_ct_kwh') or {}).get('fresh')) for s in plan.get('slots', [])]
+    return dict(reason=None, prices=[{key: row.get(key) for key in (
+        "start_timestamp", "end_timestamp", "billing_price_ct", "fresh")} for row in prices])
+
+
+def grid_diagnostic(config, plan, now_ms, deadline_ms, need_wh, charge_w, efficiency, *, preisvertrag=None):
     values = config['values']
     result = dict(enabled=values[KEYS[4]], price_limit_ct=values[KEYS[5]],
         required_kwh=None if need_wh is None else round(need_wh / efficiency / 1000, 6),
@@ -182,25 +206,11 @@ def grid_diagnostic(config, plan, now_ms, deadline_ms, need_wh, charge_w, effici
     if not values[KEYS[4]]:
         result['required_kwh'] = None
         return result
-    try:
-        from ..tariff_schedule import (recurring_tariff_slots, recurring_tariff_stages,
-            uses_recurring_tariff_axis, STATIC_TARIFF_TYPES, tariff_type)
-    except ImportError:
-        from tariff_schedule import (recurring_tariff_slots, recurring_tariff_stages,
-            uses_recurring_tariff_axis, STATIC_TARIFF_TYPES, tariff_type)
-    cfg = config['raw']
-    if uses_recurring_tariff_axis(cfg):
-        stages = recurring_tariff_stages(cfg)
-        if (stages is not None and not stages['valid']) or (
-                tariff_type(cfg) in STATIC_TARIFF_TYPES and number(cfg.get('strompreis_basis')) is None):
-            result['reason'] = 'tariff_stages_missing_or_invalid'
-            return result
-        prices = [dict(row, fresh=True) for row in recurring_tariff_slots(
-            cfg, now_ms=now_ms, lookback_ms=0, horizon_ms=max(SLOT_MS, deadline_ms - now_ms))]
-    else:
-        prices = [dict(start_timestamp=s['start_ts_ms'], end_timestamp=s['end_ts_ms'],
-            billing_price_ct=(s.get('prices_ct_kwh') or {}).get('buy'),
-            fresh=(s.get('prices_ct_kwh') or {}).get('fresh')) for s in plan.get('slots', [])]
+    preisvertrag = preisvertrag if preisvertrag is not None else tarif_preise(config['raw'], plan, now_ms, deadline_ms)
+    if preisvertrag['reason']:
+        result['reason'] = preisvertrag['reason']
+        return result
+    prices = preisvertrag['prices']
     # Materialisiere die vollständige Viertelstundenachse. Fehlende Zeilen
     # bleiben ebenso Lücken wie vorhandene Zeilen ohne gültigen Preis.
     first = int(now_ms // SLOT_MS * SLOT_MS)
@@ -526,9 +536,9 @@ def reason_text(code):
     return "; ".join(REASON_TEXT.get(part, "Beobachtungsdaten unbekannt") for part in str(code).split(";"))
 
 
-def read_execution(plan, config, now_ms):
+def read_execution(plan, config, now_ms, *, contract=None):
     """Separate Ausführungsbindung; niemals commands_allowed der Beobachtung umdeuten."""
-    contract = config_contract(config)
+    contract = config_contract(config) if contract is None else contract
     if contract['mode'] != 2 or not contract['valid']:
         return None
     observation = plan.get('backup_hold_observation') or {}
@@ -614,10 +624,11 @@ def curve_value(curve, now_ms):
     return None
 
 
-def control_context(config, plan, *, now_s, monotonic_s, live, reserve_wh,
-                    capacity_wh, max_discharge_w, previous=None):
+def konto_fortschreiben(config, plan, *, now_s, monotonic_s, live, reserve_wh,
+                        capacity_wh, max_discharge_w, previous=None,
+                        prognose_bestaetigen=True, contract=None, preisvertrag=None):
     """Pro Zyklus ein Wh-Rahmen aus aktueller Energie, ohne erneuerbares Guthaben."""
-    contract = config_contract(config)
+    contract = dict(config_contract(config) if contract is None else contract)
     if contract['mode'] != 2:
         return None
     previous = previous if isinstance(previous, Mapping) else {}
@@ -643,7 +654,7 @@ def control_context(config, plan, *, now_s, monotonic_s, live, reserve_wh,
         return result
     energy = capacity_wh * soc / 100
     full = max(reserve_wh, (contract['values'][KEYS[1]] or 0) * 1000)
-    execution = read_execution(plan, config, now_ms)
+    execution = read_execution(plan, config, now_ms, contract=contract)
     account_energy = energy
     account = dict(previous.get('closed_account') or {})
     account_key = digest(dict(capacity_wh=capacity_wh,
@@ -693,8 +704,8 @@ def control_context(config, plan, *, now_s, monotonic_s, live, reserve_wh,
         and last_mono is not None and 0 < monotonic_s - last_mono <= LIVE_MAX_AGE_MS / 1000
         and last_now is not None and now_s - last_now >= 0)
     reaction_s = 35.0
-    buffer = capacity_wh / 100 + max_discharge_w * reaction_s / 3600
-    hysteresis = max(capacity_wh / 100, max_discharge_w * reaction_s / 3600, 50)
+    buffer = None if max_discharge_w is None else capacity_wh / 100 + max_discharge_w * reaction_s / 3600
+    hysteresis = None if max_discharge_w is None else max(capacity_wh / 100, max_discharge_w * reaction_s / 3600, 50)
     result.update(reaction_s=reaction_s, entry_buffer_wh=buffer, hysteresis_wh=hysteresis)
     # Geschlossenes Wiederaufladekonto. Ausschließlich beobachtete PV-Ladung
     # verdient neue Verkaufs-/Pre-Dump-Wh; Netzladung und ein Replan niemals.
@@ -737,7 +748,8 @@ def control_context(config, plan, *, now_s, monotonic_s, live, reserve_wh,
             if any(row['floor_wh'] > capacity_wh for row in curve):
                 floor = max(floor, full)
                 result['chronological_capacity_deficit_wh'] = max(row['floor_wh'] for row in curve) - capacity_wh
-            if old_floor is not None and floor < old_floor - 0.001 and identity != previous.get('approved_identity'):
+            if (prognose_bestaetigen and old_floor is not None and floor < old_floor - 0.001
+                    and identity != previous.get('approved_identity')):
                 stable_since = monotonic_s if stable_since is None else stable_since
                 if not candidate_ids or (identity != candidate_ids[-1]['identity']
                         and issue > candidate_ids[-1]['issue_ts_ms']):
@@ -769,7 +781,8 @@ def control_context(config, plan, *, now_s, monotonic_s, live, reserve_wh,
             # Vier prognostizierte Slots allein öffnen keinen Morgenboden.
             if takeover is not None and now_ms >= takeover:
                 pv, home = number(live.get('PV_Power')), number(live.get('Home_Power'))
-                covered = (pv is not None and home is not None and pv >= home
+                covered = (pv is not None and home is not None and pv >= max(home, execution['emergency_load_w'])
+                    and live.get('PV_Power_Valid', True) is True
                     and live.get('Home_Power_Valid', True) is True)
                 since = previous.get('takeover_since_mono') if continuous and covered else None
                 since = monotonic_s if covered and since is None else since
@@ -794,7 +807,7 @@ def control_context(config, plan, *, now_s, monotonic_s, live, reserve_wh,
             result.update(grid_required_wh=residual, grid_reason='grid_charge_disabled')
             contract['raw'] = config
             diagnostic = grid_diagnostic(contract, plan, now_ms, execution['deadline_ts_ms'],
-                residual, execution['charge_w'], execution['efficiency'])
+                residual, execution['charge_w'], execution['efficiency'], preisvertrag=preisvertrag)
             result['grid_reason'] = diagnostic['reason']
             current = next((r for r in diagnostic['selected'] if r['start_ts_ms'] <= now_ms < r['end_ts_ms']),None)
             if stable_since is not None:
@@ -807,6 +820,28 @@ def control_context(config, plan, *, now_s, monotonic_s, live, reserve_wh,
                     execution_binding=execution['binding'], source_scope=execution['source_scope'])
     result['floor_wh'] = max(reserve_wh, floor)
     result['deficit_wh'] = max(0, result['floor_wh'] - energy)
+    return result
+
+
+def control_context(config, plan, *, now_s, monotonic_s, live, reserve_wh,
+                    capacity_wh, max_discharge_w, previous=None):
+    """Bisherige Dienstprojektion der gemeinsamen Konto- und Bodenrechnung."""
+    result = konto_fortschreiben(config, plan, now_s=now_s, monotonic_s=monotonic_s,
+        live=live, reserve_wh=reserve_wh, capacity_wh=capacity_wh,
+        max_discharge_w=max_discharge_w, previous=previous)
+    if result is None or not result['valid']:
+        return result
+    previous = previous if isinstance(previous, Mapping) else {}
+    energy, stamp = result['current_energy_wh'], result['measured_at_s']
+    buffer, hysteresis = result['entry_buffer_wh'], result['hysteresis_wh']
+    reaction_s = result['reaction_s']
+    last_stamp = number(previous.get('measured_at_s'))
+    last_mono = number(previous.get('monotonic_s'))
+    last_now = number(previous.get('now_s'))
+    continuous = bool(previous.get('valid') and stamp is not None and last_stamp is not None
+        and 0 <= stamp - last_stamp <= LIVE_MAX_AGE_MS / 1000
+        and last_mono is not None and 0 < monotonic_s - last_mono <= LIVE_MAX_AGE_MS / 1000
+        and last_now is not None and now_s - last_now >= 0)
     safe_wh = max(0, energy - result['floor_wh'] - buffer)
     coverage = safe_wh >= hysteresis
     since = previous.get('coverage_since_mono') if continuous and coverage else None

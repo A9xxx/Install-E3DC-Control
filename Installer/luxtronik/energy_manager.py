@@ -163,6 +163,53 @@ _SESSION_WRITE_WARNED = set()
 UPDATE_DISPATCHER = "/usr/local/sbin/e3dc-web-update-launcher"
 
 
+try:
+    from Installer.heatpump_channel_owner import user_stop_plan, user_stop_transport, user_stop_grant
+except ImportError:
+    from heatpump_channel_owner import user_stop_plan, user_stop_transport, user_stop_grant
+
+
+def run_user_stop_output(wp, state, plan, operation, persist):
+    """Gemeinsamer Plan und Versuchsbuch, bestehender Aktorvertrag."""
+    if plan["warn"] and persist():
+        logger.warning("Eigene Wärmepumpen-Rücknahme nicht bestätigt.")
+    def transport(begin):
+        if not _authorize_heatpump_output(wp, "heatpump:user_stop") or not begin():
+            return False
+        # Nur der laufende Transport umgeht den ersetzten Treiber-Backoff.
+        wp.user_stop_transport = True
+        try:
+            return operation()
+        finally:
+            wp.user_stop_transport = False
+    return user_stop_transport(state, plan, persist, transport)
+
+
+def user_stop_readback(wp, state):
+    """Frische Rücklesung des noch eigenen Wertes; keine erneute Freigabe."""
+    if isinstance(wp, StiebelIsgSgReady):
+        return (wp.readback.get("input1") == 1 if wp.readback.get("valid")
+            and 0 <= time.time() - wp.readback.get("ts", 0) <= wp.READBACK_FRESH_S else None)
+    if not isinstance(wp, (IDMHeatpump, DimplexHeatpump)):
+        return None
+    from pymodbus.client import ModbusTcpClient
+    client = ModbusTcpClient(wp.ip, port=getattr(wp, "port", 502))
+    try:
+        if not client.connect():
+            return None
+        addresses = (1712, 1710, 1711) if isinstance(wp, IDMHeatpump) else (wp.sg_address,)
+        values = [(wp._call_modbus(client, "read_holding_registers", address=address, count=1)
+            if isinstance(wp, DimplexHeatpump) else client.read_holding_registers(address=address, count=1))
+            for address in addresses]
+        if any(value is None or value.isError() or not value.registers for value in values):
+            return None
+        return [value.registers[0] for value in values] == state.get("owned_value")
+    except Exception:
+        return None
+    finally:
+        client.close()
+
+
 def _new_energy_actuator_gate():
     return default_heat_actuator_gate(
         __file__,
@@ -372,6 +419,9 @@ class SafeLuxtronik:
             raise ValueError("invalid_channel_action")
         if not _authorize_heatpump_output(self, "luxtronik:channel_preflight"):
             return "connect_failed"
+        begin = getattr(self, "user_stop_begin", None)
+        if begin is not None and not begin():
+            return "connect_failed"
         if not self.connect():
             return "connect_failed"
         action_key = (action["id"], action["kind"], mode, target)
@@ -556,7 +606,23 @@ def request_heatpump_boost(wp, *args, owner="pv", purpose="", **kwargs):
     """Luxtronik liefert eine Absicht; andere Aktoren behalten ihre Semantik."""
     if isinstance(wp, SafeLuxtronik):
         return wp.request_boost(*args, owner=owner, purpose=purpose, **kwargs)
-    return wp.set_boost(*args, **kwargs)
+    confirmed = wp.set_boost(*args, **kwargs)
+    if confirmed and any(value == 1 for value in args[::2]):
+        states = getattr(wp, "user_stop_states", None)
+        if isinstance(states, dict):
+            if (states.get("direct") or {}).get("active"):
+                states["direct"] = user_stop_grant(states["direct"])
+            states.setdefault("direct", {})["owned"] = True
+            states["direct"]["owned_value"] = (list(wp.last_ext_states) if isinstance(wp, IDMHeatpump)
+                and getattr(wp, "last_ext_states", None) is not None else [getattr(wp, "last_sent_sg_state", None)] if isinstance(wp, DimplexHeatpump) else None)
+            persist = getattr(wp, "user_stop_persist", None)
+            if persist:
+                persist()
+    elif confirmed:
+        states = getattr(wp, "user_stop_states", None)
+        if isinstance(states, dict):
+            states.setdefault("direct", {})["owned"] = False
+    return confirmed
 
 
 def request_heatpump_channel(wp, channel, mode, target=None, *, owner="pv"):
@@ -947,6 +1013,7 @@ class ShellyHeatpump:
     def update_surplus(self, grid_w, **kwargs):
         pass # Für Luxtronik ignorieren wir kontinuierlichen Überschuss
 
+
 class IDMHeatpump:
     """Modbus Wrapper für IDM-Wärmepumpen (Native Überschusssteuerung via Reg 74)."""
     COOLING_START_HYSTERESIS_C = 2.0
@@ -1331,13 +1398,16 @@ class IDMHeatpump:
         finally:
             client.close()
 
-    def update_surplus(self, grid_w, free_for_limbs_w=None, force_kw=None):
+    def update_surplus(self, grid_w, free_for_limbs_w=None, force_kw=None, *, owned_only=False):
         """Meldet begrenzten PV-Ueberschuss ueber Register 74 (FLOAT, kW).
 
         Es werden keine Temperatur-Sollwerte geschrieben. Register 74 ist eine
         fluechtige PV-Vorgabe und eignet sich fuer eine ruhige iDM-Grundlast,
         z.B. auf 2 kW begrenzt.
         """
+        # Nur der bestätigte eigene positive Registerwert begründet Rücknahmebesitz.
+        if owned_only and not (self.last_sent_surplus_kw > 0.001):
+            return True
         if not _authorize_heatpump_output(self, "idm:update_surplus_preflight"):
             return False
         from pymodbus.client import ModbusTcpClient
@@ -1361,8 +1431,11 @@ class IDMHeatpump:
         cap_reduction = send_kw < (last_kw - 0.001)
         min_interval_due = (now_ts - getattr(self, 'last_surplus_write_ts', 0.0)) >= self.surplus_min_write_interval_s
         heartbeat_due = (now_ts - getattr(self, 'last_surplus_write_ts', 0.0)) >= self.surplus_heartbeat_s
-        if not cap_reduction and not min_interval_due and not heartbeat_due:
-            return True
+        # Derselbe fehlgeschlagene Zielwert nutzt die vorhandene Schreibfrist.
+        # Eine neue Absenkung bleibt sofort möglich; ein Retry ist keine neue Kante.
+        if not getattr(self, "user_stop_transport", False) and (not cap_reduction or getattr(self, "last_failed_surplus_kw", None) == send_kw) and not min_interval_due and not heartbeat_due:
+            # Normale Rampen warten erfolgreich; eine offene Aus-Rücknahme bleibt unbestätigt.
+            return not owned_only or abs(send_kw - last_kw) <= 0.001
         # 0.00 kW ist nur ein Freigabe-Aus-Zustand. Wenn er bereits anliegt,
         # braucht Register 74 keinen Minutentakt und das Log bleibt ruhig.
         if send_kw <= 0.001 and last_kw <= 0.001 and getattr(self, 'last_surplus_write_ts', 0.0) > 0:
@@ -1374,6 +1447,8 @@ class IDMHeatpump:
         ):
             return True
 
+        self.last_surplus_write_ts = now_ts
+        self.last_failed_surplus_kw = send_kw
         client = ModbusTcpClient(self.ip, port=502)
         connected = False
         for _ in range(3):
@@ -1382,13 +1457,22 @@ class IDMHeatpump:
                 break
             time.sleep(1)
         if not connected:
+            client.close()
             logger.error(f"IDM update_surplus: Modbus-Verbindung zu {self.ip} fehlgeschlagen")
             return False
         try:
             if not self._write_float_confirmed(client, 74, send_kw, "idm:write_surplus"):
                 raise RuntimeError("IDM Überschuss-Write/Readback nicht bestätigt")
             self.last_sent_surplus_kw = send_kw
-            self.last_surplus_write_ts = now_ts
+            states = getattr(self, "user_stop_states", None)
+            if states is not None:
+                if send_kw > 0.001 and (states.get("idm74") or {}).get("active"):
+                    states["idm74"] = user_stop_grant(states["idm74"])
+                states.setdefault("idm74", {})["owned_kw"] = send_kw
+                persist = getattr(self, "user_stop_persist", None)
+                if persist:
+                    persist()
+            self.last_failed_surplus_kw = None
             source_bucket = "force" if force_kw is not None else ("off" if not self.surplus_enabled else "auto")
             kw_bucket = 0.0 if send_kw <= 0.001 else round(send_kw / 0.5) * 0.5
             info_bucket = (source_bucket, kw_bucket)
@@ -1403,6 +1487,7 @@ class IDMHeatpump:
             return False
         finally:
             client.close()
+
 
 class DimplexHeatpump:
     """Modbus wrapper for Dimplex WPM Touch / NWPM SG-Ready control."""
@@ -1579,6 +1664,7 @@ class DimplexHeatpump:
 
     def write_zirkulation(self, mode):
         return True
+
 
 
 # Diagnoseschwelle für Schreibvorgänge am Stiebel-ISG je Tag. Sie ist keine
@@ -2475,6 +2561,7 @@ class StiebelIsgSgReady:
                 self._latch_unconfirmed_write(now_ts)
             self._persist_owner_marker(True, confirmed=confirmed, reason=reason, now_ts=now_ts)
         elif confirmed:
+            self.startup_reconcile_pending = self.recovery_check_pending = False
             self.owned = False
             self.owned_confirmed = False
             self.release_pending = False
@@ -2591,11 +2678,11 @@ class StiebelIsgSgReady:
                 if self.readback.get("input1") != 1:
                     self._clear_conflict()
                 return self._outcome("confirmed", "normal_not_owned", readback_confirmed=True)
-            if current_ts < self.io_not_before_ts:
+            if not getattr(self, "user_stop_transport", False) and current_ts < self.io_not_before_ts:
                 self.release_pending = True
                 self.release_pending_reason = self.release_pending_reason or "decision_normal"
                 return self._outcome("failed", "io_backoff")
-            if self._release_backoff_active(current_ts):
+            if not getattr(self, "user_stop_transport", False) and self._release_backoff_active(current_ts):
                 # Rücknahme mehrfach unbestätigt: nur noch ein Versuch je Wartezeit.
                 self.release_pending = True
                 self.release_pending_reason = self.release_pending_reason or "decision_normal"
@@ -2695,7 +2782,7 @@ class StiebelIsgSgReady:
             if error is not None:
                 return self._outcome("blocked", "unconfirmed_write_latched")
             return result
-        if current_ts < self.io_not_before_ts:
+        if not getattr(self, "user_stop_transport", False) and current_ts < self.io_not_before_ts:
             return self._outcome("blocked", "io_backoff")
         if self.owned and self.owned_confirmed and readback_fresh and self.readback.get("input1") == 1:
             # Bereits eigener, frisch bestätigter Eingang: kein Nachschreiben. Eine
@@ -2770,7 +2857,7 @@ class StiebelIsgSgReady:
             self._record_failure(exc, now_ts)
             return None, exc
 
-    def refresh_readback_if_due(self, now_ts=None, min_interval_s=None, *, user_stop_runtime=None):
+    def refresh_readback_if_due(self, now_ts=None, min_interval_s=None, *, observe_only=False):
         """Liest die SG-Ready-Register periodisch und nimmt nur den eigenen Eingang zurück.
 
         Die Leserunde bewertet Start, Wiederkehr nach Verbindungsverlust,
@@ -2792,31 +2879,29 @@ class StiebelIsgSgReady:
         interval = self.RETRY_INTERVAL_S if urgent else _safe_float(min_interval_s, self.REFRESH_INTERVAL_S)
         if self.last_io_attempt_ts > 0.0 and (current_ts - self.last_io_attempt_ts) < interval:
             return self.readback
-        if current_ts < self.io_not_before_ts:
+        if not getattr(self, "user_stop_transport", False) and current_ts < self.io_not_before_ts:
             return self.readback
 
         def observe(sock):
             snapshot = self._read_registers(sock)
             self._record_snapshot(snapshot, current_ts)
-            return self._reconcile(sock, snapshot, current_ts, user_stop_runtime=user_stop_runtime)
+            if observe_only:
+                if not self.owned or snapshot.get("input1") == 0:
+                    self.startup_reconcile_pending = False
+                if snapshot.get("input1") == 0 and self.owned and self._release_readback_usable(snapshot):
+                    self._drop_own_claim("own_input_already_normal", current_ts)
+                return None
+            return self._reconcile(sock, snapshot, current_ts)
 
         self._run_io(observe, current_ts)
         return self.readback
 
-    def _release_reason(self, input1, input2, now_ts, *, user_stop_runtime=None):
+    def _release_reason(self, input1, input2, now_ts):
         """Grund, den eigenen gesetzten Eingang zurückzunehmen, sonst leer."""
 
         if not (self.owned and input1 == 1):
             return ""
-        # Automatik-Aus beendet die Absicht sofort. Nur die physische Rücknahme
-        # nutzt denselben beobachteten Laufzeitanker wie der zentrale Stopp.
-        # Der Startabgleich nutzt dieselbe Restlaufzeit; Schreibschalter
-        # und fremder Eingang behalten ihren bestehenden Vorrang.
-        user_stop_left_s = heatpump_takt_stop_block(
-            **user_stop_runtime, now_ts=now_ts) if user_stop_runtime else 0.0
-        if self.release_pending and not (
-                self.release_pending_reason in {"automatic_mode_off", "startup_own_input_reset"}
-                and user_stop_left_s > 0.0):
+        if self.release_pending:
             return self.release_pending_reason or "release_retry"
         if not self.enabled:
             return "opt_in_off"
@@ -2824,9 +2909,11 @@ class StiebelIsgSgReady:
             # Mit gesetztem Eingang 2 ergäbe der eigene Eingang Zustand 4 (Maximalwerte).
             return "input2_active_release"
         if self.startup_reconcile_pending:
-            return "startup_own_input_reset" if user_stop_left_s <= 0.0 else ""
-        if not self.auto_mode_enabled:
-            return "automatic_mode_off" if user_stop_left_s <= 0.0 else ""
+            # Im Dienst entscheidet der gemeinsame Plan nach allen Quellenlesern.
+            if hasattr(self, "user_stop_states"):
+                return ""
+            _, plan = user_stop_plan({}, clock=control_time.sample(), stopping=True, owned=self.owned)
+            return "startup_own_input_reset" if plan["attempt"] else ""
         if self.desired != 1:
             return "decision_normal"
         if not self.owned_confirmed and now_ts - self.last_positive_request_ts > self.UNCONFIRMED_ADOPT_S:
@@ -2843,9 +2930,6 @@ class StiebelIsgSgReady:
             return None
         self._release_immediate = False
         result = self._write_input(sock, 0, reason, now_ts)
-        if self.last_boost_outcome.get("status") == "confirmed":
-            self.startup_reconcile_pending = False
-            self.recovery_check_pending = False
         return result
 
     def _drop_own_claim(self, reason, now_ts):
@@ -2857,7 +2941,7 @@ class StiebelIsgSgReady:
         self._clear_release_backoff()
         self._persist_owner_marker(False, confirmed=True, reason=reason, now_ts=now_ts)
 
-    def _reconcile(self, sock, snapshot, now_ts, *, user_stop_runtime=None):
+    def _reconcile(self, sock, snapshot, now_ts):
         input1 = snapshot.get("input1")
         input2 = snapshot.get("input2")
         # Unbestätigter Anspruch: Nur ein im Latenzfenster gelesenes „1“ ist eigen.
@@ -2868,7 +2952,7 @@ class StiebelIsgSgReady:
             # Meldet das ISG nur den Reglertyp 5002 als 0, sind 4002 und 5001
             # gültig gelesen: Der eigene Eingang darf zurückgenommen werden.
             if self._release_readback_usable(snapshot):
-                release_reason = self._release_reason(input1, input2, now_ts, user_stop_runtime=user_stop_runtime)
+                release_reason = self._release_reason(input1, input2, now_ts)
                 if release_reason:
                     return self._release_own_input(sock, release_reason, now_ts)
                 if input1 == 0 and (
@@ -2878,9 +2962,11 @@ class StiebelIsgSgReady:
                 ):
                     self._drop_own_claim("own_input_already_normal", now_ts)
             return None
-        release_reason = self._release_reason(input1, input2, now_ts, user_stop_runtime=user_stop_runtime)
+        release_reason = self._release_reason(input1, input2, now_ts)
         if release_reason:
             return self._release_own_input(sock, release_reason, now_ts)
+        if self.startup_reconcile_pending and self.owned and hasattr(self, "user_stop_states"):
+            return None
         if self.owned and input1 == 0:
             externally_reset = bool(
                 self.owned_confirmed
@@ -3028,6 +3114,7 @@ class StiebelIsgSgReady:
             },
             "last_error": self.last_error,
         }
+
 
 
 def stiebel_sg_ready_diagnostic(wp, wp_type, config, *, stale_owner_marker=False, now_ts=None):
@@ -10475,6 +10562,7 @@ ENERGY_RESTART_CHECKPOINT_KEYS = (
     "heatpump_positive_signal_started_ts",
     "heatpump_positive_signal_demand_class",
     "heatpump_positive_signal_hold_guard",
+    "heatpump_user_stop",
     "heatpump_soc_runtime_episodes",
     "luxtronik_ww_budget_loss_guard_state",
     "luxtronik_ww_budget_loss_blocked_until_fresh_budget",
@@ -11306,7 +11394,7 @@ def e3dc_live_error_text(diagnostics):
     if reason == "stale":
         return "live_data_py.json ist %.0f s alt (Grenze %.0f s)" % (
             _safe_float(diagnostics.get("age_s"), 0.0),
-            _safe_float(diagnostics.get("max_age_s"), 15.0),
+            _safe_float(diagnostics.get("max_age_s"), 10.0),
         )
     if reason == "control_invalid":
         return (
@@ -11344,7 +11432,6 @@ def read_e3dc_live_for_energy_manager(
     data = read_runtime_live_snapshot(
         live_path=live_path,
         wallbox_path=wallbox_path,
-        live_max_age_s=15.0,
         wallbox_max_age_s=30.0,
         require_control_valid=True,
         include_web_projection=False,
@@ -11674,6 +11761,27 @@ def main():
         auto_mode_enabled=startup_auto_mode_enabled,
     )
     previous_state = load_previous_energy_state()
+    heatpump_user_stop = copy.deepcopy(((previous_state or {}).get("data") or {}).get("heatpump_user_stop") or {})
+    if not isinstance(heatpump_user_stop, dict):
+        heatpump_user_stop = {}
+    if wp is not None:
+        wp.user_stop_states = heatpump_user_stop
+        if isinstance(wp, IDMHeatpump):
+            # Nur bestätigter eigener Vorbesitz, niemals ein fremder Registerwert.
+            wp.last_sent_surplus_kw = _safe_float((heatpump_user_stop.get("idm74") or {}).get("owned_kw"), 0.0)
+            saved_surplus = heatpump_user_stop.get("idm74") or {}
+            if (saved_surplus.get("active") and not saved_surplus.get("confirmed")
+                    and _safe_float(saved_surplus.get("attempts"), 0.0) > 0):
+                wp.last_failed_surplus_kw = 0.0
+
+    def persist_user_stop():
+        latest_energy_live_state["heatpump_user_stop"] = copy.deepcopy(heatpump_user_stop)
+        return persist_energy_restart_checkpoint(ENERGY_STATE_FILE,
+            dict(((previous_state or {}).get("data") or {}), **latest_energy_live_state),
+            energy_checkpoint_runtime, force=True)
+
+    if wp is not None:
+        wp.user_stop_persist = persist_user_stop
     saved_foreign_sg = (previous_state or {}).get("data") or {}
     if (automatic_heat_foreign_sg_configured
             and saved_foreign_sg.get("schema_version") in (None, "energy_manager_restart_checkpoint_v1")):
@@ -12571,13 +12679,11 @@ def main():
                         enabled=stiebel_sg_ready_output_contract(current_config)["active"],
                         auto_mode_enabled=(AUTO_MODE == 1),
                     )
-                    wp.refresh_readback_if_due(user_stop_runtime={
-                        "wp_takt_protect": WP_TAKT_PROTECT,
-                        "last_start_ts": (wp_last_pv_boost_start_ts if wp_live_fresh
-                            and native_live["compressor_valid"]
-                            and heatpump_compressor_running(wp_data, wp_status) else 0.0),
-                        "min_runtime_min": WP_MIN_RUNTIME_MIN,
-                    })
+                    wp.refresh_readback_if_due(observe_only=bool(AUTO_MODE == 0
+                        or manual_boost_command.get("action") == "off"
+                        or wp.startup_reconcile_pending
+                        or (heatpump_user_stop.get("direct") or {}).get("active")
+                            and not (heatpump_user_stop.get("direct") or {}).get("confirmed")))
                 except Exception as stiebel_exc:
                     logger.error("Stiebel-ISG SG Ready: Leserunde fehlgeschlagen: %s", stiebel_exc)
             if heatpump_positive_signal_restored_unconfirmed:
@@ -12906,51 +13012,6 @@ def main():
                                             logger.debug("WP Boost Reset erfolgreich.")
                                         last_wp_command_time = time.time()
 
-                    if wp_type == 5 and wp_status.get('valid') and wp_write_allowed and wp and not boost_active:
-                        dimplex_sg_live = int(_safe_float(wp_data.get('dimplex_sg_value'), 0))
-                        manual_ww_flag = "/var/www/html/ramdisk/manual_ww_boost.flag"
-                        manual_ww_fresh = False
-                        try:
-                            manual_ww_fresh = (
-                                os.path.exists(manual_ww_flag)
-                                and (time.time() - os.path.getmtime(manual_ww_flag)) < (WW_SOFORT_DURATION * 60)
-                            )
-                        except Exception:
-                            manual_ww_fresh = False
-                        dimplex_owner_active = bool(
-                            price_boost_active
-                            or pre_pause_active
-                            or pv_pause_active
-                            or os.path.exists(FLAG_FILE)
-                            or manual_ww_fresh
-                            or heatpump_positive_signal_window.get("active")
-                            is True
-                        )
-                        if (
-                            dimplex_sg_live in (11, 13)
-                            and not dimplex_owner_active
-                            and (time.time() - last_wp_command_time) > 60
-                        ):
-                            heatpump_positive_output_blocked_this_cycle = True
-                            heatpump_positive_output_block_reasons.append(
-                                "dimplex_unowned_positive_output_reset"
-                            )
-                            logger.info(
-                                "Dimplex SG-Freigabe ohne aktiven Besitzer erkannt "
-                                "(SG=%s) - setze auf Gelb zurück.",
-                                dimplex_sg_live,
-                            )
-                            if request_heatpump_boost(wp, 0, None, 0, None, owner="release"):
-                                last_wp_command_time = time.time()
-                                wp_last_pv_boost_stop_ts = time.time()
-                                heatpump_positive_signal_started_ts = 0.0
-                                heatpump_positive_signal_demand_class = "none"
-                                heatpump_positive_signal_restored_unconfirmed = False
-                                heatpump_positive_signal_start_reservation_allowed = False
-                                heatpump_positive_signal_hold_guard = {}
-
-                        success = True
-
                     # Stiebel mit Shelly-SG-Kontakt: Heiz-/WW-Aktivität des WPM ist kein
                     # Boost-Signal, deshalb greifen dort weder der Fremd-Boost- noch der
                     # externe Reset-Check. Ein hängendes Relais belegt allein dessen frischer
@@ -12998,6 +13059,13 @@ def main():
                             or predump_heatpump_hold_active
                             or os.path.exists(FLAG_FILE)
                             or stiebel_shelly_manual_ww_fresh
+                            # Der gemeinsame Aus-Plan hält nur den eigenen Restlauf.
+                            or (
+                                (heatpump_user_stop.get("direct") or {}).get("active") is True
+                                and (heatpump_user_stop.get("direct") or {}).get("owned") is True
+                                and not (heatpump_user_stop.get("direct") or {}).get("confirmed")
+                                and _safe_float((heatpump_user_stop.get("direct") or {}).get("remaining_s"), 0.0) > 0.0
+                            )
                             or heatpump_positive_signal_window.get("active")
                             is True
                         )
@@ -14357,7 +14425,9 @@ def main():
                 wp_compressor_last_start_ts if soc_channel_sent > 0 or soc_manual_sent > 0 else 0.0)
             soc_episode = soc_runtime_episode(
                 heatpump_soc_runtime_episodes.get("signal"),
-                signal_started_ts=heatpump_positive_signal_started_ts or soc_channel_sent or soc_manual_sent,
+                signal_started_ts=heatpump_positive_signal_started_ts or soc_channel_sent or soc_manual_sent
+                    or ((heatpump_soc_runtime_episodes.get("signal") or {}).get("signal_started_ts")
+                        if isinstance(wp, StiebelIsgSgReady) and wp.startup_reconcile_pending and wp.owned else None),
                 compressor_started_ts=soc_compressor_start,
                 min_runtime_min=(PREDUMP_HEATPUMP_MIN_RUNTIME_MIN
                     if heatpump_positive_signal_demand_class == "pre_dump" else WP_MIN_RUNTIME_MIN),
@@ -14390,20 +14460,50 @@ def main():
                 e3dc.get("notstrom_status") if e3dc_valid and isinstance(e3dc, dict) else None,
             )
 
-            # Eine gemeinsame Rücknahmeentscheidung für Automatik-Aus,
-            # manuellen OFF und Ablauf. Die Nutzerabsicht bleibt sofort beendet;
-            # nur der belegte eigene Ausgang nutzt die vorhandene Restlaufzeit.
-            user_stop_left_s = (0.0 if isinstance(wp, SafeLuxtronik) else heatpump_takt_stop_block(
-                WP_TAKT_PROTECT,
-                (wp_compressor_last_start_ts or wp_last_pv_boost_start_ts) if wp_compressor_observation_valid
-                    and wp_compressor_running_now else 0.0,
-                WP_MIN_RUNTIME_MIN,
-                emergency_stop=bool(heatpump_grid_safety_stop or heatpump_emergency_veto
-                    or heatpump_soc_stop or not e3dc_valid),
-            ))
+            user_stop_requested = bool(AUTO_MODE == 0 or manual_boost_command.get("valid")
+                and (manual_boost_command.get("action") == "off"
+                    or time.time() - manual_boost_command.get("mtime", time.time()) > MANUAL_BOOST_MAX_DURATION * 60))
+            user_stop_plans = {}
+            if wp and not isinstance(wp, SafeLuxtronik):
+                device_owned = bool(boost_active or manual_direct_boost.get("state") == "running"
+                    or getattr(wp, "owned", False)
+                    or (heatpump_user_stop.get("direct") or {}).get("owned") is True)
+                for output, owned, volatile in (("direct", device_owned, isinstance(wp, ShellyHeatpump)),
+                        ("idm74", isinstance(wp, IDMHeatpump) and wp.last_sent_surplus_kw > 0.001, True)):
+                    old_stop = heatpump_user_stop.get(output) or {}
+                    stop_state, stop_plan = user_stop_plan(old_stop,
+                        clock=control_time.sample(), stopping=user_stop_requested or isinstance(wp, StiebelIsgSgReady) and wp.startup_reconcile_pending, owned=owned,
+                        started_ts=wp_compressor_last_start_ts,
+                        minimum_s=(soc_episode.get("min_runtime_min", WP_MIN_RUNTIME_MIN)
+                            if isinstance(wp, StiebelIsgSgReady) and wp.startup_reconcile_pending
+                            else WP_MIN_RUNTIME_MIN) * 60.0 if WP_TAKT_PROTECT else 0.0,
+                        running=wp_compressor_running_now if wp_compressor_observation_valid else None,
+                        device_ts=wp_status.get("source_ts") if wp_compressor_observation_valid else None,
+                        e3dc_ts=_grid_live.get("_ts") if e3dc_valid else None,
+                        protection=bool(heatpump_grid_safety_stop or heatpump_emergency_veto
+                            or heatpump_soc_stop or wq_aus < WQ_MIN_TEMP
+                            or wp_data.get("Betriebsart") == 3
+                            or isinstance(wp, StiebelIsgSgReady) and (
+                                not wp.enabled or wp.readback.get("input2") == 1)),
+                        volatile=volatile, readback=user_stop_readback(wp, old_stop) if output == "direct" and old_stop.get("warned") else None)
+                    stop_state["owned"] = owned
+                    if (output == "direct" and isinstance(wp, StiebelIsgSgReady)
+                            and wp.startup_reconcile_pending and stop_plan["action"] == "halten"):
+                        wp.startup_reconcile_pending, wp.desired = False, 1
+                    if output == "idm74":
+                        stop_state["owned_kw"] = wp.last_sent_surplus_kw if isinstance(wp, IDMHeatpump) else 0.0
+                    heatpump_user_stop[output] = stop_state
+                    user_stop_plans[output] = stop_plan
+
+            # Nutzer-Aus beendet auch die gespeicherte manuelle Startabsicht.
+            # Der eigene direkte Ausgang bleibt ausschließlich als Restlaufbesitz erhalten.
+            if AUTO_MODE == 0 and manual_boost_command.get("valid") and manual_boost_command.get("action") == "on":
+                consume_manual_boost_command(manual_boost_command)
+                manual_boost_command = dict(manual_boost_command, valid=False, reason="automatic_mode_user_off")
 
             # Manueller Boost Check: vor dem ersten SHI-Connect gebunden.
-            if not (manual_boost_command.get("valid")
+            if not (AUTO_MODE == 0 and manual_direct_boost.get("state") == "running"
+                    or manual_boost_command.get("valid")
                     and (manual_boost_command.get("action") == "on"
                         or (not isinstance(wp, SafeLuxtronik)
                             and manual_boost_command.get("action") == "off"))):
@@ -14433,45 +14533,17 @@ def main():
                             "für eine positive Komfortkante ist der typisierte "
                             "manual_heatpump_command_v1-Auftrag erforderlich.",
                         )
-                    elif manual_boost_command.get("action") == "off":
+                    elif user_stop_requested:
                         heatpump_positive_output_blocked_this_cycle = True
-                        heatpump_positive_output_block_reasons.append(
-                            "manual_user_off"
-                        )
-                        if wp_write_allowed and user_stop_left_s <= 0.0:
-                            if request_heatpump_boost(wp, 0, None, 0, CONF_WWW, owner="manual"):
-                                last_wp_command_time = time.time()
-                                heatpump_positive_signal_started_ts = 0.0
-                                heatpump_positive_signal_demand_class = "none"
-                                heatpump_positive_signal_restored_unconfirmed = False
-                                heatpump_positive_signal_start_reservation_allowed = False
-                                heatpump_positive_signal_hold_guard = {}
-                                manual_direct_boost = {"state": "idle"}
-                                # Nutzer-Aus beendet jeden eigenen Besitz des Ausgangs wie
-                                # der Automatik-aus-Zweig; sonst blieben boost_active bzw.
-                                # eine Pause als Rest-Besitzer stehen und sperrten spätere Starts.
-                                boost_active = False; pv_pause_active = False; pre_pause_active = False
-                                pv_pause_owner = "none"; source_recovery_pause_context = {}
-                                pv_boost_pending_start = None
-                                # Nutzer-Aus beendet auch „Warmwasser sofort“ am SG-/iDM-Ausgang
-                                # (Abbruch wie beim Ziel: Flag entfernt, kein Neustart).
-                                if manual_ww_central_actuator_for(wp, wp_type) and os.path.exists(
-                                    "/var/www/html/ramdisk/manual_ww_boost.flag"
-                                ):
-                                    try:
-                                        os.remove("/var/www/html/ramdisk/manual_ww_boost.flag")
-                                    except OSError:
-                                        pass
-                                    manual_ww_central_started_flag_ts = 0.0
-                                    logger.info("Warmwasser sofort abgebrochen: Nutzer-Aus.")
-                                if not isinstance(wp, SafeLuxtronik) and not consume_manual_boost_command(manual_boost_command):
-                                    logger.info(
-                                        "Manueller Boost wurde beendet; ein neuerer Auftrag bleibt zur Verarbeitung liegen."
-                                    )
-                            else:
-                                logger.error(
-                                    "Manueller Boost-OFF-Auftrag bleibt offen: Treiber-Release nicht bestätigt."
-                                )
+                        heatpump_positive_output_block_reasons.append("manual_user_off")
+                        consume_manual_boost_command(manual_boost_command)
+                        manual_boost_command = dict(manual_boost_command, valid=False, reason="user_off")
+                        if manual_ww_central_actuator_for(wp, wp_type):
+                            try:
+                                os.remove("/var/www/html/ramdisk/manual_ww_boost.flag")
+                            except FileNotFoundError:
+                                pass
+                            manual_ww_central_started_flag_ts = 0.0
                     elif wq_aus < WQ_MIN_TEMP:
                         heatpump_positive_output_blocked_this_cycle = True
                         heatpump_positive_output_block_reasons.append(
@@ -14531,22 +14603,6 @@ def main():
                         )
                         if wp_write_allowed:
                             logger.info(f"Manueller Boost gestoppt: SoC niedrig ({soc}%).")
-                            if request_heatpump_boost(wp, 0, None, 0, CONF_WWW, owner="manual"):
-                                last_wp_command_time = time.time()
-                                manual_direct_boost = {"state": "idle"}
-                                heatpump_positive_signal_started_ts = 0.0
-                                heatpump_positive_signal_demand_class = "none"
-                                heatpump_positive_signal_restored_unconfirmed = False
-                                heatpump_positive_signal_start_reservation_allowed = False
-                                heatpump_positive_signal_hold_guard = {}
-                                consume_manual_boost_command(manual_boost_command)
-                    elif (time.time() - manual_boost_command.get("mtime", time.time())) > (MANUAL_BOOST_MAX_DURATION * 60):
-                        heatpump_positive_output_blocked_this_cycle = True
-                        heatpump_positive_output_block_reasons.append(
-                            "manual_command_expired"
-                        )
-                        if wp_write_allowed and user_stop_left_s <= 0.0:
-                            logger.info("Manueller Boost abgelaufen.")
                             if request_heatpump_boost(wp, 0, None, 0, CONF_WWW, owner="manual"):
                                 last_wp_command_time = time.time()
                                 manual_direct_boost = {"state": "idle"}
@@ -14733,35 +14789,37 @@ def main():
                         normal_ww = heatpump_pv_contract.get("comfort_ww") or {}
                         request_heatpump_channel(wp, "ww", 0, None, owner="pv")
 
-            # --- HAUPT REGELUNG (Wärmepumpe) ---
-            if not os.path.exists(FLAG_FILE) and AUTO_MODE == 0 and boost_active and wp:
-                # Die Automatik endet sofort; boost_active bezeichnet bis zur
-                # bestätigten Rücknahme nur noch das bestehende Geräteangebot.
-                # Luxtronik bleibt im Kanalautomaten. Direkte Aktoren nutzen den
-                # vorhandenen Taktschutz mit demselben physischen Laufzeitanker.
-                logger.info("PV-Automatik deaktiviert: Beende aktiven PV-Boost.")
-                heatpump_positive_output_blocked_this_cycle = True
-                heatpump_positive_output_block_reasons.append(
-                    "automatic_mode_user_off"
-                )
-                pv_boost_pending_start = None
-                if user_stop_left_s <= 0.0 and request_heatpump_boost(wp, 0, None, 0, CONF_WWW, owner="pv"):
-                    last_wp_command_time = time.time()
-                    if heatpump_positive_signal_demand_class == "ww_immediate_manual":
-                        # Rücknahme des Knopfsignals: Neustartsperre wie beim manuellen
-                        # Direkt-Boost; der Befehl bleibt angefordert.
-                        manual_direct_restart_floor_ts = max(
-                            manual_direct_restart_floor_ts,
-                            time.time() + max(600.0, max(0.0, _safe_float(WP_RESTART_BLOCK_MIN, 0.0)) * 60.0),
-                        )
-                    heatpump_positive_signal_started_ts = 0.0
-                    heatpump_positive_signal_demand_class = "none"
-                    heatpump_positive_signal_restored_unconfirmed = False
-                    heatpump_positive_signal_start_reservation_allowed = False
-                    heatpump_positive_signal_hold_guard = {}
-                    boost_active = False; pv_pause_active = False; pre_pause_active = False
-                    pv_pause_owner = "none"; source_recovery_pause_context = {}
+            # Gemeinsamer Aus-Plan, je Ausgang genau ein Transportweg.
+            if wp and not isinstance(wp, SafeLuxtronik):
+                if isinstance(wp, IDMHeatpump):
+                    state = heatpump_user_stop["idm74"]
+                    if run_user_stop_output(wp, state, user_stop_plans["idm74"],
+                            lambda: wp.update_surplus(grid, force_kw=0.0, owned_only=True), persist_user_stop):
+                        state["owned_kw"] = 0.0
+                        state["owned"] = False
+                state = heatpump_user_stop["direct"]
+                if user_stop_requested or state.get("active") and state.get("owned") and not state.get("confirmed"):
+                    heatpump_positive_output_blocked_this_cycle = True
+                    heatpump_positive_output_block_reasons.append("automatic_mode_user_off")
                     pv_boost_pending_start = None
+                    if run_user_stop_output(wp, state, user_stop_plans["direct"],
+                            lambda: request_heatpump_boost(wp, 0, None, 0, CONF_WWW, owner="pv"), persist_user_stop):
+                        state["owned"] = False
+                        if heatpump_positive_signal_demand_class == "ww_immediate_manual":
+                            manual_direct_restart_floor_ts = max(manual_direct_restart_floor_ts,
+                                time.time() + max(600.0, max(0.0, _safe_float(WP_RESTART_BLOCK_MIN, 0.0)) * 60.0))
+                        last_wp_command_time = time.time()
+                        heatpump_positive_signal_started_ts = 0.0
+                        heatpump_positive_signal_demand_class = "none"
+                        heatpump_positive_signal_restored_unconfirmed = False
+                        heatpump_positive_signal_start_reservation_allowed = False
+                        heatpump_positive_signal_hold_guard = {}
+                        boost_active = False
+                        pv_pause_active = False
+                        pre_pause_active = False
+                        manual_direct_boost = {"state": "idle"}
+                        pv_pause_owner = "none"
+                        source_recovery_pause_context = {}
 
             if not os.path.exists(FLAG_FILE) and AUTO_MODE == 1 and wp:
                 try:
@@ -17169,7 +17227,33 @@ def main():
                         if restart_block_left_s > 0:
                             pv_boost_pending_start = None
                             if (time.time() - last_wp_takt_log_time) > 300:
-                                logger.info(f"WP-Taktschutz: Start PV-Boost noch {restart_block_left_s/60:.1f} Min gesperrt (Wiedereinschaltsperre {WP_RESTART_BLOCK_MIN:.0f} Min).")
+                                # Nur die Meldungsstufe prüft den Startwunsch ohne Wiederanlaufsperre.
+                                (
+                                    logger.info
+                                    if (
+                                        wp and wp_write_allowed
+                                        and automatic_soc_start_allowed
+                                        and not automatic_heat_foreign_lock
+                                        and not automatic_heat_foreign_lock_seen
+                                        and automatic_heat_foreign_sg_release_confirmed
+                                        and time.time() >= automatic_heat_foreign_start_floor_ts
+                                        and heat_demand_owner_allowed
+                                        and central_heatpump_start_budget_gate.get("allowed") is True
+                                        and not heatpump_positive_output_blocked_this_cycle
+                                        and time.time() >= heatpump_positive_signal_retry_not_before_ts
+                                        and (
+                                            (heat_policy_runtime_enabled
+                                             and heat_policy_decision is not None
+                                             and heat_policy_decision.target_state == heat_policy.TARGET_PV_SURPLUS)
+                                            or (not heat_policy_runtime_enabled
+                                                and heatpump_budget_allows_start(
+                                                    storage_manager_owns_energy, heat_policy_budget_w,
+                                                    GRID_START_LIMIT, soc, MIN_SOC,
+                                                ))
+                                        )
+                                    )
+                                    else logger.debug
+                                )(f"WP-Taktschutz: Start PV-Boost noch {restart_block_left_s/60:.1f} Min gesperrt (Wiedereinschaltsperre {WP_RESTART_BLOCK_MIN:.0f} Min).")
                                 last_wp_takt_log_time = time.time()
                         else:
                             policy_allows_pv_start = bool(
@@ -17337,7 +17421,8 @@ def main():
                                     cycle_actions.append({"action": "pv_hz_withdrawal", "confirmed": False})
 
                     # Native iDM Überschusssteuerung
-                    if wp_write_allowed and wp:
+                    if (wp_write_allowed and wp and not user_stop_requested
+                            and user_stop_plans.get("idm74", {}).get("action", "abgeschlossen") == "abgeschlossen"):
                         wp.update_surplus(
                             grid,
                             free_for_limbs_w=(
@@ -18348,9 +18433,10 @@ def main():
                         _event["signal_confirmed"] = False
                         _event["intent_accepted"] = True
                 if (manual_boost_command.get("action") == "off"
-                        and all(value["state"] == "frei" and not value.get("alarm")
-                                and value["withdraw_ack_ts"] is not None
-                                for value in _owned_channels.values())):
+                        and all(not value.get("alarm") and not value["possible_effect"]
+                                and (channel == "hz"
+                                     or value["state"] == "frei" and value["withdraw_ack_ts"] is not None)
+                                for channel, value in _owned_channels.items())):
                     consume_manual_boost_command(manual_boost_command)
                 # WW-Sofort bleibt angefordert, meldet eine Rücknahme oder Sperre
                 # des Warmwasserkanals aber ehrlich (einmal je Unterbrechung im Log).
@@ -18649,6 +18735,7 @@ def main():
                 "wp_last_ww_cycle_target_c": wp_last_ww_cycle_target_c,
                 "wp_compressor_running": bool(wp_compressor_running_now) if (wp_type != 4 or wp_compressor_observation_valid) else None,
                 "wp_compressor_observation_valid": bool(wp_compressor_observation_valid),
+                "heatpump_user_stop": copy.deepcopy(heatpump_user_stop),
                 "wp_compressor_history_valid": bool(wp_compressor_history_valid),
                 "wp_compressor_last_start_ts": wp_compressor_last_start_ts,
                 "wp_compressor_last_stop_ts": wp_compressor_last_stop_ts,
@@ -18696,7 +18783,10 @@ def main():
                     "price_stop_held": bool(price_heatpump_takt_stop_held),
                     "price_stop_remaining_s": max(0, int(price_heatpump_stop_block_remaining_s))
                 },
-                "idm_surplus_kw": getattr(wp, 'last_sent_surplus_kw', 0.0) if wp else 0.0,
+                "idm_surplus_kw": (None if getattr(wp, 'last_failed_surplus_kw', None) is not None
+                    else getattr(wp, 'last_sent_surplus_kw', 0.0)) if wp else 0.0,
+                "idm_surplus_reason": ("write_unconfirmed" if getattr(wp, 'last_failed_surplus_kw', None) is not None
+                    else "last_confirmed_command"),
                 "idm_ext_ww": int(getattr(wp, 'curr_ext_ww', False) or 0) if wp else 0,
                 "idm_ext_hz": int(getattr(wp, 'curr_ext_hz', False) or 0) if wp else 0,
                 "idm_ext_khl": int(getattr(wp, 'curr_ext_khl', False) or 0) if wp else 0,

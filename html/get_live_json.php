@@ -1115,7 +1115,7 @@ function liveApplyE3dcMultiHomeRelationFromConfig(&$data, $confData) {
 /**
  * Hausverbrauchsanzeige aus zeitgleichen Werten bei Fremd-Wallboxen.
  *
- * Der E3DC-Hauswert (Frame mit Ende `_ts`, Dauer `_elapsed`) enthält die Last
+ * Der E3DC-Hauswert (Messzeit `_ts`, konservativer Vorlauf `_elapsed`) enthält die Last
  * einer Fremd-Wallbox; abgezogen wird deren Leistung aus einer eigenen Messung
  * (`sample_ts`). Ein neuer Anzeigewert entsteht nur, wenn die Wallboxleistung
  * über den ganzen Frame belegt gleich war: letzte Leistungsänderung mindestens
@@ -3037,6 +3037,60 @@ function liveBoolValue($value, $default = false) {
     return $default;
 }
 
+/**
+ * Messwerte des Live-Rahmens für die Verlaufszeile (live_history.txt), je Feld unabhängig:
+ * Gültigkeitsfeld des Messvertrags und endliche Zahl, sonst null (keine Probe). Kein Bilanzersatz,
+ * kein Vorwert; eine gemessene 0 bleibt 0. SoC nur im Bereich 0 bis 100.
+ */
+function liveHistorySampleValues($frame) {
+    $number = function($keys, $validity) use ($frame) {
+        if (!is_array($frame)) return null;
+        if (array_key_exists($validity, $frame) && !liveBoolValue($frame[$validity], false)) return null;
+        foreach ($keys as $key) {
+            if (!array_key_exists($key, $frame)) continue;
+            $value = $frame[$key];
+            return !is_bool($value) && is_numeric($value) && is_finite((float)$value) ? $value + 0 : null;
+        }
+        return null;
+    };
+    $values = [
+        'pv' => $number(['PV_Power', 'pv'], 'PV_Power_Valid'),
+        'home_raw' => $number(['Home_Power', 'home_raw'], 'Home_Power_Valid'),
+        'grid' => $number(['Grid_Power', 'grid'], 'Grid_Power_Valid'),
+        'bat' => $number(['Battery_Power', 'bat'], 'Battery_Power_Valid'),
+        'soc' => $number(['SOC', 'soc'], 'SOC_Valid'),
+    ];
+    if ($values['soc'] !== null && ($values['soc'] < 0 || $values['soc'] > 100)) $values['soc'] = null;
+    return $values;
+}
+
+/** Messzeit der Probe (Sekunden) aus dem Live-Rahmen; ohne Zeitfeld die Dateizeit, sonst jetzt. */
+function liveHistorySampleTs($frame, $fileMtime = 0) {
+    $ts = is_array($frame) && array_key_exists('_ts', $frame) && is_numeric($frame['_ts']) ? (float)$frame['_ts'] : null;
+    if ($ts !== null && $ts > 10000000000) $ts /= 1000;
+    if ($ts === null || !is_finite($ts) || $ts <= 0) $ts = (int)$fileMtime > 0 ? (int)$fileMtime : time();
+    return (int)$ts;
+}
+
+/** Messzeit der letzten Verlaufszeile (Sekunden) oder null; liest nur das Dateiende. */
+function liveHistoryLastSampleTs($file) {
+    if (!is_string($file) || is_link($file) || !is_file($file)) return null;
+    $size = @filesize($file);
+    if (!is_int($size) || $size <= 0) return null;
+    $handle = @fopen($file, 'r');
+    if ($handle === false) return null;
+    $window = min($size, 16384);
+    $tail = '';
+    if (@fseek($handle, $size - $window) === 0) $tail = (string)@fread($handle, $window);
+    @fclose($handle);
+    $lines = array_values(array_filter(array_map('trim', explode("\n", $tail)), 'strlen'));
+    if (!$lines) return null;
+    $last = @json_decode(end($lines), true);
+    if (!is_array($last) || empty($last['ts']) || !is_string($last['ts'])) return null;
+    $ts = strtotime($last['ts']);
+    return $ts === false ? null : (int)$ts;
+}
+
 function liveNativeWallboxStatusContract($detail) {
     if (!is_array($detail)) {
         return ['declared' => false, 'valid' => null, 'source' => '', 'reason' => ''];
@@ -3893,6 +3947,53 @@ function liveStorageStateCurveBinding($plan, $state, $displayDay) {
         'reason_code' => 'OK',
         'legacy_bound' => !$topLevelBound,
     ];
+}
+
+// Planreihen verlassen die Live-Antwort (Abruf alle 2 s). Der Prognose- und
+// Planabruf get_forecast_data.php liefert sie einmal je Planstand aus derselben
+// Quelle (storage_plan.json). Hier bleiben nur die Kennwerte, die Live-Kacheln
+// und die Marktanzeige im Takt lesen: Status, Bindung, Zeitstempel, Kurzform.
+function liveMarketPlanForDisplay($marketPlan) {
+    if (!is_array($marketPlan)) return null;
+    // Vertragsliste und Prognosefenster (Halteplan, bediente Slots, Fenster-
+    // nachweise) sind Planreihen; Kopf, Zusammenfassung, aktueller Vertrag
+    // ohne seine Prognose und der Nachladekandidat bleiben.
+    unset($marketPlan['contracts'], $marketPlan['forecast']);
+    if (is_array($marketPlan['active_contract'] ?? null)) {
+        unset($marketPlan['active_contract']['forecast']);
+    }
+    return $marketPlan;
+}
+
+function liveHeatPriceBoostForecastHeader($forecast) {
+    // Die Slotreihe liest kein Live-Leser; die Wärmedienste projizieren sie
+    // selbst aus storage_plan.json (Heat/plan_forecast.py). Der Kopf mit
+    // Planbindung, Status und Kandidat bleibt.
+    if (!is_array($forecast)) return $forecast;
+    unset($forecast['slots']);
+    return $forecast;
+}
+
+function liveMarketSocTrajectoryForDisplay($trajectory) {
+    // Die Marktanzeige liest je Slot nur Zeitgrenzen, SoC-Verlauf, Aktion und
+    // Herkunft; Leistungs-, Reserve- und Bindungsfelder je Slot prüft bereits
+    // e3dcMarketSocTrajectoryForDisplay() gegen den Plan und liefert sie der
+    // Prognoseabruf vollständig.
+    if (!is_array($trajectory) || !is_array($trajectory['slots'] ?? null)) return $trajectory;
+    $slots = [];
+    foreach ($trajectory['slots'] as $slot) {
+        if (!is_array($slot)) continue;
+        $slots[] = [
+            'start_ts_ms' => $slot['start_ts_ms'] ?? null,
+            'end_ts_ms' => $slot['end_ts_ms'] ?? null,
+            'soc_start_pct' => $slot['soc_start_pct'] ?? null,
+            'soc_end_pct' => $slot['soc_end_pct'] ?? null,
+            'action' => $slot['action'] ?? null,
+            'origin' => $slot['origin'] ?? null,
+        ];
+    }
+    $trajectory['slots'] = $slots;
+    return $trajectory;
 }
 
 function liveStorageSimCurveContract($plan, $displayDay, $stateBinding) {
@@ -5730,13 +5831,13 @@ if ($isShadowMode) {
             $shadowPayloadTs /= 1000.0;
         }
         $shadowPayloadAgeS = time() - $shadowPayloadTs;
-        if (
-            is_array($shadowLiveData)
+        $shadowPayloadFrameValid = is_array($shadowLiveData)
             && $shadowPayloadTs > 946684800.0
             && $shadowPayloadAgeS >= -60.0
-            && $shadowPayloadAgeS <= $shadowMaxAgeS
-            && isset($shadowLiveData['PV_Power'])
-        ) {
+            && $shadowPayloadAgeS <= $shadowMaxAgeS;
+        // Dieselbe bestätigte Frist für die unabhängigen Anzeigewerte verwenden.
+        $displayShadowSample = $shadowPayloadFrameValid ? $shadowLiveData : null;
+        if ($shadowPayloadFrameValid && isset($shadowLiveData['PV_Power'])) {
             $liveData = $shadowLiveData;
             $liveSourceFile = $SHADOW_LIVE_DATA_FILE;
             $liveSourceLabel = 'shadow_master_live_data_py';
@@ -5804,16 +5905,6 @@ if (isset($liveData['notstrom_status']) && !isset($liveData['Notstrom_Status']))
     $liveData['Notstrom_Status'] = (int)$liveData['notstrom_status'];
 }
 
-// Legacy: Wurzelzähler-Invertierung betrifft nur optionale PM-Phasendiagnose.
-// Der native V5-Netzpunkt kommt direkt aus EMS Grid_Power und darf nicht gedreht werden.
-$wurzelInvert = (isset($confData['config']['wurzelzaehler_invertiert']) && in_array((string)$confData['config']['wurzelzaehler_invertiert'], ['1', 'true', 'yes']));
-if ($wurzelInvert && is_array($liveData)) {
-    if (isset($liveData['grid_p1']) && is_numeric($liveData['grid_p1'])) $liveData['grid_p1'] = -1 * (float)$liveData['grid_p1'];
-    if (isset($liveData['grid_p2']) && is_numeric($liveData['grid_p2'])) $liveData['grid_p2'] = -1 * (float)$liveData['grid_p2'];
-    if (isset($liveData['grid_p3']) && is_numeric($liveData['grid_p3'])) $liveData['grid_p3'] = -1 * (float)$liveData['grid_p3'];
-    $liveData['wurzelzaehler_invertiert_legacy'] = true;
-}
-// <---
 
 // Sicherheits-Check: Nur verarbeiten, wenn das JSON gültig ist und PV_Power enthält
 if (is_array($liveData) && isset($liveData['PV_Power'])) {
@@ -6143,7 +6234,7 @@ if (is_array($liveData) && isset($liveData['PV_Power'])) {
                 $data['wb_p3'] = (float)($openwbData['phase_power_l3_w'] ?? 0);
                 $data['wb_kva'] = liveWallboxApparentKva($openwbData);
                 $data['wb_power_factor'] = liveWallboxPowerFactor($openwbData, $owbPower);
-                $data['wb_set_amp'] = (float)($openwbData['current_set_amp'] ?? $openwbData['amp'] ?? 0);
+                $data['wb_set_amp'] = (float)($openwbData['display_set_amp'] ?? $openwbData['current_set_amp'] ?? $openwbData['amp'] ?? 0);
                 $data['wb_cap_amp'] = (float)($openwbData['cap_amp'] ?? $openwbData['target_amp'] ?? 0);
                 $data['wb_status_amp'] = (float)($openwbData['status_amp'] ?? $openwbData['amp'] ?? 0);
                 liveApplyWallboxFineAmpFields($data, 'wb', $openwbData, $data['wb_set_amp']);
@@ -6382,7 +6473,7 @@ if (is_array($liveData) && isset($liveData['PV_Power'])) {
                 // Wie der Storage Manager (storage_home_wp_split): Nur wenn die WP im
                 // E3DC-Hauswert steckt, wird sie später vom Hausverbrauch abgezogen.
                 $data['wp_home_includes_wp'] = $wpPmValid && e3dcHeatpumpHomeIncludesWp(
-                    $confData['config']['storage_home_wp_split'] ?? 'auto',
+                    $confData['config']['storage_home_wp_split'] ?? 'include',
                     $data['home_raw'] ?? 0,
                     $data['wp']
                 );
@@ -7275,7 +7366,7 @@ if ($wbNativeEnable && ($wbConfigured || $wb2Configured) && file_exists($wbNativ
             $data['wb_p3'] = (float)($nativeWb1['phase_power_l3_w'] ?? 0);
             $data['wb_kva'] = liveWallboxApparentKva($nativeWb1);
             $data['wb_power_factor'] = liveWallboxPowerFactor($nativeWb1, $data['wb']);
-            $data['wb_set_amp'] = (float)($nativeWb1['current_set_amp'] ?? $nativeWb1['amp'] ?? 0);
+            $data['wb_set_amp'] = (float)($nativeWb1['display_set_amp'] ?? $nativeWb1['current_set_amp'] ?? $nativeWb1['amp'] ?? 0);
             $data['wb_cap_amp'] = (float)($nativeWb1['cap_amp'] ?? $nativeWb1['target_amp'] ?? 0);
             $data['wb_status_amp'] = (float)($nativeWb1['status_amp'] ?? $nativeWb1['amp'] ?? 0);
             liveApplyWallboxFineAmpFields($data, 'wb', $nativeWb1, $data['wb_set_amp']);
@@ -7320,7 +7411,7 @@ if ($wbNativeEnable && ($wbConfigured || $wb2Configured) && file_exists($wbNativ
             $data['wb2_p3'] = (float)($nativeWb2['phase_power_l3_w'] ?? 0);
             $data['wb2_kva'] = liveWallboxApparentKva($nativeWb2);
             $data['wb2_power_factor'] = liveWallboxPowerFactor($nativeWb2, (float)($data['wb2'] ?? 0));
-            $data['wb2_set_amp'] = (float)($nativeWb2['current_set_amp'] ?? $nativeWb2['amp'] ?? 0);
+            $data['wb2_set_amp'] = (float)($nativeWb2['display_set_amp'] ?? $nativeWb2['current_set_amp'] ?? $nativeWb2['amp'] ?? 0);
             $data['wb2_cap_amp'] = (float)($nativeWb2['cap_amp'] ?? $nativeWb2['target_amp'] ?? 0);
             $data['wb2_status_amp'] = (float)($nativeWb2['status_amp'] ?? $nativeWb2['amp'] ?? 0);
             liveApplyWallboxFineAmpFields($data, 'wb2', $nativeWb2, $data['wb2_set_amp']);
@@ -7646,7 +7737,7 @@ if (($wb2NativeType === 'openwb' || $wb2NativeType === 'openwb_pro')
         $data['wb2_p3'] = (float)($openwbData2['phase_power_l3_w'] ?? 0);
         $data['wb2_kva'] = liveWallboxApparentKva($openwbData2);
         $data['wb2_power_factor'] = liveWallboxPowerFactor($openwbData2, $owb2Power);
-        $data['wb2_set_amp'] = (float)($openwbData2['current_set_amp'] ?? $openwbData2['amp'] ?? ($data['wb2_set_amp'] ?? 0));
+        $data['wb2_set_amp'] = (float)($openwbData2['display_set_amp'] ?? $openwbData2['current_set_amp'] ?? $openwbData2['amp'] ?? ($data['wb2_set_amp'] ?? 0));
         $data['wb2_cap_amp'] = (float)($openwbData2['cap_amp'] ?? $openwbData2['target_amp'] ?? ($data['wb2_cap_amp'] ?? 0));
         $data['wb2_status_amp'] = (float)($openwbData2['status_amp'] ?? $openwbData2['amp'] ?? ($data['wb2_status_amp'] ?? 0));
         liveApplyWallboxFineAmpFields($data, 'wb2', $openwbData2, $data['wb2_set_amp']);
@@ -8448,6 +8539,9 @@ if ($mqttHaAppliedConsumer) {
 }
 
 liveApplyE3dcMultiHomeRelationFromConfig($data, $confData);
+// Die bestehende Verbraucheraufteilung vor den ausschließlich historischen Vorwertfiltern sichern.
+$displayHomeDeduction = is_numeric($data['home_raw'] ?? null) && is_numeric($data['home'] ?? null)
+    ? max(0, (float)$data['home_raw'] - (float)$data['home']) : null;
 // Anzeige: E3DC-Hauswert und Fremd-Wallboxleistung nur aus zeitgleichen Messungen verrechnen.
 liveApplyExternalWallboxHomeSync($data, $liveData ?? null, $nativeWb ?? null);
 stabilizeCleanHomePower($data);
@@ -8463,13 +8557,24 @@ $data['house_unknown_wallbox_reasons'] = $houseQuality['house_unknown_wallbox_re
 // PERFORMANCE-FIX: Nur alle 60 Sekunden schreiben, um Pi Zero zu entlasten
 $lastWrite = file_exists($liveHistoryFile) ? filemtime($liveHistoryFile) : 0;
 // NEU: Nur schreiben, wenn die Zeit abgelaufen ist UND wir gültige Daten gelesen haben ($validData)
-$historySampleValid = !isset($data['rscp_sample_valid']) || !empty($data['rscp_sample_valid']);
-if ($validData && $historySampleValid && (time() - $lastWrite) >= 60 && !$isStandby) {
+// Die Verlaufszeile folgt dem Messvertrag des Live-Rahmens: Ein als Ganzes ungültiger Rahmen
+// (RSCP_Sample_Valid=false) ergibt keine Zeile. Einzelne ungültige Messgrößen (Haus, PV, Netz,
+// Akku, SoC) stehen je Feld als null in der Zeile; eine gemessene 0 bleibt 0. Bilanzersatz und
+// Vorwertfilter der Anzeige kommen nicht in den Verlauf, und die Zeile trägt die Messzeit der Probe.
+$historyFrame = is_array($marketSocLiveRaw ?? null) ? $marketSocLiveRaw : [];
+$historyFrameValid = liveBoolValue($historyFrame['RSCP_Sample_Valid'] ?? true, true);
+$historySample = liveHistorySampleValues($historyFrame);
+$historyTs = liveHistorySampleTs($historyFrame, $mtime ?? 0);
+if ($validData && $historyFrameValid && (time() - $lastWrite) >= 60 && !$isStandby) {
     $historyLockFile = '/var/www/html/tmp/history_write.lock';
-    $hFp = @fopen($historyLockFile, 'c+');
+    // Gemeinsamer Sperrhelfer: öffnet auch eine fremd angelegte Datei (lesend) und setzt 0664,
+    // damit Webserver und Zeitplandienst dieselbe Sperre nutzen; Symlinks bleiben ausgeschlossen.
+    $hFp = liveJsonOpenBoundLockFile($historyLockFile);
     if ($hFp && @flock($hFp, LOCK_EX | LOCK_NB)) {
         $lastWriteCheck = file_exists($liveHistoryFile) ? filemtime($liveHistoryFile) : 0;
-        if ((time() - $lastWriteCheck) >= 60) {
+        // Dieselbe Probe (unveränderte Messzeit) wird nicht ein zweites Mal geschrieben.
+        $lastHistorySampleTs = liveHistoryLastSampleTs($liveHistoryFile);
+        if ((time() - $lastWriteCheck) >= 60 && ($lastHistorySampleTs === null || $historyTs > $lastHistorySampleTs)) {
 // Für Statistik/Langzeit gibt es aktuell keinen eigenen Heizstab-Bucket.
         // Deshalb wird Heizstab/myPV-Verbrauch wie WP-Verbrauch behandelt und
         // aus dem reinen Hausverbrauch herausgerechnet.
@@ -8489,20 +8594,30 @@ if ($validData && $historySampleValid && (time() - $lastWrite) >= 60 && !$isStan
             ? null : $wpOnlyForStats + $hsPowerForStats;
         $climatePowerForStats = isset($data['climate_power_valid']) && !$data['climate_power_valid']
             ? null : max(0, (float)($data['climate_power_w'] ?? 0));
-        $realHome = isset($data['home']) && is_numeric($data['home'])
-            ? (float)$data['home']
-            : ((float)$data['home_raw'] - $wpPowerForStats);
-        if (!isset($data['home']) || !is_numeric($data['home'])) {
-            $realHome -= $climatePowerForStats;
-            if (!empty($data['is_external_wb'])) $realHome -= (float)$data['wb'];
-            if (!empty($data['is_external_wb2'])) $realHome -= (float)$data['wb2'];
+        // Hausverbrauch ohne WP (inkl. Heizstab), Klima und externe Wallbox: dieselben Verbraucherterme
+        // wie die Spalten dieser Zeile (wp, climate, wb/wb2 extern), genau einmal und ungeklemmt vom
+        // gemessenen Rohwert abgezogen; so steckt kein Verbraucher doppelt, auch wenn die Anzeige im
+        // Legacy-Zweig mit der Bilanz rechnet. Ohne Hausprobe bleibt er null. Eine gültige Boxprobe einer
+        // externen Wallbox wird genau einmal abgezogen; Zeitversatz zwischen Zähler und Box ist normal und
+        // kein Grund für eine Lücke. Ohne gültige Boxprobe (Haus laut Qualitätsprojektion „inkl. unbekannter
+        // Wallbox“) bleibt das Haus „Haus inkl. Wallbox“: kein Abzug, kein veralteter Boxwert.
+        $historyExternalWbW = 0.0;
+        if (!empty($data['is_external_wb'])) $historyExternalWbW += max(0, (float)($data['wb'] ?? 0));
+        if (!empty($data['is_external_wb2'])) $historyExternalWbW += max(0, (float)($data['wb2'] ?? 0));
+        if (!empty($data['house_includes_unknown_wallbox'])) $historyExternalWbW = 0.0;
+        if ($historySample['home_raw'] === null) {
+            $historyHome = null;
+        } else {
+            $historyHome = max(0, $historySample['home_raw'] - (float)($wpPowerForStats ?? 0)
+                - (float)($climatePowerForStats ?? 0) - $historyExternalWbW);
         }
+        $historyPvExternal = (float)($data['pv_external_w'] ?? 0);
 
         $historyLine = [
-            'ts' => date('c'),
-            'pv' => $data['pv'],
-            'pv_total_w' => $data['pv_total_w'] ?? $data['pv'],
-            'pv_e3dc_w' => $data['pv_e3dc_w'] ?? $data['pv'],
+            'ts' => date('c', $historyTs),
+            'pv' => $historySample['pv'],
+            'pv_total_w' => $historySample['pv'],
+            'pv_e3dc_w' => $historySample['pv'] === null ? null : max(0, $historySample['pv'] - $historyPvExternal),
             'pv_external_w' => $data['pv_external_w'] ?? 0,
             'pv_external_source' => $data['pv_external_source'] ?? 'not_reported',
             'pv_external_power_valid' => !empty($data['pv_external_power_valid']),
@@ -8514,22 +8629,25 @@ if ($validData && $historySampleValid && (time() - $lastWrite) >= 60 && !$isStan
             'pv_dc_only_active' => !empty($data['pv_dc_only_active']),
             'pv_external_charge_locked' => !empty($data['pv_external_charge_locked']),
             'pv_external_charge_guard_w' => $data['pv_external_charge_guard_w'] ?? 0,
-            'bat' => $data['bat'],
+            'bat' => $historySample['bat'],
             'house_includes_unknown_wallbox' => !empty($data['house_includes_unknown_wallbox']),
             'house_unknown_wallbox_reasons' => $data['house_unknown_wallbox_reasons'] ?? [],
-            'home_raw' => $data['home_raw'],
-            'home_rscp_raw' => $data['home_rscp_raw'] ?? $data['home_raw'],
+            'home_raw' => $historySample['home_raw'],
+            'home_rscp_raw' => $historySample['home_raw'],
             'home_balance' => $data['home_balance'] ?? null,
             'home_delta' => $data['home_delta'] ?? null,
-            'home' => max(0, $realHome),  // Hausverbrauch ohne WP und ohne ext. WB
-            'home_power_source' => $data['home_power_source'] ?? '',
-            'home_power_valid' => !empty($data['home_power_valid']),
+            'home' => $historyHome,  // Hausverbrauch ohne WP und ohne ext. WB; null ohne Hausprobe
+            // Quelle des Rohwerts im Verlauf: der Messvertrag des Rahmens; ältere Rahmen ohne Quellfeld
+            // bleiben 'legacy_unmarked', denn Bilanz- und Vorwertlabels der Anzeige gelten hier nicht mehr.
+            'home_power_source' => (string)($historyFrame['Home_Power_Source']
+                ?? ($historySample['home_raw'] === null ? 'rscp_missing_or_invalid' : 'legacy_unmarked')),
+            'home_power_valid' => $historySample['home_raw'] !== null,
             'home_power_independent' => !empty($data['home_power_independent']),
-            'grid_power_valid' => !empty($data['grid_power_valid']),
-            'rscp_sample_valid' => !empty($data['rscp_sample_valid']),
+            'grid_power_valid' => $historySample['grid'] !== null,
+            'rscp_sample_valid' => $historyFrameValid,
             'rscp_glitch_reasons' => $data['rscp_glitch_reasons'] ?? [],
-            'grid' => $data['grid'],
-            'soc' => $data['soc'],
+            'grid' => $historySample['grid'],
+            'soc' => $historySample['soc'],
             'wb_measure_only_configured' => e3dcWallboxMqttMeasureConfigured($wallboxConfig, 1),
             'wb_measure_only_reason' => e3dcWallboxMqttMeasureConfigured($wallboxConfig, 1) && !$wb1MeasureOnly ? 'measurement_invalid' : null,
             'wb_measure_only' => $wb1MeasureOnly,
@@ -9871,6 +9989,7 @@ if (
                 ? $chargeAcceptanceDiagnostic['display_text']
                 : null;
         }
+        $data['storage_curve_control_soc'] = null;
         foreach ([
             'iFc_w' => 'storage_ifc_w',
             'iMinLade_w' => 'storage_imin_w',
@@ -10516,6 +10635,7 @@ if ($storagePlanFresh) {
             $simCurveContract['reason_code'] = 'PROJECTION_HIDDEN_BY_EFFECTIVE_PLAN';
         }
         $data['storage_sim_curve_status'] = $simCurveContract;
+        $data['heat_price_boost_forecast'] = liveHeatPriceBoostForecastHeader($data['heat_price_boost_forecast']);
         $dispatchSlots = $canonicalPlan ? $storPlan['slots'] : [];
         foreach ($dispatchSlots as $slot) {
             if (!is_array($slot)) continue;
@@ -10768,14 +10888,16 @@ if ($storagePlanFresh) {
         if ($directMarketing !== null) {
             $data['direct_marketing'] = $directMarketing;
         }
-        $marketPlan = (isset($storPlan['market_plan']) && is_array($storPlan['market_plan']))
+        $marketPlanFull = (isset($storPlan['market_plan']) && is_array($storPlan['market_plan']))
             ? $storPlan['market_plan']
             : null;
+        // Kurzform im Live-Takt; den vollständigen Marktplan liefert get_forecast_data.php.
+        $marketPlan = liveMarketPlanForDisplay($marketPlanFull);
         if ($marketPlan !== null) {
             $data['market_plan'] = $marketPlan;
         }
-        $marketPlanSummary = (is_array($marketPlan) && isset($marketPlan['summary']) && is_array($marketPlan['summary']))
-            ? $marketPlan['summary']
+        $marketPlanSummary = (is_array($marketPlanFull) && isset($marketPlanFull['summary']) && is_array($marketPlanFull['summary']))
+            ? $marketPlanFull['summary']
             : null;
         if ($marketPlanSummary !== null) {
             $data['market_plan_summary'] = $marketPlanSummary;
@@ -11171,7 +11293,9 @@ if (file_exists($weatherAlertsFile)) {
     }
 }
 
-$data['market_soc_trajectory'] = e3dcMarketSocTrajectoryForDisplay($storPlan ?? null, $marketSocLiveRaw);
+$data['market_soc_trajectory'] = liveMarketSocTrajectoryForDisplay(
+    e3dcMarketSocTrajectoryForDisplay($storPlan ?? null, $marketSocLiveRaw)
+);
 
 $data['vehicle_soc_contract_version'] = 1;
 if (!isset($data['vehicle_soc']) || !is_array($data['vehicle_soc'])) $data['vehicle_soc'] = [];
@@ -11196,6 +11320,51 @@ if ($wpTypeCfg === 4) {
     liveApplyStiebelMeasurementProjection($data, ($wpSourceIsFresh && is_array($wpSourceJson)) ? $wpSourceJson : []);
 }
 
+// Unmittelbare Messanzeige erst nach Historie, Statistik und Lernpfaden bilden.
+// Deren bisherige Werte und Filter bleiben ausschließlich in $data bis hier erhalten.
+$displaySample = is_array($displayShadowSample ?? null)
+    ? $displayShadowSample : (is_array($marketSocLiveRaw ?? null) ? $marketSocLiveRaw : []);
+$displaySourceLabel = is_array($displayShadowSample ?? null)
+    ? 'shadow_master_live_data_py' : $liveSourceLabel;
+$data['live_source'] = $displaySourceLabel;
+if (is_array($displayShadowSample ?? null)) $data['shadow_live_source'] = $displaySourceLabel;
+$displayNumber = function($keys, $validity) use ($displaySample) {
+    if (array_key_exists($validity, $displaySample)
+        && !liveBoolValue($displaySample[$validity], false)) return null;
+    foreach ($keys as $key) {
+        if (!array_key_exists($key, $displaySample)) continue;
+        $value = $displaySample[$key];
+        return is_numeric($value) && is_finite((float)$value) ? $value + 0 : null;
+    }
+    return null;
+};
+$displayValues = [
+    'pv' => $displayNumber(['PV_Power', 'pv'], 'PV_Power_Valid'),
+    'home_raw' => $displayNumber(['Home_Power', 'home_raw'], 'Home_Power_Valid'),
+    'grid' => $displayNumber(['Grid_Power', 'grid'], 'Grid_Power_Valid'),
+    'bat' => $displayNumber(['Battery_Power', 'bat'], 'Battery_Power_Valid'),
+    'soc' => $displayNumber(['SOC', 'soc'], 'SOC_Valid'),
+];
+if ($displayValues['soc'] !== null && ($displayValues['soc'] < 0 || $displayValues['soc'] > 100)) {
+    $displayValues['soc'] = null;
+}
+$displayTs = $displayNumber(['_ts'], '_timestamp_valid');
+if ($displayTs !== null && $displayTs > 10000000000) $displayTs /= 1000;
+if ($displayTs === null || $displayTs <= 0) $displayTs = null;
+foreach ($displayValues as $key => $value) {
+    $data[$key] = $value;
+    $data[$key . '_valid'] = $value !== null;
+}
+$data['home_power_valid'] = $data['home_raw_valid'];
+$data['grid_power_valid'] = $data['grid_valid'];
+// Ohne gültige Einzelmessung bleibt der Verbraucher im gemessenen Hauswert.
+$data['home'] = $displayValues['home_raw'];
+$data['home_source'] = $data['home'] === null ? null : 'native_sample';
+$data['home_held_zero_glitch'] = false;
+if ($data['home'] !== null && $displayHomeDeduction !== null) {
+    // Dieselbe Aufteilung wie im Bestand genau einmal auf den gemessenen Rohwert anwenden.
+    $data['home'] = max(0, $data['home'] - $displayHomeDeduction);
+}
 // Messung erst nach allen Bestands-, Verlaufs- und Lernpfaden für die Anzeige auflegen.
 $data['home_without_measure_only'] = $data['home'];
 $data['wb_measure_only'] = false;
@@ -11210,7 +11379,19 @@ foreach ([1 => $wb1MeasureOnly, 2 => $wb2MeasureOnly] as $slot => $measureOnly) 
     $data[$prefix . '_measure_only_w'] = (float)$sample['power'];
     $data[$prefix . '_source'] = 'external_mqtt_measure_only';
     $data[$prefix === 'wb' ? 'is_external_wb' : 'is_external_wb2'] = true;
-    $data['home'] = max(0, (float)$data['home'] - (float)$sample['power']);
+    if ($data['home'] !== null) $data['home'] = max(0, $data['home'] - (float)$sample['power']);
 }
+
+$data['home_valid'] = $data['home'] !== null;
+$data['pv_total_w'] = $data['pv'];
+$data['pv_e3dc_w'] = $data['pv'] === null ? null : max(0, $data['pv'] - (float)$data['pv_external_w']);
+$data['ts'] = $displayTs;
+$data['time'] = $displayTs === null ? 'unbekannt' : date('H:i:s', (int)$displayTs);
+$data['house_battery_soc'] = [
+    'value' => $data['soc'], 'valid' => $data['soc_valid'],
+    'source' => $displaySourceLabel, 'source_ts' => $displayTs,
+    'age_s' => $displayTs === null ? null : max(0, time() - $displayTs),
+    'domain' => 'house_battery',
+];
 
 echo json_encode($data);

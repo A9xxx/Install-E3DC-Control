@@ -481,7 +481,9 @@ Quellen:
 
 Der Marktwert-Solar-Monitor ist ein reiner Analysepfad. Er ermittelt fortlaufend
 einen vorläufigen Monatswert-Trend, indem die 15-Minuten-Solarhochrechnung von
-Netztransparenz mit den vorhandenen Spotpreisen gewichtet wird:
+Netztransparenz mit den Day-Ahead-Preisen Deutschland/Luxemburg desselben Monats
+laut SMARD (Filter 4169, Viertelstunden; €/MWh in ct/kWh umgerechnet)
+gewichtet wird. Der Monitor bleibt experimentell und ab Werk ausgeschaltet:
 
 ```text
 marktwert_solar_trend_ct =
@@ -494,15 +496,22 @@ Wichtig:
 - Die Ausgabe ist `read_only = true`, `control_effect = none` und
   `actionable_for_control = false`.
 - Es entsteht kein Storage-Owner, kein RSCP-Befehl und keine Lade-/Entladefreigabe.
-- Der Wert ist ein vorläufiger Trend. Der offizielle Monatsmarktwert bleibt die
-  veröffentlichte ÜNB-/Netztransparenz-Marktwertübersicht.
+- Der Wert ist ein vorläufiger Trend; maßgeblich bleibt der amtliche
+  Monatsmarktwert von Netztransparenz.
 - Fehlende Netztransparenz-Zugangsdaten führen nur zu `missing_credentials` im
   Monitor; die Direktvermarktungsregelung und die Preisdaten laufen weiter.
-- Bei API-Ausfall darf ein lokal gecachter Solarhochrechnungsstand als
-  Diagnose-Fallback genutzt werden. Der Status beginnt dann mit `cached_`.
+- Der Monitor verwendet nur Viertelstunden des laufenden Monats bis jetzt. Für
+  jede vorhandene Solar-Viertelstunde muss ein SMARD-Preis vorliegen, auch bei 0 MW.
+  Bei Lücken bleibt der Trend unbekannt (`null`) mit Grund und Abdeckungsangabe.
+  Ohne lesbare Solar-Viertelstunden bleiben auch Energie und Abdeckung unbekannt.
+- Die EPEX-Preisdatei, Endkundentarife und alte Cachedateien sind keine Quelle des Trends.
+- Bei Abruffehlern, leeren oder unlesbaren Antworten meldet der Monitor
+  `unavailable` mit einem festen Grund für Anmeldung, Hochrechnung oder SMARD.
+- Die Day-Ahead-Preise stehen grundsätzlich am Vortag fest.
 
 Technisch wird der Monitor vom EPEX-Manager nach dem Schreiben der Preisdaten
-aktualisiert. Die Ergebnisdatei liegt hier:
+im vorhandenen Takt aktualisiert. Die Netztransparenz-Zugangsdaten dienen nur
+der Solar-Hochrechnung. Die Ergebnisdatei liegt hier:
 
 ```text
 /var/www/html/ramdisk/market_value_solar.json
@@ -514,11 +523,11 @@ als Passwortfeld behandelt und in Diagnosepaketen maskiert.
 
 Quellen:
 
+- SMARD Day-Ahead-Preis Deutschland/Luxemburg: https://www.smard.de/
 - Netztransparenz WebAPI FAQ: URL-Struktur
   `api/v1/data/{data}/{product}/{dateFrom}/{dateTo}` und OAuth-Client-Credentials:
   https://www.netztransparenz.de/en/FAQ/FAQ-WebAPI
-- Netztransparenz API-Dokumentation: Endpunkte `hochrechnung/Solar` und
-  `Spotmarktpreise`:
+- Netztransparenz API-Dokumentation: Endpunkt `hochrechnung/Solar`:
   https://www.netztransparenz.de/xspproxy/api/staticfiles/ntp-relaunch/dokumente/web-api/dokumentation-webserviceapi-netztransparenz_v1.21.pdf
 - Netztransparenz Marktwertübersicht als offizielle Monatswert-Referenz:
   https://www.netztransparenz.de/de-de/Erneuerbare-Energien-und-Umlagen/EEG/Transparenzanforderungen/Marktpr%C3%A4mie/Marktwert%C3%BCbersicht

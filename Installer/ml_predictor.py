@@ -582,6 +582,24 @@ def _parse_live_ts(value):
         return None
 
 
+def _live_history_power(entry, keys):
+    """Leistung aus einer Verlaufszeile: fehlender Schlüssel 0 (ältere Zeilen), Lücke (null) None."""
+    if not isinstance(entry, dict):
+        return None
+    for key in keys:
+        if key not in entry:
+            continue
+        value = entry.get(key)
+        if value is None or isinstance(value, bool):
+            return None
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return None
+        return number if math.isfinite(number) else None
+    return 0.0
+
+
 def _seed_ml_training_from_live_history(min_rows=50, refresh=False):
     """Erzeugt oder aktualisiert ML-Trainingspunkte aus live_history.txt.
 
@@ -627,15 +645,26 @@ def _seed_ml_training_from_live_history(min_rows=50, refresh=False):
                 day = dt.date().isoformat()
                 totals = totals_by_day.setdefault(day, {"home": 0.0, "wp": 0.0, "grid": 0.0})
                 prev = last_by_day.get(day)
+                samples = {
+                    "home": _live_history_power(entry, ("home", "home_raw")),
+                    "wp": _live_history_power(entry, ("wp",)),
+                    "grid": _live_history_power(entry, ("grid",)),
+                }
 
-                if prev is not None:
+                for field in ("home", "wp", "grid"):
+                    last_sample = (prev or {}).get(field)
+                    if last_sample is None:
+                        continue
+                    last_dt, last_w = last_sample
+                    # Jedes Zeitintervall genau einmal: von der vorigen Zeile bis zu dieser.
                     delta_h = (dt - prev["dt"]).total_seconds() / 3600.0
-                    # Live-Historie ist normalerweise minutenweise. Groessere
-                    # Luecken nicht hochrechnen, sonst entstehen Kunstlasten.
-                    if 0.0 < delta_h <= 0.25:
-                        totals["home"] += max(0.0, prev["home_w"]) * delta_h / 1000.0
-                        totals["wp"] += max(0.0, prev["wp_w"]) * delta_h / 1000.0
-                        totals["grid"] += max(0.0, prev["grid_w"]) * delta_h / 1000.0
+                    age_h = (dt - last_dt).total_seconds() / 3600.0
+                    # Live-Historie ist normalerweise minutenweise. Größere
+                    # Lücken nicht hochrechnen, sonst entstehen Kunstlasten.
+                    # Eine Zeile ohne Probe (null) setzt keine 0 ein: Der letzte
+                    # gültige Wert trägt nur bis zur selben Lückengrenze.
+                    if 0.0 < delta_h <= 0.25 and age_h <= 0.25:
+                        totals[field] += max(0.0, last_w) * delta_h / 1000.0
 
                 slot_minute = (dt.hour * 60 + dt.minute) // 15 * 15
                 time_gmt = (slot_minute / 60.0)
@@ -663,10 +692,11 @@ def _seed_ml_training_from_live_history(min_rows=50, refresh=False):
                 last_by_day[day] = {
                     "dt": dt,
                     "house_includes_unknown_wallbox": bool(entry.get("house_includes_unknown_wallbox")),
-                    "home_w": _as_float(entry.get("home", entry.get("home_raw")), 0.0),
-                    "wp_w": _as_float(entry.get("wp"), 0.0),
-                    "grid_w": _as_float(entry.get("grid"), 0.0),
                 }
+                for field in ("home", "wp", "grid"):
+                    # Nur eine vorhandene Probe wird zur letzten Probe; null lässt sie unverändert.
+                    last_by_day[day][field] = ((dt, samples[field]) if samples[field] is not None
+                        else (prev or {}).get(field))
     except Exception as e:
         conn.close()
         print(f"Live-History-Fallback fuer ML konnte nicht gelesen werden: {e}")

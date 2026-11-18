@@ -1,5 +1,10 @@
 """Erstellt und publiziert den Wallbox-zu-Speicher-Intent-Vertrag."""
 
+try:
+    from Installer.data_models import E3DC_WALLBOX_TYPES, wallbox_type_is_e3dc
+except ModuleNotFoundError:
+    from data_models import E3DC_WALLBOX_TYPES, wallbox_type_is_e3dc
+
 import json
 import math
 import os
@@ -54,16 +59,9 @@ def storage_curve_can_reach_target(plan, *, default=True):
     return None if value is None and default is None else bool(value)
 
 
-E3DC_WALLBOX_TYPES = frozenset((
-    "native", "e3dc", "e3dc_easy", "e3dc_easy_connect", "e3dc_legacy",
-    "e3dc_efy", "e3dc_auto", "e3dc_multi", "e3dc_multi_connect",
-    "e3dc_multi_connect_ii",
-))
 
 
-def wallbox_type_is_e3dc(value):
-    """Gemeinsame Messpunktzuordnung einschließlich der Konfigurationsaliase."""
-    return str(value or "").strip().lower().replace("-", "_").replace(" ", "_") in E3DC_WALLBOX_TYPES
+
 
 
 def measured_charge_state(previous, *, power_w, now_s, disconnected=False, gap_hold_s=600.0,

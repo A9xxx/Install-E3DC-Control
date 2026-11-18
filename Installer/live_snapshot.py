@@ -21,6 +21,12 @@ from collections import OrderedDict
 from typing import Any, Dict, Optional, Tuple
 
 
+try:
+    from .data_models import LIVE_SAMPLE_MAX_AGE_S
+except ImportError:
+    from data_models import LIVE_SAMPLE_MAX_AGE_S
+
+
 LIVE_DATA_PATH = "/var/www/html/ramdisk/live_data_py.json"
 WALLBOX_DATA_PATH = "/var/www/html/ramdisk/wallbox_native.json"
 WEB_SNAPSHOT_PATH = "/var/www/html/ramdisk/get_live_json_snapshot.json"
@@ -485,14 +491,29 @@ def project_native_live(
 
     if not isinstance(source, dict):
         return {}
-    pv_w = _first_number(source, "PV_Power", "pv")
-    grid_raw_w = _first_number(source, "Grid_Power", "grid")
+    pv_w = (_finite_number(source.get("PV_Power")) if "PV_Power" in source
+        else _first_number(source, "pv"))
+    if source.get("PV_Power_Valid") is False:
+        pv_w = None
+    grid_raw_w = (_finite_number(source.get("Grid_Power")) if "Grid_Power" in source
+        else _first_number(source, "grid"))
+    if source.get("Grid_Power_Valid") is False:
+        grid_raw_w = None
     grid_filtered_w = _first_number(source, "Grid_Power_Filtered")
-    battery_w = _first_number(source, "Battery_Power", "bat")
-    home_w = _first_number(source, "Home_Power", "home_raw", "home")
-    soc = _first_number(source, "SOC", "soc")
+    battery_w = (_finite_number(source.get("Battery_Power")) if "Battery_Power" in source
+        else _first_number(source, "bat"))
+    if source.get("Battery_Power_Valid") is False:
+        battery_w = None
+    home_w = (_finite_number(source.get("Home_Power")) if "Home_Power" in source
+        else _first_number(source, "home_raw", "home"))
+    if source.get("Home_Power_Valid") is False:
+        home_w = None
+    soc = (_finite_number(source.get("SOC")) if "SOC" in source
+        else _first_number(source, "soc"))
+    if source.get("SOC_Valid") is False or (soc is not None and not 0 <= soc <= 100):
+        soc = None
     timestamp_s = _first_number(source, "_ts", "ts")
-    if None in (pv_w, grid_raw_w, battery_w, home_w, soc):
+    if None in (grid_raw_w, battery_w, soc):
         return {}
 
     sample_valid = source.get("RSCP_Sample_Valid") is True
@@ -612,7 +633,7 @@ def read_runtime_live_snapshot(
     live_path: str = LIVE_DATA_PATH,
     wallbox_path: str = WALLBOX_DATA_PATH,
     web_snapshot_path: str = WEB_SNAPSHOT_PATH,
-    live_max_age_s: float = 15.0,
+    live_max_age_s: float = LIVE_SAMPLE_MAX_AGE_S,
     wallbox_max_age_s: float = 30.0,
     web_snapshot_max_age_s: float = 180.0,
     require_control_valid: bool = False,
@@ -634,7 +655,7 @@ def read_runtime_live_snapshot(
 
     native, native_meta = read_bound_json_object(
         live_path,
-        max_age_s=live_max_age_s,
+        max_age_s=None,
         max_bytes=4 * 1024 * 1024,
         copy_data=False,
     )
@@ -647,9 +668,14 @@ def read_runtime_live_snapshot(
         else:
             note("unreadable", source_reason=native_meta.get("reason"))
         return {}
+    stamp = _finite_number(native.get("_ts"))
+    age_s = time.time() - stamp if stamp is not None and stamp > 0 else None
+    if age_s is None or not 0 <= age_s <= LIVE_SAMPLE_MAX_AGE_S:
+        note("stale", age_s=age_s, max_age_s=LIVE_SAMPLE_MAX_AGE_S)
+        return {}
     projected = project_native_live(
         native,
-        source_age_s=native_meta.get("age_s"),
+        source_age_s=age_s,
     )
     if not projected:
         note("incomplete")
@@ -865,7 +891,7 @@ def read_runtime_live_snapshot(
 
 def _watchdog_hash() -> Optional[str]:
     snapshot = read_runtime_live_snapshot(
-        live_max_age_s=15.0,
+        live_max_age_s=LIVE_SAMPLE_MAX_AGE_S,
         wallbox_max_age_s=30.0,
         require_control_valid=True,
         include_web_projection=False,

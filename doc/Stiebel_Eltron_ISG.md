@@ -350,6 +350,9 @@ einen Shelly-SG-Ready-Kontakt schaltet. PV-Überschuss, Preis- und
 Pre-Dump-Freigaben, Wiedereinschaltsperre ab Verdichterstillstand,
 Mindestlaufzeit, Signalhalt, Sicherheitsabschaltung und die Toleranz bei
 E3DC-Datenlücken gelten unverändert. Der Ausgang hat keine eigene Regellogik.
+Bei Stiebel mit Shelly-SG-Kontakt hält E3DC-Control auch bei der Bereinigung
+abgelaufener Aufträge den eigenen Kontakt bis zum Ende der belegten
+Verdichter-Mindestlaufzeit.
 
 Die Heizgrenze sperrt die SG-Ready-Freigabe nicht. Für den automatischen
 Start genügt eine gültige, frische Warmwasser- oder Rücklauftemperatur unter

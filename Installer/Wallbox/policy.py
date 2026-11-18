@@ -243,7 +243,6 @@ class EnergyPolicyInput:
     target_wbminsoc_low_power_recovery_active: bool
     target_wbminsoc_low_power_start_ready: bool
     forecast_auto_battery_assist: bool
-    predump_wallbox_floor_block: bool
     target_wbminsoc_discharge_taper_limit_w: float
     target_wbminsoc_low_power_min_w: float
     target_wbminsoc_discharge_pull_limit_w: float
@@ -281,11 +280,8 @@ class EnergyPolicyInput:
     predump_discharge_add_w: Optional[float] = None
     predump_discharge_contract_valid: bool = True
     grid_funded_wallbox_authorized: bool = False
-    # Haltezone an wbminSoC: veröffentlichter Rahmen des Speichers (W) oder
-    # None; ``bridging`` = der Speicher überbrückt gerade aus dem
-    # Wolkenkontingent (gehaltene Leistung).
+    # Haltezone an wbminSoC: veröffentlichter PV-Rahmen des Speichers (W) oder None.
     wbminsoc_hold_zone_frame_w: Optional[float] = None
-    wbminsoc_hold_zone_bridging: bool = False
     central_pv_split: Optional[Dict[str, Any]] = None
 
 
@@ -935,9 +931,7 @@ def decide_energy_policy(ctx: EnergyPolicyInput) -> Dict[str, Any]:
     if hold_zone_active:
         floor_min_w = 6.0 * 230.0 * phases
         controlled_floor_netpoint_limit_w = min(max(0.0, float(hold_zone_frame_w or 0.0)), max_phys_wb_w)
-        if controlled_floor_guard_mode_active and not bool(ctx.wbminsoc_hold_zone_bridging):
-            # An der Untergrenze wirkt der Akkuwächter weiter, aber nicht
-            # gegen eine Überbrückung aus dem Wolkenkontingent des Speichers.
+        if controlled_floor_guard_mode_active:
             controlled_floor_netpoint_limit_w = _floor_battery_guard_limit(
                 controlled_floor_netpoint_limit_w
             )

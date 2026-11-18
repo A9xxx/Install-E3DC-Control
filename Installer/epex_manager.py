@@ -67,7 +67,6 @@ ECO_SCORE_FILE   = os.path.join(RAMDISK_DIR, "eco_score.json")
 PRICE_BOOST_PLAN_FILE = os.path.join(RAMDISK_DIR, "price_boost_plan.json")
 EPEX_CACHE_FILE = os.path.join(DATA_DIR, "epex_daten_last.json")
 MARKET_VALUE_SOLAR_FILE = os.path.join(RAMDISK_DIR, "market_value_solar.json")
-MARKET_VALUE_SOLAR_CACHE_FILE = os.path.join(DATA_DIR, "market_value_solar_last.json")
 TIBBER_API_URL = "https://api.tibber.com/v1-beta/gql"
 ENTSOE_API_ENDPOINTS = (
     "https://web-api.tp.entsoe.eu/api",
@@ -119,7 +118,7 @@ def _load_market_value_solar_report():
         update_market_value_solar_report = None
     return update_market_value_solar_report
 
-def update_market_value_solar_monitor(config, price_data):
+def update_market_value_solar_monitor(config):
     """Update the read-only Marktwert-Solar diagnostics file."""
     reporter = _load_market_value_solar_report()
     if reporter is None:
@@ -127,9 +126,8 @@ def update_market_value_solar_monitor(config, price_data):
     try:
         report = reporter(
             config,
-            price_data,
             MARKET_VALUE_SOLAR_FILE,
-            MARKET_VALUE_SOLAR_CACHE_FILE,
+            smard_fetcher=_fetch_smard_series,
             write_json_atomic=write_json_atomic,
             logger=logger,
         )
@@ -142,8 +140,8 @@ def update_market_value_solar_monitor(config, price_data):
                 (report.get("slots") or {}).get("solar"),
             )
         return report
-    except Exception as exc:
-        logger.warning("Marktwert-Solar-Monitor konnte nicht aktualisiert werden: %s", exc)
+    except Exception:
+        logger.warning("Marktwert-Solar-Monitor konnte nicht aktualisiert werden.")
     return None
 
 def parse_special_tariff_schedule(raw):
@@ -195,7 +193,7 @@ def market_safety_context(config):
     for path in (EPEX_OUTPUT_FILE, ECO_SCORE_FILE, PRICE_BOOST_PLAN_FILE, MARKET_VALUE_SOLAR_FILE):
         if not _path_is_within(path, RAMDISK_DIR):
             return False, "ramdisk_path_outside_context"
-    for path in (V4_CONFIG_FILE, EPEX_CACHE_FILE, MARKET_VALUE_SOLAR_CACHE_FILE):
+    for path in (V4_CONFIG_FILE, EPEX_CACHE_FILE):
         if not _path_is_within(path, DATA_DIR):
             return False, "data_path_outside_context"
     if not os.access(RAMDISK_DIR, os.W_OK) or not os.access(DATA_DIR, os.W_OK):
@@ -258,7 +256,7 @@ def publish_disabled_market_state(config, reason):
     write_json_atomic(PRICE_BOOST_PLAN_FILE, plan, indent=2)
     write_json_atomic(ECO_SCORE_FILE, [], indent=2)
     write_json_atomic(EPEX_OUTPUT_FILE, [], indent=2)
-    update_market_value_solar_monitor(config or {}, [])
+    update_market_value_solar_monitor(config or {})
     return plan
 
 
@@ -301,7 +299,7 @@ def publish_market_state(config, data, safety_gate=None, cache_write=True, sourc
             for consumer in MARKET_CONSUMERS
         }
         write_json_atomic(PRICE_BOOST_PLAN_FILE, boost_plan, indent=2)
-        update_market_value_solar_monitor(config, data)
+        update_market_value_solar_monitor(config)
     except Exception:
         publish_disabled_market_state(config, "market_publish_error")
         raise
@@ -348,7 +346,7 @@ def publish_configured_tariff_state(config, safety_gate=None):
             for consumer in MARKET_CONSUMERS
         }
         write_json_atomic(PRICE_BOOST_PLAN_FILE, boost_plan, indent=2)
-        update_market_value_solar_monitor(config, [])
+        update_market_value_solar_monitor(config)
     except Exception:
         publish_disabled_market_state(config, "configured_tariff_publish_error")
         raise
@@ -1140,8 +1138,8 @@ def apply_direct_marketing_market_overlay(price_data, market_data, config=None):
         logger.warning("Direktvermarktung-Marktpreis-Overlay fand keine passenden Zeitfenster.")
     return price_data
 
-def _fetch_smard_series(resolution):
-    """Interne Hilfsfunktion: Laedt SMARD Zeitreihe fuer 'hour' oder 'quarterhour'."""
+def _fetch_smard_series(resolution, start_ms=None, end_ms=None):
+    """SMARD-Reihe laden: bisherige zwei Blöcke oder alle Blöcke eines Zeitraums."""
     index_url = f"https://www.smard.de/app/chart_data/4169/DE/index_{resolution}.json"
     req = urllib.request.Request(index_url, headers={'User-Agent': 'E3DC-Control-V4/1.0', 'Accept': 'application/json'})
     with urllib.request.urlopen(req, timeout=10) as response:
@@ -1149,8 +1147,15 @@ def _fetch_smard_series(resolution):
     timestamps = index_data.get("timestamps", [])
     if not timestamps:
         raise ValueError(f"SMARD lieferte keine Timestamps fuer {resolution}!")
+    selected = timestamps[-2:]
+    if start_ms is not None and end_ms is not None:
+        ordered = sorted(timestamps)
+        # Der Block vor/auf dem Monatsanfang enthält dessen erste Viertelstunde.
+        preceding = [ts for ts in ordered if ts <= start_ms]
+        first = preceding[-1] if preceding else start_ms
+        selected = [ts for ts in ordered if first <= ts < end_ms]
     series = []
-    for ts in timestamps[-2:]:
+    for ts in selected:
         data_url = f"https://www.smard.de/app/chart_data/4169/DE/4169_DE_{resolution}_{ts}.json"
         req_data = urllib.request.Request(data_url, headers={'User-Agent': 'E3DC-Control-V4/1.0', 'Accept': 'application/json'})
         try:
@@ -1158,6 +1163,9 @@ def _fetch_smard_series(resolution):
                 raw_series = json.loads(response.read().decode('utf-8'))
                 series.extend(raw_series.get("series", []))
         except Exception as e:
+            if start_ms is not None:
+                # Keine stille Teilmenge des Monats und keine fremden Fehlertexte.
+                raise RuntimeError("smard_fetch_failed") from None
             logger.warning(f"Fehler beim Abrufen der SMARD {resolution} Woche {ts}: {e}")
     return series
 

@@ -7,7 +7,7 @@ from __future__ import annotations
 from .power_limits import safe_float, safe_int
 
 try:
-    from Installer.storage_parallel_regulator import (
+    from Installer.Storage.befehl_werte import (
         MODE_AUTO,
         MODE_CHRG,
         MODE_DISCH,
@@ -15,7 +15,7 @@ try:
         MODE_IDLE,
     )
 except ModuleNotFoundError:
-    from storage_parallel_regulator import (  # type: ignore
+    from Storage.befehl_werte import (  # type: ignore
         MODE_AUTO,
         MODE_CHRG,
         MODE_DISCH,

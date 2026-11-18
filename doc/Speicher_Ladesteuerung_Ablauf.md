@@ -21,21 +21,49 @@ Eco-Modus** und **Speicher-Netzladen** eingeschaltet sein. Der separate
 Negativpreis-Boost und die früheren aWATTar-Optionen ersetzen diese Freigaben
 nicht. Ein günstiges Zeitfenster allein startet noch keine Ladung: Prognose,
 nutzbarer Speicherinhalt, Preisvorteil, Verluste und Mindestlademenge bestimmen
-den Bedarf. Innerhalb eines geeigneten Fensters kann der Plan bis zum
-berechneten spätesten Ladebeginn warten.
+den Bedarf. Für einen freigegebenen Auftrag im geeigneten Fenster lädt der Speicher zuerst
+einen Drittel-Puffer, hält danach und lädt den Rest als Hauptblock.
 
 Die Deckungsprüfung beachtet die zeitliche Reihenfolge und die
 Speicherkapazität. Erwartete PV am nächsten Nachmittag kann eine vorherige
 Versorgungslücke in der Nacht nicht decken. Reichen Speicher und rechtzeitig
 verfügbare PV aus, bleibt das normale Netzladen aus.
 
-Der Netzladebedarf wird zeitgerichtet bestimmt: Er reicht nur bis zum nächsten
-nutzbaren günstigen Preisfenster; was dieses Fenster liefern kann, wird
-angerechnet. Die für das laufende Fenster erwartete PV-Erzeugung wird zuerst
+E3DC-Control beurteilt den Netzladebedarf bei jedem Planlauf und bei neuen
+Preisen oder Prognosen mit den gerade vorliegenden Daten. Für laufende und
+künftige Fenster gilt dieselbe Rechnung: Ein günstiges Fenster deckt den Bedarf
+bis zur nächsten bekannten, innerhalb der eingestellten Preistoleranz mindestens
+so günstigen Lademöglichkeit. Bei festen Zeittarifen stehen die Fenster im
+Planhorizont fest; bei Börsentarifen zählen nur veröffentlichte Preise. Ohne
+weiteres passendes Fenster reicht der Bedarf bis zum Ende der bekannten Preise.
+E3DC-Control rechnet spätere Fenster mit ihrer Ladefähigkeit an: Leistung im
+festen Anschlussrahmen abzüglich Ampere-Reserve mal verfügbarer Dauer und
+Wirkungsgrad, höchstens bis zum freien Speicherraum. Die momentane Hauslast
+verändert diese Vorausrechnung nicht; sie begrenzt die tatsächliche Ladung je
+Phase. Reicht das spätere Fenster nicht aus, lädt das frühere den Rest.
+Jedes Fenster bleibt an die eingestellten Wirtschaftlichkeitsgrenzen gebunden.
+Ein angerechnetes Fenster kann deshalb später wegen Marge oder Mindestmenge
+entfallen; daraus kann zusätzlicher Netzbezug entstehen. Fehlende oder ungültige
+Preise und Prognosen geben keine Ladung frei.
+Die für das laufende Fenster erwartete PV-Erzeugung wird zuerst
 berücksichtigt; aus dem Netz wird nur der Rest geladen, der zum Fensterende
-noch fehlt. Das Netzladen liegt deshalb am Ende des Fensters, davor lädt der
-Speicher aus PV und bleibt entladegesperrt; nach dem spätesten Ladestart wird
-aus dem Netz geladen, auch wenn PV gerade lädt. Ladeziel und Job folgen dem
+noch fehlt. Zuerst lädt der Speicher ein Drittel des anfänglichen Energiebedarfs mit voller
+zulässiger Leistung; E3DC-Control rechnet den Energiezuwachs aus PV darauf an.
+Dieser Drittel-Puffer wird bei sinkendem Restbedarf nicht kleiner. Danach hält der
+Speicher ohne Entladung und PV lädt frei. Den Rest lädt der Speicher zum
+berechneten spätesten Start als Hauptblock mit voller zulässiger Leistung;
+bei bereits erreichtem spätestem Start beginnt er direkt damit. Ein
+begonnener Hauptblock bleibt bis zum Ziel bestehen. E3DC-Control plant die Restladezeit
+je Ladezustand und zehn Minuten Hochlaufreserve vor der Zielzeit ein.
+Die Zielzeit liegt 30 Minuten vor Fensterende, bei Fenstern unter einer
+Stunde gilt stattdessen die halbe Fensterdauer als Zeitpuffer.
+Der Speicher nutzt PV vorrangig und nimmt sie oberhalb der Netzladerate ungedrosselt auf.
+Die Prognose stellt Drittel-Puffer, Warten und Hauptblock dar.
+E3DC-Control hält Gerätegrenze, „Max. Laden“, Markt-Ladelimit und Hausanschluss ein.
+E3DC-Control bestimmt den Anschlussrahmen aus der höchsten Phase nach Herausrechnen der eigenen
+Akkuleistung; bereits enthaltene Verbraucher zieht es nicht erneut ab.
+Ohne gültige frische Phasenwerte gibt E3DC-Control keinen Netzladestart frei.
+Ladeziel und Job folgen dem
 Sollbestand am Fensterende (Bedarf bis zum nächsten nutzbaren Fenster plus
 Puffer) und bleiben im Fenster stabil; deckt der erwartete Bestand den
 Sollbestand, bleibt das Netzladen aus. Für die Ladedauer wird die
@@ -104,7 +132,11 @@ gesperrt. Bei fehlenden gültigen Leistungsdaten oder fehlendem freien
 Hausanschlussrahmen wartet der Auftrag. Inselbetrieb und ausgeschaltete
 Speicherregelung geben kein manuelles Netzladen frei.
 
-Ziel-SoC und Ablaufzeit beenden den manuellen Auftrag. Ein gespeicherter
+Bei erreichtem Ziel gibt E3DC-Control den Speicher sofort frei. Ein manueller Ladeauftrag endet auch dann
+und der Speicher wird wieder freigegeben, wenn der SoC ab 95 % zehn Minuten
+lang nicht um mindestens 1 Prozentpunkt steigt. Bei einem Anstieg um mindestens
+1 Prozentpunkt zählt E3DC-Control die zehn Minuten neu. Ungültige oder veraltete Messwerte
+wertet es nicht. Ziel-SoC und Ablaufzeit beenden den manuellen Auftrag weiterhin. Ein gespeicherter
 Ladeauftrag beziehungsweise eine angeforderte Leistung bestätigt noch keine
 physische Batterieladung; dafür ist die gemessene Batterieleistung maßgeblich.
 
@@ -239,7 +271,7 @@ Sperre besteht. Rückweg: Ursache beheben und die Sperre als Root zurücksetzen
 neu starten. Ein Neustart des E3DC setzt die Akkugrenzen auf die
 Grundeinstellung.
 
-> **Stand:** v5.5.7
+> **Stand:** v5.5.8
 >
 > **Dateien:** `Installer/storage_simulator.py`,
 > `Installer/storage_manager.py`, `Installer/storage_parallel_regulator.py`
@@ -395,9 +427,16 @@ Kurvenhysterese; ein unerreichbares Ziel oder ein Abendziel-Rückstand
 allein hebt die Ladegrenze nicht auf. Innerhalb des Korridors und darüber
 bleiben Dämpfung und Ladegrenzen wirksam.
 
-Die echte Regelgröße ist ein geglätteter `curve_control_soc`, der den
-Batteriefluss integriert. Der Roh-SoC bleibt die Wahrheit, aber das Regelsignal
-wird nicht bei jedem kleinen Messsprung zurückgesetzt.
+Die Regelgröße ist der vom E3DC gemeldete SoC. Ein eigener integrierter
+Regel-SoC und das Sprungveto entfallen. Auch nach einem SoC-Sprung rechnen
+Kurve und Reserve mit dem gemeldeten Wert; „vermutete Kalibrierung“ ist nur
+ein Hinweis. Eine aktive Reservesperre endet weiterhin erst nach bestätigter
+Erholung mit mindestens drei frischen Proben über mindestens 30 Sekunden.
+Fehlt die Live-Datei oder ist ihre Messzeit ungültig bzw. älter als zehn
+Sekunden, gilt derselbe AUTO-Fehlerausgang wie bei einem echten RSCP-Fehler,
+ungültigem Ladestand oder fehlendem/ungültigem Notstrom-Status. Netzladen
+endet und Grenzen werden einmal freigegeben; eine bereits aktive
+Reservesperre bleibt erhalten. Ohne vorherige Sperre greift die E3DC-Reserve.
 
 Adaptive Headroom-Werte werden dabei nicht als direkter Entladeauftrag gelesen:
 
@@ -731,7 +770,7 @@ phasenbezogen angewendet; bei unbekannter einphasiger Zuordnung gilt der
 ungünstigste Fall. Die Reserve bildet den statisch konfigurierten Abstand für
 andere Verbraucher. Für den Gruppen-Phasenclamp bleibt eine aus Wirkleistung
 durch `P/230` abgeleitete Stromangabe rein diagnostisch; nur der einphasige
-Deckel der openWB Pro nutzt den Bezug je Netzphase aus dem E3DC-Wurzelzähler
+Deckel der openWB Pro nutzt den Bezug je Netzphase aus dem Netzzähler des E3DC (Wurzelzähler)
 geteilt durch die Wechselrichter-Spannung als freigegebene Messbasis (siehe
 `doc/Native_Wallbox.md`). Das Speicherbudget bleibt für die Wallbox bindend;
 die eigene, im Hauswert nachlaufende Ladeleistung kann es für einige Zyklen
@@ -970,3 +1009,14 @@ sowie Quelle und Abdeckung der Temperatur. Unter `corrections` sind Bias,
 Hausdeckel und Reihenfolge getrennt sichtbar. Der Diagnose-Export „Prognose“
 enthält beide Dateien. Notstromreserve, Hausanschluss und Gerätefreigaben
 werden durch diese Prognoseeinstellungen nicht verändert.
+
+Die Netzphasen werden über die eindeutige ROOT-Rolle des E3DC-Leistungsmessers
+zugeordnet. Ein gültiger Wurzelzähler-Eintrag übersteuert diese Rolle.
+Fehlt eine Phase oder die eindeutige Rolle, startet keine neue Wallboxladung;
+eine laufende Ladung nutzt die vorhandene Datenfrist von 300 Sekunden.
+Der Hinweis nennt die Quelle. Aus Netzsaldo oder Hausverbrauch werden keine
+Phasenwerte ersetzt. Der Speicher regelt weiterhin mit dem EMS-Netzwert.
+Die Wärmepumpenlage ist mit `storage_home_wp_split` festgelegt: `include`
+zählt sie im Hauswert, `separate` über einen eigenen Zähler außerhalb des
+Hauswerts. Altwert `auto`, leer und unbekannt gelten als `include`. Ohne
+WP-Einzelmessung bleibt der Hauswert einschließlich WP erhalten.

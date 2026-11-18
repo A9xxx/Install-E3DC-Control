@@ -21,7 +21,6 @@ WIZARD_KEYS = [
     ('e3dc_password',  'E3DC Portal Passwort',         ''),
     ('aes_password',   'RSCP AES-Passwort (am Geraet vergeben)', ''),
     ('wurzelzaehler',  'Legacy-PM-Index fuer Phasendiagnose (0=auto)', '0'),
-    ('wurzelzaehler_invertiert', 'Legacy-PM-Phasen invertiert (0/1)', '0'),
 
     # === PFLICHT: Standort fuer PV-Prognose ===
     ('hoehe', 'Breitengrad (Latitude), z.B. %s' % DEFAULT_LATITUDE, str(DEFAULT_LATITUDE)),

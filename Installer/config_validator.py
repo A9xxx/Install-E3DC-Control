@@ -20,9 +20,9 @@ try:
 except ImportError:
     from location_defaults import DEFAULT_LATITUDE, DEFAULT_LONGITUDE
 try:
-    from data_models import parse_mqtt_vehicle_allowlist, mqtt_vehicle_record_allowed
+    from data_models import LIVE_SAMPLE_MAX_AGE_S, parse_mqtt_vehicle_allowlist, mqtt_vehicle_record_allowed
 except ImportError:
-    from Installer.data_models import parse_mqtt_vehicle_allowlist, mqtt_vehicle_record_allowed
+    from Installer.data_models import LIVE_SAMPLE_MAX_AGE_S, parse_mqtt_vehicle_allowlist, mqtt_vehicle_record_allowed
 
 try:
     from .shelly_relay_owner import shelly_relay_conflict, SHELLY_OWNER_WARNING
@@ -1089,7 +1089,23 @@ def validate_storage_config(
     live = live or {}
     now = int(time.time())
     storage: Dict[str, Dict[str, Any]] = {}
+    for key in ("storage_live_stale_guard_s", "storage_soc_jump_guard_enable",
+            "storage_soc_jump_guard_min_drop_pct", "storage_soc_jump_guard_max_drop_pct_per_min",
+            "storage_soc_jump_guard_base_margin_pct", "storage_soc_jump_guard_reserve_margin_pct",
+            "storage_curve_control_soc_enable", "storage_curve_control_soc_band_pct",
+            "storage_curve_control_soc_reset_pct"):
+        if key in cfg:
+            storage[key] = _entry(key=key, label="Entfallene Speichereinstellung", unit="",
+                configured=cfg[key], live_value=None, live_key=None, effective=None,
+                source="deprecated", severity="info",
+                message="Dieser Wert wird nicht mehr ausgewertet. Es gelten 10 Sekunden Messfrist und der gemeldete Ladestand; SoC-Sprünge sind nur Hinweise.")
     wallbox: Dict[str, Dict[str, Any]] = {}
+    if "wallbox_live_stale_guard_s" in cfg:
+        wallbox["wallbox_live_stale_guard_s"] = _entry(
+            key="wallbox_live_stale_guard_s", label="Entfallene Wallbox-Messfrist", unit="s",
+            configured=cfg["wallbox_live_stale_guard_s"], live_value=None, live_key=None,
+            effective=None, source="deprecated", severity="info",
+            message="Dieser Wert wird nicht mehr ausgewertet. Speicher, Wallbox, Wärmepumpe und Heizstab verwenden 10 Sekunden Messfrist auf dem Messzeitstempel _ts.")
     consumer: Dict[str, Dict[str, Any]] = {}
     consumer.update(validate_climate_meter_config(cfg))
     consumer.update(validate_heatpump_pv_config(cfg))
@@ -1305,7 +1321,7 @@ def validate_storage_config(
     dc_first_e3dc_pv_w = max(0.0, dc_first_total_pv_w - dc_first_external_pv_w)
     dc_first_live_ts = safe_float(live.get("_ts"), 0.0)
     dc_first_live_age_s = float(now) - dc_first_live_ts if dc_first_live_ts > 0.0 else float("inf")
-    dc_first_max_age_s = max(1.0, min(30.0, safe_float(cfg.get("storage_live_stale_guard_s"), 10.0)))
+    dc_first_max_age_s = LIVE_SAMPLE_MAX_AGE_S
     dc_first_max_future_skew_s = 5.0
     dc_first_source_valid = bool(
         dc_first_values_nonnegative
@@ -2268,51 +2284,34 @@ def validate_storage_config(
         message=pv_only_reserve_message,
     )
 
-    # Wärmepumpe im Hauswert. storage_manager.augment_consumer_live
-    # (Provider energy_decision, Shelly Pro3EM, E3DC-Leistungsmesser) und Storage/predump.py
-    # normalisieren ``storage_home_wp_split`` über dieselbe Alias-Tabelle; hier nur beratend
-    # gespiegelt (keine Regeländerung): auto = Heuristik (WP gilt als im Hauswert enthalten,
-    # wenn Home_roh ≥ max(500 W, 0,55·WP)), include = Home = max(0, Home_roh − WP),
-    # separate = WP zusätzlich zum Hauswert. Unbekannte Strings wirken wie auto → warning.
+    # Feste Messlage; alte Automatikwerte werden nur beim Lesen normalisiert.
     home_wp_split_user = _has_user_value(cfg, "storage_home_wp_split")
-    home_wp_split_raw = str(cfg.get("storage_home_wp_split", "auto") or "auto").strip().lower()
-    if home_wp_split_raw in ("1", "true", "yes", "on", "include", "included", "home_includes_wp"):
-        home_wp_split_mode = "include"
-    elif home_wp_split_raw in ("0", "false", "no", "off", "separate", "excluded", "home_excludes_wp"):
-        home_wp_split_mode = "separate"
-    else:
-        home_wp_split_mode = "auto"
-    home_wp_split_unknown = bool(
-        home_wp_split_user and home_wp_split_raw != "auto" and home_wp_split_mode == "auto"
-    )
+    home_wp_split_raw = str(cfg.get("storage_home_wp_split", "include") or "").strip().lower()
+    include_aliases = ("1", "true", "yes", "on", "include", "included", "home_includes_wp")
+    separate_aliases = ("0", "false", "no", "off", "separate", "excluded", "home_excludes_wp")
+    home_wp_split_mode = "separate" if home_wp_split_raw in separate_aliases else "include"
     home_wp_split_severity = "ok"
-    if home_wp_split_mode == "include":
-        home_wp_split_message = (
-            'Die Wärmepumpe ist im E3DC-Hausverbrauch enthalten; ihre gemeldete Leistung wird herausgerechnet und getrennt geführt. Haus und Wärmepumpe zählen dadurch insgesamt nur einmal.'
-        )
-    elif home_wp_split_mode == "separate":
-        home_wp_split_message = (
-            "Die Wärmepumpe wird getrennt gemessen und zählt zusätzlich zum E3DC-Hauswert; "
-            "der Hauswert bleibt unverändert."
-        )
-    else:
-        home_wp_split_message = (
-            'Die automatische Zuordnung zählt die Wärmepumpe im Hauswert, sobald dieser mindestens 500 W und 55 % der Wärmepumpenleistung erreicht, darunter zusätzlich; bei kleinem Hausverbrauch kann die Zuordnung wechseln.'
-        )
-    if home_wp_split_unknown:
-        home_wp_split_severity = "warning"
-        home_wp_split_message = (
-            f'Die Zuordnung der Wärmepumpe zum Hausverbrauch ist unbekannt; die automatische Schätzung kann zwischen enthaltener und zusätzlicher Messung wechseln. Im Config-Editor unter „Speicher & Konfiguration“ das Feld „Wärmepumpe im Hauswert“ prüfen.'
-        )
-    elif (
-        home_wp_split_mode == "auto"
-        and _has_user_value(cfg, "wurzelzaehler")
-        and safe_float(cfg.get("wurzelzaehler"), -1.0) == 0.0
-    ):
+    home_wp_split_message = (
+        "Die Wärmepumpe ist im E3DC-Hausverbrauch enthalten; Haus und Wärmepumpe zählen insgesamt nur einmal."
+        if home_wp_split_mode == "include" else
+        "Die Wärmepumpe wird getrennt gemessen und zählt zusätzlich zum E3DC-Hauswert; der Hauswert bleibt unverändert."
+    )
+    if home_wp_split_raw not in include_aliases + separate_aliases:
         home_wp_split_severity = "info"
-        home_wp_split_message += (
-            ' Im Config-Editor unter „Speicher & Konfiguration“ bei „Wärmepumpe im Hauswert“ die Option „Wärmepumpe steckt im Hauswert“ wählen, wenn der Hausverbrauch die Wärmepumpe bereits enthält und kein separater Wurzelzähler vorhanden ist.'
+        home_wp_split_message = (
+            'Automatik entfällt, gilt als im Hausverbrauch; im Config-Editor unter „Speicher & Konfiguration“, '
+            'Feld „Wärmepumpe im Hauswert“ bestätigen.'
         )
+    root_index = safe_float(cfg.get("wurzelzaehler"), 0.0)
+    storage["wurzelzaehler"] = _entry(
+        key="wurzelzaehler", label="Wurzelzähler", unit="Index",
+        configured=cfg.get("wurzelzaehler"), live_value=None, live_key=None,
+        effective=int(root_index) if 0 < root_index <= 65535 else 0,
+        source="user" if 0 < root_index <= 65535 else "default",
+        severity="warning" if root_index > 65535 else "ok",
+        message=('Kein gültiger PM-Index (1..65535); die Rolle aus dem Gerät gilt. Im Config-Editor das Feld „Wurzelzähler“ prüfen.'
+            if root_index > 65535 else '0 verwendet die eindeutige ROOT-Rolle aus dem Gerät; ein gültiger Eintrag übersteuert sie.'),
+    )
     storage["storage_home_wp_split"] = _entry(
         key="storage_home_wp_split",
         label="Wärmepumpe im Hauswert",

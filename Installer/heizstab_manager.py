@@ -55,7 +55,12 @@ import os
 import sys
 import json
 import math
+import logging
 import inspect
+try:
+    from .data_models import LIVE_SAMPLE_MAX_AGE_S
+except ImportError:
+    from data_models import LIVE_SAMPLE_MAX_AGE_S
 from contextlib import contextmanager
 from contextvars import ContextVar
 from importlib.metadata import version, PackageNotFoundError
@@ -70,10 +75,12 @@ except ImportError:
     from Installer.quiet_logging import ensure_utf8_stdio
 
 try:
-    from Installer.control_time import system_boot_id
+    from Installer.control_time import system_boot_id, sample as control_clock
+    from Installer.heatpump_channel_owner import user_stop_plan, user_stop_transport, user_stop_grant
     from Installer.shelly_relay_owner import shelly_relay_conflict, SHELLY_OWNER_WARNING
 except ModuleNotFoundError:
-    from control_time import system_boot_id
+    from control_time import system_boot_id, sample as control_clock
+    from heatpump_channel_owner import user_stop_plan, user_stop_transport, user_stop_grant
     from shelly_relay_owner import shelly_relay_conflict, SHELLY_OWNER_WARNING
 
 _INSTALLER_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -185,6 +192,7 @@ _MODBUS_CYCLE = ContextVar("heizstab_modbus_cycle", default=None)
 _HEATER_CYCLE_STATE = ContextVar("heizstab_cycle_state", default=None)
 
 
+
 class _ModbusSession:
     """Öffnet verzögert genau einmal; ein Fehler bleibt bis Zyklusende geschlossen."""
     def __init__(self, ip, port):
@@ -216,6 +224,7 @@ class _ModbusSession:
     def close(self):
         if self.client is not None:
             self.client.close()
+
 
 
 @contextmanager
@@ -344,17 +353,67 @@ def _authorize_heater_output(
     return verdict.allowed
 
 
+def _user_stop_status(status, cfg, state):
+    """Versuchsbuch und Besitz bleiben Teil des vollständigen Status."""
+    status.update(heatpump_user_stop=state.get("heatpump_user_stop", {}),
+        heater_owned_modbus=bool(state.get("heater_owned_modbus")),
+        heater_owned_shelly=bool(state.get("heater_owned_shelly")))
+    if str(cfg.get("wp_type")) == "3":
+        status["wp_relay_episode"] = _s3em_episode(cfg, state)
+    return status
+
+
+def _restore_user_stop(state):
+    if state.get("user_stop_loaded"):
+        return
+    state["user_stop_loaded"] = True
+    try:
+        with open(RAMDISK_FILE, encoding="utf-8") as handle:
+            previous = json.load(handle)
+        if isinstance(previous, dict) and isinstance(previous.get("heatpump_user_stop"), dict):
+            state["heatpump_user_stop"] = previous["heatpump_user_stop"]
+            for key in ("heater_owned_modbus", "heater_owned_shelly"):
+                if type(previous.get(key)) is bool:
+                    state[key] = previous[key]
+        return previous if isinstance(previous, dict) else {}
+    except (OSError, ValueError, TypeError):
+        return {}
+
+
 def _invoke_actuator(func, *args, safety_gate=None):
     """Erhält bestehende Aufrufsignaturen und erlaubt die explizite Gate-Übergabe."""
-    result = func(*args) if safety_gate is None else func(*args, safety_gate=safety_gate)
     state = _HEATER_CYCLE_STATE.get()
-    if result and state is not None:
+    output = ("modbus" if func in (elwa_set_power, heizstab_set_power)
+              else "shelly" if func is shelly_set_state
+              else "pro3em" if func is shelly_3em_set_relay else None)
+    plan = (state or {}).get("user_stop_plans", {}).get(output)
+    off = not args[-1]
+    if off and plan is not None:
+        episode = state["heatpump_user_stop"][output]
+        driver = (f"transport:modbus-tcp:{args[0]}:{args[1]}" if output == "modbus"
+                  else f"transport:http-shelly:{args[0]}:switch:{int(args[1]) if output == 'pro3em' else 0}")
+        result = user_stop_transport(episode, plan, state["user_stop_persist"],
+            lambda begin: _authorize_heater_output(driver, "heatpump:user_stop", safety_gate=safety_gate,
+                safe_release=output != "pro3em", preserve_existing=output == "pro3em") and begin()
+                and (func(*args) if safety_gate is None else func(*args, safety_gate=safety_gate)))
+        if result:
+            episode["owned"] = False
+    else:
+        result = func(*args) if safety_gate is None else func(*args, safety_gate=safety_gate)
+    if result and state is not None and output is not None:
+        if not off:
+            episode = state.get("heatpump_user_stop", {}).get(output) or {}
+            state["heatpump_user_stop"][output] = user_stop_grant(episode)
         if func in (elwa_set_power, heizstab_set_power):
             state["heater_owned_modbus"] = bool(args[2] > 0)
+            if not off:
+                state["heatpump_user_stop"][output]["owned_value"] = int(args[2])
         elif func is shelly_set_state:
             state["heater_owned_shelly"] = bool(args[1])
         elif func is shelly_3em_set_relay:
             state["s3em_owned"] = bool(args[2])
+            if off:
+                state.pop("s3em_own_start", None)
     return result
 
 
@@ -489,23 +548,32 @@ def read_live():
     reason = "live_missing"
     try:
         if os.path.exists(LIVE_PY_FILE):
+            reason = "live_invalid"
+            with open(LIVE_PY_FILE, "r") as f:
+                data = json.load(f)
+            stamp = _strict_finite_number(data.get("_ts"))
             reason = "live_stale"
-            if 0 <= time.time() - os.path.getmtime(LIVE_PY_FILE) <= 30:
+            if stamp is not None and stamp > 0 and 0 <= time.time() - stamp <= LIVE_SAMPLE_MAX_AGE_S:
                 reason = "live_invalid"
-                with open(LIVE_PY_FILE, "r") as f:
-                    data = json.load(f)
                 soc, valid, soc_reason = _soc_evidence(data.get("SOC"), data)
                 return {
-                    "pv_w": float(data.get("PV_Power", 0)),
-                    "grid_w": float(data.get("Grid_Power", 0)),
+                    "pv_w": (_strict_finite_number(data.get("PV_Power"))
+                        if data.get("PV_Power_Valid") is not False else None),
+                    "grid_w": (_strict_finite_number(data.get("Grid_Power"))
+                        if data.get("Grid_Power_Valid") is not False else None),
+                    "pv_reason": ("pv_valid" if _strict_finite_number(data.get("PV_Power")) is not None
+                        and data.get("PV_Power_Valid") is not False else "pv_missing_or_invalid"),
+                    "grid_reason": ("grid_valid" if _strict_finite_number(data.get("Grid_Power")) is not None
+                        and data.get("Grid_Power_Valid") is not False else "grid_missing_or_invalid"),
                     "soc": soc, "soc_valid": valid, "soc_reason": soc_reason,
                     "price_ct": optional_live_float(data, "price_ct", "billing_price_ct"),
                     "heater_temp_c": optional_live_float(data, "heater_temp_c"),
-                    "source": "live_data_py.json",
+                    "source": "live_data_py.json", "_ts": stamp,
                 }
     except Exception:
         pass
-    return {"pv_w": 0, "grid_w": 0, "soc": None, "soc_valid": False,
+    return {"pv_w": None, "grid_w": None, "pv_reason": reason, "grid_reason": reason,
+            "soc": None, "soc_valid": False,
             "soc_reason": reason, "price_ct": None, "heater_temp_c": None, "source": "none"}
 
 
@@ -557,6 +625,7 @@ def _modbus_read_regs(ip, port, start, count=1):
         return None
 
 
+
 def _modbus_write_reg_raw(ip, port, register, value):
     """Schreibt auf derselben Verbindung; Fehler geben keine weitere Freigabe."""
     with _modbus_session(ip, port) as session:
@@ -574,6 +643,7 @@ def _modbus_write_reg_raw(ip, port, register, value):
             session.failed = True
             print(f"  [!] Modbus-Schreiben {ip}:{port} (Register {register}): {e}")
             return False
+
 
 
 # --- Generic Heizstab (bisheriges Verhalten) ---
@@ -616,6 +686,7 @@ def _modbus_write_confirmed(
         session.write_unconfirmed = True
         print(f"  [!] Modbus {ip}:{port}: Register {register} – Schreibbestätigung abweichend")
     return confirmed
+
 
 
 def heizstab_set_power(ip, port, power_w, safety_gate=None):
@@ -826,15 +897,14 @@ def shelly_3em_set_relay(ip, relay_id, on: bool, safety_gate=None):
             return False
         confirmed = shelly_3em_get_relay(ip, relay_id)
         if confirmed != bool(on):
-            print(
-                f"  [!] Shelly 3EM Relay {relay_id}: Readback unbestätigt "
-                f"(Soll={bool(on)} Ist={confirmed})"
-            )
+            print(f"  [!] Shelly 3EM Relay {relay_id}: Readback unbestätigt "
+                f"(Soll={bool(on)} Ist={confirmed})")
             return False
         return True
     except Exception as e:
         print(f"  [!] Shelly Pro3EM {ip} Relay-Fehler: {e}")
         return False
+
 
 
 def _strict_finite_number(value):
@@ -1162,6 +1232,9 @@ def reconcile_shelly_3em_relay_state(
 
     if relay_state:
         if not prior_known or not prior_on:
+            if prior_known:
+                hs_state.pop("s3em_own_start", None)
+                hs_state["s3em_owned"] = False
             if prior_known or float(hs_state.get("s3em_last_on_ts", 0) or 0) <= 0:
                 hs_state["s3em_last_on_ts"] = observed_ts
                 hs_state.pop("s3em_on_clock", None)
@@ -1176,6 +1249,8 @@ def reconcile_shelly_3em_relay_state(
         hs_state["s3em_on"] = True
         hs_state["s3em_auto_off_confirmed"] = False
     else:
+        hs_state.pop("s3em_own_start", None)
+        hs_state["s3em_owned"] = False
         if not prior_known:
             # Der physische AUS-Zustand ist belegt, sein Alter nach einem
             # Prozessneustart aber nicht. Deshalb beginnt die lokale
@@ -1188,6 +1263,7 @@ def reconcile_shelly_3em_relay_state(
         elif prior_on:
             hs_state["s3em_last_off_ts"] = observed_ts
             hs_state["s3em_owned"] = False
+            hs_state.pop("s3em_own_start", None)
             hs_state["s3em_auto_off_confirmed"] = True
             status["wp_relay_runtime_evidence"] = "external_off_readback"
         else:
@@ -1380,15 +1456,14 @@ def shelly_set_state(ip, on: bool, safety_gate=None):
             pass
         confirmed = shelly_get_state(ip)
         if confirmed is None or confirmed.get("on") != bool(on):
-            print(
-                f"  [!] Shelly {ip}: Readback unbestätigt "
-                f"(Soll={bool(on)} Ist={None if confirmed is None else confirmed.get('on')})"
-            )
+            print(f"  [!] Shelly {ip}: Readback unbestätigt "
+                f"(Soll={bool(on)} Ist={None if confirmed is None else confirmed.get('on')})")
             return False
         return True
     except Exception as e:
         print(f"  [!] Shelly {ip} Schalten fehlgeschlagen: {e}")
         return False
+
 
 
 # ---------------------------------------------------------------------------
@@ -1403,10 +1478,13 @@ def calc_netpoint_surplus(live, current_hs_power_w=0, cfg=None):
     except Exception:
         grid_guard_w = 100
 
+    grid_w = _strict_finite_number(live.get("grid_w"))
+    if grid_w is None:
+        return 0
     try:
         return max(
             0,
-            -int(float(live.get("grid_w", 0) or 0)) + int(float(current_hs_power_w or 0)) - grid_guard_w
+            -int(grid_w) + int(float(current_hs_power_w or 0)) - grid_guard_w
         )
     except Exception:
         return 0
@@ -1957,29 +2035,58 @@ def _s3em_remaining(state, kind, duration, now_ts):
     return max(0.0, min(duration, float(clock["remaining"])) - (mono - float(clock["mono"])))
 
 
+def _s3em_owned_start(state):
+    entry = state.get("s3em_own_start")
+    return (entry if isinstance(entry, dict) and entry.get("owned") is True
+        and isinstance(entry.get("boot"), str) and bool(entry["boot"])
+        and _strict_finite_number(entry.get("started_ts")) is not None
+        and entry["started_ts"] > 0 else None)
+
+
 def _s3em_episode(cfg, state):
     """Bindet den Laufzeitbeleg auch über einen geordneten Dienststopp."""
     return {
         "schema": 1,
         "endpoint": [str(cfg.get("shelly_3em_ip", "")).strip(), cfg_int(cfg, "shelly_3em_relay_id", -1)],
         "state": {key: state[key] for key in (
-            "s3em_on", "s3em_owned", "s3em_last_on_ts", "s3em_last_off_ts",
+            "s3em_on", "s3em_owned", "s3em_own_start", "s3em_last_on_ts", "s3em_last_off_ts",
             "s3em_on_clock", "s3em_off_clock", "s3em_startup_checked") if key in state},
     }
 
 
-def _restore_s3em_episode(cfg, state):
+def _s3em_state_path():
+    return os.path.join(os.path.dirname(V4_CONFIG_FILE), "s3em_own_start.json")
+
+
+def _save_s3em_episode(cfg, state):
+    """Nur eigene Schaltwechsel und verfallene Besitzbelege dauerhaft sichern."""
+    path = _s3em_state_path()
+    try:
+        with open(path + ".tmp", "w", encoding="utf-8") as handle:
+            json.dump(_s3em_episode(cfg, state), handle, ensure_ascii=False)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(path + ".tmp", path)
+    except OSError as exc:
+        logging.getLogger(__name__).warning("Relaisbesitz nicht dauerhaft gesichert: %s", exc)
+
+
+def _restore_s3em_episode(cfg, state, payload):
     """Übernimmt nur den eigenen, zum konfigurierten Relais passenden Beleg."""
     if (state.get("s3em_episode_loaded") or str(cfg.get("wp_type")) != "3"
             or "s3em_on" in state):
         return
     state["s3em_episode_loaded"] = True
     try:
-        with open(RAMDISK_FILE, "r", encoding="utf-8") as handle:
-            payload = json.load(handle)
-        if not isinstance(payload, dict):
-            return
-        episode = payload.get("wp_relay_episode", {})
+        episode = (payload or {}).get("wp_relay_episode", {})
+        try:
+            with open(_s3em_state_path(), encoding="utf-8") as handle:
+                durable = json.load(handle)
+            if (not isinstance(episode, dict) or episode.get("endpoint") != durable.get("endpoint")
+                    or (episode.get("state") or {}).get("s3em_own_start") != (durable.get("state") or {}).get("s3em_own_start")):
+                episode = durable
+        except FileNotFoundError:
+            pass
         if not isinstance(episode, dict):
             return
         endpoint = [str(cfg.get("shelly_3em_ip", "")).strip(), cfg_int(cfg, "shelly_3em_relay_id", -1)]
@@ -1993,34 +2100,36 @@ def _restore_s3em_episode(cfg, state):
                 return
         if type(saved.get("s3em_on")) is not bool or type(saved.get("s3em_owned")) is not bool:
             return
-        for key in ("s3em_on", "s3em_owned", "s3em_last_on_ts", "s3em_last_off_ts",
+        for key in ("s3em_on", "s3em_owned", "s3em_own_start", "s3em_last_on_ts", "s3em_last_off_ts",
                     "s3em_on_clock", "s3em_off_clock", "s3em_startup_checked"):
             if key in saved:
                 state[key] = saved[key]
-        # Fehlende oder ungültige Uhrdaten entziehen nicht den eigenen Besitz.
-        # Ein fehlender Altbeleg bekommt dieselbe konservative Behandlung wie
-        # ein fremder Boot; die Fristprüfung ersetzt ihn einmalig im Dienstpfad.
+        state["s3em_owned"] = bool(_s3em_owned_start(state))
+        # Bestehende Normalfrist: fehlende gespeicherte Uhr ist kein lokaler Anker.
         for kind in ("on", "off"):
-            if state.get("s3em_last_" + kind + "_ts", 0) > 0:
-                key = "s3em_" + kind + "_clock"
-                if state.get(key) is None:
-                    state[key] = {}
+            key = "s3em_" + kind + "_clock"
+            if state.get("s3em_last_" + kind + "_ts", 0) > 0 and state.get(key) is None:
+                state[key] = {}
     except (OSError, ValueError, TypeError):
         pass
 
 
 def control_cycle(cfg, live, hs_state, safety_gate=None):
     """Bindet ELWA-Lesen, bestätigte Schreibvorgänge und Abschluss an einen Socket."""
-    _restore_s3em_episode(cfg, hs_state)
-    hs_state.setdefault("s3em_owned", bool(hs_state.get("s3em_on", False)))
+    previous = _restore_user_stop(hs_state)
+    _restore_s3em_episode(cfg, hs_state, previous)
+    hs_state["s3em_owned"] = bool(_s3em_owned_start(hs_state))
     is_elwa = str(cfg.get("heizstab_type", "generic")).strip().lower() == "mypv_elwa"
     endpoint = str(cfg.get("heizstab_ip", "0.0.0.0")).strip()
     session = (_ModbusSession(endpoint, cfg.get("heizstab_port", 502))
                if is_elwa and endpoint not in ("", "0.0.0.0") else None)
     token = _MODBUS_CYCLE.set(session)
     state_token = _HEATER_CYCLE_STATE.set(hs_state)
+    own_before = dict(_s3em_owned_start(hs_state) or {})
     try:
         status = _control_cycle(cfg, live, hs_state, safety_gate=safety_gate)
+        if own_before != (_s3em_owned_start(hs_state) or {}):
+            _save_s3em_episode(cfg, hs_state)
         if session is not None and session.failed and float(hs_state.get("elwa_backoff_until", 0)) <= time.time():
             failures = int(hs_state.get("elwa_fail_count", 0)) + 1
             hs_state["elwa_fail_count"] = failures
@@ -2042,8 +2151,11 @@ def control_cycle(cfg, live, hs_state, safety_gate=None):
             status["modbus_diagnostic"] = status["pymodbus"]["reason"]
         if str(cfg.get("wp_type")) == "3":
             status["wp_relay_episode"] = _s3em_episode(cfg, hs_state)
+        _user_stop_status(status, cfg, hs_state)
         return status
     finally:
+        hs_state.pop("user_stop_plans", None)
+        hs_state.pop("user_stop_persist", None)
         try:
             if session is not None:
                 session.close()
@@ -2158,7 +2270,9 @@ def _control_cycle(cfg, live, hs_state, safety_gate=None):
         "market_plan_negative_price": bool(market_heater_ctx.get("negative_price")),
         "surplus_w":        round(surplus_w),
         "grid_surplus_w":   round(netpoint_surplus_w),
-        "pv_w":             round(pv_w),
+        "pv_w":             round(pv_w) if pv_w is not None else None,
+        "pv_reason":        live.get("pv_reason"),
+        "grid_reason":      live.get("grid_reason"),
         "soc":              soc,
         "soc_valid":        soc_valid,
         "soc_reason":       live.get("soc_reason", soc_reason),
@@ -2331,12 +2445,6 @@ def _control_cycle(cfg, live, hs_state, safety_gate=None):
             s3_relay_state,
             now_ts=s3_observed_ts,
         )
-        # Nur der erste erfolgreiche Readback übernimmt einen beim Start
-        # vorgefundenen Lauf. Spätere externe Einschaltungen bleiben Messung.
-        if type(s3_relay_state) is bool and not hs_state.get("s3em_startup_checked", False):
-            hs_state["s3em_startup_checked"] = True
-            if s3_enable and s3_relay >= 0 and s3_relay_state:
-                hs_state["s3em_owned"] = True
         s3_wallbox_transition = wallbox_phase_transition_active(
             now_ts=s3_observed_ts,
             budget_snapshot=consumer_budget_snapshot,
@@ -2347,15 +2455,48 @@ def _control_cycle(cfg, live, hs_state, safety_gate=None):
         ) = heat_actuator_context_readiness(safety_gate)
         refresh_shelly_3em_provider(s3_observed_ts)
 
-    # Die Neustartprüfung endet beim ersten erfolgreichen Lesen, auch
-    # während Automatik an. Ein späterer Fremdsollwert begründet keinen Besitz.
-    if hs_configured and not is_elwa and not hs_state.get("heater_startup_checked", False):
-        target = _modbus_read_regs(hs_ip, hs_port, 1000, count=1) if MODBUS_OK else None
-        if target is not None:
-            hs_state["heater_startup_checked"] = True
-            if target[0] > 0:
-                hs_state["heater_owned_modbus"] = True
-
+    manual_stop = read_manual_override() if heater_module_enabled else None
+    heater_stopping = bool(not global_auto or manual_stop and manual_stop.get("mode") == "off")
+    hs_state["user_stop_persist"] = lambda: save_to_ramdisk(_user_stop_status(status, cfg, hs_state))
+    own_start = _s3em_owned_start(hs_state)
+    stop_states = hs_state.setdefault("heatpump_user_stop", {})
+    stop_plans = {}
+    now_stop = time.time()
+    for output, owned, endpoint, volatile in (
+            ("modbus", hs_configured and hs_state.get("heater_owned_modbus", False), [hs_ip, str(hs_port)], False),
+            ("shelly", sh_configured and hs_state.get("heater_owned_shelly", False), [sh_ip, 0], True),
+            ("pro3em", has_s3em and s3_enable and s3_relay >= 0 and (bool(own_start) or not global_auto and hs_state.get("s3em_on") is True),
+             [s3_ip, s3_relay], True)):
+        previous_stop = stop_states.get(output) or {}
+        if previous_stop.get("endpoint", endpoint) != endpoint:
+            previous_stop = {}
+            owned = False
+            if output == "pro3em":
+                hs_state.pop("s3em_own_start", None)
+                hs_state["s3em_owned"] = False
+            else:
+                hs_state["heater_owned_" + output] = False
+        minimum = s3_min_runtime_s if output == "pro3em" else 0.0
+        stop_states[output], stop_plans[output] = user_stop_plan(previous_stop,
+            clock=control_clock(), stopping=not global_auto if output == "pro3em" else heater_stopping, owned=bool(owned),
+            started_ts=own_start["started_ts"] if output == "pro3em" and own_start else None,
+            minimum_s=minimum,
+            running=status.get("wp_relay_readback_on") if output == "pro3em" and status.get("wp_relay_readback_valid") else None,
+            device_ts=status.get("wp_relay_readback_ts") if output == "pro3em" and status.get("wp_relay_readback_valid") else None,
+            e3dc_ts=live.get("_ts") if soc_valid else None,
+            protection=bool(soc_low), volatile=volatile,
+            readback=((False if target[0] == 0 else True if target[0] == previous_stop.get("owned_value") else None)
+                if (target := _modbus_read_regs(hs_ip, hs_port, 1000, count=1)) else None) if output == "modbus" and previous_stop.get("warned") else None)
+        stop_states[output]["endpoint"] = endpoint
+        if output == "modbus" and stop_states[output].get("confirmed"):
+            owned = hs_state["heater_owned_modbus"] = False
+        stop_states[output]["owned"] = bool(owned)
+    hs_state["user_stop_plans"] = {key: value for key, value in stop_plans.items()
+        if not global_auto or heater_stopping and key != "pro3em"}
+    if heater_stopping:
+        for output, plan in hs_state["user_stop_plans"].items():
+            if plan["warn"] and hs_state["user_stop_persist"]():
+                print("  [!] Eigene Rücknahme nicht bestätigt (" + output + ").")
     if not global_auto:
         # Beobachten bleibt erlaubt. Nur eigene bestätigte Ausgänge werden
         # zurückgenommen; ein späterer Fremdsollwert wird nicht bekämpft.
@@ -2368,15 +2509,14 @@ def _control_cycle(cfg, live, hs_state, safety_gate=None):
             status["hs_manual_reason"] = "Globale Automatik aus – Handanforderung wird nicht ausgeführt"
             status["hs_reason"] = status["hs_manual_reason"]
         release_ok = True
-        legacy_owned = bool(hs_state.get("is_on") or float(hs_state.get("current_w", 0) or 0) > 0)
-        if hs_configured and hs_state.get("heater_owned_modbus", legacy_owned):
+        if hs_configured and hs_state.get("heater_owned_modbus", False):
             if MODBUS_OK and elwa_modbus_available:
                 release_ok = bool(_invoke_actuator(
                     elwa_set_power if is_elwa else heizstab_set_power,
                     hs_ip, hs_port, 0, safety_gate=safety_gate)) and release_ok
             else:
                 release_ok = False
-        if sh_configured and hs_state.get("heater_owned_shelly", legacy_owned):
+        if sh_configured and hs_state.get("heater_owned_shelly", False):
             release_ok = bool(_invoke_actuator(shelly_set_state, sh_ip, False,
                                                safety_gate=safety_gate)) and release_ok
         if release_ok:
@@ -2387,21 +2527,17 @@ def _control_cycle(cfg, live, hs_state, safety_gate=None):
             status["success"] = False
             status["hs_reason"] = "Globale Automatik aus – eigene Heizstab-Rücknahme nicht bestätigt"
         # Der Pro3EM beweist Lastannahme, keinen separaten Verdichterzustand.
-        # Bei unbekanntem Einschaltalter beginnt der vorhandene konservative
-        # Mindestlaufhalt. Aus gibt keinen neuen Start und keine Verlängerung frei.
-        relay_owned = hs_state.get("s3em_owned", False)
+        # Nur der vollständige eigene Startbeleg erhält den Restlauf.
+        # Ohne diesen Beleg schaltet Nutzer-Aus das Relais sicherheitshalber aus.
+        relay_owned = stop_states["pro3em"]["owned"]
         if has_s3em and s3_enable and s3_relay >= 0 and relay_owned:
             now_ts = time.time()
-            last_on = float(hs_state.get("s3em_last_on_ts", 0) or 0)
-            if last_on <= 0:
-                last_on = now_ts
-                hs_state["s3em_last_on_ts"] = last_on
-            remaining = _s3em_remaining(hs_state, "on", s3_min_runtime_s, now_ts)
+            remaining = stop_plans["pro3em"]["remaining_s"]
             confirmed_off = status.get("wp_relay_readback_valid") is True and status.get("wp_relay_readback_on") is False
             if confirmed_off:
                 hs_state["s3em_owned"] = False
                 hs_state["s3em_auto_off_confirmed"] = True
-            elif remaining > 0 and not (soc_low):
+            elif stop_plans["pro3em"]["action"] == "halten":
                 status["wp_takt_protect_active"] = True
                 status["wp_min_runtime_remaining_s"] = round(remaining)
                 if release_ok:
@@ -2422,7 +2558,7 @@ def _control_cycle(cfg, live, hs_state, safety_gate=None):
             _elwa_offline_status(status, hs_state)
         return _with_actuator_safety_status(status, safety_gate)
 
-    unknown_manual = read_manual_override() if heater_module_enabled else None
+    unknown_manual = manual_stop
     unknown_manual_full = bool(unknown_manual and str(unknown_manual.get("mode", "")).strip().lower() == "full")
     if not soc_valid and not unknown_manual_full:
         # Unbekannte Daten nehmen nur eigene Ausgänge zurück. Die WP wird
@@ -2432,15 +2568,14 @@ def _control_cycle(cfg, live, hs_state, safety_gate=None):
         status["predump_heater_active"] = False
         status["market_heater_active"] = False
         release_ok = True
-        legacy_owned = bool(hs_state.get("is_on") or float(hs_state.get("current_w", 0) or 0) > 0)
-        if hs_configured and hs_state.get("heater_owned_modbus", legacy_owned):
+        if hs_configured and hs_state.get("heater_owned_modbus", False):
             if MODBUS_OK and elwa_modbus_available:
                 release_ok = bool(_invoke_actuator(
                     elwa_set_power if is_elwa else heizstab_set_power,
                     hs_ip, hs_port, 0, safety_gate=safety_gate)) and release_ok
             else:
                 release_ok = False
-        if sh_configured and hs_state.get("heater_owned_shelly", legacy_owned):
+        if sh_configured and hs_state.get("heater_owned_shelly", False):
             release_ok = bool(_invoke_actuator(shelly_set_state, sh_ip, False,
                                              safety_gate=safety_gate)) and release_ok
         if release_ok:
@@ -3006,6 +3141,7 @@ def _control_cycle(cfg, live, hs_state, safety_gate=None):
                 if ok:
                     hs_state["s3em_on"] = True
                     hs_state["s3em_last_on_ts"] = now_ts
+                    hs_state["s3em_own_start"] = {"owned": True, "started_ts": now_ts, "boot": system_boot_id()}
                     hs_state.pop("s3em_on_clock", None)
                     _s3em_remaining(hs_state, "on", s3_min_runtime_s, now_ts)
                     hs_state["s3em_auto_off_confirmed"] = False
@@ -3015,6 +3151,10 @@ def _control_cycle(cfg, live, hs_state, safety_gate=None):
                         now_ts=now_ts,
                         source="shelly_3em_switch_set_confirmed_readback",
                     )
+                    stop_states["pro3em"], _ = user_stop_plan(stop_states["pro3em"],
+                        clock=control_clock(), stopping=False, owned=True, started_ts=now_ts,
+                        running=True, device_ts=status["wp_relay_readback_ts"],
+                        e3dc_ts=live.get("_ts") if soc_valid else None)
                     status["wp_relay_runtime_evidence"] = (
                         "commanded_on_confirmed_readback"
                     )
@@ -3030,7 +3170,7 @@ def _control_cycle(cfg, live, hs_state, safety_gate=None):
                     status["success"] = False
                     status["wp_relay_on"] = bool(managed_relay_on)
                     status["hs_reason"] = "WP EIN blockiert oder Readback nicht bestätigt"
-            elif not should_wp and (managed_relay_on or (not soc_valid and hs_state.get("s3em_owned", False))):
+            elif not should_wp and hs_state.get("s3em_owned", False) and (managed_relay_on or not soc_valid):
                 if runtime_left_s > 0 and not relay_emergency_stop:
                     hs_state["s3em_on"] = True
                     status["wp_relay_on"] = True
@@ -3142,8 +3282,10 @@ def save_to_ramdisk(data):
         except Exception:
             pass
         os.replace(tmp, RAMDISK_FILE)
+        return True
     except Exception as e:
         print(f"[!] Ramdisk-Fehler: {e}")
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -3223,7 +3365,7 @@ def main():
         _hs = cfg.get("heizstab_ip", "0.0.0.0").strip()
         _sh = cfg.get("shelly_heiz_ip", "0.0.0.0").strip()
         _ht = str(cfg.get("heizstab_type", "generic")).strip().lower()
-        if _hs not in ("", "0.0.0.0") and MODBUS_OK and (global_auto_enabled(cfg) or hs_state.get("heater_owned_modbus", False)):
+        if _hs not in ("", "0.0.0.0") and MODBUS_OK and hs_state.get("heater_owned_modbus", False):
             try:
                 stop_session = _ModbusSession(_hs, cfg.get("heizstab_port", "502"))
                 stop_token = _MODBUS_CYCLE.set(stop_session)
@@ -3243,7 +3385,7 @@ def main():
             except Exception as e:
                 release_ok = False
                 print(f"  [!] Heizstab Stop-Fehler: {e}")
-        if _sh not in ("", "0.0.0.0") and (global_auto_enabled(cfg) or hs_state.get("heater_owned_shelly", False)):
+        if _sh not in ("", "0.0.0.0") and hs_state.get("heater_owned_shelly", False):
             try:
                 shelly_off_ok = shelly_set_state(_sh, False)
                 release_ok = shelly_off_ok and release_ok
@@ -3264,6 +3406,9 @@ def main():
             "source_fresh": False,
             "safe_release_confirmed": bool(release_ok),
             "wp_relay_episode": _s3em_episode(cfg, hs_state) if wp_type == "3" else None,
+            "heatpump_user_stop": hs_state.get("heatpump_user_stop", {}),
+            "heater_owned_modbus": hs_state.get("heater_owned_modbus", False),
+            "heater_owned_shelly": hs_state.get("heater_owned_shelly", False),
         })
     _signal.signal(_signal.SIGTERM, _handle_stop)
     _signal.signal(_signal.SIGINT,  _handle_stop)
@@ -3283,9 +3428,10 @@ def main():
             cfg = load_config()
 
             live = read_live()
-            print(f"\n[{time.strftime('%H:%M:%S')}] PV={live['pv_w']:.0f}W "
-                  f"Grid={live['grid_w']:+.0f}W SOC={live['soc']}% "
-                  f"[{live['source']}]")
+            pv_text = f"{live['pv_w']:.0f}W" if live['pv_w'] is not None else "unbekannt"
+            grid_text = f"{live['grid_w']:+.0f}W" if live['grid_w'] is not None else "unbekannt"
+            print(f"\n[{time.strftime('%H:%M:%S')}] PV={pv_text} "
+                  f"Grid={grid_text} SOC={live['soc']}% [{live['source']}]")
 
             status = control_cycle(cfg, live, hs_state)
             save_to_ramdisk(status)

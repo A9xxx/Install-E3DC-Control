@@ -10,6 +10,17 @@ allein beim aktiven Storage Manager.
 
 from __future__ import annotations
 
+try:
+    from Installer.Storage.befehl_werte import (MODE_AUTO, MODE_IDLE, MODE_DISCH, MODE_CHRG, MODE_GRID, EMS_POWER_SETTINGS_NONZERO_MIN_W)
+except ModuleNotFoundError:
+    from Storage.befehl_werte import (MODE_AUTO, MODE_IDLE, MODE_DISCH, MODE_CHRG, MODE_GRID, EMS_POWER_SETTINGS_NONZERO_MIN_W)
+
+
+try:
+    from Installer.Storage.quellenrahmen import druck_rechnen, druck_parameter, _dc_coupled_ems_budget
+except ModuleNotFoundError:
+    from Storage.quellenrahmen import druck_rechnen, druck_parameter, _dc_coupled_ems_budget
+
 import json
 import logging
 import math
@@ -31,12 +42,6 @@ try:
 except Exception:  # pragma: no cover - package import fallback
     from .reserve import effective_ep_reserve_pct  # type: ignore
 
-try:
-    from pv_forecast_topology import resolve_buffered_pcc_limit
-except Exception:  # pragma: no cover - package import fallback
-    from .pv_forecast_topology import resolve_buffered_pcc_limit  # type: ignore
-
-
 RAMDISK = "/var/www/html/ramdisk"
 DATA_DIR = "/var/www/html/data"
 V4_CFG = os.path.join(DATA_DIR, "e3dc_v4.json")
@@ -56,18 +61,6 @@ DISABLED_WALLBOX_TYPES = {
     "none", "disabled", "deaktiviert", "aus", "keine", "keine_wallbox",
     "no_wallbox", "off", "false", "no", "0", "-1",
 }
-
-MODE_AUTO = 0
-MODE_IDLE = 1
-MODE_DISCH = 2
-MODE_CHRG = 3
-MODE_GRID = 4
-EMS_POWER_SETTINGS_NONZERO_MIN_W = 300
-# Der etablierte RSCP_POWER_SETTINGS-Vertrag arbeitet mit einem strikten
-# 50-W-Readback-Fenster. Ein frischer Readback innerhalb dieses Fensters
-# bestätigt denselben früheren Cap; ab 50 W bleibt der Pfad fail-closed und
-# hält den zuletzt sicheren Rahmen.
-RSCP_POWER_SETTINGS_TOLERANCE_W = 50
 
 AUTO_HOLD_STATES = {
     "parallel_auto",
@@ -333,179 +326,6 @@ def _effective_max_discharge_w(
     if rscp_limit:
         return rscp_limit
     return max(300, int(fallback_charge_w or _effective_max_charge_w(cfg, live)))
-
-
-def _configured_kw_or_w(value: Any) -> int:
-    raw = _safe_float(value, 0.0)
-    if raw <= 0:
-        return 0
-    if raw < 250:
-        return int(round(raw * 1000.0))
-    return int(round(raw))
-
-
-def _dc_tracker_limit_w(source: Dict[str, Any]) -> int:
-    total = 0
-    for idx in range(8):
-        total += max(0, _safe_int(source.get(f"dc{idx}_max_w"), 0))
-    return total if total >= 1000 else 0
-
-
-def _inverter_ac_limit_w(
-    cfg: Dict[str, Any],
-    active_state: Dict[str, Any],
-    live: Dict[str, Any],
-) -> int:
-    for key in (
-        "wr_ac_limit_w",
-        "wechselrichter_limit_w",
-        "wechselrichterleistung_w",
-        "inverter_ac_limit_w",
-        "ac_power_limit_w",
-    ):
-        val = _configured_kw_or_w(cfg.get(key))
-        if val >= 1000:
-            return val
-    for source in (live, active_state):
-        for key in ("ac_power_limit_w", "wr_ac_limit_w", "inverter_ac_limit_w"):
-            val = _safe_int(source.get(key), 0)
-            if val >= 1000:
-                return val
-        val = _dc_tracker_limit_w(source)
-        if val >= 1000:
-            return val
-    return 0
-
-
-def _dc_coupled_ems_budget(
-    pv_potential_w: Any,
-    wr_max_ac_w: Any,
-    export_limit_w: Any,
-    home_w: Any,
-    wp_w: Any,
-    wallbox_actual_w: Any,
-    battery_max_charge_w: Any,
-    soc_pct: Any,
-    external_ac_pv_w: Any = 0,
-    external_ac_pv_valid: Any = False,
-    external_ac_pv_source: Any = "",
-) -> Dict[str, Any]:
-    pv_total_w = max(0, _safe_int(pv_potential_w, 0))
-    wr_limit_w = max(0, _safe_int(wr_max_ac_w, 0))
-    feed_limit_w = max(0, _safe_int(export_limit_w, 0))
-    fixed_load_w = max(0, _safe_int(home_w, 0)) + max(0, _safe_int(wp_w, 0))
-    wb_w = max(0, _safe_int(wallbox_actual_w, 0))
-    max_charge_w = max(0, _safe_int(battery_max_charge_w, 0))
-    soc = _safe_float(soc_pct, 0.0)
-
-    # PV_Power ist die physikalische Gesamt-PV am Netzpunkt. E3DC liefert den
-    # externen AC-Erzeuger separat als EMS_POWER_ADD; e3dc_live hat ihn in
-    # PV_Power bereits eingerechnet. Nur ein typgültiger Quellensplit darf ihn
-    # vor der DC-Wechselrichtergrenze wieder abziehen. Fehlt dieser Nachweis,
-    # bleibt die bisherige konservative Behandlung erhalten.
-    external_source = str(external_ac_pv_source or "").strip()
-    external_value = _safe_float(external_ac_pv_w, 0.0)
-    external_trusted = bool(
-        external_ac_pv_valid is True
-        and external_source == "e3dc_add_power"
-        and not isinstance(external_ac_pv_w, bool)
-        and math.isfinite(external_value)
-        and external_value >= 0.0
-    )
-    external_ac_w = (
-        min(pv_total_w, max(0, int(round(external_value))))
-        if external_trusted
-        else 0
-    )
-    e3dc_dc_pv_w = max(0, pv_total_w - external_ac_w)
-
-    if wr_limit_w >= 1000:
-        battery_must_dc_w = max(0, e3dc_dc_pv_w - wr_limit_w)
-        e3dc_ac_available_w = min(
-            max(0, e3dc_dc_pv_w - battery_must_dc_w),
-            wr_limit_w,
-        )
-    else:
-        battery_must_dc_w = 0
-        e3dc_ac_available_w = e3dc_dc_pv_w
-
-    # Der externe AC-Erzeuger belastet nicht die E3DC-DC-/WR-Grenze, gehört
-    # aber weiterhin vollständig in die PCC-/Einspeisebilanz.
-    ac_available_w = e3dc_ac_available_w + external_ac_w
-
-    total_ac_load_w = fixed_load_w + wb_w
-    export_potential_w = max(0, ac_available_w - total_ac_load_w)
-    battery_must_ac_w = (
-        max(0, export_potential_w - feed_limit_w)
-        if feed_limit_w > 0
-        else 0
-    )
-    battery_must_total_w = battery_must_dc_w + battery_must_ac_w
-    battery_room_w = 0 if soc >= 100.0 else max_charge_w
-    battery_must_real_w = min(battery_must_total_w, battery_room_w)
-
-    dc_real_w = min(battery_must_dc_w, battery_room_w)
-    remaining_after_dc_w = max(0, battery_room_w - dc_real_w)
-    ac_real_w = min(battery_must_ac_w, remaining_after_dc_w)
-    loss_dc_w = max(0, battery_must_dc_w - dc_real_w)
-    loss_ac_w = max(0, battery_must_ac_w - ac_real_w)
-
-    wallbox_budget_total_w = max(0, ac_available_w - fixed_load_w - battery_must_ac_w)
-    wallbox_budget_increase_w = max(0, wallbox_budget_total_w - wb_w)
-
-    return {
-        "pv_total_w": pv_total_w,
-        "e3dc_dc_pv_w": e3dc_dc_pv_w,
-        "e3dc_ac_available_w": e3dc_ac_available_w,
-        "external_ac_pv_w": external_ac_w,
-        "external_ac_pv_trusted": external_trusted,
-        "external_ac_pv_source": external_source,
-        "ac_available_w": ac_available_w,
-        "battery_must_dc_w": battery_must_dc_w,
-        "battery_must_ac_w": battery_must_ac_w,
-        "battery_must_real_w": battery_must_real_w,
-        "wallbox_budget_total_w": wallbox_budget_total_w,
-        "wallbox_budget_increase_w": wallbox_budget_increase_w,
-        "curtailment_loss_w": loss_dc_w + loss_ac_w,
-        "export_limit_w": feed_limit_w,
-        "wr_max_ac_w": wr_limit_w,
-    }
-
-
-def _meter_balance_home_w(pv_w: Any, grid_w: Any, bat_w: Any) -> int:
-    return int(_safe_int(pv_w, 0) + _safe_int(grid_w, 0) - _safe_int(bat_w, 0))
-
-
-def _meter_balance_plausible(
-    pv_w: Any,
-    grid_w: Any,
-    bat_w: Any,
-    home_w: Any,
-) -> Dict[str, Any]:
-    pv = max(0, _safe_int(pv_w, 0))
-    grid = _safe_int(grid_w, 0)
-    bat = _safe_int(bat_w, 0)
-    home = max(0, _safe_int(home_w, 0))
-    balance_home_w = _meter_balance_home_w(pv, grid, bat)
-    if balance_home_w >= 0:
-        balance_error_w = abs(balance_home_w - home)
-    else:
-        balance_error_w = abs(balance_home_w) + home
-    error_limit_w = max(1800, int(round(pv * 0.25)))
-    relevant = bool(pv > 1000 and (abs(grid) > 1000 or abs(bat) > 500))
-    plausible = not (
-        relevant
-        and (
-            balance_home_w < -500
-            or balance_error_w > error_limit_w
-        )
-    )
-    return {
-        "home_balance_w": balance_home_w,
-        "home_balance_error_w": balance_error_w,
-        "home_balance_error_limit_w": error_limit_w,
-        "home_balance_plausible": plausible,
-    }
 
 
 def _normalize_wb_mode(value: Any) -> int:
@@ -1220,16 +1040,12 @@ class ParallelStorageRegulator:
         self.cfg = cfg or {}
         self.max_charge_w = _effective_max_charge_w(self.cfg)
         self.max_discharge_w = _effective_max_discharge_w(self.cfg, fallback_charge_w=self.max_charge_w)
+        druckparameter = druck_parameter(self.cfg, self.max_charge_w)
+        self.druckparameter = druckparameter
         self.target_soc = max(5.0, min(100.0, _safe_float(self.cfg.get("storage_target_soc"), 90.0)))
-        self.curve_tolerance_pct = max(0.2, _safe_float(
-            self.cfg.get("storage_parallel_curve_tolerance_pct"),
-            _safe_float(self.cfg.get("tl_tolerance_pct"), 3.0),
-        ))
-        self.grid_limit_w = max(50, _safe_int(self.cfg.get("tl_grid_limit_w"), 100))
-        self.grid_relief_enter_w = max(300, _safe_int(
-            self.cfg.get("storage_parallel_grid_relief_enter_w"),
-            max(300, self.grid_limit_w * 3),
-        ))
+        self.curve_tolerance_pct = druckparameter['curve_tolerance_pct']
+        self.grid_limit_w = druckparameter['grid_limit_w']
+        self.grid_relief_enter_w = druckparameter['grid_relief_enter_w']
         self.wb_hold_s = max(30, _safe_int(self.cfg.get("storage_parallel_wb_hold_s"), 300))
         self.price_house_discharge_w = 0
         self.price_house_discharge_step_up_w = max(100, _safe_int(
@@ -1238,9 +1054,7 @@ class ParallelStorageRegulator:
         self.price_house_discharge_step_down_w = max(100, _safe_int(
             self.cfg.get("storage_parallel_price_house_step_down_w"), 600
         ))
-        self.curve_charge_enter_w = max(300, _safe_int(
-            self.cfg.get("storage_parallel_curve_charge_enter_w"), 300
-        ))
+        self.curve_charge_enter_w = druckparameter['curve_charge_enter_w']
         self.curve_charge_keep_w = max(50, min(
             self.curve_charge_enter_w,
             _safe_int(self.cfg.get("storage_parallel_curve_charge_keep_w"), 120),
@@ -1306,9 +1120,7 @@ class ParallelStorageRegulator:
                 max(1800, int(self.max_charge_w * 0.25)),
             ),
         )
-        self.abregel_min_charge_w = max(0, _safe_int(
-            self.cfg.get("abregel_min_charge_w"), 300
-        ))
+        self.abregel_min_charge_w = druckparameter['abregel_min_charge_w']
         self.curve_guard_enter_below_pct = max(0.0, _safe_float(
             self.cfg.get("storage_parallel_curve_guard_enter_below_pct"), 1.0
         ))
@@ -1336,13 +1148,7 @@ class ParallelStorageRegulator:
             self.night_floor_enter_pct,
             _safe_float(self.cfg.get("storage_parallel_night_floor_keep_pct"), 0.6),
         )
-        self.curve_auto_hold_exit_pct = max(0.5, min(
-            self.curve_tolerance_pct,
-            _safe_float(
-                self.cfg.get("storage_parallel_curve_auto_hold_exit_pct"),
-                0.5,
-            ),
-        ))
+        self.curve_auto_hold_exit_pct = druckparameter['curve_auto_hold_exit_pct']
         self.curve_auto_hold_release_below_pct = max(0.0, min(
             self.curve_guard_enter_below_pct,
             self.curve_tolerance_pct,
@@ -1362,45 +1168,20 @@ class ParallelStorageRegulator:
                 max(1800, self.curve_charge_release_stabilize_s),
             ),
         )
-        self.curve_cap_enter_margin_w = max(100, _safe_int(
-            self.cfg.get("storage_parallel_curve_cap_enter_margin_w"), 600
-        ))
-        self.curve_cap_keep_margin_w = max(0, min(
-            self.curve_cap_enter_margin_w,
-            _safe_int(self.cfg.get("storage_parallel_curve_cap_keep_margin_w"), 150),
-        ))
-        self.curve_cap_feed_buffer_w = max(0, _safe_int(
-            self.cfg.get("abregel_puffer_w"),
-            300,
-        ))
+        self.curve_cap_enter_margin_w = druckparameter['curve_cap_enter_margin_w']
+        self.curve_cap_keep_margin_w = druckparameter['curve_cap_keep_margin_w']
+        self.curve_cap_feed_buffer_w = druckparameter['curve_cap_feed_buffer_w']
         # Der native Pfad verwendet denselben fachlichen Austrittsvertrag wie
         # die bestehende Konfiguration. Bei älteren Konfigurationen ohne den
         # Hystereseschlüssel bleibt das bisherige AUTO-Band der konservative
         # Migrationswert; neue Installationen nutzen abregel_hysterese_w.
-        curve_cap_release_hysteresis_default_w = (
-            _safe_int(self.cfg.get("abregel_auto_band_w"), 1800)
-            if "abregel_auto_band_w" in self.cfg
-            else 2000
-        )
-        self.curve_cap_release_hysteresis_w = max(
-            self.curve_cap_feed_buffer_w,
-            _safe_int(
-                self.cfg.get("abregel_hysterese_w"),
-                curve_cap_release_hysteresis_default_w,
-            ),
-        )
-        self.curve_cap_release_band_w = self.curve_cap_release_hysteresis_w
+        self.curve_cap_release_hysteresis_w = druckparameter['curve_cap_release_hysteresis_w']
+        self.curve_cap_release_band_w = druckparameter['curve_cap_release_band_w']
         self.curve_cap_release_grace_s = max(
             0.0,
             _safe_float(self.cfg.get("abregel_auto_grace_s"), 30.0),
         )
-        self.curve_cap_feedback_band_w = max(
-            self.curve_cap_release_band_w,
-            _safe_int(
-                self.cfg.get("storage_parallel_curve_cap_feedback_band_w"),
-                self.curve_cap_release_band_w,
-            ),
-        )
+        self.curve_cap_feedback_band_w = druckparameter['curve_cap_feedback_band_w']
         # Der Abregel-Puffer definiert den Zielabstand zum harten Einspeiselimit.
         # Die Ausloeseschwelle muss darunter liegen, sonst reagiert der Schutz
         # erst am harten Limit statt im Pufferband.
@@ -1416,9 +1197,7 @@ class ParallelStorageRegulator:
                 8.0,
             ),
         ))
-        self.curve_cap_step_w = max(100, _safe_int(
-            self.cfg.get("storage_parallel_curve_cap_step_w"), 500
-        ))
+        self.curve_cap_step_w = druckparameter['curve_cap_step_w']
         self.headroom_discharge_enable = _cfg_bool(
             self.cfg,
             "storage_headroom_discharge_enable",
@@ -1921,238 +1700,64 @@ class ParallelStorageRegulator:
                 self.max_charge_w,
                 curve_safe_charge_w,
             )
-        curve_cap_target_w = 0
-        curve_cap_margin_w = self.curve_cap_keep_margin_w if previous_parallel_state == "parallel_curve_charge_cap" else self.curve_cap_enter_margin_w
-        curve_cap_relevant = bool(
-            curve_above_enter
-            or curve_above_keep
-            or (previous_parallel_state == "parallel_curve_charge_cap" and curve_above_soft)
-        )
-        previous_curve_cap_w = (
-            max(0, _safe_int(previous_parallel_val, 0))
-            if previous_parallel_state == "parallel_curve_charge_cap"
-            else 0
-        )
-        curve_cap_release_pending = bool(active_state.get("curve_cap_release_pending"))
-        curve_cap_release_requested = bool(
-            active_state.get("curve_cap_release_requested")
-        )
-        curve_cap_release_confirmed_since_ts = max(
-            0.0,
-            _safe_float(active_state.get("curve_cap_release_confirmed_since_ts"), 0.0),
-        )
-        curve_cap_bounded_zero_w = max(
-            EMS_POWER_SETTINGS_NONZERO_MIN_W,
-            self.abregel_min_charge_w,
-        )
-        curve_cap_tracking_active = bool(
-            (
-                previous_parallel_state == "parallel_curve_charge_cap"
-                and previous_curve_cap_w > 0
-            )
-            or curve_cap_release_pending
-            or curve_cap_release_requested
-        )
-        if curve_cap_relevant:
-            curve_cap_target_w = 0
-        curve_cap_keep_active = False
-        curve_cap_grid_contract_valid = bool(
-            _truthy(live.get("RSCP_Sample_Valid", True))
-            and _truthy(live.get("Grid_Power_Valid", True))
-        )
-        grid_import_w = max(0, grid_w, grid_ema_w)
-        grid_export_w = 0 if grid_import_w > 0 else max(0, -grid_w, -grid_ema_w)
-        curve_cap_real_grid_import_active = bool(
-            curve_cap_grid_contract_valid
-            and grid_import_w >= self.grid_relief_enter_w
-        )
-        curve_cap_release_below_since_ts = (
-            max(0.0, _safe_float(active_state.get("curve_cap_release_below_since_ts"), 0.0))
-            if (
-                previous_parallel_state == "parallel_curve_charge_cap"
-                and previous_curve_cap_w > 0
-            )
-            else 0.0
-        )
-        curve_cap_post_release_until_ts = max(
-            0.0,
-            _safe_float(active_state.get("curve_cap_post_release_until_ts"), 0.0),
-        )
-        if curve_cap_post_release_until_ts <= now_s:
-            curve_cap_post_release_until_ts = 0.0
-        curve_cap_post_release_guard_initial = bool(curve_cap_post_release_until_ts > now_s)
-        settings_readback_valid = bool(
-            live.get("ems_power_settings_read") is True
-            and live.get("ems_power_settings_valid") is True
-            and isinstance(live.get("power_limits_active"), bool)
-            and isinstance(live.get("ems_max_charge_power_w"), int)
-            and not isinstance(live.get("ems_max_charge_power_w"), bool)
-            and int(live.get("ems_max_charge_power_w")) >= 0
-            and isinstance(live.get("ems_max_discharge_power_w"), int)
-            and not isinstance(live.get("ems_max_discharge_power_w"), bool)
-            and int(live.get("ems_max_discharge_power_w")) >= 0
-            and isinstance(live.get("ems_discharge_start_power_w"), int)
-            and not isinstance(live.get("ems_discharge_start_power_w"), bool)
-            and int(live.get("ems_discharge_start_power_w")) >= 0
-        )
-        settings_bounded_zero_confirmed = bool(
-            settings_readback_valid
-            and live.get("power_limits_active") is True
-            and int(live.get("ems_max_charge_power_w")) <= curve_cap_bounded_zero_w
-        )
-        settings_previous_curve_cap_confirmed = bool(
-            settings_readback_valid
-            and live.get("power_limits_active") is True
-            and previous_curve_cap_w > 0
-            and abs(int(live.get("ems_max_charge_power_w")) - previous_curve_cap_w)
-            < RSCP_POWER_SETTINGS_TOLERANCE_W
-        )
-        settings_release_confirmed = bool(
-            settings_readback_valid
-            and live.get("power_limits_active") is False
-        )
-        meter_home_w = home_rule_w + wp_w
-        if wallbox_home_includes and wallbox_w > 250:
-            meter_home_w += int(wallbox_w)
-        meter_balance = _meter_balance_plausible(pv_w, grid_w, bat_w, meter_home_w)
-        meter_balance_plausible = bool(meter_balance["home_balance_plausible"])
-        # Harter Abregelschutz darf sich nicht an der aktuellen Batterieladung
-        # hochziehen. Die Batterieladung kann bereits Ergebnis der vorherigen
-        # Regelentscheidung sein. Entscheidend sind nur Netz-Einspeisung und
-        # echte PV-Leistung oberhalb der WR-Grenze.
-        curve_cap_measured_charge_w = 0
-        inverter_limit_w = _inverter_ac_limit_w(self.cfg, active_state, live)
-        configured_export_limit_w = _configured_kw_or_w(self.cfg.get("einspeiselimit", 0))
-        live_derate_limit_w = _safe_int(live.get("derate_at_power_w", active_state.get("derate_at_power_w")), 0)
-        pcc_limit_contract = resolve_buffered_pcc_limit(
-            configured_export_limit_w,
-            live_derate_limit_w,
-            self.curve_cap_feed_buffer_w,
-        )
-        derate_hard_limit_w = int(pcc_limit_contract.get("hard_limit_w") or 0)
-        derate_limit_w = int(pcc_limit_contract.get("limit_w") or 0)
-        derate_limit_source = str(pcc_limit_contract.get("source") or "none")
-        derating_active = bool(
-            _truthy(live.get("pv_derating_active", active_state.get("pv_derating_active", False)))
-            or _truthy(live.get("ems_derating_active", active_state.get("ems_derating_active", False)))
-            or _truthy(live.get("power_limits_active", active_state.get("power_limits_active", False)))
-        )
-        ems_budget = _dc_coupled_ems_budget(
-            pv_w,
-            inverter_limit_w,
-            derate_limit_w,
-            home_w,
-            wp_w,
-            wallbox_w,
-            self.max_charge_w,
-            soc,
-            external_ac_pv_w=live.get("Ext_PV_Power"),
-            external_ac_pv_valid=live.get("Ext_PV_Power_Valid"),
-            external_ac_pv_source=live.get("Ext_PV_Power_Source"),
-        )
-        inverter_pressure_w = int(ems_budget["battery_must_dc_w"])
-        derating_pressure_w = int(ems_budget["battery_must_ac_w"])
-        ems_mandatory_charge_w = int(ems_budget["battery_must_real_w"])
-        feed_export_threshold_w = max(0, int(derate_limit_w))
-        release_export_threshold_w = (
-            max(0, int(feed_export_threshold_w) - int(self.curve_cap_release_band_w))
-            if feed_export_threshold_w > 0
-            else 0
-        )
-        if feed_export_threshold_w > 0:
-            grid_export_error_w = int(grid_export_w) - int(feed_export_threshold_w)
-            grid_export_over_limit_w = max(0, grid_export_error_w)
-            curve_cap_below_threshold_w = max(0, -grid_export_error_w)
-        else:
-            grid_export_error_w = int(grid_export_w) if curve_above_enter else 0
-            grid_export_over_limit_w = max(0, grid_export_error_w)
-            curve_cap_below_threshold_w = 0
-        curve_cap_feedback_active = bool(
-            curve_cap_tracking_active
-            and curve_cap_grid_contract_valid
-            and feed_export_threshold_w > 0
-            and not curve_cap_real_grid_import_active
-            and (
-                grid_export_over_limit_w > 0
-                or curve_cap_below_threshold_w <= self.curve_cap_feedback_band_w
-            )
-        )
-        if curve_cap_feedback_active:
-            curve_cap_grid_pressure_w = max(0, int(previous_curve_cap_w) + int(grid_export_error_w))
-            if curve_cap_grid_pressure_w < previous_curve_cap_w:
-                curve_cap_grid_pressure_w = max(
-                    curve_cap_grid_pressure_w,
-                    max(0, int(previous_curve_cap_w) - int(self.curve_cap_step_w)),
-                )
-        else:
-            curve_cap_grid_pressure_w = int(grid_export_over_limit_w)
-        curve_cap_dc_hold_margin_w = max(
-            int(previous_curve_cap_w),
-            int(inverter_pressure_w),
-        )
-        curve_cap_dc_hold_active = bool(
-            previous_curve_cap_w >= self.curve_charge_enter_w
-            and curve_cap_grid_contract_valid
-            and curve_above_soft
-            and inverter_pressure_w >= max(self.abregel_min_charge_w, self.curve_charge_enter_w)
-            and feed_export_threshold_w > 0
-            and release_export_threshold_w > 0
-            and not curve_cap_real_grid_import_active
-            and (
-                int(grid_export_w) + int(curve_cap_dc_hold_margin_w)
-                >= max(0, int(release_export_threshold_w) - int(self.curve_cap_feedback_band_w))
-            )
-        )
-        # DC-/WR-Druck darf den harten Abregelschutz nur begleiten, wenn der
-        # AC-Netzpunkt schon an der Abregelgrenze arbeitet oder der Pfad durch
-        # die Hysterese gehalten wird. Ist der Abregelschutz bereits aktiv,
-        # bleibt echter WR-Druck auch bei kurzen Haus-/Grid-Spruengen erhalten.
-        # PV knapp oberhalb der WR-Leistung ist sonst nur Diagnose; der E3DC
-        # kann diesen Anteil oft autonom aufnehmen.
-        curve_cap_dc_pressure_active = bool(
-            inverter_pressure_w > 0
-            and curve_cap_grid_contract_valid
-            and feed_export_threshold_w > 0
-            and not curve_cap_real_grid_import_active
-            and (
-                grid_export_over_limit_w > 0
-                or curve_cap_feedback_active
-                or curve_cap_dc_hold_active
-                or (
-                    release_export_threshold_w > 0
-                    and grid_export_w >= release_export_threshold_w
-                    and (
-                        curve_above_soft
-                        or curve_above_keep
-                        or curve_above_enter
-                        or previous_curve_cap_w >= self.curve_charge_enter_w
-                        or derating_active
-                    )
-                )
-            )
-        )
-        curve_cap_dc_pressure_w = int(inverter_pressure_w) if curve_cap_dc_pressure_active else 0
-        curve_cap_model_pressure_w = (
-            int(ems_mandatory_charge_w)
-            if (
-                meter_balance_plausible
-                and (
-                    grid_export_over_limit_w > 0
-                    or curve_cap_feedback_active
-                    or curve_cap_dc_pressure_active
-                )
-            )
-            else 0
-        )
-        curve_cap_direct_pressure_w = int(grid_export_over_limit_w) + int(curve_cap_dc_pressure_w)
-        curve_cap_pressure_w = max(
-            int(curve_cap_grid_pressure_w),
-            int(curve_cap_direct_pressure_w),
-        )
-        curve_cap_physical_pressure_w = max(
-            int(curve_cap_grid_pressure_w) + int(inverter_pressure_w),
-            int(inverter_pressure_w),
-        )
+        druck = druck_rechnen(
+            cfg=self.cfg, live=live, jetzt_s=now_s,
+            parameter=dict(self.druckparameter, max_charge_w=self.max_charge_w),
+            messsatz={'bat_w': bat_w, 'curve_above_enter': curve_above_enter, 'curve_above_keep': curve_above_keep, 'curve_above_soft': curve_above_soft, 'grid_ema_w': grid_ema_w, 'grid_w': grid_w, 'home_rule_w': home_rule_w, 'home_w': home_w, 'pv_w': pv_w, 'soc': soc, 'wallbox_home_includes': wallbox_home_includes, 'wallbox_w': wallbox_w, 'wp_w': wp_w},
+            vorzustand=dict(active_state, previous_parallel_state=previous_parallel_state,
+                           previous_parallel_val=previous_parallel_val))
+        configured_export_limit_w = druck.werte['configured_export_limit_w']
+        curve_cap_below_threshold_w = druck.werte['curve_cap_below_threshold_w']
+        curve_cap_bounded_zero_w = druck.werte['curve_cap_bounded_zero_w']
+        curve_cap_dc_hold_active = druck.werte['curve_cap_dc_hold_active']
+        curve_cap_dc_hold_margin_w = druck.werte['curve_cap_dc_hold_margin_w']
+        curve_cap_dc_pressure_active = druck.werte['curve_cap_dc_pressure_active']
+        curve_cap_dc_pressure_w = druck.werte['curve_cap_dc_pressure_w']
+        curve_cap_direct_pressure_w = druck.werte['curve_cap_direct_pressure_w']
+        curve_cap_feedback_active = druck.werte['curve_cap_feedback_active']
+        curve_cap_grid_contract_valid = druck.werte['curve_cap_grid_contract_valid']
+        curve_cap_grid_pressure_w = druck.werte['curve_cap_grid_pressure_w']
+        curve_cap_keep_active = druck.werte['curve_cap_keep_active']
+        curve_cap_margin_w = druck.werte['curve_cap_margin_w']
+        curve_cap_measured_charge_w = druck.werte['curve_cap_measured_charge_w']
+        curve_cap_model_pressure_w = druck.werte['curve_cap_model_pressure_w']
+        curve_cap_physical_pressure_w = druck.werte['curve_cap_physical_pressure_w']
+        curve_cap_post_release_guard_initial = druck.werte['curve_cap_post_release_guard_initial']
+        curve_cap_post_release_until_ts = druck.werte['curve_cap_post_release_until_ts']
+        curve_cap_pressure_w = druck.werte['curve_cap_pressure_w']
+        curve_cap_real_grid_import_active = druck.werte['curve_cap_real_grid_import_active']
+        curve_cap_release_below_since_ts = druck.werte['curve_cap_release_below_since_ts']
+        curve_cap_release_confirmed_since_ts = druck.werte['curve_cap_release_confirmed_since_ts']
+        curve_cap_release_pending = druck.werte['curve_cap_release_pending']
+        curve_cap_release_requested = druck.werte['curve_cap_release_requested']
+        curve_cap_relevant = druck.werte['curve_cap_relevant']
+        curve_cap_target_w = druck.werte['curve_cap_target_w']
+        curve_cap_tracking_active = druck.werte['curve_cap_tracking_active']
+        derate_hard_limit_w = druck.werte['derate_hard_limit_w']
+        derate_limit_source = druck.werte['derate_limit_source']
+        derate_limit_w = druck.werte['derate_limit_w']
+        derating_active = druck.werte['derating_active']
+        derating_pressure_w = druck.werte['derating_pressure_w']
+        ems_budget = druck.werte['ems_budget']
+        ems_mandatory_charge_w = druck.werte['ems_mandatory_charge_w']
+        feed_export_threshold_w = druck.werte['feed_export_threshold_w']
+        grid_export_error_w = druck.werte['grid_export_error_w']
+        grid_export_over_limit_w = druck.werte['grid_export_over_limit_w']
+        grid_export_w = druck.werte['grid_export_w']
+        grid_import_w = druck.werte['grid_import_w']
+        inverter_limit_w = druck.werte['inverter_limit_w']
+        inverter_pressure_w = druck.werte['inverter_pressure_w']
+        live_derate_limit_w = druck.werte['live_derate_limit_w']
+        meter_balance = druck.werte['meter_balance']
+        meter_balance_plausible = druck.werte['meter_balance_plausible']
+        meter_home_w = druck.werte['meter_home_w']
+        pcc_limit_contract = druck.werte['pcc_limit_contract']
+        previous_curve_cap_w = druck.werte['previous_curve_cap_w']
+        release_export_threshold_w = druck.werte['release_export_threshold_w']
+        settings_bounded_zero_confirmed = druck.werte['settings_bounded_zero_confirmed']
+        settings_previous_curve_cap_confirmed = druck.werte['settings_previous_curve_cap_confirmed']
+        settings_readback_valid = druck.werte['settings_readback_valid']
+        settings_release_confirmed = druck.werte['settings_release_confirmed']
         curve_cap_export_room_w = int(curve_cap_pressure_w)
         curve_cap_excess_charge_w = max(0, int(bat_w) - int(curve_cap_export_room_w))
         projected_export_without_charge_w = int(grid_export_w)

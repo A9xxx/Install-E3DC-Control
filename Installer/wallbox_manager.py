@@ -107,6 +107,7 @@ from Wallbox.soc_tracker import (
 from Wallbox.controller import allocate_power
 from Wallbox import command_gate
 from Wallbox import simple_core, distribution as wallbox_distribution
+from market_economics import grid_charge_phase_replacement_w
 from reserve import effective_ep_reserve_pct
 from Wallbox import openwb_pro_control_lease
 from Wallbox import deficit_control as wallbox_deficit_control
@@ -156,6 +157,15 @@ def _simple_core_refresh(c_data, config):
     elif normalize_wb_mode(config.get("wb%d_mode" % cid, MODE_OFF)) == MODE_OFF:
         c_data["_simple_core_status"] = dict(active=True, state="idle",
             reason="observe", sentence="Nur beobachten")
+
+
+def _simple_core_display_amp(c_data, manager_amp):
+    """Sollstrom nur für die Anzeige: bei geführter Kernbox der Kernausgang."""
+    box = c_data or {}
+    led = bool(box.get("_simple_core_enabled")
+               and (box.get("_simple_core_status") or {}).get("reason") != "observe")
+    core = simple_core.number((box.get("_simple_core_state") or {}).get("output_amp")) if led else None
+    return manager_amp if core is None else round(core, 1)
 
 
 def _simple_core_detail_fields(c_data):
@@ -349,23 +359,7 @@ def _simple_core_cycle(c_data, snapshot, *, now_ts, last_change_ts, chargers=Non
     confirmed = False
     if action in ("set_current", "start"):
         target = decision["target_amp"]
-        # Der vorhandene Mindesthalt bindet nur die frische Absenkung.
-        # Zuteilung, Wattdeckel und Storage-Hard-Block bleiben unverändert.
         observed = simple_core.number(snapshot.get("offered_amp"))
-        minimum_reduction = bool(action == "set_current"
-            and snapshot.get("status_valid") is True and snapshot.get("charging") is True
-            and observed is not None and snapshot["min_amp"] <= target < observed
-            and target == snapshot["min_amp"]
-            and target <= snapshot["house_fuse_cap_amp"])
-        if minimum_reduction:
-            allocation = c_data.get("_multi_allocation_output_cap") or {}
-            allocation["running_minimum_hold"] = wallbox_decision.pv_only_running_minimum_hold_contract(
-                pv_only_class=True, running=True, slot_amp=min(_cfg_float(allocation.get("cap_amp"), 0),
-                    max(0.0, _cfg_float(snapshot.get("share_w"), 0))/(230*snapshot["phases"])),
-                reported_amp=observed, min_amp=target, phases=snapshot["phases"],
-                wb_id=cid, cycle_token=c_data.get("_wallbox_cycle_token"),
-                plug_session_id=_wallbox_group_deficit_current_session_id(c_data),
-                plug_connected=True)
         _bind_effective_current_output_contract(c_data, target, reason="simple_core",
             allocated_budget_w=snapshot["share_w"], target_phases=snapshot["phases"],
             target_power_w=target*230*snapshot["phases"])
@@ -375,12 +369,8 @@ def _simple_core_cycle(c_data, snapshot, *, now_ts, last_change_ts, chargers=Non
         command = {"method": method, "amp": target,
             "force_state": (2 if native else 0) if action == "start" or phase_resume else None,
             "reason": "simple_core_start" if action == "start" else "simple_core_current"}
-        hold = (c_data.get("_multi_allocation_output_cap") or {}).get("running_minimum_hold") or {}
-        if minimum_reduction and hold.get("active") is True:
-            binding = dict(schema=openwb_pro_session.MINIMUM_HOLD_REDUCTION_SCHEMA,
-                active=True, wb_id=cid, cycle_token=c_data.get("_wallbox_cycle_token"),
-                plug_session_id=hold["plug_session_id"], target_amp=target,
-                observed_amp=observed, min_amp=target)
+        binding = _wallbox_running_minimum_reduction(c_data, command, c_id=cid)
+        if binding:
             with command_gate.minimum_hold_reduction_scope(charger, binding):
                 receipt = _execute_wallbox_current_with_receipt(c_data, command, c_id=cid)
         else:
@@ -925,13 +915,16 @@ def _wallbox_storage_power_budget_contract(
         }
 
     if runtime_block_kind == "flex":
+        parts_known = bool(budget.get("budget_pv_valid") is True
+            and type(budget.get("budget_pv_w")) is int and type(budget.get("budget_battery_w")) is int
+            and not freshness.get("stale"))
         return {
             "valid": True,
             "available_w": 0.0,
-            "budget_pv_w": 0,
-            "budget_battery_w": 0,
-            "budget_pv_valid": not freshness.get("stale"),
-            "budget_pv_source": "runtime_flex_zero",
+            "budget_pv_w": 0 if parts_known else None,
+            "budget_battery_w": 0 if parts_known else None,
+            "budget_pv_valid": parts_known,
+            "budget_pv_source": "runtime_flex_zero" if parts_known else str(budget.get("budget_pv_source") or "missing"),
             "continuation_only": bool(freshness.get("stale")),
             "stale": bool(freshness.get("stale")),
             "source": "stale_control_v2_continuation" if freshness.get("stale") else "fresh_control_v2",
@@ -3320,7 +3313,7 @@ from Wallbox.modes import (
 )
 from Wallbox.runtime_state import WallboxRuntimeState
 from market_economics import current_market_consumer_release
-from data_models import live_power_plausibility
+from data_models import LIVE_SAMPLE_MAX_AGE_S, live_power_plausibility
 
 
 WALLBOX_MANAGER_OWNER_LOCK_FILE = WALLBOX_MANAGER_LOCK_PATH
@@ -5131,7 +5124,7 @@ def _wbminsoc_floor_support_contract(
     restart_above_pct = None
     if effective_wb_mode == 4:
         wbminsoc_gate_open = bool(wbmin_mode4_gate_open)
-    elif effective_wb_mode in (9, 10, 11):
+    elif effective_wb_mode in (9, 10, 11) and battery_soc is not None:
         restart_above_pct = wb_soc_hyst_pct
         if effective_wb_mode in (9, 10) and not effective_allow_grid:
             restart_above_pct = max(
@@ -5240,9 +5233,8 @@ def _wallbox_wbminsoc_hold_zone_frame(
     Der Storage Manager veröffentlicht im Wallbox-Rahmen den Vertrag
     ``wallbox_wbminsoc_hold_zone``. Ist er aktiv (Band einschließlich der
     Untergrenze), regelt die Wallbox im veröffentlichten Rahmen – dem
-    batterieneutralen PV-Rahmen bzw. während einer Überbrückung aus dem
-    Wolkenkontingent der gehaltenen Leistung (``budget_w``, ältere Stände
-    ``hold_frame_w``) – und rechnet kein eigenes Budget. Gebunden an einen
+    batterieneutralen PV-Rahmen (``budget_w``) – und rechnet kein eigenes
+    Budget. Gebunden an einen
     frischen, gültigen Rahmen (``budget_valid``, ``ts`` höchstens
     ``max_age_s`` alt, soweit veröffentlicht), den Regelpfad
     ``PV + Akku bis Untergrenze`` (bzw. denselben Pfad in
@@ -5259,12 +5251,9 @@ def _wallbox_wbminsoc_hold_zone_frame(
         "active": False,
         "reason": "",
         "frame_w": None,
-        "bridging": False,
         "storage_reason": str(zone.get("reason") or ""),
     }
-    frame_w = _wallbox_live_finite(
-        zone.get("budget_w") if "budget_w" in zone else zone.get("hold_frame_w")
-    )
+    frame_w = _wallbox_live_finite(zone.get("budget_w"))
     zone_ts = _wallbox_live_finite(zone.get("ts"))
     zone_max_age = _wallbox_live_finite(zone.get("max_age_s"))
     now_value = _wallbox_live_finite(now_ts)
@@ -5306,7 +5295,6 @@ def _wallbox_wbminsoc_hold_zone_frame(
             "active": True,
             "reason": str(zone.get("reason") or "hold_zone"),
             "frame_w": round(frame_w, 1),
-            "bridging": bool(zone.get("bridging") is True),
         })
     return result
 
@@ -5404,13 +5392,11 @@ def _wallbox_idle_pv_balance_contract(
     if any(value is None for value in (grid, battery, sample_ts, sample_elapsed, reserve, now, age_limit)):
         result["reason"] = "non_finite_input"
         return result
-    # _ts markiert das Ende der RSCP-Abfragen. Auch die Sammeldauer zählt
-    # deshalb zum konservativen Alter der ältesten Messung im Frame.
     if (
         sample_ts <= 0.0
         or sample_elapsed < 0.0
         or now < sample_ts
-        or now - sample_ts + sample_elapsed > max(0.0, age_limit)
+        or now - sample_ts > max(0.0, age_limit)
     ):
         result["reason"] = "live_sample_stale"
         return result
@@ -15707,12 +15693,43 @@ def _abort_openwb_pro_phase_transition_before_output(
     cfg = config if isinstance(config, dict) else {}
     phase = _valid_phase_count(st.get("phases_target"), 0)
     current = _fresh_wallbox_reported_current_amp(st)
-    if status is not None and not (
+    reservation = box.get("_wallbox_phase_transition_reservation") or {}
+    evidence_data = box
+    if reason == "mode_off":
+        intent = box.get("_openwb_pro_phase_output_intent") or {}
+        ack = box.get("_openwb_pro_phase_output_ack") or {}
+        reservation_id = str(reservation.get("transition_id") or reservation.get("reservation_id") or "")
+        if (reservation_id
+                and intent.get("schema") == "openwb_pro_phase_output_intent_v1"
+                and intent.get("action") == "send_zero"
+                and intent.get("method") == "set_amp_and_state"
+                and intent.get("transition_id") == reservation_id
+                and str(intent.get("intent_id") or "").startswith(reservation_id + ":send_zero:")
+                and ack.get("schema") == "openwb_pro_phase_output_ack_v1"
+                and ack.get("intent_id") == intent.get("intent_id")
+                and ack.get("success") is True):
+            # Der quittierte Nullstromschritt ist kein gesendetes Phasenziel.
+            # Unquittierte Ausgänge und Recovery bleiben im vorhandenen Beleg.
+            evidence_data = dict(box)
+            evidence_data.pop("_openwb_pro_phase_output_intent", None)
+            evidence_data.pop("_openwb_pro_phase_output_ack", None)
+    evidence = _phase_transition_preoutput_evidence(evidence_data, reservation)
+    user_off_preoutput = bool(
+        reason == "mode_off"
+        and _cfg_float(box.get("_openwb_pro_phase_sequence_phase_sent_ts"), 0.0) <= 0.0
+        and str(reservation.get("stage") or "") in ("await_budget", "ramp_to_zero", "zero_settle")
+        and not any(evidence.get(key) for key in (
+            "output_intent_bound", "output_ack_bound", "recovery_hold_bound"))
+    )
+    if reason == "mode_off" and not user_off_preoutput:
+        return False
+    readback_confirmed = bool(
         phase in (1, 3) and current is not None
         and openwb_pro_session.phase_target_readback_confirmed(st, phase)
         and _wallbox_status_fresh_at(st, now_ts=now_ts, max_age_s=15)
         and st.get("cp_interrupt_isactive") in (False, 0)
-    ):
+    )
+    if status is not None and not readback_confirmed and not user_off_preoutput:
         return False
     keys = tuple(_OPENWB_PRO_DISCONNECTED_PHASE_TERMINAL_KEYS) + (
         "_simple_core_state", "current_set_amp", "_last_openwb_hold_amp",
@@ -15728,10 +15745,22 @@ def _abort_openwb_pro_phase_transition_before_output(
     if status is not None and intent_preimage.get("valid") is not True:
         return False
     for key in _OPENWB_PRO_DISCONNECTED_PHASE_TERMINAL_KEYS:
+        if user_off_preoutput and not readback_confirmed and key in (
+            "_openwb_pro_phase_change_block_until", "_last_phase_switch_ts"):
+            continue
         box.pop(key, None)
     box.pop("_openwb_pro_failed_phase_target_candidate", None)
     openwb_pro_session.clear_phase_wait(box)
-    if status is not None:
+    if user_off_preoutput and not readback_confirmed:
+        # Nur die lokale Absicht entfällt. Alte Strom-/Startphasenmerker
+        # dürfen nach dem 0-A-Schritt keinen Wiederanlauf vorgeben.
+        for key in ("current_set_amp", "_last_openwb_hold_amp", "_openwb_pro_start_phase_target"):
+            box.pop(key, None)
+        core = deepcopy(box.get("_simple_core_state") or {})
+        for key in ("reserve_phases", "phase_target", "phase_since", "last_tick"):
+            core.pop(key, None)
+        box["_simple_core_state"] = core
+    elif status is not None:
         box["current_set_amp"] = current
         box["_last_openwb_hold_amp"] = current
         box["_openwb_pro_start_phase_target"] = phase
@@ -22453,14 +22482,14 @@ def _apply_wallbox_measurement_gap_protection(box, live, config, *, now_ts):
         # Native Stopps sind Toggle-Flanken und behalten ihren bisherigen Ladebeleg.
         return
     snapshot = live if isinstance(live, dict) else {}
-    stamp = _cfg_float(snapshot.get("_ts", snapshot.get("ts")), 0.0)
-    if not (stamp > 0 and 0 <= now_ts-stamp <= 15 and snapshot.get("Grid_Power_Valid") is not False):
+    stamp = _cfg_float(snapshot.get("_ts"), 0.0)
+    if not (stamp > 0 and 0 <= now_ts-stamp <= LIVE_SAMPLE_MAX_AGE_S ):
         return
     grid_w = _wallbox_live_finite(snapshot.get("Grid_Power"))
     reason = ""
-    if snapshot.get("Notstrom_Status") in (1, 2):
+    if snapshot.get("ems_emergency_power_status_valid") is True and snapshot.get("ems_emergency_power_status") in (1, 4):
         reason = "emergency_power_measurement_gap"
-    elif grid_w is not None and _wallbox_grid_import_settle_hard_limit(config, snapshot, grid_w) == "house_connection_limit":
+    elif snapshot.get("Grid_Power_Valid") is not False and grid_w is not None and _wallbox_grid_import_settle_hard_limit(config, snapshot, grid_w) == "house_connection_limit":
         reason = "house_connection_measurement_gap"
     if not reason:
         box.pop("_measurement_gap_protection", None)
@@ -26691,8 +26720,7 @@ def _wallbox_fine_regulation_diagnostics(box, status, live, *, now_ts, valid, di
     previous = box.get("_fine_regulation_diagnostics") or {}
     sample = _wallbox_live_finite(live.get("_ts", live.get("ts")))
     grid = _wallbox_live_finite(live.get("Grid_Power"))
-    source_valid = bool(valid and sample is not None and grid is not None
-                        and 0 <= now_ts - sample <= 15.0)
+    source_valid = bool(valid and sample is not None and grid is not None)
     offered = _fresh_wallbox_reported_current_amp(status)
     phases = int(status.get("phases_target") or status.get("phase_effective_phases") or 0)
     offered_known = any(_wallbox_live_finite(status.get(key)) is not None
@@ -26818,7 +26846,9 @@ def _attach_openwb_pro_one_phase_diagnostics(wb_detail, c_data):
     hints = [(c_data.get("_simple_core_energy") or {}).get("phase_mapping_hint")]
     snapshot = c_data.get("_simple_core_input") or {}
     if snapshot.get("house_phase_source") == "phases_missing":
-        hints.append("Keine Phasenwerte vom E3DC-Leistungsmesser – Zuordnung des Wurzelzählers prüfen")
+        hints.append("Keine Phasenwerte vom E3DC-Leistungsmesser – Quelle: "
+                     + str(snapshot.get("grid_pm_source") or "unbekannt")
+                     + ". Im Config-Editor die Zuordnung unter „Wurzelzähler / PM-Index“ prüfen. Eine Änderung wirkt nach einem Neustart des Live-Dienstes.")
     live = (c_data.get("_openwb_pro_one_phase_output_context") or {}).get("live") or {}
     if _grid_pm_hint_due(live):
         hints.append("Netzwert und Phasenwerte des Leistungsmessers weichen seit mindestens 5 Minuten ab – Zuordnung des Wurzelzählers prüfen")
@@ -33145,8 +33175,34 @@ def _openwb_pro_start_window_deckel_amp(c_data, config, c_id, charger_max_amp, p
     return float(deckel)
 
 
+def _wallbox_running_minimum_reduction(box, cmd, *, c_id=None):
+    """Frisch gemessene laufende Ladung darf ohne Haltebindung auf Mindeststrom sinken."""
+    snapshot = box.get("_simple_core_input") or {}
+    power = simple_core.number(snapshot.get("power_w"))
+    minimum = simple_core.number(snapshot.get("min_amp"))
+    requested = simple_core.number(cmd.get("amp"))
+    phases = snapshot.get("phases")
+    if not (box.get("_simple_core_enabled") and cmd.get("reason") == "simple_core_current"
+            and cmd.get("method") in _EFFECTIVE_CURRENT_METHODS and cmd.get("force_state") is None
+            and snapshot.get("status_valid") is True and snapshot.get("charging") is True
+            and power is not None and power > 250 and phases in (1, 2, 3)
+            and minimum is not None and minimum >= 6 and requested == minimum):
+        return None
+    # Der Angebotsreadback bleibt maßgeblich, wo der Treiber ihn liefert.
+    observed = _fresh_wallbox_reported_current_amp(box.get("_status_current") or {})
+    if observed is None:
+        observed = power / (230 * phases)
+    if requested >= observed:
+        return None
+    return dict(schema=openwb_pro_session.MINIMUM_HOLD_REDUCTION_SCHEMA,
+        active=True, wb_id=int(c_id if c_id is not None else box.get("id", 0)),
+        cycle_token=box.get("_wallbox_cycle_token"),
+        plug_session_id=_wallbox_group_deficit_current_session_id(box),
+        target_amp=requested, observed_amp=observed, min_amp=minimum)
+
+
 def _wallbox_minimum_hold_reduction_authority_matches(c_data, command, *, c_id=None):
-    """Erlaubt ausschließlich die exakt gebundene Absenkung auf den Mindeststrom.
+    """Erlaubt ausschließlich die Absenkung einer laufenden Ladung auf Mindeststrom.
 
     Typisierte Ausnahme für Effektivstrom-, Allokations- und Watt-Gate: nur der
     im selben Zyklus vom Startfenster (charging_confirmed, Nullbudget, bestätigte
@@ -33160,11 +33216,7 @@ def _wallbox_minimum_hold_reduction_authority_matches(c_data, command, *, c_id=N
     if method not in _EFFECTIVE_CURRENT_METHODS:
         return False
     if box.get("_simple_core_enabled") and cmd.get("reason") == "simple_core_current":
-        hold_amp = _multi_allocation_running_minimum_hold_amp(box)
-        requested = simple_core.number(cmd.get("amp"))
-        observed = _fresh_wallbox_reported_current_amp(box.get("_status_current") or {})
-        return bool(cmd.get("force_state") is None and hold_amp >= 6
-            and requested == hold_amp and observed is not None and requested < observed)
+        return bool(_wallbox_running_minimum_reduction(box, cmd, c_id=c_id))
     if str(cmd.get("reason") or "") != openwb_pro_session.MINIMUM_HOLD_REDUCTION_REASON:
         return False
     if cmd.get("force_state") is not None or str(cmd.get("kind") or "") == "stop":
@@ -42853,7 +42905,11 @@ def _refresh_openwb_secondary_heartbeat_if_due(
     c_id=None,
     status=None,
 ):
-    """Erneuere die Secondary-Lease nur mit frischem Ladepunktstatus."""
+    """Erneuere die Secondary-Lease nur mit frischem Ladepunktstatus.
+
+    Der Aufruf liegt hinter den Regel- und Schutzausgängen des Zyklus und
+    nutzt über die vorhandene Vergabe nur einen noch freien Ausgangsslot.
+    """
 
     data = c_data if isinstance(c_data, dict) else {}
     charger = data.get("charger")
@@ -43906,40 +43962,6 @@ def _native_e3dc_stop_latch_retry_due(
 
 
 
-def _house_fuse_phase_import_amp(live, grid_power_raw):
-    """Konservative Diagnose der höchsten Hausanschluss-Phasenlast."""
-    phase_imports = []
-    for key in ("grid_p1", "grid_p2", "grid_p3"):
-        try:
-            phase_w = float(live.get(key, 0.0) or 0.0)
-        except Exception:
-            phase_w = 0.0
-        if abs(phase_w) > 1.0:
-            phase_imports.append(max(0.0, phase_w) / 230.0)
-    if phase_imports:
-        return max(phase_imports)
-    # Ein Summenwert enthält keine Information über die Verteilung. Für eine
-    # Schutzdiagnose darf er deshalb nicht still durch drei geteilt werden.
-    return max(0.0, float(grid_power_raw or 0.0)) / 230.0
-
-
-def _house_fuse_phase_active_import_vector(live):
-    """Diagnose-Wirkleistungs-Vektor in Ampere (P/230V); kein RMS-Freigabewert."""
-    data = live if isinstance(live, dict) else {}
-    if data.get("RSCP_Sample_Valid") is False:
-        return None
-    values = []
-    try:
-        for key in ("grid_p1", "grid_p2", "grid_p3"):
-            value = float(data.get(key, 0.0) or 0.0)
-            if not math.isfinite(value):
-                return None
-            values.append(max(0.0, value) / 230.0)
-    except (TypeError, ValueError):
-        return None
-    return values
-
-
 def _wallbox_phase_rotation(config, charger_id, phases=None):
     """Binde die lokale Wallboxphase an die PCC-Phasen, falls konfiguriert."""
 
@@ -44063,7 +44085,7 @@ def _pcc_phase_import_vector(live, *, live_age_s=None, now_ts=None):
         age = (now - ts) if ts > 0.0 else None
     else:
         age = _cfg_float(live_age_s, float("inf"))
-    fresh = bool(ts > 0.0 and age is not None and math.isfinite(age) and age <= 10.0)
+    fresh = bool(ts > 0.0 and age is not None and math.isfinite(age) and 0 <= age <= LIVE_SAMPLE_MAX_AGE_S)
     pm_available = lv.get("Grid_PM_Available", lv.get("grid_pm_available"))
     pm_available = True if pm_available is None else bool(pm_available)
     pvi_observed = _cfg_float(lv.get("pvi_ac_observed_at_s"), 0.0)
@@ -44131,6 +44153,8 @@ def _d1_corridor_charge_available(budget, live, now_ts):
 def _wallbox_grid_power_for_budget(live, grid_power_raw=0.0, acute_import_override_w=3500.0):
     """Gedämpftes Netzsignal für Budgetpfade, Rohwert bei akuter Netzlast."""
     try:
+        if isinstance(live, dict) and (_wallbox_live_finite(live.get("Grid_Power")) is None or live.get("Grid_Power_Valid") is False):
+            return 0.0
         raw = float(grid_power_raw or 0.0)
     except (TypeError, ValueError):
         raw = 0.0
@@ -44195,7 +44219,7 @@ def _simple_core_measured_local_a(box, status, power_factor_margin=0.9):
 
 
 def _simple_core_house_phase_limits(config, live, grid_power_w, boxes, statuses, house_state=None,
-        *, live_snapshot_fresh=None, live_sample_invalid=None):
+        *, live_snapshot_fresh=None, live_sample_invalid=None, grid_charge_phase_budget=None):
     """Vorhandene harte PCC-Grenze als elektrischer Zuteilerrahmen.
 
     Nur die Phasenwerte des E3DC bestimmen den Hausrahmen. Fehlen gültige
@@ -44230,8 +44254,7 @@ def _simple_core_house_phase_limits(config, live, grid_power_w, boxes, statuses,
     meter_stamp = simple_core.number(live.get("_ts"))
     if live_snapshot_fresh is None:
         age = max(0.0, time.time()-meter_stamp) if meter_stamp is not None and meter_stamp > 0 else math.inf
-        live_snapshot_fresh = age <= max(5.0,
-            min(60.0, _cfg_float(config.get("wallbox_live_stale_guard_s"), 20.0)))
+        live_snapshot_fresh = age <= LIVE_SAMPLE_MAX_AGE_S
     if live_sample_invalid is None:
         live_sample_invalid = not bool(live_power_plausibility(live).get("sample_valid", True))
     phases_valid = bool(meter_stamp is not None and meter_stamp > 0
@@ -44245,11 +44268,16 @@ def _simple_core_house_phase_limits(config, live, grid_power_w, boxes, statuses,
             return limits
         return tuple(max(0.0, min(limit, maximum-max(0.0, house)))
             for limit, maximum, house in zip(limits, grid_max, held))
+    # Der Auftrag ersetzt nur den im PM enthaltenen Akku-Istanteil.
+    replacement = grid_charge_phase_replacement_w(live, grid_charge_phase_budget, time.time())
+    raw = [watts + extra for watts, extra in zip(raw, replacement)]
+    measured_parts = [0.0, 0.0, 0.0]
     box_parts = [0.0, 0.0, 0.0]
     all_acknowledged = [True, True, True]
     unknown_parts = 0.0
     acknowledgement = {}
     wall_now, mono_now = time.time(), time.monotonic()
+    measurement_stamp = wall_now
     for box in boxes:
         watts = simple_core.measured_grid_power([box])
         phases = box.get("phases")
@@ -44289,6 +44317,10 @@ def _simple_core_house_phase_limits(config, live, grid_power_w, boxes, statuses,
             projected = wallbox_phase_balancing.rotate_local_to_pcc(local_w, rotation)
         state = box.get("core_state") or {}
         stamp = simple_core.number(status.get("native_status_sample_ts", status.get("driver_status_last_ok_ts")))
+        if (not box.get("observe_only") and box.get("status_valid") is True
+                and stamp is not None and 0 <= wall_now - stamp <= LIVE_SAMPLE_MAX_AGE_S):
+            measured_parts = [a + b for a, b in zip(measured_parts, projected)]
+            measurement_stamp = min(measurement_stamp, stamp)
         sample_mono = mono_now-(wall_now-stamp) if stamp is not None else None
         acknowledged = simple_core.acknowledge_measurement(state, local, sample_mono, mono_now)
         acknowledgement[box["id"]] = dict(acknowledged=acknowledged,
@@ -44312,6 +44344,7 @@ def _simple_core_house_phase_limits(config, live, grid_power_w, boxes, statuses,
             if (not acknowledged or not meter_after_ack) and (projected[phase] > 0 or target[phase] > 0
                     or phase in (rotation[:phases] if rotation else range(3))):
                 all_acknowledged[phase] = False
+    house_state["managed_vehicle_phases"] = dict(ts=measurement_stamp, phase_w=measured_parts)
     house_state["acknowledgements"] = acknowledgement
     held = house_state.setdefault("house_a", [None, None, None])
     for phase in range(3):
@@ -44751,7 +44784,7 @@ def run():
             grid_max_amps = _parse_grid_max_amps(config.get("grid_max_amps"), 35.0)
             grid_wallbox_reserve_amps = _sfloat(config.get("grid_wallbox_reserve_amps"), 2.0)
             wb_min_lade_w = max(1380.0, _sfloat(config.get("wbminlade"), 1380))
-            live_fresh_guard_s = max(5.0, min(60.0, _sfloat(config.get("wallbox_live_stale_guard_s"), 20.0)))
+            live_fresh_guard_s = LIVE_SAMPLE_MAX_AGE_S
             _wb_native_mode_raw = int(_sfloat(config.get("wb_native_mode"), 0))
             wb_dist_mode = normalize_distribution_mode(_wb_native_mode_raw)
             wb_legacy_global_mode = normalize_wb_mode(_wb_native_mode_raw) if _wb_native_mode_raw > 2 else MODE_OFF
@@ -45223,8 +45256,6 @@ def run():
                         wb_max_amp = _wallbox_global_max_amp(dyn_config, wb_global_max_amp)
                         if "grid_max_amps" in dyn_config: grid_max_amps = _parse_grid_max_amps(dyn_config.get("grid_max_amps"), 35.0)
                         if "grid_wallbox_reserve_amps" in dyn_config: grid_wallbox_reserve_amps = _sfloat(dyn_config.get("grid_wallbox_reserve_amps"), 2.0)
-                        if "wallbox_live_stale_guard_s" in dyn_config:
-                            live_fresh_guard_s = max(5.0, min(60.0, _sfloat(dyn_config.get("wallbox_live_stale_guard_s"), 20.0)))
                         if "wbminlade" in dyn_config:
                             wb_min_lade_w = float(dyn_config.get("wbminlade", 1380))
                             if wb_min_lade_w < 1380: wb_min_lade_w = 1380
@@ -46357,10 +46388,16 @@ def run():
                     # SOC-Abstand zur Ladekurve (Fuzzy) + StoragePlan free_for_limbs_w.
                     # ================================================================
                     def get_float(d, key, default=0.0):
-                        v = d.get(key, default)
-                        if v is None: return default
-                        try: return float(v)
-                        except: return default
+                        if key in ("SOC", "PV_Power", "Battery_Power", "Grid_Power", "Home_Power", "Ext_PV_Power"):
+                            value = _wallbox_live_finite(d.get(key))
+                            if d.get(key + "_Valid") is False or (key == "SOC" and value is not None and not 0 <= value <= 100):
+                                return None
+                            return value
+                        try:
+                            val = d.get(key, default)
+                            return float(val) if val is not None else default
+                        except (TypeError, ValueError):
+                            return default
 
                     def read_recent_json(path, max_age_s=20.0):
                         try:
@@ -46374,7 +46411,8 @@ def run():
                         except Exception:
                             return {}
 
-                    grid_power_raw    = get_float(live, "Grid_Power")
+                    grid_power_measured = get_float(live, "Grid_Power")
+                    grid_power_raw = grid_power_measured if grid_power_measured is not None else 0.0
                     try:
                         grid_raw_override_w = max(0.0, float(config.get("wb_grid_raw_override_w", 3500) or 3500))
                     except (TypeError, ValueError):
@@ -46833,104 +46871,6 @@ def run():
                             or _budget.get("storage_state") == "wallbox_predump_floor_hold"
                         )
                     )
-                    e3dc_wb_discharge_bat_until_soc = _validated_native_wallbox_floor_soc(live)
-                    effective_wb_floor_soc = _effective_wallbox_floor_soc(
-                        config,
-                        live,
-                        wb_minsoc_cfg,
-                    )
-                    emergency_wb_floor_soc = effective_ep_reserve_pct(config, live)
-                    e3dc_wb_floor_clamp_active = bool(
-                        e3dc_wb_discharge_bat_until_soc is not None
-                        and e3dc_wb_discharge_bat_until_soc > wb_minsoc_cfg + 0.05
-                    )
-                    emergency_wb_floor_clamp_active = bool(
-                        emergency_wb_floor_soc > wb_minsoc_cfg + 0.05
-                    )
-                    _effective_floor_sources = []
-                    if (
-                        e3dc_wb_floor_clamp_active
-                        and abs(
-                            float(e3dc_wb_discharge_bat_until_soc)
-                            - float(effective_wb_floor_soc)
-                        ) <= 0.05
-                    ):
-                        _effective_floor_sources.append("e3dc_wallbox")
-                    if (
-                        emergency_wb_floor_clamp_active
-                        and abs(
-                            float(emergency_wb_floor_soc)
-                            - float(effective_wb_floor_soc)
-                        ) <= 0.05
-                    ):
-                        _effective_floor_sources.append("emergency_reserve")
-                    wbminsoc_floor_source = (
-                        "multiple_hard_floors"
-                        if len(_effective_floor_sources) > 1
-                        else _effective_floor_sources[0]
-                        if _effective_floor_sources
-                        else "config"
-                    )
-                    wbminsoc_runtime_change = runtime.bind_configured_wbminsoc(
-                        wb_minsoc_cfg
-                    )
-                    wbminsoc_floor_raised_this_cycle = bool(
-                        wbminsoc_runtime_change.get("raised") is True
-                        and battery_soc <= effective_wb_floor_soc + 0.05
-                    )
-                    if wbminsoc_floor_raised_this_cycle:
-                        _raise_status_by_id = {
-                            int(_item.get("id", 0) or 0): _item.get("status")
-                            for _item in valid_chargers_status
-                        }
-                        for _raise_box in chargers:
-                            _raise_id = int(_raise_box.get("id", 0) or 0)
-                            _raise_status = _raise_status_by_id.get(_raise_id)
-                            if (
-                                _wb_status_real_charging(_raise_status)
-                                or int(_raise_box.get("current_set_amp", 0) or 0) > 0
-                                or _wb_status_real_power(_raise_status) > 250.0
-                            ):
-                                # Eine weitere Grenzanhebung während derselben
-                                # noch offenen Stop-Episode darf die bereits
-                                # gesendete native Togglekante nicht erneut
-                                # scharfstellen.
-                                _begin_wbminsoc_runtime_raise_episode(
-                                    _raise_box
-                                )
-                    wbminsoc_floor_raise_guard_active = False
-                    target_wbminsoc_floor_closed_active = False
-                    _curve_support = {}
-                    _wbminsoc_floor_support = {}
-                    _wbminsoc_hold_zone_frame = {}
-                    wbminsoc_floor_note = ""
-                    if wbminsoc_floor_source == "e3dc_wallbox":
-                        wbminsoc_floor_note = (
-                            "E3DC-Untergrenze %.1f%% hebt lokale Wallbox-Reserve %.1f%% "
-                            "auf wirksam %.1f%% an."
-                        ) % (
-                            float(e3dc_wb_discharge_bat_until_soc),
-                            float(wb_minsoc_cfg),
-                            float(effective_wb_floor_soc),
-                        )
-                    elif wbminsoc_floor_source == "emergency_reserve":
-                        wbminsoc_floor_note = (
-                            "Notstromreserve %.1f%% begrenzt die lokale Wallbox-Reserve "
-                            "%.1f%% auf wirksam %.1f%%."
-                        ) % (
-                            float(emergency_wb_floor_soc),
-                            float(wb_minsoc_cfg),
-                            float(effective_wb_floor_soc),
-                        )
-                    elif wbminsoc_floor_source == "multiple_hard_floors":
-                        wbminsoc_floor_note = (
-                            "E3DC-Untergrenze und Notstromreserve begrenzen die lokale "
-                            "Wallbox-Reserve %.1f%% auf wirksam %.1f%%."
-                        ) % (
-                            float(wb_minsoc_cfg),
-                            float(effective_wb_floor_soc),
-                        )
-
                     # Budget-Timeout-Reaktion: bei STALE auf 6A drosseln, bei TIMEOUT stoppen.
                     # Wichtig: Der PV-Fallback weiter unten darf STALE/TIMEOUT nicht wieder auffuellen.
                     if _price_boost_budget_override:
@@ -47022,6 +46962,7 @@ def run():
                         execution_evidence_valid=bool(
                             _budget_ok
                             and not _budget_live_sample_invalid
+                            and predump_wallbox_requested_active
                         ),
                     )
 
@@ -47035,6 +46976,9 @@ def run():
                     # Wallbox-Budget werden.
                     if (
                         free_for_limbs_w <= 0
+                        and pv_power_raw is not None
+                        and get_float(live, "Home_Power") is not None
+                        and battery_power_raw is not None
                         and grid_power_budget_w < -200
                         and not (_budget_stale or _budget_timeout)
                         and not storage_grid_hold_active
@@ -47066,7 +47010,7 @@ def run():
                     except Exception: pass
 
                     # delta: positiv = SOC ueber Kurve (gut), negativ = SOC unter Kurve
-                    delta = (battery_soc - soll_soc_now) if soll_soc_now is not None else 0.0
+                    delta = (battery_soc - soll_soc_now) if battery_soc is not None and soll_soc_now is not None else 0.0
 
                     # --- EcoScore lesen (fuer Modus 5) ---
                     eco_score_now = 0.0
@@ -47234,6 +47178,124 @@ def run():
                         # Pre-Dump-Freigabe: lokale Verbraucher vor Netzeinspeisung.
                         # Fachlich entspricht das Mode 10: PV+Speicher, aber kein Netz.
                         effective_wb_mode = max(effective_wb_mode, 10)
+                    # Derselbe wirksame Pre-Dump wie bei der Moduserhöhung:
+                    # nur den Eingang des vorhandenen wbminSoC-Tors ersetzen.
+                    # Nutzerwert und Anhebungserkennung bleiben unverändert.
+                    predump_wallbox_floor_soc = None
+                    if (predump_wallbox_active and predump_wallbox_gate_open and predump_charger_ids
+                            and _truthy_config(config.get("predump_enable", 1))):
+                        for _pd_floor_value in (_budget.get("predump_floor_soc"),
+                                                _budget.get("predump_target_soc")):
+                            _pd_floor_value = simple_core.number(_pd_floor_value)
+                            if _pd_floor_value is not None and 0.0 <= _pd_floor_value <= 100.0:
+                                predump_wallbox_floor_soc = _pd_floor_value
+                                break
+                    _wb_floor_input_soc = (wb_minsoc_cfg if predump_wallbox_floor_soc is None
+                                          else predump_wallbox_floor_soc)
+                    e3dc_wb_discharge_bat_until_soc = _validated_native_wallbox_floor_soc(live)
+                    effective_wb_floor_soc = _effective_wallbox_floor_soc(
+                        config,
+                        live,
+                        _wb_floor_input_soc,
+                    )
+                    emergency_wb_floor_soc = effective_ep_reserve_pct(config, live)
+                    e3dc_wb_floor_clamp_active = bool(
+                        e3dc_wb_discharge_bat_until_soc is not None
+                        and e3dc_wb_discharge_bat_until_soc > _wb_floor_input_soc + 0.05
+                    )
+                    emergency_wb_floor_clamp_active = bool(
+                        emergency_wb_floor_soc > _wb_floor_input_soc + 0.05
+                    )
+                    _effective_floor_sources = []
+                    if (
+                        e3dc_wb_floor_clamp_active
+                        and abs(
+                            float(e3dc_wb_discharge_bat_until_soc)
+                            - float(effective_wb_floor_soc)
+                        ) <= 0.05
+                    ):
+                        _effective_floor_sources.append("e3dc_wallbox")
+                    if (
+                        emergency_wb_floor_clamp_active
+                        and abs(
+                            float(emergency_wb_floor_soc)
+                            - float(effective_wb_floor_soc)
+                        ) <= 0.05
+                    ):
+                        _effective_floor_sources.append("emergency_reserve")
+                    wbminsoc_floor_source = (
+                        "multiple_hard_floors"
+                        if len(_effective_floor_sources) > 1
+                        else _effective_floor_sources[0]
+                        if _effective_floor_sources
+                        else "predump" if predump_wallbox_floor_soc is not None else "config"
+                    )
+                    wbminsoc_runtime_change = runtime.bind_configured_wbminsoc(
+                        wb_minsoc_cfg
+                    )
+                    wbminsoc_floor_raised_this_cycle = bool(
+                        wbminsoc_runtime_change.get("raised") is True
+                        and battery_soc is not None
+                        and battery_soc <= effective_wb_floor_soc + 0.05
+                    )
+                    if wbminsoc_floor_raised_this_cycle:
+                        _raise_status_by_id = {
+                            int(_item.get("id", 0) or 0): _item.get("status")
+                            for _item in valid_chargers_status
+                        }
+                        for _raise_box in chargers:
+                            _raise_id = int(_raise_box.get("id", 0) or 0)
+                            _raise_status = _raise_status_by_id.get(_raise_id)
+                            if (
+                                _wb_status_real_charging(_raise_status)
+                                or int(_raise_box.get("current_set_amp", 0) or 0) > 0
+                                or _wb_status_real_power(_raise_status) > 250.0
+                            ):
+                                # Eine weitere Grenzanhebung während derselben
+                                # noch offenen Stop-Episode darf die bereits
+                                # gesendete native Togglekante nicht erneut
+                                # scharfstellen.
+                                _begin_wbminsoc_runtime_raise_episode(
+                                    _raise_box
+                                )
+                    wbminsoc_floor_raise_guard_active = False
+                    target_wbminsoc_floor_closed_active = False
+                    _curve_support = {}
+                    _wbminsoc_floor_support = {}
+                    _wbminsoc_hold_zone_frame = {}
+                    wbminsoc_floor_note = ""
+                    if predump_wallbox_floor_soc is not None:
+                        wbminsoc_floor_note = (
+                            "Pre-Dump: Boden %.1f%% statt wbminSoC %.1f%%; "
+                            "mit Notstromreserve und E3DC-Untergrenze wirksam %.1f%%."
+                        ) % (predump_wallbox_floor_soc, wb_minsoc_cfg, effective_wb_floor_soc)
+                    elif wbminsoc_floor_source == "e3dc_wallbox":
+                        wbminsoc_floor_note = (
+                            "E3DC-Untergrenze %.1f%% hebt lokale Wallbox-Reserve %.1f%% "
+                            "auf wirksam %.1f%% an."
+                        ) % (
+                            float(e3dc_wb_discharge_bat_until_soc),
+                            float(wb_minsoc_cfg),
+                            float(effective_wb_floor_soc),
+                        )
+                    elif wbminsoc_floor_source == "emergency_reserve":
+                        wbminsoc_floor_note = (
+                            "Notstromreserve %.1f%% begrenzt die lokale Wallbox-Reserve "
+                            "%.1f%% auf wirksam %.1f%%."
+                        ) % (
+                            float(emergency_wb_floor_soc),
+                            float(wb_minsoc_cfg),
+                            float(effective_wb_floor_soc),
+                        )
+                    elif wbminsoc_floor_source == "multiple_hard_floors":
+                        wbminsoc_floor_note = (
+                            "E3DC-Untergrenze und Notstromreserve begrenzen die lokale "
+                            "Wallbox-Reserve %.1f%% auf wirksam %.1f%%."
+                        ) % (
+                            float(wb_minsoc_cfg),
+                            float(effective_wb_floor_soc),
+                        )
+
                     curve_wb_relief_active = bool(
                         _budget_ok
                         and bool(_budget.get("curve_wb_relief"))
@@ -47246,49 +47308,6 @@ def run():
 
                     def hysteresis_gate(name, value, start_at, stop_at, default_open=False):
                         return runtime.hysteresis_gate(name, value, start_at, stop_at, default_open)
-
-                    predump_wallbox_floor_soc = 0.0
-                    predump_wallbox_floor_gate_open = True
-                    predump_wallbox_floor_block = False
-                    try:
-                        _pd_floor_raw = float(_budget.get(
-                            "predump_floor_soc",
-                            _budget.get(
-                                "predump_target_soc",
-                                _plan.get(
-                                    "predump_min_soc",
-                                    config.get("storage_predump_min_soc", 0),
-                                ),
-                            ),
-                        ) or 0.0)
-                    except Exception:
-                        _pd_floor_raw = 0.0
-                    if (
-                        _pd_floor_raw > 0.0
-                        and _predump_has_candidate
-                        and predump_wallbox_candidate_active
-                        and _truthy_config(config.get("predump_enable", 1))
-                        and _truthy_config(config.get("predump_wallbox_enable", 0))
-                        and battery_soc is not None
-                    ):
-                        _pd_emergency_floor = effective_ep_reserve_pct(config, live)
-                        predump_wallbox_floor_soc = max(_pd_emergency_floor, _pd_floor_raw)
-                        _pd_floor_release_pct = max(
-                            1.0,
-                            _sf(config.get("predump_wallbox_floor_release_pct", 2.0), 2.0),
-                        )
-                        _pd_floor_stop_pct = max(
-                            0.0,
-                            _sf(config.get("predump_wallbox_floor_stop_pct", 0.0), 0.0),
-                        )
-                        predump_wallbox_floor_gate_open = hysteresis_gate(
-                            "predump_wallbox_floor",
-                            float(battery_soc) - predump_wallbox_floor_soc,
-                            _pd_floor_release_pct,
-                            _pd_floor_stop_pct,
-                            default_open=True,
-                        )
-                        predump_wallbox_floor_block = not predump_wallbox_floor_gate_open
 
                     # Gültige, frische und identitätsgebundene
                     # Storage-Zuteilung mit Consumer-Vertrag ist kurvenbewusst;
@@ -47418,10 +47437,6 @@ def run():
                     # als Quelle sehen, bleiben aber ebenfalls unter dem WR-Limit.
                     home_w_raw = get_float(live, "Home_Power", 0.0)
                     home_w_control = home_w_raw
-                    if not bool(live_plausibility.get("home_valid", True)):
-                        balance_home_w = float(live_plausibility.get("home_balance_w", 0.0) or 0.0)
-                        if balance_home_w > 0 and bool(live_plausibility.get("grid_valid", True)):
-                            home_w_control = balance_home_w
                     live_wb_w = get_float(live, "Wallbox_Power", 0.0)
                     home_w = home_w_control
                     # Frische Ladeleistung der Nicht-E3DC-
@@ -47432,11 +47447,11 @@ def run():
                     ui_state["home_external_wallbox_w"] = (None if any(
                         value is None for value in _external_share_by_id.values()) else round(external_share_w, 1))
                     ui_state["home_external_wallbox_stale"] = bool(external_share_stale)
-                    if external_share_w > 0.0:
+                    if external_share_w > 0.0 and home_w_control is not None:
                         home_w = max(0.0, home_w_control - external_share_w)
                     ui_state["home_external_wallbox_stale"] = bool(external_share_stale)
                     _bind_external_wallbox_share_hold(chargers, external_share_stale)
-                    bat_discharge_w  = max(0.0, -battery_power_raw)
+                    bat_discharge_w  = (max(0.0, -battery_power_raw) if battery_power_raw is not None else 0.0)
                     grid_reserve_w = max(0.0, _sf(config.get("wb_grid_reserve_w", 450), 450.0))
                     openwb_pro_export_sink_available = False
                     if (
@@ -47614,12 +47629,16 @@ def run():
                         filtered_available_w=pv_only_allowed_w,
                     )
                     pv_only_allowed_w = _budget_balance_diagnostic["available_w"]
-                    pv_surplus_ex_wb_w = max(0.0, pv_power_raw-home_w-grid_reserve_w)
+                    pv_surplus_ex_wb_w = (max(0.0, pv_power_raw-home_w-grid_reserve_w)
+                        if pv_power_raw is not None and home_w is not None else 0.0)
+                    if pv_power_raw is None or home_w is None:
+                        pv_only_allowed_w = _authorized_wallbox_budget_w if _fresh_wallbox_budget_authorized else 0.0
                     if _central_frame.get("active"):
                         pv_only_allowed_w = float(_central_frame.get("frame_w") or 0.0)
                         pv_surplus_ex_wb_w = pv_only_allowed_w
                     openwb_pro_curve_direct_start_min_w = 6.0 * 230.0
-                    bat_assist_allowed_w = max(0.0, pv_power_raw + bat_discharge_w - home_w - grid_reserve_w)
+                    bat_assist_allowed_w = (max(0.0, pv_power_raw + bat_discharge_w - home_w - grid_reserve_w)
+                        if pv_power_raw is not None and home_w is not None and battery_power_raw is not None else 0.0)
                     # Policy: Akkustützung nach Korridorlage,
                     # an der Untergrenze nur bis zum benannten Wh-Kontingent.
                     # wbminSoC-Tor, Akkustützung, Torfakten der Untergrenze und
@@ -47727,6 +47746,7 @@ def run():
                     )
                     wbminsoc_floor_raise_guard_active = bool(
                         not _runtime_wbminsoc_gate_open
+                        and battery_soc is not None
                         and battery_soc <= effective_wb_floor_soc + 0.05
                         and any(
                             bool(_cd.get("_wbminsoc_runtime_raise_pending"))
@@ -47775,6 +47795,8 @@ def run():
                     )
                     storage_curve_budget_active = bool(
                         _budget_ok
+                        and pv_power_raw is not None
+                        and home_w is not None
                         and (
                             wallbox_curve_reserve_w > 0
                             or _forecast_auto_storage_state in (
@@ -47957,10 +47979,10 @@ def run():
                         and target_wbminsoc_discharge_target_w > 0
                     )
                     if target_wbminsoc_discharge_pull_active:
-                        current_battery_discharge_w = max(0.0, -battery_power_raw)
+                        current_battery_discharge_w = (max(0.0, -battery_power_raw) if battery_power_raw is not None else 0.0)
                         target_wbminsoc_discharge_pull_w = max(
                             0.0,
-                            max(0.0, battery_power_raw)
+                            (max(0.0, battery_power_raw) if battery_power_raw is not None else 0.0)
                             + max(0.0, target_wbminsoc_discharge_target_w - current_battery_discharge_w),
                         )
                         if target_wbminsoc_discharge_pull_w > 0:
@@ -48012,7 +48034,7 @@ def run():
                         )
                     _wbminsoc_floor_support["curve_support"] = _curve_support
                     if forecast_auto_relief_active:
-                        if forecast_auto_battery_assist:
+                        if forecast_auto_battery_assist and pv_power_raw is not None and home_w is not None:
                             # Bei erreichbarer Prognose darf der E3DC im AUTO den
                             # Netzpunkt fuehren. Die Wallbox bekommt dann einen
                             # Gesamtdeckel aus PV plus maximaler Batterieentladung,
@@ -48033,8 +48055,8 @@ def run():
                         # gewichtete Speicherladeleistung. Dadurch bekommt die
                         # Wallbox Vorrang vor Speicherladung, ohne dass der
                         # Speicher mit harten wbminSoC-Schwellen blockiert.
-                        _eba_pv_ok = pv_power_raw > 100
-                        if wbminsoc_gate_open and _eba_pv_ok:
+                        _eba_pv_ok = pv_power_raw is not None and pv_power_raw > 100
+                        if wbminsoc_gate_open and _eba_pv_ok and battery_power_raw is not None:
                             _i_fc = float(_budget.get('iFc_w', 0.0) or 0.0)
                             _i_min = float(_budget.get('iMinLade_raw_w', _budget.get('iMinLade_w', 0.0)) or 0.0)
                             _i_min2 = float(_budget.get('iMinLade2_w', _i_min) or 0.0)
@@ -48054,8 +48076,8 @@ def run():
                             if eba_i_power_w > _eba_cap_w:
                                 eba_i_power_w = _eba_cap_w
                     elif effective_wb_mode in (9, 10, 11):
-                        _eba_pv_ok = (effective_wb_mode in (10, 11) or pv_power_raw > 100)
-                        if wbminsoc_gate_open and _eba_pv_ok and soc_diff_for_wb > 0:
+                        _eba_pv_ok = (effective_wb_mode in (10, 11) or (pv_power_raw is not None and pv_power_raw > 100))
+                        if wbminsoc_gate_open and _eba_pv_ok and soc_diff_for_wb > 0 and battery_power_raw is not None:
                             if effective_wb_mode in (10, 11):
                                 # PV + Akku bis Untergrenze ist Grundladung-stabil
                                 # ohne Grundladung: oberhalb der Floor-Hysterese
@@ -48084,7 +48106,7 @@ def run():
                             eba_cap_w = _eba_cap_base_w * _eba_cap_factor + battery_power_raw - grid_power_budget_w * 2.0
                             if eba_i_power_w > eba_cap_w:
                                 eba_i_power_w = eba_cap_w
-                    if effective_wb_mode in (4, 9, 10, 11):
+                    if effective_wb_mode in (4, 9, 10, 11) and battery_power_raw is not None:
                         for _c in chargers:
                             _prev_iaval = float(_c.get('iAvalPower', 0.0) or 0.0)
                             _prev_wb_w = float(_c.get('_eba_prev_wb_power_w', wb_actual_power) or 0.0)
@@ -48096,7 +48118,7 @@ def run():
                                 _new_iaval = _prev_iaval * 0.995 + eba_i_power_w * 0.025
                             else:
                                 _new_iaval = _prev_iaval * 0.8 + eba_i_power_w * 0.2
-                            if effective_wb_mode == 4 and pv_power_raw < 100 and _new_iaval > 0:
+                            if effective_wb_mode == 4 and (pv_power_raw is None or pv_power_raw < 100) and _new_iaval > 0:
                                 _new_iaval = 0.0
                             _cap_base_w = max_charge_w if effective_wb_mode == 4 else (
                                 wbminsoc_tapered_discharge_w
@@ -48246,7 +48268,6 @@ def run():
                             target_wbminsoc_low_power_recovery_active=target_wbminsoc_low_power_recovery_active,
                             target_wbminsoc_low_power_start_ready=target_wbminsoc_low_power_start_ready,
                             forecast_auto_battery_assist=forecast_auto_battery_assist,
-                            predump_wallbox_floor_block=predump_wallbox_floor_block,
                             target_wbminsoc_discharge_taper_limit_w=target_wbminsoc_discharge_taper_limit_w,
                             target_wbminsoc_low_power_min_w=target_wbminsoc_low_power_min_w,
                             target_wbminsoc_discharge_pull_limit_w=target_wbminsoc_discharge_pull_limit_w,
@@ -48298,9 +48319,6 @@ def run():
                                 _wbminsoc_hold_zone_frame.get("frame_w")
                                 if _wbminsoc_hold_zone_frame.get("active") is True
                                 else None
-                            ),
-                            wbminsoc_hold_zone_bridging=bool(
-                                _wbminsoc_hold_zone_frame.get("bridging") is True
                             ),
                         )
                     )
@@ -48589,7 +48607,7 @@ def run():
                         effective_wb_mode in (9, 10, 11)
                         and native_e3dc_connected
                         and wbminsoc_gate_open
-                        and (effective_wb_mode in (10, 11) or pv_power_raw > 100)
+                        and (effective_wb_mode in (10, 11) or (pv_power_raw is not None and pv_power_raw > 100))
                         and abs(native_e3dc_real_power_w) <= 500
                     )
                     if native_e3dc_start_without_power and cap_amp > 0:
@@ -48876,6 +48894,12 @@ def run():
                             _support = _budget.get("battery_support_authorized")
                             if _support is None:
                                 _support = (_curve_support or {}).get("authorized") is True
+                            _predump_support = bool(predump_wallbox_active and predump_wallbox_gate_open
+                                and _id in predump_charger_ids and predump_wallbox_floor_soc is not None
+                                and _budget.get("battery_support_authorized") is True)
+                            if _predump_support:
+                                _support = (_budget.get("battery_support_authorized")
+                                    if _budget_ok and _storage_wallbox_budget_contract.get("valid") is True else None)
                             _core_prepared_rows.append(dict(id=_id, mode=_mode, phases=_phases,
                                 status_valid=bool(_status.get("driver_status_valid") is True and not _status.get("driver_status_stale", True)),
                                 status_age_s=(time.time()-simple_core.number(_status.get("native_status_sample_ts", _status.get("driver_status_last_ok_ts"))))
@@ -48896,8 +48920,8 @@ def run():
                                 eligible=bool(not _unplug.get("disconnect_uncontested")
                                     and (_wb_status_connected(_status) or _wb_status_real_charging(_status))),
                                 unplug_offer=_box.get(_OPENWB_PRO_UNPLUG_OFFER_KEY) if _unplug.get("disconnect_uncontested") else None,
-                                soc_valid=(_wallbox_live_finite(live.get("SOC")) is not None
-                                    and 0 <= _wallbox_live_finite(live.get("SOC")) <= 100),
+                                soc_valid=battery_soc is not None,
+                                predump_active=_predump_support,
                                 floor_open=wbminsoc_gate_open, battery_support_authorized=_support,
                                 charging=_wb_status_real_charging(_status),
                                 curve_support=_curve_support,
@@ -48915,7 +48939,8 @@ def run():
                             _row["measured_amp"] = max(_local) if _local is not None else None
                         _core_house_limits = _simple_core_house_phase_limits(
                             config, live, grid_power_raw, _core_energy_boxes, _status_by_id, _core_house_state,
-                            live_snapshot_fresh=live_snapshot_fresh, live_sample_invalid=live_sample_invalid)
+                            live_snapshot_fresh=live_snapshot_fresh, live_sample_invalid=live_sample_invalid,
+                            grid_charge_phase_budget=_budget.get("grid_charge_phase_budget"))
                         _core_house_state.update(valid=_core_house_state.get("source") == "measured_phases")
                         _core_house_state.pop("error", None)
                     except Exception as _house_error:
@@ -50838,7 +50863,7 @@ def run():
                         }
 
                     # PV-Netto-Surplus fuer Dashboard
-                    pv_netto_surplus_w = max(0, int(-grid_power_budget_w + max(0, battery_power_raw))) if math.isfinite(grid_power_budget_w) and math.isfinite(battery_power_raw) else None
+                    pv_netto_surplus_w = max(0, int(-grid_power_budget_w + max(0, battery_power_raw))) if math.isfinite(grid_power_budget_w) and battery_power_raw is not None else None
                     made_changes = False
 
                     # --- UI-State befuellen ---
@@ -50928,11 +50953,11 @@ def run():
                     ui_state["wb_effective_budget_w"] = int(max(0.0, allowed_w))
                     ui_state["wb_effective_extra_w"] = int(max(0.0, allowed_w - max(0.0, wb_actual_power)))
                     ui_state["pv_surplus_w"]      = pv_netto_surplus_w
-                    ui_state["grid_w_raw"]        = round(grid_power_raw, 0) if math.isfinite(grid_power_raw) else None
+                    ui_state["grid_w_raw"]        = round(grid_power_measured, 0) if grid_power_measured is not None else None
                     ui_state["grid_w_budget"]     = round(grid_power_budget_w, 0) if math.isfinite(grid_power_budget_w) else None
                     ui_state["grid_w_filtered"]   = round(get_float(live, "Grid_Power_Filtered", grid_power_raw), 0) if math.isfinite(get_float(live, "Grid_Power_Filtered", grid_power_raw)) else None
-                    ui_state["grid_filter_active"] = bool(abs(grid_power_budget_w - grid_power_raw) > 1.0)
-                    ui_state["bat_w_raw"]         = round(battery_power_raw, 0) if math.isfinite(battery_power_raw) else None
+                    ui_state["grid_filter_active"] = bool(grid_power_measured is not None and abs(grid_power_budget_w - grid_power_measured) > 1.0)
+                    ui_state["bat_w_raw"]         = round(battery_power_raw, 0) if battery_power_raw is not None else None
                     ui_state["live_sample_valid"] = bool(live_plausibility.get("sample_valid", True))
                     ui_state["live_sample_invalid"] = bool(live_sample_invalid)
                     ui_state["home_power_valid"]  = bool(live_plausibility.get("home_valid", True))
@@ -51160,9 +51185,7 @@ def run():
                         predump_wallbox_active
                     )
                     ui_state["predump_wallbox_gate_open"] = bool(predump_wallbox_gate_open)
-                    ui_state["predump_wallbox_floor_soc"] = round(predump_wallbox_floor_soc, 1) if predump_wallbox_floor_soc > 0 else None
-                    ui_state["predump_wallbox_floor_gate_open"] = bool(predump_wallbox_floor_gate_open)
-                    ui_state["predump_wallbox_floor_block"] = bool(predump_wallbox_floor_block)
+                    ui_state["predump_wallbox_floor_soc"] = round(predump_wallbox_floor_soc, 1) if predump_wallbox_floor_soc is not None else None
                     # Wh-Kontingent an der Korridor-Untergrenze (Akkustützung nach Korridorlage) auch im Hauptpfad.
                     ui_state["curve_floor_support"] = {
                         "active": bool(
@@ -51388,7 +51411,7 @@ def run():
                         and startable_connected
                         and not manual_pause_blocks_storage_intent
                         and (wbminsoc_gate_open or effective_wb_mode == 11 or wb_floor_pv_start_ready)
-                        and (effective_wb_mode in (10, 11) or pv_power_raw > 100)
+                        and (effective_wb_mode in (10, 11) or (pv_power_raw is not None and pv_power_raw > 100))
                     )
                     wb_start_request_authorized = bool(
                         wb_start_requested
@@ -51705,6 +51728,8 @@ def run():
                             config, chargers, valid_chargers_status, wb_charge_mode,
                             manual_pause=wb_manual_pause, now_ts=intent_now,
                         ),
+                        "managed_vehicle_phases": (_core_house_state.get("managed_vehicle_phases")
+                            if _core_house_state.get("valid") is True else None),
                         "wallbox_storage_points": wallbox_storage_points,
                         "active": car_active_for_intent,
                         "battery_request": battery_request,
@@ -51852,9 +51877,7 @@ def run():
                             predump_wallbox_active
                         ),
                         "predump_wallbox_gate_open": bool(predump_wallbox_gate_open),
-                        "predump_wallbox_floor_soc": predump_wallbox_floor_soc if predump_wallbox_floor_soc > 0 else None,
-                        "predump_wallbox_floor_gate_open": bool(predump_wallbox_floor_gate_open),
-                        "predump_wallbox_floor_block": bool(predump_wallbox_floor_block),
+                        "predump_wallbox_floor_soc": predump_wallbox_floor_soc,
                         # Wh-Kontingent an der Korridor-Untergrenze (Akkustützung nach
                         # Korridorlage): Anzeige nur, solange die Wallbox unter der
                         # Untergrenze laedt und das Kontingent zaehlt bzw. aufgebraucht ist.
@@ -54226,13 +54249,6 @@ def run():
                         c_public_mode = normalize_wb_mode(c_mode)
                         c_public_label = mode_label(c_public_mode)
                         c_control_mode = controller_mode(c_public_mode, grid_allowed=local_grid_allowed)
-                        _refresh_openwb_secondary_heartbeat_if_due(
-                            c_data,
-                            c_public_mode,
-                            now_ts=now_ts,
-                            c_id=c_id,
-                            status=_loop_charger_status,
-                        )
                         if (
                             storage_charge_priority_active
                             and c_control_mode > 0
@@ -54674,6 +54690,7 @@ def run():
                                 "reservation_scale": _core_energy_row.get("reservation_scale"),
                                 "house_phase_a": _core_house_state.get("house_a"),
                                 "house_phase_source": _core_house_state.get("source"),
+                                "grid_pm_source": (live or {}).get("grid_pm_source"),
                                 "box_acknowledgements": _core_house_state.get("acknowledgements", {}),
                                 "current_acknowledged": (_core_house_state.get("acknowledgements", {}).get(c_id) or {}).get("acknowledged"),
                                 "share_w": _core_share,
@@ -54690,7 +54707,7 @@ def run():
                                         or (_wallbox_live_finite(live.get("SOC")) is not None
                                             and 0 <= _wallbox_live_finite(live.get("SOC")) <= 100
                                             and _wallbox_battery_not_discharging(live) is not None))),
-                                "soc_valid": _wallbox_live_finite(live.get("SOC")) is not None and 0 <= _wallbox_live_finite(live.get("SOC")) <= 100,
+                                "soc_valid": battery_soc is not None,
                                 "budget_valid": bool(_budget_ok and _storage_wallbox_budget_contract.get("valid") is True),
                                 "budget_stale": _budget_stale, "budget_timeout": bool(_budget_timeout and not local_grid_allowed),
                                 "source": _core_energy_row.get("source"),
@@ -54698,7 +54715,11 @@ def run():
                                 "observe_only": next((row["observe_only"] for row in _core_energy_boxes if row["id"] == c_id), True),
                                 "departure_blocked": bool(c_public_mode == MODE_BATTERY_DEPARTURE and _battery_departure_state(config, c_id, c_public_mode, now_ts).get("blocked")),
                                 "battery_support_authorized": _budget.get("battery_support_authorized") if _budget_ok else None,
+                                "battery_support_reason": _budget.get("battery_support_reason") if _budget_ok else None,
                                 "curve_support": _core_curve_support if c_public_mode == MODE_CURVE else _curve_support,
+                                "predump_active": bool(predump_wallbox_active and predump_wallbox_gate_open
+                                    and c_id in predump_charger_ids and predump_wallbox_floor_soc is not None
+                                    and _budget.get("battery_support_authorized") is True),
                                 "explicit_support": bool(c_public_mode == MODE_BASE and wallbox_policy.base_charge_active(
                                     params={"base_6a": True}, base_floor_reachable=base_floor_reachable,
                                     soll_soc_now_available=soll_soc_now is not None,
@@ -58138,6 +58159,8 @@ def run():
                             and not price_boost_wallbox_active
                             and not predump_wallbox_active
                             and grid_power_budget_w > -800.0
+                            and pv_power_raw is not None
+                            and battery_power_raw is not None
                             and pv_power_raw < max(300.0, hw_power_w * 0.25)
                             and battery_power_raw < -max(700.0, min(1200.0, hw_power_w * 0.5))
                             and not c_data.get(
@@ -63547,6 +63570,26 @@ def run():
                             c_id=cd.get("id"),
                         )
 
+                    # Der Secondary-Heartbeat der openWB Standard ist
+                    # nachrangig: Er läuft hinter allen Regel- und
+                    # Schutzausgängen dieses Zyklus und nutzt nur einen noch
+                    # freien Ausgangsslot (vorhandene Vergabe). Im
+                    # Übernahmezyklus trägt so die Absenkung auf den
+                    # Hausanschluss den einen Ausgang; der Heartbeat folgt
+                    # im nächsten freien Zyklus innerhalb seiner Fristen.
+                    for cd in chargers:
+                        _refresh_openwb_secondary_heartbeat_if_due(
+                            cd,
+                            normalize_wb_mode(wb_charge_mode.get(cd.get("id"), 0)),
+                            now_ts=now_ts,
+                            c_id=cd.get("id"),
+                            status=next(
+                                (v.get("status") for v in valid_chargers_status
+                                 if v.get("id") == cd.get("id")),
+                                None,
+                            ),
+                        )
+
                     # UI Update
                     # wb_current_amp nachfuehren (fuer selbstlernende Min-Leistung)
                     # Das ist der tatsaechlich gesetzte Strom der ersten aktiven Wallbox.
@@ -63883,6 +63926,7 @@ def run():
                                 'id': c_id,
                                 'amp': _detail_amp,
                                 'current_set_amp': _detail_manager_amp,
+                                'display_set_amp': _simple_core_display_amp(c_data, _detail_manager_amp),
                                 'cap_amp': _detail_cap_amp,
                                 'target_amp': round(float(_detail_cap_amp or _detail_manager_amp or 0), 1),
                                 'status_amp': _detail_hw_amp,

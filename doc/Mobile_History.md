@@ -10,6 +10,13 @@ Die mobile Historie wird über `mobile.php?seite=history` geöffnet. `mobile.php
 - Das Archiv zeigt vorhandene, vom System erkannte Tagesdateien als 24-Stunden-Ansicht.
 - Die Werte können für die Darstellung auf Absolutwerte umgeschaltet werden.
 
+## Messwerte im Leistungsverlauf
+
+E3DC-Control speichert die Messzeit der Probe. Einzelne ungültige Messwerte
+bleiben im Leistungsverlauf unbekannt; gültige Nullwerte bleiben erhalten.
+Die Diagramme stellen fehlende Werte als Lücken dar. E3DC-Control speichert
+eine Probe mit unveränderter Messzeit nicht erneut.
+
 ## Daten und Datenschutz
 
 Die Diagramme werden im Browser aus den lokalen Systemdaten aufgebaut. Die dafür benötigten JavaScript- und CSS-Bibliotheken werden mit E3DC-Control ausgeliefert; die Historienansicht lädt keine Assets von externen CDNs.

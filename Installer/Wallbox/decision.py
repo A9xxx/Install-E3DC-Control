@@ -872,8 +872,14 @@ def _amp_value(value: float, step: float) -> float:
     return round(float(value), 1)
 
 
+VEHICLE_IDENTIFIER_PLACEHOLDERS = frozenset({"", "null", "none", "undefined"})
+
+
 def compact_vehicle_identifier(value: Any) -> str:
-    return "".join(ch for ch in str(value or "").lower() if ch.isalnum())
+    text = str(value or "").strip().lower()
+    if text in VEHICLE_IDENTIFIER_PLACEHOLDERS:
+        return ""
+    return "".join(ch for ch in text if ch.isalnum())
 
 
 VEHICLE_PROFILE_ID_KEYS = (
@@ -890,6 +896,12 @@ VEHICLE_PROFILE_ID_KEYS = (
 
 
 
+def first_vehicle_identifier(status: Dict[str, Any]) -> str:
+    """Wähle wie die Oberfläche die erste nicht leere kompaktierte Kennung."""
+    return next((key for field in ("vehicle_id", "rfid_tag", "car_id")
+                 if (key := compact_vehicle_identifier(status.get(field)))), "")
+
+
 def confirmed_session_vehicle_identity(
     status: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
@@ -903,11 +915,7 @@ def confirmed_session_vehicle_identity(
     """
 
     st = status if isinstance(status, dict) else {}
-    live_key = compact_vehicle_identifier(
-        st.get("vehicle_id")
-        or st.get("rfid_tag")
-        or st.get("car_id")
-    )
+    live_key = first_vehicle_identifier(st)
     if st.get("stable_vehicle_identity_current") is True and live_key:
         return {
             "confirmed": True,
@@ -1226,9 +1234,7 @@ def vehicle_control_pilot_interruption_capability_from_profiles(
         if not profile:
             result["reason"] = "configured_vehicle_profile_not_unique"
             return result
-        live_key = compact_vehicle_identifier(
-            st.get("vehicle_id") or st.get("rfid_tag") or st.get("car_id")
-        )
+        live_key = first_vehicle_identifier(st)
         profile_aliases = {
             compact_vehicle_identifier(profile.get(key))
             for key in VEHICLE_PROFILE_ID_KEYS
@@ -5843,15 +5849,9 @@ def curve_floor_support_wh_limit(
 
 
 WBMINSOC_HOLD_ZONE_SCHEMA = "wallbox_wbminsoc_hold_zone_v2"
-# Dieselbe Rücksetzzeit wie beim Wh-Kontingent unter dem Korridor.
-WBMINSOC_HOLD_ZONE_RESET_S = 60.0
-# Längster Zeitschritt, den das Kontingent in einem Zyklus zählt.
-WBMINSOC_HOLD_ZONE_MAX_STEP_S = 30.0
 # Tatsächlich ladende Wallbox: dieselbe feste Untergrenze wie die Ein-Kante
 # der PV-only-Entladegrenze der Speicherseite.
 WBMINSOC_HOLD_ZONE_CHARGING_MIN_W = 500.0
-# Messtoleranz der Akkustützung, wie beim Akku-Wh-Konto des Mindesthalts.
-WBMINSOC_HOLD_ZONE_SUPPORT_TOLERANCE_W = 100.0
 # Modi mit Haltezone: dieselben Besitzermodi wie die Direktabsenkung an der
 # Untergrenze (``PV + Akku bis Untergrenze`` und ``Sofort bis Preislimit``
 # ohne Preis- oder Netzfenster). ``Akku bis Abfahrt`` behält seinen eigenen
@@ -5928,9 +5928,6 @@ def wbminsoc_hold_zone_contract(
     wallbox_w: Any = 0.0,
     wallbox_measurement_valid: Any = False,
     residual_w: Any = 0.0,
-    battery_w: Any = 0.0,
-    support_wh_limit: Any = 0.0,
-    bridge_allowed: Any = True,
     previous: Optional[Dict[str, Any]] = None,
     now_s: Any = 0.0,
     mode: Any = None,
@@ -5938,8 +5935,8 @@ def wbminsoc_hold_zone_contract(
 ) -> Dict[str, Any]:
     """Haltezone an wbminSoC für die Modi mit Akkuladen bis zur Untergrenze.
 
-    Im Band (``wbminsoc_hold_zone_band``) stützt der Speicher die Wallbox
-    nicht und lädt auch nicht vorrangig: Die Wallbox bekommt den
+    Im Band (``wbminsoc_hold_zone_band``) bietet der Speicher der Wallbox
+    keine dauerhafte Akkustützung und lädt auch nicht vorrangig: Die Wallbox bekommt den
     batterieneutralen PV-Rahmen ``frame_w`` – ihre laufende Leistung plus den
     vorzeichenbehafteten Rest aus PV minus Haus, Wärmepumpe, Heizstab und
     Wallboxen (``residual_w``) –, der Speicher lädt nur, was die Wallbox nicht
@@ -5957,20 +5954,9 @@ def wbminsoc_hold_zone_contract(
     einschließlich der Untergrenze und unabhängig vom wbminSoC-Tor; die
     Wallbox-Seite rechnet dort kein eigenes PV-Budget.
 
-    Kurze Schwankungen, etwa Lastspitzen eines Kochfelds oder eine Wolke,
-    überbrückt das Wolken-Wh-Kontingent (``wb_curve_floor_support_wh``): War
-    die Wallbox im Vorzyklus vom PV-Rahmen gedeckt (oder wurde sie schon
-    überbrückt) und fällt der Rahmen jetzt unter ihre laufende Leistung, bleibt
-    diese Leistung gehalten (``hold_frame_w``), solange Kontingent übrig ist
-    und der Speicher die Wallbox tatsächlich tragen darf (``bridge_allowed``).
-    Gehalten wird nie mehr als die laufende Leistung. Beim Eintritt in die
-    Haltezone gilt der batterieneutrale Rahmen; eine vorher gestützte höhere
-    Wallboxleistung wird also nicht gehalten.
-
-    Gezählt wird die Akkuentladung, die die Wallbox bezieht, abzüglich 100 W
-    Messtoleranz (wie beim Akku-Wh-Konto des Mindesthalts). Das Kontingent
-    beginnt wieder bei null, wenn 60 s lang keine Akkustützung der Wallbox
-    anlag, die Haltezone verlassen war oder keine Wallbox lud.
+    Bei Schwankungen folgt die Wallbox dem Rahmen im bestehenden 10-s-Takt.
+    Der Akku deckt Übergänge bis zur Stromanpassung beziehungsweise bis zum
+    bestehenden Unterdeckungsstopp; der Vertrag führt kein Wh-Konto.
 
     Unter der Untergrenze bleibt es beim Verhalten von ``PV-Kurve ruhig``
     (Ladekurve hat Vorrang), darüber bei der Stützung bis zur Untergrenze.
@@ -5983,21 +5969,13 @@ def wbminsoc_hold_zone_contract(
     prev = previous if isinstance(previous, dict) else {}
     now_value = _safe_float(now_s, 0.0)
     last_ts = _safe_float(prev.get("ts"), 0.0)
-    continuous = bool(
-        last_ts > 0.0
-        and 0.0 < now_value - last_ts <= WBMINSOC_HOLD_ZONE_MAX_STEP_S
-    )
-    previous_active = bool(prev.get("active") is True and continuous)
-    # Die Bandzugehörigkeit (obere Hysterese) hängt nur am SoC. Ein einzelner
-    # nicht zulässiger Zyklus (etwa ein kurz veralteter Wallbox-Intent) löscht
-    # sie deshalb nicht; ältere Vorzustände kennen nur ``active``.
+    # Nur Bandzugehörigkeit und Zeitstempel tragen die obere Hysterese.
+    # Ein nicht zulässiger Zyklus löscht sie nicht; nach zwei Frischefenstern
+    # ohne Fortschreibung beginnt die Bandprüfung wie bisher neu.
     previous_inside = bool(
-        continuous
-        and (
-            prev.get("band_inside") is True
-            if "band_inside" in prev
-            else prev.get("active") is True
-        )
+        last_ts > 0.0
+        and 0.0 < now_value - last_ts <= 2 * WBMINSOC_HOLD_ZONE_MAX_AGE_S
+        and prev.get("band_inside") is True
     )
     band = wbminsoc_hold_zone_band(
         soc=soc,
@@ -6020,55 +5998,11 @@ def wbminsoc_hold_zone_contract(
     residual = _safe_float(residual_w, 0.0)
     if not math.isfinite(residual):
         residual = 0.0
-    battery = _safe_float(battery_w, 0.0)
-    if not math.isfinite(battery):
-        battery = 0.0
     wallbox_charging = bool(
         wallbox_measurement_valid is True
         and wallbox_value >= WBMINSOC_HOLD_ZONE_CHARGING_MIN_W
     )
-    limit = max(0.0, _safe_float(support_wh_limit, 0.0))
-    dt_s = (
-        min(WBMINSOC_HOLD_ZONE_MAX_STEP_S, max(0.0, now_value - last_ts))
-        if last_ts > 0.0
-        else 0.0
-    )
-    used = max(0.0, _safe_float(prev.get("support_wh_used"), 0.0))
-    idle_since = _safe_float(prev.get("idle_since"), 0.0)
-    supported_w = 0.0
-    if active and wallbox_charging:
-        supported_w = max(
-            0.0,
-            min(max(0.0, -battery), wallbox_value) - WBMINSOC_HOLD_ZONE_SUPPORT_TOLERANCE_W,
-        )
-        used += supported_w * dt_s / 3600.0
-    if supported_w > 0.0:
-        idle_since = 0.0
-    elif idle_since <= 0.0:
-        idle_since = now_value
-    elif now_value - idle_since >= WBMINSOC_HOLD_ZONE_RESET_S:
-        used = 0.0
-    remaining = max(0.0, limit - used)
     frame_w = max(0.0, frame_wallbox_value + residual)
-    # Die Wallbox war im Vorzyklus vom PV-Rahmen gedeckt oder wurde bereits
-    # überbrückt; nur dann ist ein Einbruch des Rahmens eine kurze Schwankung.
-    previous_covered = bool(
-        previous_active
-        and (
-            prev.get("bridging") is True
-            or _safe_float(prev.get("wallbox_w"), 0.0)
-            <= _safe_float(prev.get("frame_w"), 0.0) + WBMINSOC_HOLD_ZONE_SUPPORT_TOLERANCE_W
-        )
-    )
-    bridging = bool(
-        active
-        and wallbox_charging
-        and bridge_allowed is True
-        and previous_covered
-        and remaining > 0.0
-        and frame_w < wallbox_value - WBMINSOC_HOLD_ZONE_SUPPORT_TOLERANCE_W
-    )
-    hold_frame_w = wallbox_value if bridging else frame_w
     if not band["valid"]:
         reason = "soc_or_floor_unknown"
     elif not mode_allowed:
@@ -6077,8 +6011,6 @@ def wbminsoc_hold_zone_contract(
         reason = "not_eligible"
     elif not band["in_band"]:
         reason = "outside_band"
-    elif bridging:
-        reason = "hold_zone_contingent_bridge"
     else:
         reason = "hold_zone_pv_frame"
     return {
@@ -6088,7 +6020,7 @@ def wbminsoc_hold_zone_contract(
         "reason": reason,
         # Veröffentlichtes PV-Budget der Wallboxgruppe im Band (nur gültig,
         # solange ``active`` gilt und ``ts`` höchstens ``max_age_s`` alt ist).
-        "budget_w": int(round(hold_frame_w)) if active else 0,
+        "budget_w": int(round(frame_w)) if active else 0,
         "budget_valid": bool(active),
         "max_age_s": WBMINSOC_HOLD_ZONE_MAX_AGE_S,
         "mode": mode_value,
@@ -6099,19 +6031,11 @@ def wbminsoc_hold_zone_contract(
         "band": band,
         "band_inside": bool(band["in_band"]),
         "frame_w": int(round(frame_w)),
-        "hold_frame_w": int(round(hold_frame_w)),
         "residual_w": int(round(max(0.0, residual))),
         "residual_signed_w": int(round(residual)),
         "wallbox_w": int(round(wallbox_value)),
         "frame_wallbox_w": int(round(frame_wallbox_value)),
         "wallbox_charging": wallbox_charging,
-        "bridging": bridging,
-        "bridge_allowed": bool(bridge_allowed is True),
-        "supported_w": int(round(supported_w)),
-        "support_wh_used": round(used, 1),
-        "support_wh_limit": round(limit, 1),
-        "support_wh_remaining": round(remaining, 1),
-        "idle_since": round(idle_since, 3) if idle_since > 0.0 else 0.0,
         "ts": round(now_value, 3),
     }
 

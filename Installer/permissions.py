@@ -2161,6 +2161,8 @@ FILE_DEFINITIONS = [
     {"path": "/var/www/html/ramdisk/manual_bat_override.json", "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": False},
     # storage_manager_state.json: storage_manager.py schreibt, energy_manager/wallbox_manager lesen
     {"path": "/var/www/html/ramdisk/storage_manager_state.json", "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": False},
+    {"path": "/var/www/html/ramdisk/speicherkern_schatten.json", "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": False},
+    {"path": "/var/www/html/ramdisk/speicherkern_schatten_aggregate.json", "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": False},
     # native_schedule_aborted.flag: PHP ('Plan loeschen') schreibt, wallbox_manager.py liest
     {"path": "/var/www/html/ramdisk/native_schedule_aborted.flag", "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": False},
     # value_filter.json: get_live_json.php schreibt (PHP/www-data), solar.js liest -> gruppenschreibbar

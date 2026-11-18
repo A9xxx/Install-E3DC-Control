@@ -22,8 +22,24 @@ nachträglichen Pre-Dump.
 
 Erreicht der Speicher das Pre-Dump-Minimum, wird nicht die normale
 Batterieentladung für das Haus gesperrt. Die Untergrenze beendet nur die aktive
-Vorab-Entladung beziehungsweise stoppt freigegebene Pre-Dump-Verbraucher wie
-eine Wallbox.
+Vorab-Entladung. Freigegebene Verbraucher folgen danach ihren normalen
+Lade- und Stoppregeln.
+
+Bei aktivem Pre-Dump und freigegebener Wallbox gilt für die Akkustützung
+der Wallbox der Pre-Dump-Boden statt `wbminsoc`, nie unter der Notstromreserve
+oder einer gültigen E3DC-Wallbox-Untergrenze. Voraussetzung sind ein frisches,
+gültiges Speicherbudget und die geöffnete Pre-Dump-Freigabe. Danach gilt im
+selben Regelzyklus wieder `wbminsoc`; die Einstellung wird nicht verändert.
+Läuft die Mindestladezeit noch, lädt das Auto mit Mindeststrom zu Ende und
+stoppt über den normalen Unterdeckungsstopp. Der Akku kann dabei etwas unter
+das wirtschaftliche Pre-Dump-Ziel fallen, nie unter die Notstromreserve.
+Eine laufende Ladung folgt anschließend den normalen PV- und Stoppregeln.
+Pause, Not-Aus und Ladepunktsperre stoppen weiterhin sofort.
+
+Das separate Wallbox-Bodenhysteresetor mit den Schlüsseln
+`predump_wallbox_floor_release_pct` und `predump_wallbox_floor_stop_pct`
+wird nicht mehr verwendet. Die Akkustützung nutzt die bestehende Hysterese
+des wbminSoC-Tors.
 
 ## Planung
 
@@ -169,7 +185,15 @@ Aktuell gilt:
 
 - Wallbox: Mindestleistung, Phasen und Fahrzeugfähigkeit werden beachtet. Ein
   BEV mit hoher Mindestleistung wird eher kurz und passend gestartet als über
-  Stunden am unteren Rand getaktet.
+  Stunden am unteren Rand getaktet. Pre-Dump in eine freigegebene Wallbox folgt
+  der Einstellung und wird ausgeführt, auch wenn die Regelung den Zweck nicht
+  kennt. Energetisch lohnt er sich vor allem, wenn das Fahrzeug vor der
+  erwarteten PV-Spitze abfährt oder die Energie sonst aus dem Netz laden würde.
+  Bleibt das Fahrzeug angesteckt und würde es die Mittagsspitze ohnehin direkt
+  aus PV aufnehmen, verschiebt Pre-Dump nur Energie vom Hausspeicher ins
+  Fahrzeug. Beim Entladen und späteren Wiederaufladen des Speichers gehen dabei
+  zusammen grob 10 % verloren, und der Speicher durchläuft einen zusätzlichen
+  Teilzyklus.
 - Wärmepumpe: Der Energy Manager meldet die echte elektrische Leistung in die
   Ramdisk. Der Storage Manager übernimmt diese Leistung als `WP_Power` und
   zieht sie aus dem reinen Hausverbrauch heraus, damit sie im Pre-Dump nicht
@@ -191,8 +215,11 @@ freigegeben und läuft er bereits (Last von mindestens 250 Watt,
 zu einer Unterkante unterhalb des Ziels weiterlaufen. Sie liegt höchstens
 0,5 Prozentpunkte beziehungsweise 300 Wh unter dem Ziel
 (`predump_consumer_landing_under_pct`, `predump_consumer_landing_under_wh`; es
-gilt der kleinere Wert). Das Pre-Dump-Minimum und die Notstromreserve bleiben
-harter Boden: Die Unterkante liegt nie darunter.
+gilt der kleinere Wert). Die Unterkante dieses zusätzlichen Pre-Dump-Budgets
+liegt nie unter dem Pre-Dump-Minimum oder der Notstromreserve. An der
+Unterkante endet die zusätzliche Pre-Dump-Zuteilung. Die Wallbox folgt ihren
+vorhandenen Mindestlade- und Unterdeckungszeiten; dadurch kann der Akku noch
+etwas unter die wirtschaftliche Landekante fallen, nie unter die Notstromreserve.
 
 ## Netzschutz während Pre-Dump
 

@@ -7,6 +7,7 @@ import os
 import sys
 import json
 import time
+import math
 import logging
 from logging.handlers import RotatingFileHandler
 
@@ -265,18 +266,15 @@ def get_config():
 def live_data_age_s(data=None):
     """Alter der Live-Daten in Sekunden.
 
-    Primaer gilt der vom e3dc-live Dienst geschriebene ``_ts``. Falls aeltere
-    Installationen dieses Feld noch nicht liefern, ist die Datei-MTime der
-    Fallback. Fehlt beides, wird ein sehr grosser Wert geliefert.
+    Maßgeblich ist ausschließlich der Messzeitstempel ``_ts``.
+    Ohne gültigen Zeitstempel sind die Messwerte ungültig.
     """
     now = time.time()
     try:
         if isinstance(data, dict):
             ts = float(data.get("_ts", 0) or 0)
-            if ts > 0:
-                return max(0.0, now - ts)
-        if os.path.exists(LIVE_DATA_FILE_PY):
-            return max(0.0, now - os.path.getmtime(LIVE_DATA_FILE_PY))
+            if math.isfinite(ts) and 0 < ts <= now:
+                return now - ts
     except Exception:
         pass
     return 999999.0

@@ -220,54 +220,11 @@ if (isset($_POST['restart_manager'])) {
     $restartOk = false;
     $restartErrors = [];
     if ($isDocker) {
-        if ($installRoot === '') {
-            http_response_code(503);
-            echo 'Installationskontext fehlt; es wurde kein Dienst beendet oder gestartet.';
-            exit;
+        $restart = e3dcQueueDockerContainerRestart();
+        $restartOk = !empty($restart['success']);
+        if (!$restartOk) {
+            $restartErrors[] = (string)($restart['message'] ?? 'Containerneustart konnte nicht angefordert werden.');
         }
-        $installRootReal = @realpath($installRoot);
-        $python = e3dcGetTrustedPythonInterpreter();
-        $scripts = [];
-        if ($isHeaterPage) {
-            $scripts['Heizstab-Manager'] = [$installRoot . '/Installer/heizstab_manager.py', '/var/www/html/logs/heizstab_manager.log'];
-        } else {
-            $scripts['Energy-Manager'] = [$luxInstallDir . 'energy_manager.py', '/var/www/html/logs/energy_manager.log'];
-            if ($wpType === 4) {
-                $scripts['Stiebel-Livedienst'] = [$installRoot . '/Installer/stiebel/stiebel_live.py', '/var/www/html/logs/stiebel_live.log'];
-            } elseif ($wpType === 5) {
-                $scripts['Dimplex-Livedienst'] = [$installRoot . '/Installer/dimplex/dimplex_live.py', '/var/www/html/logs/dimplex_live.log'];
-            }
-        }
-
-        $pkill = is_executable('/usr/bin/pkill') ? '/usr/bin/pkill' : '/bin/pkill';
-        $pgrep = is_executable('/usr/bin/pgrep') ? '/usr/bin/pgrep' : '/bin/pgrep';
-        if ($python === null || $installRootReal === false || !is_executable($pkill) || !is_executable($pgrep) || !is_executable('/bin/sh')) {
-            $restartErrors[] = 'Der Docker-Laufzeitkontext ist nicht eindeutig verfügbar.';
-        } else {
-            foreach ($scripts as $label => [$scriptPath, $logPath]) {
-                $scriptReal = @realpath($scriptPath);
-                if ($scriptReal === false || is_link($scriptPath) || !is_file($scriptReal)
-                    || !str_starts_with($scriptReal, rtrim($installRootReal, '/') . '/')) {
-                    $restartErrors[] = $label . ' wurde im gebundenen Installationspfad nicht gefunden.';
-                    continue;
-                }
-                $stop = e3dcRunArgvProcess([$pkill, '-f', $scriptReal], 5.0, ['max_output_bytes' => 8192]);
-                $stopCode = (int)($stop['exit_code'] ?? 1);
-                if (!in_array($stopCode, [0, 1], true)) {
-                    $restartErrors[] = $label . ' konnte nicht kontrolliert beendet werden.';
-                    continue;
-                }
-                $command = 'nohup ' . escapeshellarg($python) . ' ' . escapeshellarg($scriptReal)
-                    . ' > ' . escapeshellarg($logPath) . ' 2>&1 &';
-                $start = e3dcRunArgvProcess(['/bin/sh', '-c', $command], 5.0, ['max_output_bytes' => 8192]);
-                sleep(1);
-                $probe = e3dcRunArgvProcess([$pgrep, '-f', $scriptReal], 5.0, ['max_output_bytes' => 8192]);
-                if (empty($start['success']) || empty($probe['success']) || trim((string)($probe['stdout'] ?? '')) === '') {
-                    $restartErrors[] = $label . ' wurde nach dem Startversuch nicht als laufend bestätigt.';
-                }
-            }
-        }
-        $restartOk = $restartErrors === [];
     } else {
         if ($isHeaterPage) {
             $requestedServices = ['e3dc-heizstab'];
@@ -301,7 +258,10 @@ if (isset($_POST['restart_manager'])) {
         );
         exit;
     }
-    echo "<script>window.location.href = window.location.href;</script>";
+    $restartNotice = $isDocker
+        ? 'window.alert(' . json_encode(e3dcDockerContainerRestartMessage(), JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT) . ');'
+        : '';
+    echo "<script>" . $restartNotice . "window.location.href = window.location.href;</script>";
     exit;
 }
 
@@ -515,31 +475,15 @@ if (isset($_POST['toggle_auto_mode'])) {
     }
     $restartOk = false;
     $restartDetails = '';
-    if ($isDocker) {
-        $python = e3dcGetTrustedPythonInterpreter();
-        $energyManagerPath = $luxInstallDir . 'energy_manager.py';
-        $energyManagerReal = $energyManagerPath !== '' ? @realpath($energyManagerPath) : false;
-        if ($python !== null && $energyManagerReal !== false && !is_link($energyManagerPath)) {
-            $pkill = is_executable('/usr/bin/pkill') ? '/usr/bin/pkill' : '/bin/pkill';
-            $pgrep = is_executable('/usr/bin/pgrep') ? '/usr/bin/pgrep' : '/bin/pgrep';
-            $stop = is_executable($pkill)
-                ? e3dcRunArgvProcess([$pkill, '-f', $energyManagerReal], 5.0, ['max_output_bytes' => 8192])
-                : ['exit_code' => 127];
-            $stopCode = (int)($stop['exit_code'] ?? 1);
-            if (in_array($stopCode, [0, 1], true) && is_executable('/bin/sh')) {
-                $command = 'nohup ' . escapeshellarg($python) . ' ' . escapeshellarg($energyManagerReal)
-                    . ' > /var/www/html/logs/energy_manager.log 2>&1 &';
-                $start = e3dcRunArgvProcess(['/bin/sh', '-c', $command], 5.0, ['max_output_bytes' => 8192]);
-                sleep(1);
-                $probe = is_executable($pgrep)
-                    ? e3dcRunArgvProcess([$pgrep, '-f', $energyManagerReal], 5.0, ['max_output_bytes' => 8192])
-                    : ['success' => false];
-                $restartOk = !empty($start['success'])
-                    && !empty($probe['success'])
-                    && trim((string)($probe['stdout'] ?? '')) !== '';
-            }
+    if ($new_mode === 0) {
+        // Aus zyklisch einlesen; eigenen Ausgang und Restlauf im Dienst behalten.
+        $restartOk = true;
+    } elseif ($isDocker) {
+        $restart = e3dcQueueDockerContainerRestart();
+        $restartOk = !empty($restart['success']);
+        if (!$restartOk) {
+            $restartDetails = (string)($restart['message'] ?? 'Containerneustart konnte nicht angefordert werden.');
         }
-        if (!$restartOk) $restartDetails = 'Der Energy-Manager-Prozess wurde nach dem Startversuch nicht bestätigt.';
     } else {
         $restart = e3dcRunServiceWrapperAction('restart', [$serviceName]);
         $requiredUnit = str_ends_with($serviceName, '.service') ? $serviceName : $serviceName . '.service';
@@ -559,9 +503,13 @@ if (isset($_POST['toggle_auto_mode'])) {
         exit;
     }
     if ($new_mode === 0 || $new_mode === 1) {
-        e3dcWpViewRecordOutcome($new_mode === 1 ? 'auto_on' : 'auto_off'); // nur Rückmeldung für die neue Ansicht
+        e3dcWpViewRecordOutcome($new_mode === 1 ? 'auto_on' : 'auto_off'); // Rückmeldung nach erfolgreicher Speicherung
     }
-    echo "<script>window.location.href = window.location.href;</script>";
+    $offNotice = $new_mode === 0 ? 'window.alert(' . json_encode(e3dcWpViewOutcomeTexts()['auto_off'], JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT) . ');' : '';
+    $restartNotice = $isDocker && $new_mode !== 0
+        ? 'window.alert(' . json_encode(e3dcDockerContainerRestartMessage(), JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT) . ');'
+        : '';
+    echo "<script>" . $offNotice . $restartNotice . "window.location.href = window.location.href;</script>";
     exit;
 }
 
@@ -1243,7 +1191,7 @@ if ($isChargingOnly) {
                     <form method="post">
                         <?= e3dcCsrfInput() ?>
                         <?php if ($autoMode == 1): ?>
-                            <button type="submit" name="toggle_auto_mode" value="0" class="btn btn-outline-success btn-sm h-100 fw-bold" title="Klick schaltet die Automatik sofort aus. Bei Luxtronik-Direktanbindung läuft ein gerade laufender Verdichter bei PV- und Tarif-Aufträgen zum Schutz der Wärmepumpe seine Mindestlaufzeit zu Ende.">
+                            <button type="submit" name="toggle_auto_mode" value="0" class="btn btn-outline-success btn-sm h-100 fw-bold" title="Automatik und Auftrag sofort beenden. Ein laufender Verdichter läuft seine Mindestlaufzeit zu Ende.">
                                 <i class="fas fa-check-circle me-1"></i> AUTO
                             </button>
                         <?php else: ?>

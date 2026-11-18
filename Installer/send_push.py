@@ -4,8 +4,44 @@ import sys
 import json
 import sqlite3
 import argparse
+import socket
+import ipaddress
+from urllib.parse import urlsplit
 
 
+
+
+
+def resolve_push_addresses(host):
+    """Löst A und AAAA auf; als kleine Funktion ohne Netz prüfbar."""
+    return [item[4][0] for item in socket.getaddrinfo(host, None, socket.AF_UNSPEC, socket.SOCK_STREAM)]
+
+
+def push_endpoint_is_public(endpoint, resolver=None):
+    try:
+        parsed = urlsplit(endpoint)
+        host = parsed.hostname or ""
+        if parsed.scheme.lower() != "https" or parsed.username is not None or parsed.password is not None or "." not in host.rstrip("."):
+            return False
+        try:
+            ipaddress.ip_address(host)
+            return False
+        except ValueError:
+            pass
+        addresses = (resolver or resolve_push_addresses)(host)
+        if not addresses:
+            return False
+        for address in addresses:
+            ip = ipaddress.ip_address(address)
+            if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped:
+                ip = ip.ipv4_mapped
+            blocked = ("0.0.0.0/8", "10.0.0.0/8", "127.0.0.0/8", "169.254.0.0/16", "172.16.0.0/12",
+                       "192.168.0.0/16", "100.64.0.0/10", "224.0.0.0/4", "::/128", "::1/128", "fe80::/10", "fc00::/7", "ff00::/8")
+            if any(ip in ipaddress.ip_network(network) for network in blocked):
+                return False
+        return True
+    except (ValueError, OSError, TypeError):
+        return False
 
 
 def get_vapid_claims():
@@ -63,9 +99,13 @@ def send_push_message(title, body, url=None, actions_json=None):
     payload = json.dumps(payload_dict)
 
     success_count = 0
+    skipped_count = 0
     errors = []
 
     for row in rows:
+        if not push_endpoint_is_public(row["endpoint"]):
+            skipped_count += 1
+            continue
         subscription_info = {
             "endpoint": row["endpoint"],
             "keys": {
@@ -85,13 +125,13 @@ def send_push_message(title, body, url=None, actions_json=None):
             )
             success_count += 1
         except WebPushException as ex:
-            errors.append(repr(ex))
+            errors.append("Push-Dienst hat den Versand nicht bestätigt.")
             # Optional: Bei Gone (410) könnte man die Row löschen
 
     if success_count > 0:
-        print(json.dumps({"success": True, "count": success_count, "errors": errors}))
+        print(json.dumps({"success": True, "count": success_count, "skipped": skipped_count, "errors": errors}))
     else:
-        print(json.dumps({"error": f"Konnte an kein Gerät senden. {errors}"}))
+        print(json.dumps({"success": False, "count": 0, "skipped": skipped_count, "error": "Konnte an kein Gerät senden.", "errors": errors}))
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

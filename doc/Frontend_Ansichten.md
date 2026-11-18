@@ -30,6 +30,13 @@ Die einfache Config-Ansicht ist als Raster aufgebaut:
 
 1. **E3DC Verbindung**
    IP-Adresse, RSCP-Port und Zugangsdaten.
+   Gespeicherte Passwörter, PINs, Token und Schlüssel werden als „gesetzt“ oder „nicht gesetzt“ angezeigt;
+   die Eingabefelder bleiben leer. Leer lassen erhält den vorhandenen Wert, eine neue Eingabe ersetzt ihn.
+   Zum Leeren eines Werts „Wert löschen“ am betreffenden Feld wählen und speichern.
+   Verbindungstests verwenden bei leerem Feld den gespeicherten Wert auf dem Server.
+   Beim Import und Wiederherstellen bleiben leere Geheimnisse unverändert. Der Download „Einstellungen ohne
+   Zugangsdaten“ enthält keine Zugangsdaten; der „Raw Download“ mit Zugangsdaten steht nur mit gesetzter
+   Web-PIN und nach Bestätigung zur Verfügung.
 
 2. **Speicherbetrieb**
    Speichergröße, Hausreserve, Ladeleistung, Einspeiselimit, PV-Kurve und Pre-Dump.

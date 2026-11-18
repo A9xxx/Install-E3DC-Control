@@ -225,25 +225,33 @@ foreach ($lines as $line) {
             'wp_kaelte_soll' => 0, 'wp_freq' => 0,
             'wp_vl_cnt' => 0, 'wp_rl_cnt' => 0, 'wp_ww_cnt' => 0, 'wp_at_cnt' => 0, 'wp_freq_cnt' => 0,
             'b1_cnt' => 0, 'wp_cnt' => 0, 'wp_power_cnt' => 0, 'wp_kaelte_cnt' => 0, 'wp_kaelte_soll_cnt' => 0,
-            'eco_score' => 0, 'eco_cnt' => 0
+            'eco_score' => 0, 'eco_cnt' => 0,
+            // Lücken (null) sind keine Proben: je Messgröße nur Zeilen mit Wert mitteln.
+            'pv_cnt' => 0, 'home_cnt' => 0, 'bat_cnt' => 0, 'grid_cnt' => 0, 'soc_cnt' => 0
         ];
         foreach ($extInverterChartColumns as $extCol => $_extKey) { $buckets[$tsRounded][$extCol] = 0; $buckets[$tsRounded][$extCol . '_cnt'] = 0; }
     }
-    
+
     $b = &$buckets[$tsRounded];
     $b['count']++;
-    
-    $pvTotal = isset($d['pv_total_w']) ? (float)$d['pv_total_w'] : (isset($d['pv']) ? (float)$d['pv'] : 0.0);
-    $pvExternal = isset($d['pv_external_w']) ? max(0.0, (float)$d['pv_external_w']) : 0.0;
-    $pvExternal = min($pvExternal, max(0.0, $pvTotal));
-    $pvE3dc = isset($d['pv_e3dc_w']) ? max(0.0, (float)$d['pv_e3dc_w']) : max(0.0, $pvTotal - $pvExternal);
 
-    $b['pv'] += isset($d['pv']) ? $d['pv'] : $pvTotal;
-    $b['pv_total_w'] += $pvTotal;
-    $b['pv_e3dc_w'] += $pvE3dc;
-    $b['pv_external_w'] += $pvExternal;
-    
-    $homeRaw = isset($d['home_raw']) ? $d['home_raw'] : (isset($d['home']) ? $d['home'] : 0);
+    $pvValue = e3dc_chart_optional_float($d['pv'] ?? null);
+    $pvTotal = e3dc_chart_optional_float($d['pv_total_w'] ?? null);
+    if ($pvTotal === null) $pvTotal = $pvValue;
+    if ($pvValue === null) $pvValue = $pvTotal;
+    if ($pvTotal !== null) {
+        $pvExternal = isset($d['pv_external_w']) ? max(0.0, (float)$d['pv_external_w']) : 0.0;
+        $pvExternal = min($pvExternal, max(0.0, $pvTotal));
+        $pvE3dc = isset($d['pv_e3dc_w']) ? max(0.0, (float)$d['pv_e3dc_w']) : max(0.0, $pvTotal - $pvExternal);
+        $b['pv'] += $pvValue;
+        $b['pv_total_w'] += $pvTotal;
+        $b['pv_e3dc_w'] += $pvE3dc;
+        $b['pv_external_w'] += $pvExternal;
+        $b['pv_cnt']++;
+    }
+
+    $homeRaw = e3dc_chart_optional_float($d['home_raw'] ?? null);
+    if ($homeRaw === null) $homeRaw = e3dc_chart_optional_float($d['home'] ?? null);
     $wp = e3dc_chart_optional_float($d['wp'] ?? null);
     if (array_key_exists('wp_power_valid', $d) && $d['wp_power_valid'] === false) $wp = null;
     $hs = isset($d['hs']) ? $d['hs'] : (isset($d['hs_power']) ? $d['hs_power'] : 0);
@@ -286,16 +294,19 @@ foreach ($lines as $line) {
     if (!empty($d['is_external_wb2']) || (($d['wb2_source'] ?? '') === 'mqtt_ha')) {
         $externalWbLoad += max(0, $wb2);
     }
-    $b['home'] += max(0, $homeRaw - $heatPowerForHome - $climate - $externalWbLoad);
-    
-    $b['bat'] += isset($d['bat']) ? $d['bat'] : 0;
-    $b['grid'] += isset($d['grid']) ? $d['grid'] : 0;
+    if ($homeRaw !== null) { $b['home'] += max(0, $homeRaw - $heatPowerForHome - $climate - $externalWbLoad); $b['home_cnt']++; }
+
+    $bat = e3dc_chart_optional_float($d['bat'] ?? null);
+    if ($bat !== null) { $b['bat'] += $bat; $b['bat_cnt']++; }
+    $grid = e3dc_chart_optional_float($d['grid'] ?? null);
+    if ($grid !== null) { $b['grid'] += $grid; $b['grid_cnt']++; }
     $b['wb'] += $wb;
     $b['wb2'] += $wb2;
     if ($wp !== null) { $b['wp'] += $wp; $b['wp_power_cnt']++; }
     $b['hs'] += $hs;
     $b['climate'] += $climate;
-    $b['soc'] += isset($d['soc']) ? $d['soc'] : 0;
+    $soc = e3dc_chart_optional_float($d['soc'] ?? null);
+    if ($soc !== null) { $b['soc'] += $soc; $b['soc_cnt']++; }
     
     if (isset($d['optimization_score'])) { $b['eco_score'] += $d['optimization_score']; $b['eco_cnt']++; }
     
@@ -399,13 +410,14 @@ foreach ($buckets as $ts => $b) {
     $c = $b['count'];
     $data['labels'][] = date('H:i', $ts);
     $data['timestamps'][] = (int)$ts * 1000;
-    $data['pv'][] = round($b['pv'] / $c);
-    $data['pv_total_w'][] = round($b['pv_total_w'] / $c);
-    $data['pv_e3dc_w'][] = round($b['pv_e3dc_w'] / $c);
-    $data['pv_external_w'][] = round($b['pv_external_w'] / $c);
-    $data['home'][] = round($b['home'] / $c);
-    $data['bat'][] = round($b['bat'] / $c);
-    $data['grid'][] = round($b['grid'] / $c);
+    // Ohne Probe im Bucket bleibt die Messgröße null (Lücke im Diagramm), nie 0.
+    $data['pv'][] = $b['pv_cnt'] > 0 ? round($b['pv'] / $b['pv_cnt']) : null;
+    $data['pv_total_w'][] = $b['pv_cnt'] > 0 ? round($b['pv_total_w'] / $b['pv_cnt']) : null;
+    $data['pv_e3dc_w'][] = $b['pv_cnt'] > 0 ? round($b['pv_e3dc_w'] / $b['pv_cnt']) : null;
+    $data['pv_external_w'][] = $b['pv_cnt'] > 0 ? round($b['pv_external_w'] / $b['pv_cnt']) : null;
+    $data['home'][] = $b['home_cnt'] > 0 ? round($b['home'] / $b['home_cnt']) : null;
+    $data['bat'][] = $b['bat_cnt'] > 0 ? round($b['bat'] / $b['bat_cnt']) : null;
+    $data['grid'][] = $b['grid_cnt'] > 0 ? round($b['grid'] / $b['grid_cnt']) : null;
     $data['wb'][] = !empty($b['wb_unknown']) ? null : round($b['wb'] / $c);
     $data['wb2'][] = !empty($b['wb2_unknown']) ? null : round($b['wb2'] / $c);
     $data['wp'][] = $b['wp_power_cnt'] > 0 ? round($b['wp'] / $b['wp_power_cnt']) : null;
@@ -422,7 +434,7 @@ foreach ($buckets as $ts => $b) {
         $data['climate_split_complete'][] = empty($b['climate_unknown']);
     }
 
-    $data['soc'][] = round($b['soc'] / $c, 1);
+    $data['soc'][] = $b['soc_cnt'] > 0 ? round($b['soc'] / $b['soc_cnt'], 1) : null;
     
     $slotPrice = e3dc_chart_price_for_ts_ms($ecoScores, $ts * 1000);
     $pricePeriod = (int)(floor($ts / $bucketSize) * $bucketSize);

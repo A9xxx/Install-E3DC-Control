@@ -65,3 +65,13 @@ Der Live-Dienst `e3dc-dimplex-live` liest nur. Aktive SG-Schreibbefehle kommen a
 
 - `1` für direkte Grad Celsius
 - `0.1` für Zehntelgrad
+
+### Automatik ausschalten
+
+E3DC-Control beendet den Auftrag sofort. Ein laufender Verdichter behält seine
+allgemeine Mindestlaufzeit, auch bei einem Pre-Dump-Auftrag. Danach nimmt
+E3DC-Control die eigene SG-Freigabe einmal auf Normalbetrieb zurück.
+Fremde SG-Werte bleiben unverändert, auch bei eingeschalteter Automatik und
+späteren Prüfzyklen. Hausanschlussgrenzen, Inselbetrieb, Gerätefehler und eine
+zu kalte Wärmequelle bleiben vorrangig. Beim administrativen Dienstende
+gibt E3DC-Control keine Gerätebefehle aus.

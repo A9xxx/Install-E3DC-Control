@@ -3795,6 +3795,11 @@ $data['storage_plan_meta'] = $storageCanonicalPlanValid
 $data['direct_marketing'] = is_array($data['storage_plan_meta']['direct_marketing'] ?? null)
     ? $data['storage_plan_meta']['direct_marketing']
     : null;
+// Vollständiger Marktplan (Verträge, Prognosefenster, Halteplan) aus derselben
+// Quelle wie die Live-Antwort; dort steht im 2-s-Takt nur noch die Kurzform.
+$data['market_plan'] = is_array($storagePlanMeta['market_plan'] ?? null)
+    ? $storagePlanMeta['market_plan']
+    : null;
 $directMarketingSocProjection = is_array($storagePlanMeta['planner']['direct_marketing_projection'] ?? null)
     ? $storagePlanMeta['planner']['direct_marketing_projection']
     : [];
@@ -3812,6 +3817,23 @@ $data['direct_marketing_soc_projection'] = [
 $marketSocLiveRaw = e3dcReadRegularFileBound('/var/www/html/ramdisk/live_data_py.json', 2097152);
 $marketSocLive = is_string($marketSocLiveRaw) ? @json_decode($marketSocLiveRaw, true) : null;
 $data['market_soc_trajectory'] = e3dcMarketSocTrajectoryForDisplay($storagePlanMeta, $marketSocLive);
+// Das Planungsende stammt ausschließlich aus dem bestätigten Bedarfshorizont.
+$marketPlanningForecast = $data['market_plan']['forecast'] ?? [];
+$marketPlanningEnd = $marketPlanningForecast['energy_horizon_actual_end_ts_ms'] ?? null;
+$marketPlanningStart = $storagePlanMeta['valid_from_ts_ms'] ?? null;
+$marketPlanningLimit = $storagePlanMeta['horizon_end_ts_ms'] ?? null;
+$marketPlanningFinite = static function($value) {
+    return (is_int($value) || is_float($value)) && is_finite((float)$value);
+};
+$data['market_planning_end_ts_ms'] = (
+    ($data['market_soc_trajectory']['complete'] ?? null) === true
+    && ($marketPlanningForecast['energy_horizon_complete'] ?? null) === true
+    && $marketPlanningFinite($marketPlanningEnd)
+    && $marketPlanningFinite($marketPlanningStart)
+    && $marketPlanningFinite($marketPlanningLimit)
+    && $marketPlanningStart <= $marketPlanningEnd
+    && $marketPlanningEnd <= $marketPlanningLimit
+) ? $marketPlanningEnd : null;
 $data['direct_marketing_trajectory'] = forecastDirectMarketingTrajectoryForDisplay(
     $storagePlanMeta,
     $forecastRequiresDirectMarketingPrice,

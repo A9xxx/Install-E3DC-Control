@@ -130,6 +130,9 @@ def allocate_consumer_budget_contract(
     start_candidates=(),
     protected_active=(),
     heatpump_exclusive_budget_w=0,
+    pv_pool_w=None,
+    battery_pool_w=None,
+    battery_caps_w=None,
 ):
     """Teilt genau einen versiegelbaren Verbraucherrahmen deterministisch auf.
 
@@ -178,11 +181,20 @@ def allocate_consumer_budget_contract(
         len(starts) == len(set(starts)) and len(protected) == len(set(protected))
         and all(consumer in CONSUMERS for consumer in starts + protected)
     )
+    sources = any(value is not None for value in (pv_pool_w, battery_pool_w, battery_caps_w))
+    pv_pool = _strict_nonnegative_int(pv_pool_w)
+    battery_pool = _strict_nonnegative_int(battery_pool_w)
+    battery_caps = _strict_power_map(battery_caps_w)
+    source_valid = not sources or (
+        pv_pool is not None and battery_pool is not None and battery_caps is not None
+        and total == pv_pool + battery_pool and hp_exclusive == 0)
     reason = None
     if not start_policy_valid:
         reason = "consumer_start_priority_evidence_invalid"
     elif total is None:
         reason = "total_budget_type_invalid"
+    elif not source_valid:
+        reason = "consumer_source_contract_invalid"
     elif hp_exclusive is None or hp_exclusive > total:
         reason = "heatpump_exclusive_source_invalid"
     elif requested is None:
@@ -262,15 +274,30 @@ def allocate_consumer_budget_contract(
 
     remaining = total - hp_exclusive
     exclusive_remaining = hp_exclusive
+    pv_remaining, battery_remaining = pv_pool, battery_pool
+    source_allocations = {consumer: dict(pv_w=0, battery_w=0) for consumer in CONSUMERS}
 
     def available_for(consumer):
+        if sources:
+            return pv_remaining + min(battery_remaining,
+                battery_caps[consumer] - source_allocations[consumer]["battery_w"])
         return remaining + (exclusive_remaining if consumer == "heatpump" else 0)
 
     def consume(consumer, watts):
-        nonlocal remaining, exclusive_remaining
-        own_w = min(watts, exclusive_remaining) if consumer == "heatpump" else 0
-        exclusive_remaining -= own_w
-        remaining -= watts - own_w
+        nonlocal remaining, exclusive_remaining, pv_remaining, battery_remaining
+        if sources:
+            # A1: Quellen werden in derselben Verbrauchsbuchung fortgeschrieben.
+            pv_w = min(watts, pv_remaining)
+            battery_w = watts - pv_w
+            pv_remaining -= pv_w
+            battery_remaining -= battery_w
+            source_allocations[consumer]["pv_w"] += pv_w
+            source_allocations[consumer]["battery_w"] += battery_w
+            remaining -= watts
+        else:
+            own_w = min(watts, exclusive_remaining) if consumer == "heatpump" else 0
+            exclusive_remaining -= own_w
+            remaining -= watts - own_w
 
     allocations = {consumer: 0 for consumer in CONSUMERS}
     blockers = []
@@ -385,6 +412,10 @@ def allocate_consumer_budget_contract(
         "heatpump_start_state": hp_start_state,
         "heatpump_start_reason_code": hp_start_reason_code,
         "released_budget_receiver": released_receiver,
+        **(dict(pv_pool_w=pv_pool, battery_pool_w=battery_pool,
+            battery_caps_w=battery_caps, source_allocations=source_allocations,
+            pv_remaining_w=pv_remaining, battery_remaining_w=battery_remaining)
+            if sources else {}),
     }
 
 
@@ -448,6 +479,30 @@ def validate_consumer_budget_contract(contract):
             or allocation_sum - used > total - exclusive
         ):
             return {**result, "reason_code": "heatpump_exclusive_source_conservation_failed"}
+    if any(key in data for key in ("pv_pool_w", "battery_pool_w", "battery_caps_w", "source_allocations")):
+        pv = _strict_nonnegative_int(data.get("pv_pool_w"))
+        battery = _strict_nonnegative_int(data.get("battery_pool_w"))
+        caps = _strict_power_map(data.get("battery_caps_w"))
+        pv_left = _strict_nonnegative_int(data.get("pv_remaining_w"))
+        battery_left = _strict_nonnegative_int(data.get("battery_remaining_w"))
+        booking = data.get("source_allocations")
+        if (None in (pv, battery, caps, pv_left, battery_left)
+                or not isinstance(booking, dict) or set(booking) != set(CONSUMERS)
+                or total != pv + battery or data.get("heatpump_exclusive_budget_w", 0) != 0):
+            return {**result, "reason_code": "consumer_source_contract_invalid"}
+        pv_used = battery_used = 0
+        for consumer in CONSUMERS:
+            row = booking[consumer]
+            if not isinstance(row, dict) or set(row) != {"pv_w", "battery_w"}:
+                return {**result, "reason_code": "consumer_source_booking_invalid"}
+            pw, bw = (_strict_nonnegative_int(row[key]) for key in ("pv_w", "battery_w"))
+            if pw is None or bw is None or pw + bw != allocations[consumer] or bw > caps[consumer]:
+                return {**result, "reason_code": "consumer_source_right_exceeded"}
+            pv_used += pw
+            battery_used += bw
+        if (pv_used + pv_left != pv or battery_used + battery_left != battery
+                or pv_left + battery_left != remaining):
+            return {**result, "reason_code": "consumer_source_conservation_failed"}
     for consumer in CONSUMERS:
         allocation = allocations[consumer]
         if enabled_map[consumer] and minimums[consumer] > limits[consumer]:

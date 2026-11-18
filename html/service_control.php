@@ -38,6 +38,34 @@ function dockerServiceProcessStatusForControl($install_path, $script) {
             'active' => !empty($result['success']) && $state === 'active'];
 }
 
+function serviceControlUnitPids($service) {
+    $probe = e3dcRunArgvProcess(
+        ['/usr/bin/systemctl', 'show', '--property=ControlGroup', '--value', '--', $service],
+        5.0, ['max_output_bytes' => 8192]
+    );
+    $group = trim((string)($probe['stdout'] ?? ''));
+    if (empty($probe['success'])) return null;
+    if ($group === '') return []; // Inaktive Unit ohne Cgroup: keine alten Prozesse.
+    if ($group === '/' || !str_starts_with($group, '/') || str_contains($group, '..')) return null;
+    $root = '/sys/fs/cgroup' . $group;
+    if (!@is_dir($root)) $root = '/sys/fs/cgroup/systemd' . $group;
+    $pending = [$root];
+    $pids = [];
+    while ($pending !== []) {
+        $dir = array_pop($pending);
+        $raw = @file_get_contents($dir . '/cgroup.procs');
+        if ($raw === false) return null;
+        foreach (preg_split('/\s+/', trim($raw), -1, PREG_SPLIT_NO_EMPTY) ?: [] as $pid) {
+            if (!ctype_digit($pid) || (int)$pid <= 0) return null;
+            $pids[] = $pid;
+        }
+        foreach (@glob($dir . '/*', GLOB_ONLYDIR) ?: [] as $child) {
+            if (!is_link($child)) $pending[] = $child;
+        }
+    }
+    return array_values(array_unique($pids));
+}
+
 function serviceUnitExistsForControl($service) {
     foreach (['/etc/systemd/system', '/lib/systemd/system', '/usr/lib/systemd/system'] as $base) {
         if (file_exists($base . '/' . $service)) {
@@ -281,13 +309,27 @@ if ($isServiceMutation) {
     $is_docker_action = file_exists('/.dockerenv');
 
     if ($is_docker_action) {
-        // Docker: kein systemctl vorhanden — direkte Prozess-Steuerung via pkill + nohup
-
-
         if (!isset($docker_service_map[$service])) {
             echo json_encode(["success" => false, "error" => "Kein Docker-Mapping für diesen Dienst"]);
             exit;
         }
+
+        // Ein Dienstneustart betrifft unter Docker den vollständigen Dienstsatz.
+        if ($action === 'restart') {
+            $restart = e3dcQueueDockerContainerRestart();
+            $queued = !empty($restart['success']);
+            if (!$queued) http_response_code(500);
+            echo json_encode([
+                'success' => $queued,
+                'restart_queued' => $queued,
+                'is_docker' => true,
+                'message' => $queued ? e3dcDockerContainerRestartMessage()
+                    : (string)($restart['message'] ?? 'Containerneustart konnte nicht angefordert werden.'),
+            ], JSON_UNESCAPED_UNICODE | $processJsonFlags);
+            exit;
+        }
+        // Start, Stop, Enable und Disable behalten ihren bestehenden Prozesspfad.
+
 
         $script   = $docker_service_map[$service][0];
         $logfile  = "/var/www/html/logs/" . $docker_service_map[$service][1];
@@ -315,7 +357,7 @@ if ($isServiceMutation) {
         $stop_ok = true;
         $start_ok = true;
         $noop = in_array($action, ['start', 'enable'], true) && $was_running;
-        if (in_array($action, ['stop', 'restart'])) {
+        if ($action === 'stop') {
             $stop_result = is_executable($pkill)
                 ? e3dcRunArgvProcess([$pkill, '-f', $kill_pattern], 5.0, ['max_output_bytes' => 8192])
                 : ['exit_code' => 127, 'stderr' => 'pkill fehlt'];
@@ -324,7 +366,7 @@ if ($isServiceMutation) {
             $out .= "pkill: " . ($kill_out !== '' ? $kill_out : ($stop_ok ? "OK" : "fehlgeschlagen")) . "\n";
             sleep(1);
         }
-        if (in_array($action, ['start', 'restart', 'enable']) && !$noop && $stop_ok) {
+        if (in_array($action, ['start', 'enable']) && !$noop && $stop_ok) {
             if ($runner === 'npm') {
                 $start_cmd = "cd " . escapeshellarg($workdir) . " && nohup npm run start"
                            . " >> " . escapeshellarg($logfile) . " 2>&1 &";
@@ -361,12 +403,9 @@ if ($isServiceMutation) {
         $after_pids = preg_split('/\s+/', trim((string)($after_probe['stdout'] ?? '')), -1, PREG_SPLIT_NO_EMPTY) ?: [];
         sort($after_pids, SORT_STRING);
         $process_running = !empty($after_probe['success']) && $after_pids !== [];
-        $process_replaced = $process_running && $after_pids !== $before_pids;
         $is_active = $process_running || $alive_fresh;
         $action_success = true;
-        if ($action === 'restart') {
-            $action_success = $stop_ok && $start_ok && ($process_replaced || $alive_advanced);
-        } elseif (in_array($action, ['start', 'enable'], true)) {
+        if (in_array($action, ['start', 'enable'], true)) {
             $action_success = $noop || ($start_ok && ($process_running || $alive_advanced));
         } elseif (in_array($action, ['stop', 'disable'], true)) {
             $action_success = $stop_ok && !$process_running;
@@ -389,7 +428,35 @@ if ($isServiceMutation) {
         exit;
     }
 
-    echo json_encode(e3dcControlSystemdService($action, $service, $allowed_services), JSON_UNESCAPED_UNICODE | $processJsonFlags);
+    $before_pids = $action === 'restart' ? serviceControlUnitPids($service) : null;
+    $result = e3dcControlSystemdService($action, $service, $allowed_services);
+    if ($action === 'restart' && !empty($result['success'])) {
+        $after_pids = serviceControlUnitPids($service);
+        $proof_readable = $before_pids !== null && $after_pids !== null
+            && @is_readable('/proc') && @scandir('/proc') !== false
+            && @is_readable('/proc/1/stat');
+        $old_pids_gone = $proof_readable;
+        foreach ($before_pids ?? [] as $pid) {
+            clearstatcache(true, '/proc/' . $pid);
+            if (@is_dir('/proc/' . $pid)) {
+                $old_pids_gone = false;
+                if (!@is_readable('/proc/' . $pid)) $proof_readable = false;
+            }
+        }
+        $process_replaced = $old_pids_gone && $after_pids !== null && $after_pids !== []
+            && array_intersect($before_pids ?? [], $after_pids) === [];
+        if (!$proof_readable) {
+            $result['wrapper_result'] = $result;
+            $result['success'] = false;
+            $result['confirmation_readable'] = false;
+            $result['message'] = 'Neustart ausgeführt, Bestätigung auf diesem System nicht lesbar';
+        } elseif (!$process_replaced) {
+            $result['success'] = false;
+            $result['message'] = 'Dienstneustart nicht bestätigt: Alte Prozesse sind noch vorhanden oder ein neuer Prozess fehlt.';
+            http_response_code(500);
+        }
+    }
+    echo json_encode($result, JSON_UNESCAPED_UNICODE | $processJsonFlags);
     exit;
 }
 

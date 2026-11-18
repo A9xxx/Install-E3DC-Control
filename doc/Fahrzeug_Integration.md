@@ -29,6 +29,14 @@ Eingabe. Die Wallbox darf trotzdem nach PV, Budget, Preisfenster oder kWh-Ziel
 laden; nur SoC-basierte Abschlüsse und Zielladungen bleiben ohne gesicherten
 Wert aus.
 
+## Eigene Fahrzeug-Vorlagen
+
+Auf der Seite „Wallbox“ speichert E3DC-Control unter „Eigene Fahrzeug-Vorlagen“
+die geänderte Ladeleistung und übernimmt sie für zugeordnete Ladepunkte.
+Beim Verknüpfen eines erkannten Fahrzeugs bleiben Name und technische Werte
+der Vorlage erhalten. Bei der Zuordnung haben Kennungen Vorrang vor Namen;
+Platzhalter gelten nicht als Fahrzeugkennung.
+
 ## openWB Pro ohne eigenen Fahrzeug-SoC
 
 Die reine Einstellung **PWM** auf der Maintenance-Seite der Pro bietet keine

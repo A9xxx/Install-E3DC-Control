@@ -707,6 +707,9 @@ document.addEventListener('visibilitychange', () => {
  * Helper function for dynamic battery colors and icons
  */
 function getBatStatus(batVal, soc, notstromReserve) {
+    if (!Number.isFinite(batVal) || !Number.isFinite(soc)) return {
+        hex: '#6c757d', txt: 'text-muted', bg: 'bg-secondary', fill: 'transparent', icon: 'fa-battery-half'
+    };
     const redThreshold = (notstromReserve || 0) + 10;
     const isLowSoc = soc <= redThreshold;
 
@@ -2335,8 +2338,13 @@ function marketSocDisplay(data = {}, nowMs = Date.now()) {
     if (!finite(t.valid_from_ts_ms) || !finite(t.valid_until_ts_ms)
         || nowMs < t.valid_from_ts_ms || nowMs >= t.valid_until_ts_ms) return fail('market_plan_expired');
     const sample = t.live_soc_check?.source_ts_ms;
-    if (!finite(sample) || nowMs - sample > 300000 || sample > nowMs + 1000) return fail('live_soc_stale');
+    // Zeitstempel aus der Zukunft prüft der Server mit seiner eigenen Uhr. Die Browseruhr darf um einige Sekunden
+    // nachgehen; hier zählt nur, ob die Bestätigung älter als fünf Minuten ist.
+    if (!finite(sample) || nowMs - sample > 300000) return fail('live_soc_stale');
     if (!Array.isArray(t.slots) || !t.slots.length) return fail('market_projection_input_invalid');
+    const catalog = data.market_plan?.phase_catalog;
+    if (!catalog || typeof catalog !== 'object' || Array.isArray(catalog)) return fail('market_plan_binding_invalid');
+    const selected = Array.isArray(t.selected_actions) ? t.selected_actions : [];
     const points = [];
     let previous = null;
     for (const slot of t.slots) {
@@ -2348,19 +2356,69 @@ function marketSocDisplay(data = {}, nowMs = Date.now()) {
             || previous.soc_end_pct !== slot.soc_start_pct)) {
             points.push({x: (previous.end_ts_ms + slot.start_ts_ms) / 2, y: null});
         }
-        points.push({x: slot.start_ts_ms, y: slot.soc_start_pct, action: slot.action, origin: slot.origin});
-        points.push({x: slot.end_ts_ms, y: slot.soc_end_pct, action: slot.action, origin: slot.origin});
+        const phase = slot.phase || selected.find(action => action.start_ts_ms <= slot.start_ts_ms
+            && slot.start_ts_ms < action.end_ts_ms)?.phase;
+        const displayLabel = catalog[phase]?.label || '';
+        points.push({x: slot.start_ts_ms, y: slot.soc_start_pct, action: slot.action, origin: slot.origin, displayLabel});
+        points.push({x: slot.end_ts_ms, y: slot.soc_end_pct, action: slot.action, origin: slot.origin, displayLabel});
         previous = slot;
     }
-    const windows = (Array.isArray(t.selected_actions) ? t.selected_actions : []).filter(action =>
-        action && ['hold_economic', 'grid_charge'].includes(action.action)
-        && ['hold_discharge', 'hold_horizon', 'hold_replacement', 'selected_grid_wait', 'grid_charge'].includes(action.origin)
-        && finite(action.start_ts_ms) && finite(action.end_ts_ms) && action.end_ts_ms > action.start_ts_ms);
+    const windows = [];
+    selected.filter(action =>
+        action && catalog[action.phase]?.display && catalog[action.phase].action === action.action
+        && finite(action.start_ts_ms) && finite(action.end_ts_ms) && action.end_ts_ms > action.start_ts_ms)
+        .map(action => ({...action, displayLabel: catalog[action.phase].label}))
+        .sort((a, b) => a.start_ts_ms - b.start_ts_ms)
+        .forEach(action => {
+            // Der Plan liefert je Viertelstunde eine Aktion; angrenzende Fenster derselben Art
+            // erscheinen wie beim Nachladen als ein Block.
+            const last = windows[windows.length - 1];
+            if (last && last.action === action.action && last.displayLabel === action.displayLabel
+                && action.start_ts_ms <= last.end_ts_ms) {
+                last.end_ts_ms = Math.max(last.end_ts_ms, action.end_ts_ms);
+            } else {
+                windows.push(action);
+            }
+        });
     return {complete: true, reasonCode: null, planId: t.plan_id, points, windows,
         expiresAt: Math.min(t.valid_until_ts_ms, sample + 300001)};
 }
 
 // Eine Live-Entwertung sperrt nur die Marktanzeige bereits laufender Abrufe.
+// Leistung nur aus der bestätigten Marktlinie, ohne zweite Speicherbilanz.
+function marketFlowSeries(data, timestamps, historyLength = 0) {
+    if (!marketSocDisplay(data).complete) return [];
+    const trajectory = data.market_soc_trajectory;
+    const finite = value => typeof value === 'number' && Number.isFinite(value);
+    return timestamps.map((timestamp, index) => {
+        if (index < historyLength || !finite(timestamp)) return null;
+        const left = Math.max(timestamp, trajectory.integration_start_ts_ms);
+        const right = Math.min(timestamp + 900000, trajectory.horizon_end_ts_ms);
+        if (!(right > left)) return null;
+        let duration = 0, battery = 0, grid = 0;
+        for (const slot of trajectory.slots) {
+            const overlap = Math.min(right, slot.end_ts_ms) - Math.max(left, slot.start_ts_ms);
+            if (overlap <= 0) continue;
+            if (!finite(slot.power_w) || !finite(slot.grid_w)) return null;
+            duration += overlap;
+            battery += slot.power_w * overlap;
+            grid += slot.grid_w * overlap;
+        }
+        return duration > 0 ? {battery: battery / duration, grid: grid / duration} : null;
+    });
+}
+
+function applyMarketFlowSeries(datasets, flows, battery, grid, mapFlip, dashFor) {
+    for (const [label, key, standard] of [['Batterie', 'battery', battery], ['Netz', 'grid', grid]]) {
+        const dataset = datasets.find(item => item.label === label);
+        if (!dataset || !flows.some(value => value !== null)) continue;
+        const raw = standard.map((value, index) => flows[index] === null || !flows[index] ? value : flows[index][key]);
+        dataset.flowRaw = raw;
+        dataset.data = mapFlip(raw);
+        dataset.segment = {...dataset.segment, borderDash: dashFor(raw)};
+    }
+}
+
 function marketSocRequestData(data, requestEpoch) {
     if (requestEpoch === (window._storageMarketEpoch || 0)) return data;
     const liveView = marketSocDisplay(window._storageLiveData || {});
@@ -2389,17 +2447,10 @@ function marketSocHint(data = {}) {
     return hint;
 }
 
-function marketSocActionText(action, origin) {
-    if (action === 'grid_charge') return 'Nachladen bei günstigem Preis';
-    if (action === 'hold_economic') return origin === 'selected_grid_wait'
-        ? 'Speicher halten bis zum Nachladen' : 'Speicher halten für teurere Stunden';
-    return '';
-}
-
 function marketSocTooltip(ctx) {
     if (!ctx.dataset?.marketSoc && !ctx.dataset?.marketWindow) return null;
     const point = ctx.raw || {};
-    const action = marketSocActionText(point.action, point.origin);
+    const action = point.displayLabel || '';
     if (ctx.dataset.marketWindow) return action;
     // Zwei kurze Zeilen bleiben auch in schmalen Diagrammen lesbar.
     return [`SoC-Prognose mit Marktplan: ${Number(point.y).toFixed(1)} %`, 'Geplant, wird jede Viertelstunde neu bestätigt', ...(action ? [action] : [])];
@@ -2412,8 +2463,56 @@ function marketSocTooltipTitle(items, fallback) {
         : fallback(items);
 }
 
+function marketPlanningEndPixel(chart) {
+    const index = chart.data.datasets.findIndex(dataset => dataset.marketSoc);
+    if (index < 0 || !chart.isDatasetVisible(index) || !chart.chartArea || !chart.scales.x) return null;
+    const end = chart.data.datasets[index].marketPlanningEndTsMs;
+    const scale = chart.scales.x;
+    if (typeof end !== 'number' || !Number.isFinite(end) || end < scale.min || end > scale.max) return null;
+    const pixel = scale.getPixelForValue(end);
+    return Number.isFinite(pixel) && pixel >= chart.chartArea.left && pixel <= chart.chartArea.right ? pixel : null;
+}
+
 const storageMarketWindowsPlugin = {
     id: 'storageMarketWindows',
+    afterDatasetsDraw(chart) {
+        const pixel = marketPlanningEndPixel(chart);
+        if (pixel === null) {
+            if (chart.$marketPlanningTitle && chart.canvas) chart.canvas.title = '';
+            chart.$marketPlanningTitle = false;
+            return;
+        }
+        const {ctx, chartArea: area} = chart;
+        const dark = document.documentElement?.getAttribute?.('data-bs-theme') === 'dark';
+        ctx.save();
+        ctx.strokeStyle = dark ? '#adb5bd' : '#626b73';
+        ctx.fillStyle = ctx.strokeStyle;
+        ctx.lineWidth = 1;
+        ctx.setLineDash([4, 4]);
+        ctx.beginPath();
+        ctx.moveTo(pixel, area.top);
+        ctx.lineTo(pixel, area.bottom);
+        ctx.stroke();
+        ctx.font = '11px sans-serif';
+        const label = 'Planungsende';
+        const width = ctx.measureText(label).width;
+        const left = Math.max(area.left, Math.min(pixel + 5, area.right - width));
+        ctx.fillText(label, left, area.top + 12);
+        ctx.restore();
+    },
+    afterEvent(chart, args) {
+        if (!chart.canvas) return;
+        const pixel = marketPlanningEndPixel(chart), event = args.event;
+        const near = pixel !== null && event.type !== 'mouseout' && Math.abs(event.x - pixel) <= 8
+            && event.y >= chart.chartArea.top && event.y <= chart.chartArea.bottom;
+        if (near) {
+            chart.canvas.title = 'Planungsende: Ladefenster, die danach enden, plant E3DC-Control erst ein, wenn sie im Planungszeitraum liegen.';
+            chart.$marketPlanningTitle = true;
+        } else if (chart.$marketPlanningTitle) {
+            chart.canvas.title = '';
+            chart.$marketPlanningTitle = false;
+        }
+    },
     beforeDatasetsDraw(chart) {
         const area = chart.chartArea;
         if (!area || !chart.scales.x) return;
@@ -2444,7 +2543,7 @@ const storageMarketWindowsPlugin = {
     }
 };
 
-function appendMarketSocDatasets(datasets, data, timestamps, yAxisID = 'y1', historyLength = 0) {
+function appendMarketSocDatasets(datasets, data, timestamps, yAxisID = 'y1', historyLength = 0, planningEndTsMs = null) {
     const view = marketSocDisplay(data);
     if (!view.complete) return view;
     if (!timestamps.length || !timestamps.every(ts => typeof ts === 'number' && Number.isFinite(ts))) {
@@ -2460,21 +2559,20 @@ function appendMarketSocDatasets(datasets, data, timestamps, yAxisID = 'y1', his
         baseline.borderDash = [4, 4]; baseline.borderWidth = 1; baseline.segment = undefined;
     }
     const from = timestamps[0], until = timestamps[timestamps.length - 1];
-    const fullHorizon = yAxisID !== 'ySoc' && until >= data.timestamps?.[data.timestamps.length - 1];
-    view.chartEnd = fullHorizon ? Math.max(until, view.points[view.points.length - 1].x) : until;
-    // Auch Tages-/Hybridausschnitte behalten sämtliche echten Endpunkte.
-    // Die Achse begrenzt ausschließlich den sichtbaren Bereich.
+    // Die Marktlinie endet sichtbar mit der übrigen Prognose, auch wenn der Plan weiter reicht.
+    // Die Datenpunkte bleiben vollständig; die Achse begrenzt ausschließlich den sichtbaren Bereich.
+    view.chartEnd = until;
     datasets.push({label: 'SoC-Prognose mit Marktplan (%)', data: view.points,
-        marketSoc: true, borderColor: '#20c997', borderWidth: 2.5, pointRadius: 0,
+        marketSoc: true, marketPlanningEndTsMs: planningEndTsMs, borderColor: '#20c997', borderWidth: 2.5, pointRadius: 0,
         tension: 0, spanGaps: false, fill: false, yAxisID, order: 3});
     // Ein Datensatz je Fensterart, damit die Legende jede Art nur einmal nennt.
     const windowSets = new Map();
     const darkTheme = typeof document !== 'undefined' && document.documentElement?.getAttribute?.('data-bs-theme') === 'dark';
     view.windows.forEach(action => {
         const left = Math.max(from, action.start_ts_ms);
-        const right = fullHorizon ? action.end_ts_ms : Math.min(until, action.end_ts_ms);
+        const right = Math.min(until, action.end_ts_ms);
         if (left >= right) return;
-        const label = marketSocActionText(action.action, action.origin);
+        const label = action.displayLabel;
         if (!windowSets.has(label)) {
             const hold = action.action === 'hold_economic';
             windowSets.set(label, {label, marketWindow: true, data: [],
@@ -2484,8 +2582,8 @@ function appendMarketSocDatasets(datasets, data, timestamps, yAxisID = 'y1', his
                 pointHitRadius: 0, borderWidth: 0, yAxisID, order: 20});
             datasets.push(windowSets.get(label));
         }
-        windowSets.get(label).data.push({x: action.start_ts_ms, y: 0, action: action.action, origin: action.origin},
-            {x: action.end_ts_ms, y: 100, action: action.action, origin: action.origin});
+        windowSets.get(label).data.push({x: action.start_ts_ms, y: 0, action: action.action, origin: action.origin, displayLabel: label},
+            {x: action.end_ts_ms, y: 100, action: action.action, origin: action.origin, displayLabel: label});
     });
     datasets.forEach(dataset => {
         dataset.data = dataset.data.map((value, index) => value && typeof value === 'object'
@@ -2711,9 +2809,13 @@ function cacheStorageCurveData(data) {
     else if (window._storageReason == null) window._storageReason = '';
     if (mergedData.soc !== undefined && mergedData.soc !== null && !isNaN(parseFloat(mergedData.soc))) {
         window._storageLiveSoc = parseFloat(mergedData.soc);
+    } else if (mergedData.soc === null) {
+        window._storageLiveSoc = null;
     }
     if (mergedData.storage_curve_control_soc !== undefined && mergedData.storage_curve_control_soc !== null && !isNaN(parseFloat(mergedData.storage_curve_control_soc))) {
         window._storageControlSoc = parseFloat(mergedData.storage_curve_control_soc);
+    } else if (mergedData.storage_curve_control_soc === null) {
+        window._storageControlSoc = null;
     }
     const marketView = marketSocDisplay(mergedData);
     if (!marketView.complete || planChanged
@@ -3229,7 +3331,8 @@ function initMobileStorageCurveTrigger() {
 }
 
 function formatRingPower(w, compact = false) {
-    w = Math.abs(parseFloat(w) || 0);
+    w = Math.abs(parseFloat(w));
+    if (!Number.isFinite(w)) return 'unbekannt';
     if (w >= 1000) {
         const digits = compact ? 1 : 1;
         return (w / 1000).toLocaleString('de-DE', {minimumFractionDigits: digits, maximumFractionDigits: digits}) + ' kW';
@@ -3278,7 +3381,7 @@ function setRingStackSegments(segments, totalValue, maxLength = 86, gap = 1.4) {
         .filter(s => s.value >= 20);
 
     segments.forEach(s => setRingPathSegment(s.id, 0, 0));
-    if (!active.length) return;
+    if (!Number.isFinite(totalValue) || !active.length) return;
 
     const total = Math.max(1000, totalValue || active.reduce((sum, s) => sum + s.value, 0));
     const available = Math.max(18, maxLength - Math.max(0, active.length - 1) * gap);
@@ -3321,13 +3424,13 @@ function updateMobileRingFlow(data, values) {
     if (!document.getElementById('m-flow-ring-view') || !data) return;
     values = values || {};
 
-    const pv = Math.max(0, parseFloat(values.pv || 0));
-    const bat = parseFloat(values.bat || 0);
-    const grid = parseFloat(values.grid || 0);
-    const home = Math.max(0, parseFloat(values.home || 0));
+    const pv = Math.max(0, parseFloat(values.pv));
+    const bat = parseFloat(values.bat);
+    const grid = parseFloat(values.grid);
+    const home = Math.max(0, parseFloat(values.home));
     const wbUnknown = wallboxConfiguredFlag(data, 1) && wallboxObservationUnknown(data, 'wb');
     const wb2Unknown = wallboxConfiguredFlag(data, 2) && wallboxObservationUnknown(data, 'wb2');
-    const consumptionKnown = !wbUnknown && !wb2Unknown;
+    const consumptionKnown = Number.isFinite(home) && !wbUnknown && !wb2Unknown;
     const wb = Math.max(0, parseFloat(values.wb || 0));
     const wb2 = Math.max(0, parseFloat(values.wb2 || 0));
     const wp = Math.max(0, parseFloat(values.wp || 0));
@@ -3360,12 +3463,15 @@ function updateMobileRingFlow(data, values) {
     }
     setRingText('m-ring-consumption-text', 'Verbrauch: ' + (consumptionKnown ? formatRingPower(consumption) : 'unbekannt'));
     setRingText('m-ring-home-text', formatRingPower(home));
-    setRingText('m-ring-soc', storageSoc !== null ? 'Speicher ' + Math.round(storageSoc) + '%' : 'Speicher --%');
+    setRingText('m-ring-soc', storageSoc !== null ? 'Speicher ' + Math.round(storageSoc) + '%' : 'Speicher unbekannt');
     setRingPathSegment('m-ring-arc-soc', storageSoc !== null ? storageSoc : 0, 0);
 
     const gridRow = document.getElementById('m-ring-grid-row');
     const gridIcon = document.getElementById('m-ring-grid-icon');
-    if (exportW > 20) {
+    if (!Number.isFinite(grid)) {
+        setRingText('m-ring-grid-text', 'Netz unbekannt');
+        if (gridRow) gridRow.style.display = '';
+    } else if (exportW > 20) {
         placeRingRow('m-ring-grid-row', 'm-ring-output-list');
         if (gridRow) { gridRow.classList.add('export'); gridRow.classList.remove('import'); }
         if (gridIcon) gridIcon.className = 'fas fa-arrow-right';
@@ -3386,7 +3492,9 @@ function updateMobileRingFlow(data, values) {
 
     const batRow = document.getElementById('m-ring-bat-row');
     const batIcon = document.getElementById('m-ring-bat-icon');
-    if (bat > 50) {
+    if (!Number.isFinite(bat)) {
+        setRingRow('m-ring-bat-row', 'Speicher unbekannt', true);
+    } else if (bat > 50) {
         placeRingRow('m-ring-bat-row', 'm-ring-output-list');
         if (batRow) { batRow.classList.add('charge'); batRow.classList.remove('discharge'); }
         if (batIcon) batIcon.className = 'fas fa-arrow-right-to-bracket';
@@ -3401,7 +3509,7 @@ function updateMobileRingFlow(data, values) {
         if (batIcon) batIcon.className = 'fas fa-car-battery';
         setRingRow('m-ring-bat-row', 'Speicher ruht', false, true);
     }
-    setRingRow('m-ring-home-row', (data.home_includes_wp ? (data.home_includes_climate ? 'Haus inkl. WP und Klima ' : 'Haus inkl. WP ') : (data.home_includes_climate ? 'Haus inkl. Klima ' : 'Haus ')) + formatRingPower(home), home > 20);
+    setRingRow('m-ring-home-row', (data.home_includes_wp ? (data.home_includes_climate ? 'Haus inkl. WP und Klima ' : 'Haus inkl. WP ') : (data.home_includes_climate ? 'Haus inkl. Klima ' : 'Haus ')) + formatRingPower(home), !Number.isFinite(home) || home > 20);
     if (String(data.wp_type) === '7') {
         setRingRow('m-ring-wp-row', 'WP ' + (data.wp === null || data.wp_power_valid === false ? 'unbekannt' : formatRingPower(data.wp)), true);
     } else {
@@ -3567,25 +3675,33 @@ function getMarketValueSolar(data) {
 }
 
 function marketValueSolarStatusLabel(status) {
-    const cached = String(status || '').startsWith('cached_');
-    const normalized = String(status || '').replace(/^cached_/, '');
     const labels = {
         preliminary: 'vorläufig',
         disabled: 'deaktiviert',
         missing_credentials: 'Zugangsdaten fehlen',
-        unavailable: 'nicht verfügbar',
-        no_solar_data: 'keine Solar-Hochrechnung',
-        no_price_data: 'keine Preise',
-        no_price_matches: 'keine Preiszuordnung'
+        unavailable: 'nicht verfügbar'
     };
-    const label = labels[normalized] || normalized.replace(/_/g, ' ');
-    return cached && label ? 'Cache: ' + label : label;
+    return labels[status] || 'nicht verfügbar';
 }
 
 function formatMarketValueSolarSummary(report, compact = false) {
     if (!report || typeof report !== 'object') return '';
     const value = parseFloat(report.solar_weighted_market_value_ct);
-    const status = marketValueSolarStatusLabel(report.status);
+    const reasons = {
+        missing_netztransparenz_credentials: 'Zugangsdaten fehlen',
+        netztransparenz_token_failed: 'Netztransparenz-Anmeldung nicht verfügbar',
+        netztransparenz_solar_failed: 'Solar-Hochrechnung nicht verfügbar',
+        no_parseable_solar_slots: 'keine lesbare Solar-Hochrechnung',
+        smard_fetch_failed: 'SMARD-Preise nicht verfügbar',
+        no_parseable_smard_prices: 'keine lesbaren SMARD-Preise',
+        incomplete_spot_prices: 'SMARD-Preise unvollständig',
+        no_solar_data: 'keine Solar-Hochrechnung',
+        no_solar_energy: 'keine Solarenergie im Zeitraum'
+    };
+    const reason = reasons[report.error] || '';
+    const status = report.solar_weighted_market_value_ct == null && report.enabled !== false
+        ? 'nicht verfügbar' + (reason ? ' – ' + reason : '')
+        : marketValueSolarStatusLabel(report.status);
     const prefix = compact ? 'MW Solar' : 'Marktwert Solar';
     if (Number.isFinite(value)) {
         const formatted = value.toLocaleString('de-DE', {minimumFractionDigits: 2, maximumFractionDigits: 2}) + ' ct/kWh';
@@ -3604,10 +3720,10 @@ function formatMarketValueSolarTitle(report) {
     if (report.enabled === false) lines.push('Monitor ist deaktiviert.');
     if (report.status === 'missing_credentials') lines.push('Netztransparenz Client-ID/Secret fehlen.');
     const slots = report.slots && typeof report.slots === 'object' ? report.slots : {};
-    if (slots.matched != null || slots.solar != null) lines.push('Slots: ' + (slots.matched ?? 0) + '/' + (slots.solar ?? 0));
+    if (slots.matched != null && slots.solar != null) lines.push('Slots: ' + slots.matched + '/' + slots.solar);
     const quality = report.quality && typeof report.quality === 'object' ? report.quality : {};
     if (quality.completeness_pct != null) lines.push('Abdeckung: ' + parseFloat(quality.completeness_pct).toLocaleString('de-DE', {maximumFractionDigits: 1}) + ' %');
-    if (Array.isArray(report.warnings) && report.warnings.length) lines.push('Hinweise: ' + report.warnings.join(', '));
+    if (report.preliminary && report.enabled !== false) lines.push('Experimenteller Monatswert-Trend; maßgeblich bleibt der amtliche Monatsmarktwert.');
     return lines.filter(Boolean).join('\n');
 }
 
@@ -5935,7 +6051,7 @@ function renderDirectMarketingCurveSection(data = null) {
                         <span class="text-info fw-bold">${directMarketingHtmlEscape(marketValueSolarTextOnly)}</span>
                         <span class="text-muted">keine Regelwirkung</span>
                     </div>
-                    <div class="text-muted">Der Monitor berechnet den vorläufigen Monatswert-Solar-Trend aus Solar-Hochrechnung und Spotpreisen. Er steuert keinen Speicher- oder Netzbefehl.</div>
+                    <div class="text-muted">Der Monitor berechnet den vorläufigen Monatswert-Solar-Trend aus der Netztransparenz-Solarhochrechnung und Day-Ahead-Preisen von SMARD. Er steuert keinen Speicher- oder Netzbefehl.</div>
                 `;
             }
             if (windowsEl) windowsEl.innerHTML = '';
@@ -6765,7 +6881,7 @@ function climateMeterHistoryDatasets(data) {
 
 function formatWatts(w) {
     w = parseFloat(w);
-    if (isNaN(w)) return '--';
+    if (!Number.isFinite(w)) return 'unbekannt';
     const isMobile = document.body.classList.contains('mode-mobile');
     const cls = isMobile ? 'unit' : 'val-unit';
     const sp = isMobile ? ' ' : '';
@@ -7007,6 +7123,8 @@ function updateEnergyFlowHoverCards(data, values = {}) {
         : preferKwh(data.pv_today_kwh, stats.total_pv_kwh);
     const pvSplitNote = livePvSourceSplitText(data, ' | ', false);
     const pvSource = livePvSourceInfo(data);
+    const socNow = parseFloat(data.soc);
+    const socText = Number.isFinite(socNow) ? `${Math.round(socNow)}%` : 'unbekannt';
     const gridNow = Math.round(values.grid ?? data.grid ?? 0);
     const batNow = Math.round(values.bat ?? data.bat ?? 0);
     const hsNow = Math.max(0, values.hs ?? data.hs_power ?? 0);
@@ -7070,8 +7188,8 @@ function updateEnergyFlowHoverCards(data, values = {}) {
             total: `${flowHoverKwh(stats.total_bat_in_kwh, 1)} / ${flowHoverKwh(stats.total_bat_out_kwh, 1)}`,
             items: batteryTargetItems,
             note: batteryCounterSplitGap
-                ? `SoC ${Math.round(data.soc || 0)}% | Tageswert aus Batterie-Zähler; Ziel-Aufteilung aus Leistungsbilanz.`
-                : `SoC ${Math.round(data.soc || 0)}%`
+                ? `SoC ${socText} | Tageswert aus Batterie-Zähler; Ziel-Aufteilung aus Leistungsbilanz.`
+                : `SoC ${socText}`
         },
         wallbox: {
             title: 'Wallbox 1',
@@ -7235,6 +7353,7 @@ function updateModernDashboardActivity(data, values) {
 }
 
 function calculateLiveAutarky(home, wb, wp, grid, climate = 0) {
+    if (![home, wb, wp, grid, climate].every(Number.isFinite)) return NaN;
     let totalVerbrauch = home + wb + wp + Math.max(0, climate || 0);
     let netzBezug = grid > 0 ? grid : 0;
 
@@ -7586,8 +7705,8 @@ function restartService(skipConfirm = false) {
             }
             return data;
         })
-        .then(() => {
-                alert("✓ Alle Dienste wurden zurückgesetzt und neu gestartet.\nDas Web-Interface ist kurzzeitig eventuell nicht erreichbar.");
+        .then(data => {
+            alert(data.message || "Zurücksetzen der Dienste und Neustart angefordert. Die Oberfläche anschließend neu laden.");
         })
         .catch(err => alert("✗ Neustart nicht bestätigt: " + err.message));
 }
@@ -9564,10 +9683,24 @@ function renderMarketSocHint(data, container) {
     if (!element && text) {
         element = document.createElement('div');
         element.dataset.marketSocHint = '1';
-        element.style.cssText = 'font-size:.78rem;text-align:center;padding:4px 8px;color:#d49b31;';
+        // Der Container hat eine feste Höhe, die das Diagramm ganz ausfüllt. Der Hinweis liegt deshalb unten im
+        // Innenabstand des Containers, statt unter dem Canvas abgeschnitten zu werden.
+        element.style.cssText = 'position:absolute;left:0;right:0;bottom:0;z-index:2;font-size:.78rem;line-height:1.2;text-align:center;padding:2px 8px;color:#d49b31;pointer-events:none;';
         container.appendChild(element);
     }
     if (element) { element.textContent = text; element.hidden = !text; }
+    if (!element) return;
+    // Solange der Hinweis sichtbar ist, hält der (positionierte) Container unten Platz für ihn frei; Chart.js misst die
+    // Fläche ohne Innenabstand und verkleinert das Diagramm über seinen Größenbeobachter. Bootstrap setzt den
+    // Innenabstand mit !important, deshalb mit Vorrang setzen und beim Ausblenden wieder entfernen.
+    if (text) {
+        container.style.setProperty('padding-bottom', '24px', 'important');
+    } else {
+        container.style.removeProperty('padding-bottom');
+    }
+    // Ein gleichzeitig sichtbarer Prognosestatus liegt über dem Hinweis statt auf ihm.
+    const status = container.querySelector('[data-forecast-projection-status]');
+    if (status) status.style.bottom = text ? '24px' : '6px';
 }
 
 function expireMarketSocChart(chart, view, baseline, xScale, data, container) {
@@ -9682,7 +9815,11 @@ function clearForecastProjectionStatus() {
         ? container.querySelector('[data-forecast-projection-status]')
         : null;
     const marketHint = container ? container.querySelector('[data-market-soc-hint]') : null;
-    if (marketHint) { marketHint.hidden = true; marketHint.textContent = ''; }
+    if (marketHint) {
+        marketHint.hidden = true;
+        marketHint.textContent = '';
+        container.style.removeProperty('padding-bottom');
+    }
     if (!status) return;
     status.hidden = true;
     status.textContent = '';
@@ -9766,7 +9903,7 @@ function livePvSourceInfo(data) {
     const measurementSource = String(data.pv_external_source || '').trim().toLowerCase();
     const topologyPresent = data.pv_external_topology_present === true || data.pv_external_capable === true;
     const topologyValid = data.pv_external_topology_valid === true;
-    const total = totalRaw !== null ? Math.max(0, totalRaw) : 0;
+    const total = totalRaw !== null ? Math.max(0, totalRaw) : NaN;
     const external = measurementValid && externalRaw !== null
         ? Math.max(0, Math.min(externalRaw, total))
         : 0;
@@ -10184,7 +10321,7 @@ function energyFlowConsumptionValidity(data) {
     const known = value => (typeof value === 'number' || (typeof value === 'string' && value.trim() !== ''))
         && Number.isFinite(Number(value));
     return {
-        home: known(Number.isFinite(parseFloat(data.home)) ? data.home : data.home_raw),
+        home: known(data.home),
         wallbox: !wallboxConfiguredFlag(data, 1) || (!wallboxObservationUnknown(data, 'wb') && known(data.wb)),
         wallbox2: !wallboxConfiguredFlag(data, 2) || (!wallboxObservationUnknown(data, 'wb2') && known(data.wb2)),
         ...(data.climate_power_valid === undefined ? {} : {climate: data.climate_power_valid === true})
@@ -10192,7 +10329,7 @@ function energyFlowConsumptionValidity(data) {
 }
 
 function updateEnergyFlowAggregates(values = {}, container = document.getElementById('flow-view')) {
-    const generationW = Math.max(0, Number(values.pv || 0)) + Math.max(0, Number(values.external_pv || 0));
+    const generationW = Number.isFinite(values.pv) ? Math.max(0, values.pv) + Math.max(0, Number(values.external_pv || 0)) : NaN;
     const consumerKeys = ['home', 'wallbox', 'wallbox2', 'wp', 'hs', 'climate'];
     const validity = values.validity || {};
     const unknownKeys = consumerKeys.filter(key => validity[key] === false || values[key] === null
@@ -10367,7 +10504,7 @@ function currentLiveSocForChart() {
         return null;
     }
 
-    const value = Number(houseBattery.value);
+    const value = parseFloat(houseBattery.value);
     return Number.isFinite(value) && value >= 0 && value <= 100 ? value : null;
 }
 
@@ -10945,7 +11082,10 @@ function loadJsLiveChart(hours, file = null) {
 
                 // --- NEU: PEAK SHAVING OVERLAY ---
                 if (typeof SHOW_PEAK_SHAVING !== 'undefined' && SHOW_PEAK_SHAVING && typeof E3DC_LIMITS !== 'undefined' && E3DC_LIMITS.einspeise > 0) {
+                    // Eine Hauslücke (null) ist kein Hausverbrauch von 0 W: Der Bucket bleibt in der Überlagerung leer.
+                    const peakHomeKnown = (i) => !data.home || (data.home[i] !== null && data.home[i] !== undefined);
                     let limitLineData = data.pv.map((_, i) => {
+                        if (!peakHomeKnown(i) || data.pv[i] === null || data.pv[i] === undefined) return null;
                         let h = data.home ? (data.home[i] || 0) : 0;
                         let w = data.wp ? (data.wp[i] || 0) : 0;
                         let c = data.climate ? (data.climate[i] || 0) : 0;
@@ -10956,6 +11096,7 @@ function loadJsLiveChart(hours, file = null) {
 
                     let kuppeData = [...data.pv];
                     let gridLimit = data.pv.map((_, i) => {
+                        if (!peakHomeKnown(i)) return null;
                         let h = data.home ? (data.home[i] || 0) : 0;
                         let w = data.wp ? (data.wp[i] || 0) : 0;
                         let c = data.climate ? (data.climate[i] || 0) : 0;
@@ -10998,6 +11139,8 @@ function loadJsLiveChart(hours, file = null) {
             const liveTimeContext = buildCompactChartTimeContext(data.timestamps, data.labels, gridColor, textColor, isDarkMode, 12);
             const liveXScale = liveTimeContext.xScale;
             const liveTooltip = {
+                // Wie Hybrid und Kosten: Hinweisfeld oben auf der vom Zeiger abgewandten Seite.
+                ...chartTooltipPlacement(),
                 filter: function(item) {
                     if (item.dataset.label && item.dataset.label.includes('__HIDDEN__')) return false;
                     if (item.dataset.label === 'Peak-Ersparnis') {
@@ -11285,7 +11428,8 @@ function loadJsForecastChart(file = '') {
             const gridColor = isDarkMode ? '#333' : '#e9ecef';
             const forecastTimeContext = buildForecastChartTimeContext(data, gridColor, textColor, isDarkMode);
 
-            const mapFlip = (arr) => chartFlipNegatives && arr ? arr.map(Math.abs) : arr;
+            // Eine Lücke (null) bleibt eine Lücke im Diagramm und wird nicht zu 0 gespiegelt.
+            const mapFlip = (arr) => chartFlipNegatives && arr ? arr.map(value => value === null ? null : Math.abs(value)) : arr;
             const dashIfNeg = (arr) => (ctx) => chartFlipNegatives && arr && (arr[ctx.p0DataIndex] < 0 || arr[ctx.p1DataIndex] < 0) ? [4, 4] : undefined;
             const predumpHeadroomW = Array.isArray(data.predump_w)
                 ? data.predump_w.map(v => Math.max(0, parseFloat(v) || 0))
@@ -11372,7 +11516,9 @@ function loadJsForecastChart(file = '') {
             }
 
             const marketBaseline = datasets.map(dataset => ({...dataset, data: Array.isArray(dataset.data) ? dataset.data.slice() : []}));
-            const marketView = appendMarketSocDatasets(datasets, marketData, data.timestamps || []);
+            applyMarketFlowSeries(datasets, marketFlowSeries(marketData, data.timestamps || []),
+                forecastBattery, forecastGrid, mapFlip, dashIfNeg);
+            const marketView = appendMarketSocDatasets(datasets, marketData, data.timestamps || [], 'y1', 0, marketData.market_planning_end_ts_ms);
             const marketXScale = marketSocXScale(marketView, data.timestamps || [], forecastTimeContext.xScale);
             datasets = applyHiddenState(datasets);
             const forecastTooltipFilter = function(item) {
@@ -11395,7 +11541,8 @@ function loadJsForecastChart(file = '') {
                     else if (cleanLabel === 'Netz') origVal = forecastGrid[ctx.dataIndex];
                 }
 
-                let val = chartRawY(ctx);
+                if (Array.isArray(ctx.dataset.flowRaw)) origVal = ctx.dataset.flowRaw[ctx.dataIndex];
+                let val = Array.isArray(ctx.dataset.flowRaw) ? origVal : chartRawY(ctx);
                 if (cleanLabel === 'Batterie' || cleanLabel === 'Batterie Leistung') {
                     cleanLabel = origVal > 0 ? 'Laden' : (origVal < 0 ? 'Entladen' : 'Batterie');
                     val = Math.abs(val);
@@ -11418,6 +11565,7 @@ function loadJsForecastChart(file = '') {
                 // weder Achse noch Tooltip-Callbacks des Hybrid-Charts erbt.
                 liveLineChart.options.plugins.tooltip = {
                     ...(liveLineChart.options.plugins.tooltip || {}),
+                    ...chartTooltipPlacement(),
                     filter: forecastTooltipFilter,
                     callbacks: {
                         title: items => marketSocTooltipTitle(items, forecastTimeContext.tooltipTitle),
@@ -11449,6 +11597,7 @@ function loadJsForecastChart(file = '') {
                                 }
                             },
                             tooltip: {
+                                ...chartTooltipPlacement(),
                                 filter: forecastTooltipFilter,
                                 callbacks: {
                                     title: items => marketSocTooltipTitle(items, forecastTimeContext.tooltipTitle),
@@ -11467,6 +11616,12 @@ function loadJsForecastChart(file = '') {
             }
             expireMarketSocChart(liveLineChart, marketView, marketBaseline, forecastTimeContext.xScale,
                 marketData, document.getElementById('liveChartContainer'));
+            // Wie Live, Hybrid und Preis jede Minute neu laden; sonst läuft die Bestätigung des Marktplans nach fünf
+            // Minuten ab, obwohl der Plan weiter gilt.
+            scheduleJsChartAutoRefresh('forecast', requestGeneration, () => {
+                const container = document.getElementById('liveChartContainer');
+                if (container && container.style.display === 'block') loadJsForecastChart(file);
+            });
         })
         .catch(err => {
             if (isCurrentJsChartRequest('forecast', requestGeneration)) {
@@ -11888,7 +12043,9 @@ function loadJsHybridChart(hours, file = null) {
         }
 
         const marketBaseline = datasets.map(dataset => ({...dataset, data: Array.isArray(dataset.data) ? dataset.data.slice() : []}));
-        const marketView = appendMarketSocDatasets(datasets, marketData, timestamps, 'y1', historyLength);
+        applyMarketFlowSeries(datasets, marketFlowSeries(marketData, timestamps, historyLength),
+            bat, grid, mapFlip, dashIfNegOrFore);
+        const marketView = appendMarketSocDatasets(datasets, marketData, timestamps, 'y1', historyLength, marketData.market_planning_end_ts_ms);
         datasets = applyHiddenState(datasets);
         const hybridTimeContext = buildCompactChartTimeContext(timestamps, labels, gridColor, textColor, isDarkMode, 8);
         labels = hybridTimeContext.labels;
@@ -11913,11 +12070,13 @@ function loadJsHybridChart(hours, file = null) {
             let value = chartRawY(ctx);
             const unit = label.includes('SoC') ? '%' : label.toLowerCase().includes('preis') ? 'ct/kWh' : 'W';
             if (cleanLabel === 'Batterie') {
-                const original = bat[ctx.dataIndex];
+                const original = ctx.dataset.flowRaw ? ctx.dataset.flowRaw[ctx.dataIndex] : bat[ctx.dataIndex];
+                if (ctx.dataset.flowRaw) value = original;
                 cleanLabel = original > 0 ? 'Laden' : original < 0 ? 'Entladen' : 'Batterie';
                 value = Math.abs(value);
             } else if (cleanLabel === 'Netz') {
-                const original = grid[ctx.dataIndex];
+                const original = ctx.dataset.flowRaw ? ctx.dataset.flowRaw[ctx.dataIndex] : grid[ctx.dataIndex];
+                if (ctx.dataset.flowRaw) value = original;
                 cleanLabel = original > 0 ? 'Netzbezug' : original < 0 ? 'Einspeisung' : 'Netz';
                 value = Math.abs(value);
             } else if (cleanLabel.startsWith('Wallbox')) {
@@ -12202,7 +12361,6 @@ function _weatherAlertText(alert) {
             entry.description,
             entry.instruction,
             entry.severity,
-            entry.region,
             entry.event_codes && entry.event_codes.GROUP,
             entry.event_codes && entry.event_codes.II
         );
@@ -12354,7 +12512,6 @@ function _weatherAlertPrimaryText(alert) {
             first.description,
             first.instruction,
             first.severity,
-            first.region,
             first.event_codes && first.event_codes.GROUP,
             first.event_codes && first.event_codes.II
         );
@@ -12417,14 +12574,19 @@ function _weatherAlertVisual(alert) {
     const negativePrimaryText = /keine\s+(aktive\s+)?(dwd-)?warnung|keine\s+wetterwarnung|keine\s+erhoehte|keine\s+erhöhte|no active|no elevated/.test(primaryText);
     const isThunderCode = hasWeatherCode && [95, 96, 99].includes(code);
     const isThunder = !negativeWeatherText && (_weatherAlertIsThunder(alert) || isThunderCode);
-    const isHeat = !negativeWeatherText && /hitze|hitzewarnung|heiß|heiss|heat|temperature|temperatur/.test(text);
+    // „Temperatur“ steht auch in Frost- und Glättetexten des DWD und ist deshalb kein Hitzemerkmal.
+    const isHeat = !negativeWeatherText && /hitze|hitzewarnung|heiß|heiss|heat/.test(text);
     const isWinter = !negativeWeatherText && (/schnee|glätte|glaette|frost|eisregen|glatteis|snow|ice/.test(text) || (hasWeatherCode && ((code >= 71 && code <= 77) || code === 85 || code === 86)));
     const isRain = !negativeWeatherText && (precip > 0.2 || /regen|starkregen|schauer|niederschlag|überflutung|ueberflutung|hochwasser|rain|shower|flood/.test(text) || (hasWeatherCode && [51, 53, 55, 61, 63, 65, 80, 81, 82].includes(code)));
     const isWind = !negativeWeatherText && /sturm|orkan|wind|böe|boe|boeen|böen|storm|gale|gust/.test(text);
-    const primaryHeat = !negativePrimaryText && /hitze|hitzewarnung|heiß|heiss|heat|temperature|temperatur/.test(primaryText);
+    const primaryHeat = !negativePrimaryText && /hitze|hitzewarnung|heiß|heiss|heat/.test(primaryText);
     const primaryWinter = !negativePrimaryText && /schnee|glätte|glaette|frost|eisregen|glatteis|snow|ice/.test(primaryText);
     const primaryRain = !negativePrimaryText && /regen|starkregen|schauer|niederschlag|überflutung|ueberflutung|hochwasser|rain|shower|flood/.test(primaryText);
     const primaryWind = !negativePrimaryText && /sturm|orkan|wind|böe|boe|boeen|böen|storm|gale|gust/.test(primaryText);
+    // Die erste Warnung steht auch im Titel; meldet sie Gewitter, zeigt das Abzeichen Gewitter,
+    // auch wenn ihr Text Sturmböen oder Starkregen nennt.
+    const firstEntry = _weatherAlertEntries(alert)[0];
+    const primaryThunder = !!(firstEntry && firstEntry.thunderstorm);
     const hour = new Date().getHours();
     const isNight = hour < 6 || hour >= 21;
     const isWarning = (alert && (alert.active || risk.active) && level > 0) || isThunder;
@@ -12436,7 +12598,10 @@ function _weatherAlertVisual(alert) {
         let icon = 'fa-exclamation-triangle';
         let label = 'Wetterwarnung';
         let textLabel = '';
-        if (primaryHeat || isHeat) {
+        if (primaryThunder) {
+            icon = 'fa-cloud-bolt';
+            label = 'Gewitterwarnung';
+        } else if (primaryHeat || isHeat) {
             icon = 'fa-temperature-high';
             label = 'Hitzewarnung';
             textLabel = 'Hitze';
@@ -12449,9 +12614,15 @@ function _weatherAlertVisual(alert) {
             label = 'Winterwarnung';
             textLabel = 'Winter';
         } else if (primaryRain || isRain) {
+            // Hochwasser nur, wenn die Warnung selbst so heißt. Der Gefahrenhinweis einer Dauerregenwarnung
+            // („Überflutungen von Straßen/Unterführungen“) macht daraus keine Hochwasserwarnung.
+            const first = firstEntry || {};
+            const warnName = [alert && alert.title, alert && alert.summary, alert && alert.event, alert && alert.headline,
+                first.event, first.headline].filter(Boolean).join(' ').toLowerCase();
+            const isFlood = /hochwasser|überflutung|ueberflutung|flood/.test(warnName);
             icon = 'fa-cloud-showers-heavy';
-            label = /hochwasser|überflutung|ueberflutung|flood/.test(text) ? 'Hochwasserwarnung' : 'Regenwarnung';
-            textLabel = /hochwasser|überflutung|ueberflutung|flood/.test(text) ? 'Flut' : 'Regen';
+            label = isFlood ? 'Hochwasserwarnung' : 'Regenwarnung';
+            textLabel = isFlood ? 'Flut' : 'Regen';
         } else if (isThunder) {
             icon = 'fa-cloud-bolt';
             label = 'Gewitterwarnung';
@@ -12947,7 +13118,7 @@ function processLiveData(data) {
     }
 
     // Berechnungen
-    let homeVal = Number.isFinite(parseFloat(data.home)) ? parseFloat(data.home) : (data.home_raw || 0);
+    let homeVal = parseFloat(data.home);
     let heatRodVal = data.hs_power || 0;
     if (heatRodVal < 0) heatRodVal = 0;
     if (homeVal < 0) homeVal = 0;
@@ -12955,26 +13126,26 @@ function processLiveData(data) {
     const wb1Power = wb1Configured ? (parseFloat(data.wb) || 0) : 0;
     const wb2Power = wb2Configured ? (parseFloat(data.wb2) || 0) : 0;
     const wbVal = wb1Power + wb2Power;
-    const batVal = Math.round(data.bat);
+    const batVal = Math.round(parseFloat(data.bat));
     const batAbs = Math.abs(batVal);
     const houseSocValue = data.house_battery_soc && Number.isFinite(parseFloat(data.house_battery_soc.value))
         ? parseFloat(data.house_battery_soc.value)
         : parseFloat(data.soc);
     const batStat = getBatStatus(batVal, houseSocValue, data.notstrom_reserve);
-    const gridVal = Math.round(data.grid);
+    const gridVal = Math.round(parseFloat(data.grid));
     const gridAbs = Math.abs(gridVal);
     const wpVal = parseFloat(data.wp) || 0;
     const climateVal = climateLivePower(data);
 
     // Live Autarkie
     let autarkieLive = calculateLiveAutarky(homeVal, wbVal, wpVal, gridVal, climateVal);
-    if (document.getElementById('val-autarky-live')) $('#val-autarky-live').text(autarkieLive.toFixed(0) + '%');
+    if (document.getElementById('val-autarky-live')) $('#val-autarky-live').text((Number.isFinite(autarkieLive) ? autarkieLive.toFixed(0) + '%' : 'unbekannt'));
 
     // Header Values Update (Nur auf Unterseiten vorhanden)
         if (document.getElementById('head-pv')) {
         const fmtHead = (v) => formatWatts(v).replace(/<[^>]*>?/gm, '');
         $('#head-pv').text(fmtHead(data.pv)); $('#head-bat').text(fmtHead(batAbs));
-        $('#head-soc').text(Math.round(houseSocValue) + '%').attr('title', 'Hausakku-SoC');
+        $('#head-soc').text((Number.isFinite(houseSocValue) ? Math.round(houseSocValue) + '%' : 'unbekannt')).attr('title', 'Hausakku-SoC');
         $('#head-home').text(fmtHead(homeVal)); $('#head-grid').text(fmtHead(gridAbs)); $('#head-wb').text((wb1Configured && wallboxObservationUnknown(data, 'wb')) || (wb2Configured && wallboxObservationUnknown(data, 'wb2')) ? '--' : fmtHead(wbVal));
         if(document.getElementById('head-wp')) $('#head-wp').text(data.wp_power_valid === false || data.wp === null ? '--' : fmtHead(wpVal));
         if(document.getElementById('head-climate')) $('#head-climate').text(fmtHead(climateVal));
@@ -13056,7 +13227,7 @@ function processLiveData(data) {
 
     if (document.getElementById('val-pv')) {
         $('#val-pv').html(formatWatts(data.pv));
-        const socText = `${Math.round(houseSocValue)}%`;
+        const socText = Number.isFinite(houseSocValue) ? `${Math.round(houseSocValue)}%` : 'unbekannt';
         const socTitle = (data.notstrom_reserve && data.notstrom_reserve > 0)
             ? `Hausakku-SoC ${socText}, Notstromreserve ${data.notstrom_reserve.toFixed(1)}%`
             : `Hausakku-SoC ${socText}`;
@@ -13567,7 +13738,7 @@ function processLiveData(data) {
 
         let batTimeText = '';
         if (typeof BAT_CAPACITY !== 'undefined' && BAT_CAPACITY > 0 && batAbs > 50) {
-            let hours = 0; let soc = parseFloat(data.soc) || 0;
+            let hours = 0; let soc = parseFloat(data.soc);
             if (batVal > 0 && soc < 100) {
                 hours = ((100 - soc) / 100 * BAT_CAPACITY * 1000) / batVal;
                 if (hours > 0 && hours < 48) { let h = Math.floor(hours); let m = Math.round((hours - h) * 60); batTimeText = `(voll: ${h}:${m.toString().padStart(2, '0')}h)`; }
@@ -13659,10 +13830,10 @@ function processLiveData(data) {
             let content = '';
             if (CURRENT_VIEW === 'pv') {
                 const pvBreakdownText = livePvBreakdownHtml(data);
-                content = pvBreakdownText ? `Gesamt: ${data.pv}W | ${pvBreakdownText}` : `Gesamt: ${data.pv}W`;
+                content = pvBreakdownText ? `Gesamt: ${flowPlainWatts(data.pv)} | ${pvBreakdownText}` : `Gesamt: ${flowPlainWatts(data.pv)}`;
             } else if (CURRENT_VIEW === 'grid') {
                 const phaseText = liveGridPhaseLabeledText(data);
-                content = phaseText ? `Netz: ${data.grid}W (${phaseText})` : `Netz: ${data.grid}W`;
+                content = phaseText ? `Netz: ${flowPlainWatts(data.grid)} (${phaseText})` : `Netz: ${flowPlainWatts(data.grid)}`;
                 if (data.ac0_w !== undefined) {
                     const wrTotal = (data.ac0_w || 0) + (data.ac1_w || 0) + (data.ac2_w || 0);
                     content += ` | WR: ${Math.round(wrTotal)}W (L1: ${livePhaseWattText(data.ac0_w)} | L2: ${livePhaseWattText(data.ac1_w)} | L3: ${livePhaseWattText(data.ac2_w)})`;
@@ -13745,7 +13916,7 @@ function processLiveData(data) {
             const el = document.getElementById(id); if (!el) return;
             if (!flowAnimationCache[id]) flowAnimationCache[id] = { speed: null, gap: null, reverse: null, stopped: false };
             const cache = flowAnimationCache[id];
-            if (Math.abs(val) < 15) { if (!cache.stopped) { el.classList.add('stopped'); cache.stopped = true; } return; }
+            if (!Number.isFinite(val) || Math.abs(val) < 15) { if (!cache.stopped) { el.classList.add('stopped'); cache.stopped = true; } return; }
             const absVal = Math.abs(val); let newGap = 30;
             if (absVal > 6000) newGap = 10; else if (absVal > 3000) newGap = 15; else if (absVal > 1000) newGap = 20;
             if (cache.stopped) { el.classList.remove('stopped'); cache.stopped = false; }
@@ -13762,7 +13933,7 @@ function processLiveData(data) {
         $('#f-val-wp').text(heatpumpPowerText(data, wpVal).replace(/<[^>]*>?/gm, ''));
         $('#f-val-climate').text(formatWatts(climateVal).replace(/<[^>]*>?/gm, ''));
         $('#f-val-grid').text(formatWatts(gridVal).replace(/<[^>]*>?/gm, '')); $('#f-val-bat').text(formatWatts(batAbs).replace(/<[^>]*>?/gm, ''));
-        $('#f-val-hs').text(formatWatts(hsVal).replace(/<[^>]*>?/gm, '')); $('#f-lbl-soc').text(Math.round(data.soc) + '% SoC');
+        $('#f-val-hs').text(formatWatts(hsVal).replace(/<[^>]*>?/gm, '')); $('#f-lbl-soc').text((Number.isFinite(parseFloat(data.soc)) ? Math.round(data.soc) + '% SoC' : 'unbekannt'));
         const hsTempNode = $('#f-val-hs-temp');
         if (hsTempNode.length) {
             if (data.elwa_water_temp_c != null) {
@@ -13793,12 +13964,12 @@ function processLiveData(data) {
         $('#flow-line-bat, #flow-dot-bat').attr('stroke', batStat.hex);
         applyFlowSelectorColor('.node-bat', batStat.hex);
 
-        let socPct = Math.round(data.soc);
+        let socPct = Math.round(parseFloat(data.soc));
         const batEl = document.getElementById('f-node-bat');
         if (batEl) {
             batEl.style.setProperty('--bat-fill', batStat.fill);
-            batEl.style.setProperty('--bat-soc', socPct + '%');
-            batEl.style.setProperty('--bat-soc-top', Math.min(100, socPct + 10) + '%');
+            batEl.style.setProperty('--bat-soc', (Number.isFinite(socPct) ? socPct + '%' : '0%'));
+            batEl.style.setProperty('--bat-soc-top', (Number.isFinite(socPct) ? Math.min(100, socPct + 10) + '%' : '0%'));
         }
         if (data.wp_boost_active === true) { $('.node-wp').addClass('boost'); $('#flow-line-wp, #flow-dot-wp').attr('stroke', '#dc3545'); } else { $('.node-wp').removeClass('boost'); applyFlowSelectorColor('.node-wp', getFlowColor('heatpump', '#f97316')); $('#flow-line-wp, #flow-dot-wp').attr('stroke', getFlowColor('heatpump', '#f97316')); }
         const gridStat = getGridFlowStatus(gridVal);
@@ -13925,7 +14096,7 @@ function processMobileData(data) {
             const el = document.getElementById(id); if (!el) return;
             if (!flowAnimationCache[id]) flowAnimationCache[id] = { speed: null, gap: null, reverse: null, stopped: false };
             const cache = flowAnimationCache[id];
-            if (Math.abs(val) < 15) { if (!cache.stopped) { el.classList.add('stopped'); cache.stopped = true; } return; }
+            if (!Number.isFinite(val) || Math.abs(val) < 15) { if (!cache.stopped) { el.classList.add('stopped'); cache.stopped = true; } return; }
             const absVal = Math.abs(val); let newGap = 30;
             if (absVal > 6000) newGap = 10; else if (absVal > 3000) newGap = 15; else if (absVal > 1000) newGap = 20;
             if (cache.stopped) { el.classList.remove('stopped'); cache.stopped = false; }
@@ -13940,8 +14111,8 @@ function processMobileData(data) {
         if (wb1Configured && data.wb !== undefined && data.wb !== null && Math.abs(data.wb) < 50) data.wb = 0;
         if (wb2Configured && data.wb2 !== undefined && data.wb2 !== null && Math.abs(data.wb2) < 50) data.wb2 = 0;
 
-        let pv = data.pv || 0; let bat = data.bat || 0; let grid = data.grid || 0;
-        let h = Number.isFinite(parseFloat(data.home)) ? parseFloat(data.home) : (data.home_raw || 0);
+        let pv = parseFloat(data.pv); let bat = parseFloat(data.bat); let grid = parseFloat(data.grid);
+        let h = parseFloat(data.home);
         let hsVal = data.hs_power || 0; if (hsVal < 0) hsVal = 0;
         if (h < 0) h = 0;
         let wb = wb1Configured ? (data.wb || 0) : 0;
@@ -13988,11 +14159,11 @@ function processMobileData(data) {
 
         const batStat = getBatStatus(bat, data.soc, data.notstrom_reserve);
         let resText = (data.notstrom_reserve && data.notstrom_reserve > 0) ? ` (R: ${data.notstrom_reserve.toFixed(0)}%)` : '';
-        $('#f-lbl-soc').text(Math.round(data.soc) + '% SoC' + resText);
+        $('#f-lbl-soc').text((Number.isFinite(parseFloat(data.soc)) ? Math.round(data.soc) + '% SoC' : 'unbekannt') + resText);
         $('#f-node-bat .fa-icon').removeClass('fa-battery-full fa-battery-three-quarters fa-battery-half fa-battery-quarter fa-battery-empty').addClass(batStat.icon);
 
         let autarkieLive = calculateLiveAutarky(h, wb, wp, grid, climate);
-        if (document.getElementById('m-val-autarky-live')) $('#m-val-autarky-live').text(autarkieLive.toFixed(0) + '%');
+        if (document.getElementById('m-val-autarky-live')) $('#m-val-autarky-live').text((Number.isFinite(autarkieLive) ? autarkieLive.toFixed(0) + '%' : 'unbekannt'));
         if (data.autarky_day !== undefined) $('#m-val-autarky-day').text(Math.round(data.autarky_day) + '%');
         if (data.selfcon_day !== undefined) $('#m-val-selfcon-day').text(Math.round(data.selfcon_day) + '%');
 
@@ -14010,12 +14181,12 @@ function processMobileData(data) {
         $('#flow-line-bat, #flow-dot-bat').attr('stroke', batStat.hex);
         applyFlowSelectorColor('.node-bat', batStat.hex);
 
-        const socPct = Math.round(data.soc);
+        const socPct = Math.round(parseFloat(data.soc));
         const batEl2 = document.getElementById('f-node-bat');
         if (batEl2) {
             batEl2.style.setProperty('--bat-fill', batStat.fill);
-            batEl2.style.setProperty('--bat-soc', socPct + '%');
-            batEl2.style.setProperty('--bat-soc-top', Math.min(100, socPct + 10) + '%');
+            batEl2.style.setProperty('--bat-soc', (Number.isFinite(socPct) ? socPct + '%' : '0%'));
+            batEl2.style.setProperty('--bat-soc-top', (Number.isFinite(socPct) ? Math.min(100, socPct + 10) + '%' : '0%'));
         }
         if (data.wp_boost_active === true) { $('.node-wp').addClass('boost'); $('#flow-line-wp, #flow-dot-wp').attr('stroke', '#dc3545'); }
         else { $('.node-wp').removeClass('boost'); applyFlowSelectorColor('.node-wp', getFlowColor('heatpump', '#f97316')); $('#flow-line-wp, #flow-dot-wp').attr('stroke', getFlowColor('heatpump', '#f97316')); }
@@ -14208,8 +14379,8 @@ function processMobileData(data) {
         const diagContainer = document.getElementById('diagramContainer');
         if (detailsEl && diagContainer && diagContainer.style.display !== 'none' && (typeof CURRENT_VIEW !== 'undefined' && CURRENT_VIEW !== 'price')) {
             let content = '';
-            if (CURRENT_VIEW === 'pv') { const pvBreakdownText = livePvBreakdownHtml(data); content = pvBreakdownText ? `Gesamt: ${data.pv}W | ${pvBreakdownText}` : `Gesamt: ${data.pv}W`; }
-            else if (CURRENT_VIEW === 'grid') { const phaseText = liveGridPhaseLabeledText(data); content = phaseText ? `Netz: ${data.grid}W (${phaseText})` : `Netz: ${data.grid}W`; if (data.ac0_w !== undefined) { const wrTotal = (data.ac0_w || 0) + (data.ac1_w || 0) + (data.ac2_w || 0); content += `<br>WR: ${Math.round(wrTotal)}W (L1: ${livePhaseWattText(data.ac0_w)} | L2: ${livePhaseWattText(data.ac1_w)} | L3: ${livePhaseWattText(data.ac2_w)})`; } }
+            if (CURRENT_VIEW === 'pv') { const pvBreakdownText = livePvBreakdownHtml(data); content = pvBreakdownText ? `Gesamt: ${flowPlainWatts(data.pv)} | ${pvBreakdownText}` : `Gesamt: ${flowPlainWatts(data.pv)}`; }
+            else if (CURRENT_VIEW === 'grid') { const phaseText = liveGridPhaseLabeledText(data); content = phaseText ? `Netz: ${flowPlainWatts(data.grid)} (${phaseText})` : `Netz: ${flowPlainWatts(data.grid)}`; if (data.ac0_w !== undefined) { const wrTotal = (data.ac0_w || 0) + (data.ac1_w || 0) + (data.ac2_w || 0); content += `<br>WR: ${Math.round(wrTotal)}W (L1: ${livePhaseWattText(data.ac0_w)} | L2: ${livePhaseWattText(data.ac1_w)} | L3: ${livePhaseWattText(data.ac2_w)})`; } }
             else if (CURRENT_VIEW === 'wb') { if (data.wb_p1 !== undefined) content = `WB 1 L1: ${livePhaseWattText(data.wb_p1)}W | L2: ${livePhaseWattText(data.wb_p2)}W | L3: ${livePhaseWattText(data.wb_p3)}W`; }
             else if (CURRENT_VIEW === 'wb2') { if (data.wb2_p1 !== undefined) content = `WB 2 L1: ${livePhaseWattText(data.wb2_p1)}W | L2: ${livePhaseWattText(data.wb2_p2)}W | L3: ${livePhaseWattText(data.wb2_p3)}W`; }
             else if (CURRENT_VIEW === 'hs') { const hsActual = data.hs_power || 0; const hsReq = data.hs_requested_w || data.hs_target_w || 0; content = `Heizstab Ist: ${hsActual}W`; if (hsReq > 0 && Math.abs(hsReq - hsActual) > 20) content += ` | Anforderung: ${hsReq}W`; if (data.elwa_water_temp_c != null) content += ` | Wasser: ${Number(data.elwa_water_temp_c).toFixed(1)}°C`; if (data.elwa_status) content += ` | Status: ${data.elwa_status}`; }

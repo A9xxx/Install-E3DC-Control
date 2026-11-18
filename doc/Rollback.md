@@ -16,6 +16,39 @@ export E3DC_INSTALL_PATH="/absoluter/pfad/zur/installation"
 test -f "$E3DC_INSTALL_PATH/e3dc-setup"
 ```
 
+## Rückfall von 5.5.8 auf 5.5.7
+
+**Docker:** Auf dem Host in `.env` `E3DC_IMAGE_TAG=v5.5.7` setzen und
+`sudo docker compose up -d` ausführen; die vorhandenen Daten-Volumes bleiben
+erhalten.
+
+**Bare Metal:** Der Rückweg ist das beim Update angelegte verifizierte Backup
+(siehe „Betriebsdaten wiederherstellen“). Nach dem Update geänderte
+Einstellungen und hinzugekommene Statistik- und Diagnosedaten sind darin nicht
+enthalten und vorher gesondert zu sichern.
+
+**Web-PIN und Zugangsdaten:** 5.5.7 wertet „Domainzugriff ohne Web-PIN“ nicht
+aus und zeigt keinen Hinweis. Config-Editor und Seite „Wallbox“ liefern
+gespeicherte Geheimnisse unter 5.5.7 wieder als Feldwerte an den Browser.
+
+**Phasenwerte und Wärmepumpe:** Ein gespeicherter Wert für „Phasen invertieren“
+kann unter 5.5.7 wieder wirken; nach dem Rückfall unter „E3DC
+System-Verbindung“ prüfen. Für „Wärmepumpe im Hauswert“ bietet 5.5.7 wieder die
+automatische Auswahl; den gespeicherten Wert prüfen.
+
+**Speicher und Messfristen:** Markt-Netzladen und Halten folgen wieder dem
+Ablauf von 5.5.7 mit gleichmäßiger Kleinladerate. Einstellungen, die 5.5.8 nicht
+mehr auswertet, gelten unter 5.5.7 wieder, soweit sie noch gespeichert sind.
+
+**PV-Prognose und Leistungsverlauf:** 5.5.7 verwendet den
+Solcast-Zwischenspeicher von 5.5.8 nicht; ein erfolgreicher Neuabruf benötigt je
+Site einen Abruf aus dem Tageskontingent. Lücken im Leistungsverlauf aus der
+Zeit mit 5.5.8 zeigt 5.5.7 als Nullwerte an.
+
+**Daten und Dienste:** 5.5.8 ändert keine Datenbankstruktur und führt keine
+neuen Dienste ein. Die Vergleichsdaten der neuen Speicherregelung liegen nur in
+der Ramdisk; 5.5.7 wertet sie nicht aus.
+
 ## Rückfall von 5.5.7 auf 5.5.6
 
 **Docker:** Auf dem Host in `.env` `E3DC_IMAGE_TAG=v5.5.6` setzen und
@@ -545,7 +578,7 @@ oder einen Prozessabbruch außerhalb des erkannten Fehlerpfads.
 
 ## Programmstand zurücksetzen
 
-Der aktuelle Stable-Stand ist `v5.5.7`.
+Der aktuelle Stable-Stand ist `v5.5.8`.
 
 Beim Rücklauf wird der tatsächliche Dateisystemzustand einer Unit weiterhin
 streng gegen reguläre Unit-Datei, kanonische `/dev/null`-Maske, unerwarteten

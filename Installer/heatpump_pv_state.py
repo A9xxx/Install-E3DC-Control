@@ -397,6 +397,8 @@ def _channel_checkpoint_envelope(envelope):
     envelope = copy.deepcopy(envelope)
     targets = {name: state.pop("pre_boost_target_c")
                for name, state in envelope["state"]["channels"].items()}
+    stops = {name: state.pop("user_stop")
+             for name, state in envelope["state"]["channels"].items()}
     tariff_channels = []
     for name, state in envelope["state"]["channels"].items():
         if state["owner"] == "tariff":
@@ -411,6 +413,9 @@ def _channel_checkpoint_envelope(envelope):
     extra = {"state_sha256": envelope["sha256"], "targets": targets}
     envelope["channel_return_targets"] = {
         **extra, "sha256": hashlib.sha256(_canonical(extra)).hexdigest()}
+    stop_extra = {"state_sha256": envelope["sha256"], "channels": stops}
+    envelope["channel_user_stop"] = {
+        **stop_extra, "sha256": hashlib.sha256(_canonical(stop_extra)).hexdigest()}
     return envelope
 
 
@@ -444,6 +449,22 @@ def _channel_checkpoint_restore(state, envelope):
     for name, target in extra["targets"].items():
         restored["channels"][name]["pre_boost_target_c"] = target
     # Ungültige Zusatzdaten geben kein Besitzrecht und keinen Ersatzwert vor.
+    state = _channel_checkpoint_validator(restored) or state
+    stop_extra = envelope.get("channel_user_stop")
+    if stop_extra is None:
+        return state
+    if not isinstance(stop_extra, dict) or set(stop_extra) != {"state_sha256", "channels", "sha256"}:
+        raise ValueError("user_stop_checkpoint_invalid")
+    payload = {key: stop_extra[key] for key in ("state_sha256", "channels")}
+    if (stop_extra["state_sha256"] != envelope["sha256"]
+            or stop_extra["sha256"] != hashlib.sha256(_canonical(payload)).hexdigest()
+            or not isinstance(stop_extra["channels"], dict)
+            or set(stop_extra["channels"]) != set(state["channels"])
+            or not all(isinstance(value, dict) for value in stop_extra["channels"].values())):
+        raise ValueError("user_stop_checkpoint_invalid")
+    restored = copy.deepcopy(state)
+    for name, episode in stop_extra["channels"].items():
+        restored["channels"][name]["user_stop"] = episode
     return _channel_checkpoint_validator(restored) or state
 
 
@@ -480,6 +501,8 @@ def _channel_checkpoint_signature(value):
     transition.pop("updated_ts", None)
     for channel in transition["channels"].values():
         channel.pop("last_sample_ts", None)
+        for key in ("clock", "device", "e3dc", "age_s", "wait_s", "remaining_s"):
+            channel["user_stop"].pop(key, None)
     return hashlib.sha256(_canonical(transition)).hexdigest()
 
 

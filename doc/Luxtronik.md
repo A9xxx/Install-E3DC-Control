@@ -103,11 +103,11 @@ im aktuellen Zyklus nachweislich die Entladung um die gemessene WP-Leistung
 begrenzen. Bei fehlendem oder veraltetem Beleg und bei Vorrang der
 Lastspitzenkappung wirkt der SoC-Schutz sofort.
 
-Nutzer-Aus nimmt auch Tarif-Aufträge zurück. Bei Luxtronik-Direktanbindung
-behält ein laufender Verdichter für Warmwasser und Heizung seine Mindestlaufzeit,
-auch nach dem durch „AUTO AUS“ ausgelösten Dienstneustart. Fehlt der aktuelle
+Nutzer-Aus beendet manuelle Aufträge, Preis-, Pre-Dump-, PV- und Tarif-Aufträge
+sofort. Ein bereits laufender Verdichter behält für Warmwasser und Heizung seine Mindestlaufzeit.
+„AUTO AUS“ wird vom laufenden Dienst eingelesen. Fehlt der aktuelle
 Gerätestatus oder die Verdichterbeobachtung, bleibt der Mindestlaufhalt für
-PV- und Tarif-Aufträge höchstens 60 Sekunden ab der letzten gültigen Beobachtung
+eigene positive Aufträge höchstens 60 Sekunden ab der letzten gültigen Beobachtung
 bestehen. Wiederholte Abfragen verlängern die Frist nicht; eine neue gültige Probe
 erneuert den Beleg. Danach wird der Auftrag zurückgenommen. Gerätefehler,
 EVU-Sperre, Inselbetrieb, Hausanschlussgrenze und Uhrfehler wirken weiterhin sofort.
@@ -234,6 +234,11 @@ Nach einem Schutzentzug gilt eine Wiedereinschaltsperre von mindestens zehn
 Minuten. Nach zwei Entzügen aus demselben Geräteschutzgrund bleibt der
 PV-Boost bis zum nächsten Tag gesperrt; der Grund wird angezeigt.
 Automatik-Aus startet ebenfalls die konfigurierte Wiedereinschaltsperre.
+
+E3DC-Control meldet die Wiedereinschaltsperre auf Informationsstufe nur,
+wenn sie einen ansonsten freigegebenen PV-Boost-Start verzögert. Andernfalls
+bleibt der Hinweis auf Debug-Stufe. Die Sperre beträgt ab Werk 20 Minuten
+und ist konfigurierbar.
 
 Die Wiedereinschaltsperre (`wp_restart_block_min`) zählt ab dem gemessenen
 Verdichterstillstand, nicht ab der Rücknahme des Sollwerts. Das gilt für
@@ -1039,3 +1044,26 @@ Ohne Einzelmessung bleibt der Hauswert einschließlich WP stehen.
 Im Diagnose-Export enthält `mqtt_ha_inbound.json` zusätzlich `heatpump_display`
 mit Typ, Frische, Gültigkeit und Gründen. Freie Status-/Modustexte sind ausgelassen,
 Topics werden wie bisher bereinigt.
+
+### Eigene Gerätewerte bei ausgeschalteter Automatik
+
+Nach dem Ende eines laufenden Mindestlaufs nimmt E3DC-Control eigene
+Heizungsangebote einmal geordnet zurück. Werte, die E3DC-Control nicht selbst
+gesetzt hat, bleiben bei ausgeschalteter Automatik unverändert. Eine spätere
+fremde Änderung löst keine erneute Heizungsrücknahme aus. Die konfigurierte
+Warmwasser-Grundstellung bleibt die dokumentierte Ausnahme und wird weiterhin
+über denselben Warmwasser-Ausgang gepflegt. Gerätefehler, Inselbetrieb und
+Hausanschlussgrenzen sowie eine zu kalte Wärmequelle können einen laufenden
+Restlauf weiterhin verkürzen. Nach Nutzer-Aus gilt für alle Besitzer die
+allgemeine Verdichter-Mindestlaufzeit (`wp_min_runtime_min`), nicht die
+Pre-Dump-Haltefrist. Eine Verringerung wird übernommen. Eine Erhöhung verlängert
+den begonnenen Restlauf nicht. Wiederholtes Aus und ein Dienstneustart verlängern ihn ebenfalls nicht.
+
+
+Der gemeinsame Vertrag für Restlauf, Rücknahme und Gerätewiederkehr steht in
+[V4: Rücknahme nach Nutzer-Aus](V4_Konfiguration_und_Regelung.md#rücknahme-nach-nutzer-aus).
+
+Beim Dienstende schaltet der Heizstab-Manager ausschließlich selbst
+übernommene Heizstab- und Shelly-Ausgänge aus. Global eingeschaltete Automatik ersetzt keinen
+eigenen Besitz; insbesondere bleibt bei lokal ausgeschaltetem Heizstab ein
+fremd gesetzter Ausgang unverändert.

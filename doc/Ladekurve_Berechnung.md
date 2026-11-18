@@ -285,10 +285,10 @@ Die Kurvenladung besteht aus drei Größen:
   unnötiges Ping-Pong geladen werden kann.
 
 Seit 5.0.6 wird der Rückstand nicht mehr als harter Vollgas-Sprung behandelt.
-Der Manager mittelt den Aufholbedarf über ein Zeitfenster, tapert ihn nahe der
-Kurve ab und integriert den sichtbaren Batteriefluss in einen
-`curve_control_soc`. Dadurch reagieren Regler und Anzeige weniger auf
-sekündliches SoC-Rauschen und die typische Sägezahnform wird gedämpft.
+Der Manager mittelt den Aufholbedarf über ein Zeitfenster und tapert ihn nahe
+der Kurve ab. Kurvenabstand und Reserve beziehen sich auf den vom E3DC
+gemeldeten SoC. Ein eigener integrierter Regel-SoC entfällt; ein SoC-Sprung
+ist ausschließlich ein Hinweis auf eine vermutete Kalibrierung.
 
 ```text
 unter der Kurve, aber nah dran -> iFc + sanfter Aufholterm
@@ -386,7 +386,7 @@ Für die Nachvollziehbarkeit sind diese Werte entscheidend:
 | Feld | Bedeutung |
 |---|---|
 | `curve_soc_now` | aktueller Sollwert der Ladekurve |
-| `curve_gap_pct` | Abstand zwischen Regel-SoC und Kurve |
+| `curve_gap_pct` | Abstand zwischen gemeldetem SoC und Kurve |
 | `i_fc_w` / `ifc_w` | Grund-Ladeleistung bis zum nächsten Anker |
 | `curve_gap_catchup_w` | zusätzlicher, geglätteter Aufholterm |
 | `rscp_charge_limit_w` | tatsächlich gesetzte EMS-Ladegrenze |

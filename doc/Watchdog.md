@@ -3,6 +3,12 @@
 E3DC-Control V4 läuft über systemd-Dienste. `screen`-Sessions sind nur noch
 Legacy und werden nicht für den normalen Betrieb verwendet.
 
+PiGuard schreibt Log, Heartbeat und Warnungen als `www-data`. Die Logrotation
+behält die letzten 200 Zeilen. Dafür verwendet der Watchdog `setpriv`, ersatzweise
+`runuser`. Fehlen beide Werkzeuge, meldet er dies im Journal und schreibt keine
+Webdateien mit Root-Rechten. Das gilt auch für Docker-Hosts mit installiertem
+Watchdog.
+
 ## Wichtige Dienste
 
 ```text

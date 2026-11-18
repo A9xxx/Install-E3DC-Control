@@ -304,24 +304,53 @@ def _render_pi_guard(
     venv_python_quoted = shlex.quote(context.venv_python)
     bundle_value = shlex.quote(bundle_sha256)
 
+    # Nur Diagnose: Alter wird separat bewertet, alte lesbare Werte bleiben vergleichbar.
+    # Der Healthcheck prüft Prozessbereitschaft, aber keine Datenstagnation.
+    docker_probe = shlex.quote("""import glob, os, sys, time
+sys.path.insert(0, '/app/pi/Install/Installer')
+from live_snapshot import read_bound_json_object, project_native_live, _finite_number
+pattern = sys.argv[1]
+age = 0
+if pattern:
+    newest = max(glob.glob(pattern.replace('{day}', '*')), key=os.path.getmtime)
+    age = int(time.time() - os.stat(newest).st_mtime)
+    if age < 0:
+        raise ValueError('Dateizeit liegt in der Zukunft')
+raw, meta = read_bound_json_object('/var/www/html/ramdisk/live_data_py.json', max_age_s=None, max_bytes=4*1024*1024)
+snapshot = project_native_live(raw)
+values = [_finite_number(snapshot.get(key)) for key in ('home_raw', 'pv', 'grid')]
+if not meta.get('valid') or snapshot.get('native_control_valid') is not True or any(value is None for value in values):
+    raise ValueError('Livewerte nicht lesbar oder ungültig')
+print(str(age) + '|' + '_'.join(str(int(round(value))) for value in values))
+""")
+
     guard_content = f"""#!/bin/bash
 VERSION="2026.05.15"
 BUNDLE_SHA256={bundle_value}
 
+# Alle Webdateien werden mit den Rechten des Webservers geschrieben.
+web_write() {{
+    if command -v setpriv >/dev/null 2>&1; then
+        setpriv --reuid=www-data --regid=www-data --init-groups -- bash -c 'umask 002; '"$1" _ "${{@:2}}"
+    elif command -v runuser >/dev/null 2>&1; then
+        runuser -u www-data -- bash -c 'umask 002; '"$1" _ "${{@:2}}"
+    else
+        logger -t PIGUARD "Webdatei nicht geschrieben: runuser und setpriv fehlen."
+        return 1
+    fi
+}}
+
 log_msg() {{
     echo "$1" | logger -t PIGUARD
     if [ -d "/var/www/html/logs" ]; then
-        echo "$(LC_TIME=C date '+%b %d %H:%M:%S') PIGUARD: $1" >> /var/www/html/logs/piguard.log
-        tail -n 200 /var/www/html/logs/piguard.log > /var/www/html/logs/piguard.tmp && mv /var/www/html/logs/piguard.tmp /var/www/html/logs/piguard.log
-        chmod 664 /var/www/html/logs/piguard.log 2>/dev/null
+        web_write 'echo "$1" >> /var/www/html/logs/piguard.log; tail -n 200 /var/www/html/logs/piguard.log > /var/www/html/logs/piguard.tmp && mv /var/www/html/logs/piguard.tmp /var/www/html/logs/piguard.log' "$(LC_TIME=C date '+%b %d %H:%M:%S') PIGUARD: $1"
     fi
 }}
 
 write_heartbeat() {{
     local status="${{1:-OK}}"
     if [ -d "/var/www/html/ramdisk" ]; then
-        echo "$(date +%s);$status" > /var/www/html/ramdisk/watchdog.heartbeat
-        chmod 664 /var/www/html/ramdisk/watchdog.heartbeat 2>/dev/null
+        web_write 'printf "%s\\n" "$1" > /var/www/html/ramdisk/watchdog.heartbeat' "$(date +%s);$status"
     fi
 }}
 
@@ -343,6 +372,7 @@ warned_bluelink=false
 warned_live_stale=false
 warned_update_pause=false
 warned_update_grace=false
+docker_restart_attempted=false
 LAST_CHECKED_FILE=""
 LAST_LIVE_HASH=""
 live_stale_fail=0
@@ -393,8 +423,7 @@ quiesce_limits_text() {{
 write_quiesce_latch_warning() {{
     local now_ts="$1" limits
     limits=$(quiesce_limits_text)
-    printf '{{"warning": "Emergency-Quiesce aktiv - manueller Reset nach Prüfung erforderlich. %s. Rückweg: Ursache beheben und das Emergency-Latch zurücksetzen oder den E3DC neu starten (setzt die Akkugrenzen auf die Grundeinstellung).", "level": "critical", "ts": %s, "battery_limits": "%s"}}\n' "$limits" "$now_ts" "$limits" > /var/www/html/ramdisk/watchdog_warning.json
-    chmod 664 /var/www/html/ramdisk/watchdog_warning.json 2>/dev/null
+    web_write 'printf "%s\\n" "$1" > /var/www/html/ramdisk/watchdog_warning.json' "$(printf '{{"warning": "Emergency-Quiesce aktiv - manueller Reset nach Prüfung erforderlich. %s. Rückweg: Ursache beheben und das Emergency-Latch zurücksetzen oder den E3DC neu starten (setzt die Akkugrenzen auf die Grundeinstellung).", "level": "critical", "ts": %s, "battery_limits": "%s"}}\\n' "$limits" "$now_ts" "$limits")"
 }}
 
 new_storage_incident_id() {{
@@ -454,7 +483,7 @@ watchdog_update_grace_active() {{
 
 IS_DOCKER=false
 if command -v docker &> /dev/null; then
-    if docker ps -a --format '{{.Names}}' | grep -q "^e3dc-control$"; then
+    if docker ps -a --format '{{{{.Names}}}}' | grep -q "^e3dc-control$"; then
         IS_DOCKER=true
     fi
 fi
@@ -561,17 +590,49 @@ while true; do
   fi
 
   if [ "$is_standby_slave" = false ]; then
-      # --- CHECK 2: E3DC SCREEN ODER DOCKER CONTAINER ---
+      # --- CHECK 2: Docker nur bei lesbar nachgewiesenem Hänger neu starten. ---
       if [ "$IS_DOCKER" = true ]; then
-          if ! docker ps --format '{{{{.Names}}}}' | grep -q "^e3dc-control$"; then
-            ((e3dc_fail++))
-            if [ $e3dc_fail -eq 5 ] && [ "$warned_e3dc" = false ]; then
-                /usr/local/bin/boot_notify.sh "⚠️ Docker Container 'e3dc-control' fehlt! Restart in 2 Min."
-                warned_e3dc=true
-            fi
+          docker_running=$(timeout 5 docker inspect --format '{{{{.State.Running}}}}' e3dc-control 2>/dev/null)
+          docker_sample=""
+          if [ "$docker_running" = true ]; then
+              docker_sample=$(timeout 5 docker exec e3dc-control /opt/venv/bin/python3 -B -c {docker_probe} "$MONITOR_FILE" 2>/dev/null) || docker_sample=""
+          fi
+          if [ "$docker_running" != true ] || [[ ! "$docker_sample" =~ ^[0-9]+[|][-0-9_]+$ ]]; then
+              if [ "$warned_e3dc" = false ]; then
+                  /usr/local/bin/boot_notify.sh "⚠️ Docker Container 'e3dc-control' fehlt, ist gestoppt oder seine Hängerprüfung ist nicht lesbar. Kein automatischer Neustart."
+                  warned_e3dc=true
+              fi
+              file_fail=0
+              live_stale_fail=0
+              LAST_LIVE_HASH=""
           else
-            e3dc_fail=0
-            warned_e3dc=false
+              docker_age="${{docker_sample%%|*}}"
+              current_hash="${{docker_sample#*|}}"
+              if [ "$docker_age" -gt 900 ]; then ((file_fail++)); else file_fail=0; fi
+              if [ "$LAST_LIVE_HASH" = "$current_hash" ]; then
+                  ((live_stale_fail++))
+              else
+                  live_stale_fail=0
+                  LAST_LIVE_HASH="$current_hash"
+              fi
+              if [ $file_fail -eq 0 ] && [ $live_stale_fail -eq 0 ]; then
+                  warned_e3dc=false
+                  docker_restart_attempted=false
+              fi
+              if {{ [ $file_fail -ge 18 ] || [ $live_stale_fail -ge 18 ]; }} && [ "$docker_restart_attempted" = false ]; then
+                  # Direkt vor dem Befehl erneut prüfen: bewusste Stopps respektieren.
+                  docker_restart_attempted=true
+                  if [ "$(timeout 5 docker inspect --format '{{{{.State.Running}}}}' e3dc-control 2>/dev/null)" = true ]; then
+                      if timeout 30 docker restart e3dc-control; then
+                          /usr/local/bin/boot_notify.sh "⚠️ E3DC Docker Container neu gestartet (Hänger)."
+                      else
+                          /usr/local/bin/boot_notify.sh "⚠️ E3DC Docker Container: Neustart wegen Hänger fehlgeschlagen."
+                      fi
+                  elif [ "$warned_e3dc" = false ]; then
+                      /usr/local/bin/boot_notify.sh "⚠️ Docker Container 'e3dc-control' läuft nicht mehr. Kein automatischer Neustart."
+                  fi
+                  warned_e3dc=true
+              fi
           fi
       else
           if ! systemctl is-active --quiet e3dc-live 2>/dev/null; then
@@ -586,47 +647,50 @@ while true; do
           fi
       fi
 
-      # --- CHECK 3: DATEI-AKTIVITÄT (Hänger-Schutz) ---
-      # Dynamische Dateinamen (z.B. protokoll.{{day}}.txt)
-      ACTUAL_FILE="$MONITOR_FILE"
-      if [[ "$MONITOR_FILE" == *"{{day}}"* ]]; then
-          # Strategie: Wir suchen die neueste Datei, die auf das Muster passt.
-          # Das löst Probleme beim Tageswechsel (z.B. wenn E3DC noch in die gestrige Datei schreibt).
-          PATTERN=$(echo "$MONITOR_FILE" | sed 's/{{day}}/*/g')
-          LATEST=$(ls -1t $PATTERN 2>/dev/null | head -n 1)
-          if [ -n "$LATEST" ]; then
-              ACTUAL_FILE="$LATEST"
-          else
-              dow=$(date +%u)
-              case $dow in
-                  1) d="Mo" ;; 2) d="Di" ;; 3) d="Mi" ;; 4) d="Do" ;; 5) d="Fr" ;; 6) d="Sa" ;; 7) d="So" ;;
-              esac
-              ACTUAL_FILE=$(echo "$MONITOR_FILE" | sed "s/{{day}}/$d/")
+      if [ "$IS_DOCKER" = false ]; then
+          # --- CHECK 3: DATEI-AKTIVITÄT (Hänger-Schutz) ---
+          # Dynamische Dateinamen (z.B. protokoll.{{day}}.txt)
+          ACTUAL_FILE="$MONITOR_FILE"
+          if [[ "$MONITOR_FILE" == *"{{day}}"* ]]; then
+              # Strategie: Wir suchen die neueste Datei, die auf das Muster passt.
+              # Das löst Probleme beim Tageswechsel (z.B. wenn E3DC noch in die gestrige Datei schreibt).
+              PATTERN=$(echo "$MONITOR_FILE" | sed 's/{{day}}/*/g')
+              LATEST=$(ls -1t $PATTERN 2>/dev/null | head -n 1)
+              if [ -n "$LATEST" ]; then
+                  ACTUAL_FILE="$LATEST"
+              else
+                  dow=$(date +%u)
+                  case $dow in
+                      1) d="Mo" ;; 2) d="Di" ;; 3) d="Mi" ;; 4) d="Do" ;; 5) d="Fr" ;; 6) d="Sa" ;; 7) d="So" ;;
+                  esac
+                  ACTUAL_FILE=$(echo "$MONITOR_FILE" | sed "s/{{day}}/$d/")
+              fi
           fi
-      fi
 
-      # Logge Datei-Wechsel (z.B. neuer Tag oder Start)
-      if [ "$ACTUAL_FILE" != "$LAST_CHECKED_FILE" ] && [ -n "$ACTUAL_FILE" ]; then
-          log_msg "Überwache Datei: $ACTUAL_FILE"
-          LAST_CHECKED_FILE="$ACTUAL_FILE"
-      fi
-
-      if [ -n "$ACTUAL_FILE" ] && [ -f "$ACTUAL_FILE" ]; then
-        current_time=$(date +%s)
-        file_time=$(stat -c %Y "$ACTUAL_FILE")
-        diff=$((current_time - file_time))
-
-        # Alarm wenn Datei älter als 15 Minuten (900 Sekunden)
-        if [ $diff -gt 900 ]; then
-          ((file_fail++))
-          if [ $file_fail -eq 5 ] && [ "$warned_file" = false ]; then
-              /usr/local/bin/boot_notify.sh "⚠️ Datei veraltet! ($ACTUAL_FILE > 15min). Restart Service in 2 Min."
-              warned_file=true
+          # Logge Datei-Wechsel (z.B. neuer Tag oder Start)
+          if [ "$ACTUAL_FILE" != "$LAST_CHECKED_FILE" ] && [ -n "$ACTUAL_FILE" ]; then
+              log_msg "Überwache Datei: $ACTUAL_FILE"
+              LAST_CHECKED_FILE="$ACTUAL_FILE"
           fi
-        else
-          file_fail=0
-          warned_file=false
-        fi
+
+          if [ -n "$ACTUAL_FILE" ] && [ -f "$ACTUAL_FILE" ]; then
+            current_time=$(date +%s)
+            file_time=$(stat -c %Y "$ACTUAL_FILE")
+            diff=$((current_time - file_time))
+
+            # Alarm wenn Datei älter als 15 Minuten (900 Sekunden)
+            if [ $diff -gt 900 ]; then
+              ((file_fail++))
+              if [ $file_fail -eq 5 ] && [ "$warned_file" = false ]; then
+                  /usr/local/bin/boot_notify.sh "⚠️ Datei veraltet! ($ACTUAL_FILE > 15min). Restart Service in 2 Min."
+                  warned_file=true
+              fi
+            else
+              file_fail=0
+              warned_file=false
+            fi
+          fi
+
       fi
 
       # --- CHECK 5 & 6: Zusatzdienste (nur wenn nicht im Docker-Modus) ---
@@ -676,7 +740,7 @@ while true; do
   fi
 
   # --- CHECK 7: E3DC LIVE-STAGNATION (Zukunftssicher & Freeze-Schutz) ---
-  if [ "$is_standby_slave" = false ]; then
+  if [ "$is_standby_slave" = false ] && [ "$IS_DOCKER" = false ]; then
       current_hash=$("$VENV_PY" "$INSTALL_DIR/Installer/live_snapshot.py" --watchdog-hash 2>/dev/null)
       if [ -n "$current_hash" ]; then
           if [ "$LAST_LIVE_HASH" == "$current_hash" ]; then
@@ -694,7 +758,7 @@ while true; do
   fi
 
   # --- CHECK 8: STORAGE MANAGER HANG / CRASH ---
-  if [ "$is_standby_slave" = false ]; then
+  if [ "$is_standby_slave" = false ] && [ "$IS_DOCKER" = false ]; then
       if [ -f "/var/www/html/ramdisk/storage_manager_state.json" ]; then
           sm_time=$(stat -c %Y "/var/www/html/ramdisk/storage_manager_state.json")
           sm_current_time=$(date +%s)
@@ -731,8 +795,7 @@ while true; do
                       ((sm_restart_attempts++))
                       sm_last_action_ts=$sm_current_time
                       log_msg "WATCHDOG: Storage Manager reagiert nicht (State ${{sm_diff}}s alt, Dienst aktiv=${{sm_service_active}}). Restart ${{sm_restart_attempts}}/2."
-                      printf '{{"warning": "Storage Manager reagiert nicht - Neustartversuch %s/2", "level": "warning", "ts": %s}}\n' "$sm_restart_attempts" "$sm_current_time" > /var/www/html/ramdisk/watchdog_warning.json
-                      chmod 664 /var/www/html/ramdisk/watchdog_warning.json 2>/dev/null
+                      web_write 'printf "%s\\n" "$1" > /var/www/html/ramdisk/watchdog_warning.json' "$(printf '{{"warning": "Storage Manager reagiert nicht - Neustartversuch %s/2", "level": "warning", "ts": %s}}\\n' "$sm_restart_attempts" "$sm_current_time")"
                       systemctl restart e3dc-storage-manager.service 2>/dev/null
                       if [ "$warned_sm" = false ]; then
                           /usr/local/bin/boot_notify.sh "Watchdog: E3DC Storage Manager reagiert nicht - Neustartversuch ${{sm_restart_attempts}}/2."
@@ -745,8 +808,7 @@ while true; do
                           sm_incident_id=$(new_storage_incident_id)
                       fi
                       log_msg "WATCHDOG: Storage Manager nach 2 Neustarts weiter gestoert. Starte einmaligen Emergency-Quiesce."
-                      printf '{{"warning": "Kerndienst ausgefallen - einmaliger Emergency-Quiesce gestartet", "level": "critical", "ts": %s}}\n' "$sm_current_time" > /var/www/html/ramdisk/watchdog_warning.json
-                      chmod 664 /var/www/html/ramdisk/watchdog_warning.json 2>/dev/null
+                      web_write 'printf "%s\\n" "$1" > /var/www/html/ramdisk/watchdog_warning.json' "$(printf '{{"warning": "Kerndienst ausgefallen - einmaliger Emergency-Quiesce gestartet", "level": "critical", "ts": %s}}\\n' "$sm_current_time")"
                       if [ -x "$VENV_PY" ] && [ -f "$INSTALL_DIR/Installer/emergency_release.py" ]; then
                           "$VENV_PY" "$INSTALL_DIR/Installer/emergency_release.py" \
                               --incident-id "$sm_incident_id" \
@@ -761,8 +823,7 @@ while true; do
                       else
                           log_msg "WATCHDOG: Emergency-Quiesce unvollstaendig (Exit $quiesce_rc); kein Retry und kein Hardware-Fallback."
                           quiesce_limits=$(quiesce_limits_text)
-                          printf '{{"warning": "Emergency-Quiesce unvollstaendig - manueller Eingriff erforderlich. %s.", "level": "critical", "ts": %s, "exit_code": %s, "battery_limits": "%s"}}\n' "$quiesce_limits" "$sm_current_time" "$quiesce_rc" "$quiesce_limits" > /var/www/html/ramdisk/watchdog_warning.json
-                          chmod 664 /var/www/html/ramdisk/watchdog_warning.json 2>/dev/null
+                          web_write 'printf "%s\\n" "$1" > /var/www/html/ramdisk/watchdog_warning.json' "$(printf '{{"warning": "Emergency-Quiesce unvollstaendig - manueller Eingriff erforderlich. %s.", "level": "critical", "ts": %s, "exit_code": %s, "battery_limits": "%s"}}\\n' "$quiesce_limits" "$sm_current_time" "$quiesce_rc" "$quiesce_limits")"
                           /usr/local/bin/boot_notify.sh "Watchdog: Emergency-Quiesce unvollstaendig - manueller Eingriff erforderlich."
                       fi
                   fi
@@ -804,30 +865,18 @@ while true; do
     log_msg "Netzwerk ($ROUTER_IPS) seit 5 Min weg. Reboot!"
     systemctl reboot
   fi
-  if [ $e3dc_fail -ge 18 ]; then
-    if [ "$IS_DOCKER" = true ]; then
-        log_msg "Docker Container fehlt seit 3 Min. Restart!"
-        docker restart e3dc-control
-        /usr/local/bin/boot_notify.sh "⚠️ E3DC Docker Container neu gestartet."
-    else
+  if [ $e3dc_fail -ge 18 ] && [ "$IS_DOCKER" = false ]; then
         log_msg "$CORE_SERVICE_LABEL Watchdog: Restart Core Service!"
         restart_core_service
         /usr/local/bin/boot_notify.sh "⚠️ $CORE_SERVICE_LABEL Service neu gestartet (Watchdog)."
-    fi
     e3dc_fail=0
     warned_e3dc=false
     sleep 60
   fi
-  if [ $file_fail -ge 18 ]; then
-    if [ "$IS_DOCKER" = true ]; then
-        log_msg "Watchdog-Datei veraltet. Restart Docker Container!"
-        docker restart e3dc-control
-        /usr/local/bin/boot_notify.sh "⚠️ E3DC Docker Container neu gestartet (Datei $ACTUAL_FILE veraltet)."
-    else
+  if [ $file_fail -ge 18 ] && [ "$IS_DOCKER" = false ]; then
         log_msg "Watchdog-Datei $ACTUAL_FILE seit >18 Min nicht aktualisiert. Restart $CORE_SERVICE_LABEL Service!"
         restart_core_service
         /usr/local/bin/boot_notify.sh "⚠️ $CORE_SERVICE_LABEL Service neu gestartet (Datei $ACTUAL_FILE veraltet)."
-    fi
     file_fail=0
     warned_file=false
     sleep 60
@@ -846,16 +895,10 @@ while true; do
     bluelink_fail=0
     warned_bluelink=false
   fi
-  if [ $live_stale_fail -ge 18 ]; then
-    if [ "$IS_DOCKER" = true ]; then
-        log_msg "E3DC Werte (PV/Haus) 3 Min lang exakt gleich. Container Freeze! Restart!"
-        docker restart e3dc-control
-        /usr/local/bin/boot_notify.sh "⚠️ E3DC Docker Container neu gestartet (Werte eingefroren)."
-    else
+  if [ $live_stale_fail -ge 18 ] && [ "$IS_DOCKER" = false ]; then
         log_msg "E3DC Werte (PV/Haus) 3 Min lang exakt gleich. Freeze! Restart $CORE_SERVICE_LABEL!"
         restart_core_service
         /usr/local/bin/boot_notify.sh "⚠️ $CORE_SERVICE_LABEL Service neu gestartet (Werte eingefroren)."
-    fi
     live_stale_fail=0
     warned_live_stale=false
     LAST_LIVE_HASH=""

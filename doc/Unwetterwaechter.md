@@ -43,6 +43,13 @@ Für den Speicherregler werden derzeit diese Warnungen als relevant betrachtet:
 Damit ist der Wächter nicht nur ein Gewitterfilter, sondern ein
 Unwetter-Ausfallschutz.
 
+## Wetterabzeichen in der Kopfzeile
+
+E3DC-Control zeigt amtliche Frostwarnungen als Winterwarnung und die erste
+Gewitterwarnung mit dem Gewittersymbol, auch bei zusätzlichen Sturmböen oder
+Starkregen. Ortsnamen beeinflussen die Symbolauswahl nicht. Diese Anzeige
+ändert weder die Warnung noch die oben beschriebenen steuernden Warnregeln.
+
 ## Betriebsarten
 
 ### Aus

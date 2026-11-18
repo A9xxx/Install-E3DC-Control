@@ -443,7 +443,9 @@ function clearWallboxManualPauseOnModeChange(&$updates, $wbId, $newMode, $previo
 }
 
 function compactVehicleIdentifierWallbox($value) {
-    return preg_replace('/[^a-z0-9]/', '', strtolower(trim((string)$value)));
+    $value = strtolower(trim((string)$value));
+    if (in_array($value, ['', 'null', 'none', 'undefined'], true)) return '';
+    return preg_replace('/[^a-z0-9]/', '', $value);
 }
 
 function wallboxVehicleAliases($vehicle) {
@@ -463,6 +465,21 @@ function wallboxSavedCarMatchesSelection($car, $selection) {
         if ($alias === $probe) return true;
     }
     return false;
+}
+
+function wallboxPowerEditorProfileId($selection, $savedCars) {
+    $name = strtolower(trim((string)$selection));
+    if (in_array($name, ['', 'null', 'none', '__none', 'undefined'], true)) return null;
+    // Kennungen und IDs aller Vorlagen haben Vorrang vor alten Namenszuordnungen.
+    foreach (($savedCars ?? []) as $car) {
+        if (wallboxSavedCarMatchesSelection($car, $selection)) return (string)($car['id'] ?? '');
+    }
+    foreach (($savedCars ?? []) as $car) {
+        if (is_array($car) && strtolower(trim((string)($car['name'] ?? ''))) === $name) {
+            return (string)($car['id'] ?? '');
+        }
+    }
+    return null;
 }
 
 function canonicalWallboxVehicleSelection($value, $savedCars) {
@@ -895,9 +912,15 @@ function getDetectedOpenwbVehiclesForWallbox($savedCars, $config = []) {
         if (!$plugged && !$charging) continue;
         $stableIdentityCurrent = !empty($data['stable_vehicle_identity_current']);
         if (!$stableIdentityCurrent) continue;
-        $vehicleId = trim((string)($data['vehicle_id'] ?? $data['rfid_tag'] ?? ''));
+        $vehicleId = '';
+        foreach (['vehicle_id', 'rfid_tag', 'car_id'] as $key) {
+            if (compactVehicleIdentifierWallbox($data[$key] ?? '') !== '') {
+                $vehicleId = trim((string)$data[$key]);
+                break;
+            }
+        }
         $name = trim((string)($data['car_name'] ?? ''));
-        if ($vehicleId === '' && $name === '') continue;
+        if ($vehicleId === '') continue;
         $match = findSavedCarIndexForIdentifiers($savedCars, [
             'vehicle_id' => $data['vehicle_id'] ?? '',
             'rfid_tag' => $data['rfid_tag'] ?? '',
@@ -921,6 +944,9 @@ function getDetectedOpenwbVehiclesForWallbox($savedCars, $config = []) {
             array_key_exists('car_soc_rule_confirmed', $data),
             $data
         ) && $socValue !== null;
+        $inUse = (int)($data['phases_in_use'] ?? 0);
+        $observedMaxPhases = $inUse >= 3 ? 3 : ($inUse === 1 &&
+            (!wallboxTruthy($data['can_switch_phases'] ?? false) || (int)($data['phases_target'] ?? 0) >= 3) ? 1 : null);
         $detected[] = [
             'wb' => $wb,
             'name' => $name ?: ($wb === 1 ? 'openWB Fahrzeug' : 'openWB Pro Fahrzeug'),
@@ -928,10 +954,8 @@ function getDetectedOpenwbVehiclesForWallbox($savedCars, $config = []) {
             'soc' => $socConfirmed ? $socValue : null,
             'range_km' => $socConfirmed ? ($data['car_range'] ?? null) : null,
             'power' => (int)($data['phases_in_use'] ?? 0) >= 3 ? 11.0 : (isset($data['charge_power']) ? (float)$data['charge_power'] : 11.0),
-            // Eine beobachtete Einphasigkeit ist eine Phasenzahl,
-            // kein „unbekannt“. Ohne Wert galt der Ladepunkt als 3p-fähig
-            // (Folge: 3p-Deckel im 1p-Betrieb, vergebliche Hochschaltversuche).
-            'max_phases' => isset($data['max_phases']) && is_numeric($data['max_phases']) ? (int)$data['max_phases'] : ((int)($data['phases_in_use'] ?? 0) >= 3 ? 3 : ((int)($data['phases_in_use'] ?? 0) === 1 ? 1 : null)),
+            // 1p bei Box-Ziel 3p belegt eine Fahrzeuggrenze; ein 1p-Ziel nicht.
+            'max_phases' => isset($data['max_phases']) && is_numeric($data['max_phases']) ? (int)$data['max_phases'] : $observedMaxPhases,
             'source' => $socSource !== '' ? $socSource : ($data['source'] ?? ($wb === 1 ? 'openWB' : 'openWB Pro')),
         ];
     }
@@ -948,16 +972,21 @@ function getObservedOpenwbChargeProfilesForWallbox() {
         $profileName = trim((string)($data['charge_template_name'] ?? ''));
         if ($profileName === '') continue;
         $stableIdentityCurrent = !empty($data['stable_vehicle_identity_current']);
+        $vehicleId = '';
+        foreach (['vehicle_id', 'rfid_tag', 'car_id'] as $key) {
+            if (compactVehicleIdentifierWallbox($data[$key] ?? '') !== '') {
+                $vehicleId = trim((string)$data[$key]);
+                break;
+            }
+        }
         $profiles[] = [
             'wb' => $wb,
             'name' => $profileName,
             'vehicle_name' => trim((string)($data['car_name'] ?? '')),
-            'vehicle_id' => $stableIdentityCurrent
-                ? trim((string)($data['vehicle_id'] ?? $data['rfid_tag'] ?? ''))
-                : '',
+            'vehicle_id' => $stableIdentityCurrent ? $vehicleId : '',
             'stable_identity_current' => $stableIdentityCurrent,
             'retained_identity_present' => !$stableIdentityCurrent
-                && trim((string)($data['vehicle_id'] ?? $data['rfid_tag'] ?? $data['car_id'] ?? '')) !== '',
+                && $vehicleId !== '',
         ];
     }
     return $profiles;
@@ -1901,6 +1930,7 @@ if (isset($_POST['save_custom_car'])) {
     $cloudVehicleId = trim($_POST['custom_car_cloud_vehicle_id'] ?? '');
     $cloudVehicleName = trim($_POST['custom_car_cloud_vehicle_name'] ?? '');
     $vehicleId = trim($_POST['custom_car_vehicle_id'] ?? '');
+    if (compactVehicleIdentifierWallbox($vehicleId) === '') $vehicleId = '';
     $targetIndex = null;
     if ($linkSavedId !== '') {
         foreach ($cars as $idx => $car) {
@@ -1939,17 +1969,24 @@ if (isset($_POST['save_custom_car'])) {
         'cloud_vehicle_name' => $cloudVehicleName !== '' ? $cloudVehicleName : ($existingCar['cloud_vehicle_name'] ?? ''),
         'capacity' => (float)str_replace(',', '.', $_POST['custom_car_capacity'] ?? '72.0'),
         'power' => (float)str_replace(',', '.', $_POST['custom_car_power'] ?? '11.0'),
-        'max_phases' => max(1, min(3, (int)($_POST['custom_car_max_phases'] ?? wallboxVehicleMaxPhases([
-            'power' => (float)str_replace(',', '.', $_POST['custom_car_power'] ?? '11.0')
-        ])))),
+        'max_phases' => isset($_POST['custom_car_max_phases']) && in_array((string)$_POST['custom_car_max_phases'], ['1', '2', '3'], true)
+            ? (int)$_POST['custom_car_max_phases'] : ($existingCar['max_phases'] ?? null),
         'control_pilot_interruption' => $cpRequired,
         'efficiency' => (float)str_replace(',', '.', $_POST['custom_car_efficiency'] ?? '90'),
         'consumption' => (float)str_replace(',', '.', $_POST['custom_car_consumption'] ?? '18'),
         'target_soc' => (int)($_POST['custom_car_target'] ?? 80),
         'max_soc' => (int)($_POST['custom_car_max'] ?? 90)
     ];
+    if ($targetIndex !== null && ($linkSavedId !== '' || ($_POST['custom_car_detected'] ?? '') === '1')) {
+        // Verknüpfen ergänzt ausschließlich Identität und den gewählten CP-Vertrag.
+        $newCar = array_merge($existingCar, array_intersect_key($newCar, array_flip([
+            'vehicle_id', 'cloud_vehicle_id', 'cloud_vehicle_name', 'control_pilot_interruption',
+        ])));
+    } elseif ($targetIndex !== null) {
+        $newCar = array_merge($existingCar, $newCar);
+    }
     if ($targetIndex !== null) {
-        $cars[$targetIndex] = array_merge($existingCar, $newCar);
+        $cars[$targetIndex] = $newCar;
     } else {
         $cars[] = $newCar;
     }
@@ -2005,11 +2042,15 @@ if (isset($_POST['save_custom_car'])) {
         $message = errorMessage('Fahrzeugprofil nicht übernommen', (string)($tx['message'] ?? 'Der kanonische Profil-Commit ist fehlgeschlagen.'));
     }
 }
-if (isset($_POST['update_custom_car_cp'])) {
+// Die Tabellenaktionen teilen Validierung, Revisionsbindung und Transaktion.
+$profileEdits = array_intersect_key(array_flip([
+    'update_custom_car_cp', 'update_custom_car_phases', 'update_custom_car_power',
+]), $_POST);
+if (!empty($profileEdits)) {
+    $action = array_key_first($profileEdits);
+    $profileId = trim((string)$_POST[$action]);
     $cars = $savedCarsRaw === false ? [] : json_decode($savedCarsRaw, true);
     if (!is_array($cars)) $cars = [];
-    $profileId = trim((string)($_POST['update_custom_car_cp'] ?? ''));
-    $cpMode = strtolower(trim((string)($_POST['custom_car_control_pilot_interruption_mode'] ?? '')));
     $targetIndex = null;
     foreach ($cars as $idx => $car) {
         if (is_array($car) && (string)($car['id'] ?? '') === $profileId) {
@@ -2017,60 +2058,63 @@ if (isset($_POST['update_custom_car_cp'])) {
             break;
         }
     }
-    if ($targetIndex === null) {
-        $message = errorMessage('CP-Wakeup nicht gespeichert', 'Das ausgewählte Fahrzeugprofil wurde nicht gefunden.');
-    } elseif (!in_array($cpMode, ['required', 'not_required'], true)) {
-        $message = errorMessage('CP-Wakeup nicht gespeichert', 'Erforderlich oder nicht erforderlich auswählen.');
+    $assignUpdates = [];
+    $error = '';
+    if (isset($_POST['update_custom_car_cp'])) {
+        $label = 'CP-Wakeup';
+        $cpMode = strtolower(trim((string)($_POST['custom_car_control_pilot_interruption_mode'] ?? '')));
+        if (!in_array($cpMode, ['required', 'not_required'], true)) {
+            $error = 'Erforderlich oder nicht erforderlich auswählen.';
+        }
+        if ($targetIndex !== null) $cars[$targetIndex]['control_pilot_interruption'] = ($cpMode === 'required');
+        $valueLabel = $cpMode === 'required' ? 'erforderlich' : 'nicht erforderlich';
+        $savedMessage = "als {$valueLabel} gespeichert.";
+    } elseif (isset($_POST['update_custom_car_phases'])) {
+        $label = 'Phasenzahl';
+        $phasesRaw = trim((string)($_POST['custom_car_max_phases'] ?? ''));
+        if (!in_array($phasesRaw, ['1', '2', '3'], true)) {
+            $error = '1, 2 oder 3 Phasen auswählen.';
+        }
+        $phases = (int)$phasesRaw;
+        if ($targetIndex !== null) {
+            $cars[$targetIndex]['max_phases'] = $phases;
+            $cars[$targetIndex]['phases'] = $phases;
+        }
+        $savedMessage = "auf {$phases}p gespeichert. Der Wallbox-Manager übernimmt sie im nächsten Regelzyklus.";
     } else {
-        // Nur den CP-Vertrag ändern; alle anderen Profilwerte bleiben exakt
-        // erhalten. Der kanonische Transaktionspfad prüft die Ausgangsrevision.
-        $cars[$targetIndex]['control_pilot_interruption'] = ($cpMode === 'required');
-        $tx = e3dcWallboxPlanTransaction([], [
+        $label = 'Ladeleistung';
+        $powerRaw = str_replace(',', '.', trim((string)($_POST['custom_car_power'] ?? '')));
+        $power = is_numeric($powerRaw) ? (float)$powerRaw : NAN;
+        if (!is_finite($power) || $power < 0.1 || $power > 100.0) {
+            $error = 'Eine Ladeleistung von 0,1 bis 100 kW eingeben.';
+        }
+        if ($targetIndex !== null) $cars[$targetIndex]['power'] = $power;
+        $valueLabel = str_replace('.', ',', (string)$power);
+        $savedMessage = "auf {$valueLabel} kW gespeichert und für zugeordnete Wallboxen übernommen.";
+        foreach ([1, 2] as $slot) {
+            $assignedProfileId = wallboxPowerEditorProfileId($confData['config']["wb{$slot}_car_id"] ?? '', $cars);
+            if ($targetIndex !== null && $assignedProfileId === (string)$cars[$targetIndex]['id']) {
+                $assignUpdates["wb{$slot}_charge_power"] = (string)$power;
+                if ($slot === 1) $assignUpdates['car_charge_power'] = (string)$power;
+            }
+        }
+    }
+    if ($targetIndex === null) $error = 'Das ausgewählte Fahrzeugprofil wurde nicht gefunden.';
+    if ($error !== '') {
+        $message = errorMessage($label . ' nicht gespeichert', $error);
+    } else {
+        $txOptions = [
             'operation' => 'plan',
             'saved_cars' => $cars,
             'expected_saved_cars_sha256' => $savedCarsExpectedRevision,
-        ]);
+        ];
+        $tx = e3dcWallboxPlanTransaction($assignUpdates, $txOptions);
         if (!empty($tx['success']) && !empty($tx['canonical_committed'])) {
+            foreach ($assignUpdates as $key => $value) $confData['config'][$key] = $value;
             $profileName = (string)($cars[$targetIndex]['name'] ?? 'Fahrzeug');
-            $cpLabel = $cpMode === 'required' ? 'erforderlich' : 'nicht erforderlich';
-            $message = successMessage("✓ CP-Wakeup für '{$profileName}' als {$cpLabel} gespeichert.");
+            $message = successMessage("✓ {$label} für '{$profileName}' {$savedMessage}");
         } else {
-            $message = errorMessage('CP-Wakeup nicht gespeichert', (string)($tx['message'] ?? 'Der kanonische Profil-Commit ist fehlgeschlagen.'));
-        }
-    }
-}
-if (isset($_POST['update_custom_car_phases'])) {
-    // Phasenzahl eines bestehenden Profils direkt in der
-    // Vorlagentabelle ändern; alle anderen Profilwerte bleiben exakt erhalten.
-    $cars = $savedCarsRaw === false ? [] : json_decode($savedCarsRaw, true);
-    if (!is_array($cars)) $cars = [];
-    $profileId = trim((string)($_POST['update_custom_car_phases'] ?? ''));
-    $phasesRaw = trim((string)($_POST['custom_car_max_phases'] ?? ''));
-    $phases = is_numeric($phasesRaw) ? (int)$phasesRaw : 0;
-    $targetIndex = null;
-    foreach ($cars as $idx => $car) {
-        if (is_array($car) && (string)($car['id'] ?? '') === $profileId) {
-            $targetIndex = $idx;
-            break;
-        }
-    }
-    if ($targetIndex === null) {
-        $message = errorMessage('Phasenzahl nicht gespeichert', 'Das ausgewählte Fahrzeugprofil wurde nicht gefunden.');
-    } elseif (!in_array($phases, [1, 2, 3], true)) {
-        $message = errorMessage('Phasenzahl nicht gespeichert', '1, 2 oder 3 Phasen auswählen.');
-    } else {
-        $cars[$targetIndex]['max_phases'] = $phases;
-        $cars[$targetIndex]['phases'] = $phases;
-        $tx = e3dcWallboxPlanTransaction([], [
-            'operation' => 'plan',
-            'saved_cars' => $cars,
-            'expected_saved_cars_sha256' => $savedCarsExpectedRevision,
-        ]);
-        if (!empty($tx['success']) && !empty($tx['canonical_committed'])) {
-            $profileName = (string)($cars[$targetIndex]['name'] ?? 'Fahrzeug');
-            $message = successMessage("✓ Phasenzahl für '{$profileName}' auf {$phases}p gespeichert. Der Wallbox-Manager übernimmt sie im nächsten Regelzyklus.");
-        } else {
-            $message = errorMessage('Phasenzahl nicht gespeichert', (string)($tx['message'] ?? 'Der kanonische Profil-Commit ist fehlgeschlagen.'));
+            $message = errorMessage($label . ' nicht gespeichert', (string)($tx['message'] ?? 'Der kanonische Profil-Commit ist fehlgeschlagen.'));
         }
     }
 }
@@ -2129,6 +2173,7 @@ if (isset($_POST['save_cloud_integration'])) {
         'bluelink_interval' => (string)(int)($_POST['bluelink_interval'] ?? '15'),
         'bluelink_ignore_plug_status' => isset($_POST['bluelink_ignore_plug_status']) && $_POST['bluelink_ignore_plug_status'] == '1' ? '1' : '0'
     ];
+    $updates = e3dc_config_editor_secret_values($updates, array_intersect_key((array)($_POST['clear_secrets'] ?? []), $updates));
     if (upsertWallboxConfigValues($config_file, $updates)) {
         if (e3dcIsDockerEnvironment()) {
             $message = errorMessage(
@@ -5007,6 +5052,7 @@ if ($hasWb2) {
                     }
                 ?>
                 <form action="<?= htmlspecialchars($formAction) ?>" method="post" class="p-3 mb-3 rounded-3 border border-warning border-opacity-25" style="background: rgba(255, 193, 7, 0.06);">
+                    <input type="hidden" name="custom_car_detected" value="1">
                     <?= e3dcCsrfInput() ?>
                     <input type="hidden" name="save_custom_car" value="1">
                     <input type="hidden" name="custom_car_assign_wb" value="<?= $detWb ?>">
@@ -5025,7 +5071,8 @@ if ($hasWb2) {
                     <div class="row g-2">
                         <div class="col-12 col-lg-4">
                             <label class="form-label text-muted small fw-bold mb-1">Mit vorhandener Vorlage verknüpfen</label>
-                            <select name="custom_car_link_saved_id" class="form-select form-select-sm rounded-pill">
+                            <p class="small text-muted">Beim Verknüpfen bleiben Name und technische Werte der Vorlage erhalten.</p>
+                            <select name="custom_car_link_saved_id" class="form-select form-select-sm rounded-pill" onchange="this.form.querySelectorAll('[data-new-car-field]').forEach(el => { el.hidden = this.value !== ''; el.querySelectorAll('input, select').forEach(field => field.disabled = this.value !== ''); });">
                                 <option value="">Neue Vorlage anlegen</option>
                                 <?php foreach ($saved_cars as $car): ?>
                                     <option value="<?= htmlspecialchars($car['id'] ?? '') ?>"><?= htmlspecialchars($car['name'] ?? 'Fahrzeug') ?></option>
@@ -5046,7 +5093,7 @@ if ($hasWb2) {
                                 <?php endforeach; ?>
                             </select>
                         </div>
-                        <div class="col-12 col-lg-4">
+                        <div class="col-12 col-lg-4" data-new-car-field>
                             <label class="form-label text-muted small fw-bold mb-1">Name</label>
                             <input type="text" name="custom_car_name" class="form-control form-control-sm rounded-pill" value="<?= htmlspecialchars($suggestName) ?>" required>
                         </div>
@@ -5054,36 +5101,42 @@ if ($hasWb2) {
                             <label class="form-label text-muted small fw-bold mb-1">Fahrzeug-ID / MAC / RFID</label>
                             <input type="text" name="custom_car_vehicle_id" class="form-control form-control-sm rounded-pill" value="<?= htmlspecialchars($detVehicleId) ?>">
                         </div>
-                        <div class="col-6 col-md-2">
+                        <div class="col-6 col-md-2" data-new-car-field>
                             <label class="form-label text-muted small fw-bold mb-1">Akku (kWh)</label>
                             <input type="number" step="0.1" name="custom_car_capacity" class="form-control form-control-sm rounded-pill" value="<?= htmlspecialchars((string)($detCapacity > 0 ? $detCapacity : 72.0)) ?>">
                         </div>
-                        <div class="col-6 col-md-2">
+                        <div class="col-6 col-md-2" data-new-car-field>
                             <label class="form-label text-muted small fw-bold mb-1">Lader (kW)</label>
                             <input type="number" step="0.1" name="custom_car_power" class="form-control form-control-sm rounded-pill" value="<?= htmlspecialchars((string)($detPower > 0 ? $detPower : 11.0)) ?>">
                         </div>
-                        <div class="col-6 col-md-1">
+                        <div class="col-6 col-md-1" data-new-car-field>
                             <label class="form-label text-muted small fw-bold mb-1">Ph.</label>
                             <select name="custom_car_max_phases" class="form-select form-select-sm rounded-pill">
                                 <?php $detPhases = wallboxVehicleMaxPhases(['power' => ($detPower > 0 ? $detPower : 11.0), 'max_phases' => $det['max_phases'] ?? null]); ?>
+                                <option value="" <?= $detPhases === '' ? 'selected' : '' ?>>--</option>
                                 <option value="1" <?= (int)$detPhases === 1 ? 'selected' : '' ?>>1p</option>
                                 <option value="2" <?= (int)$detPhases === 2 ? 'selected' : '' ?>>2p</option>
-                                <option value="3" <?= (int)$detPhases === 3 || !in_array((int)$detPhases, [1, 2, 3], true) ? 'selected' : '' ?>>3p</option>
+                                <option value="3" <?= (int)$detPhases === 3 ? 'selected' : '' ?>>3p</option>
                             </select>
                         </div>
-                        <div class="col-6 col-md-1">
+                        <?php if (($det['max_phases'] ?? null) === null): ?>
+                        <div class="col-12" data-new-car-field>
+                            <div class="form-text small">Phasenzahl eintragen; ohne Wert bleibt eine openWB Pro bei 16 A einphasig.</div>
+                        </div>
+                        <?php endif; ?>
+                        <div class="col-6 col-md-1" data-new-car-field>
                             <label class="form-label text-muted small fw-bold mb-1">Ziel</label>
                             <input type="number" name="custom_car_target" class="form-control form-control-sm rounded-pill" value="80">
                         </div>
-                        <div class="col-6 col-md-1">
+                        <div class="col-6 col-md-1" data-new-car-field>
                             <label class="form-label text-muted small fw-bold mb-1">Max</label>
                             <input type="number" name="custom_car_max" class="form-control form-control-sm rounded-pill" value="90">
                         </div>
-                        <div class="col-6 col-md-1">
+                        <div class="col-6 col-md-1" data-new-car-field>
                             <label class="form-label text-muted small fw-bold mb-1">Eff.</label>
                             <input type="number" name="custom_car_efficiency" class="form-control form-control-sm rounded-pill" value="90">
                         </div>
-                        <div class="col-6 col-md-2">
+                        <div class="col-6 col-md-2" data-new-car-field>
                             <label class="form-label text-muted small fw-bold mb-1">kWh/100 km</label>
                             <input type="number" step="0.1" name="custom_car_consumption" class="form-control form-control-sm rounded-pill" value="18">
                         </div>
@@ -5213,13 +5266,21 @@ if ($hasWb2) {
                                 <tr>
                                     <td class="ps-3 border-secondary-subtle"><strong><?= htmlspecialchars($car['name'] ?? '') ?></strong></td>
                                     <td class="border-secondary-subtle"><?= number_format((float)($car['capacity'] ?? 0), 1, ',', '.') ?> kWh</td>
-                                    <td class="border-secondary-subtle"><?= number_format((float)($car['power'] ?? 0), 1, ',', '.') ?> kW</td>
+                                    <td class="border-secondary-subtle">
+                                        <form action="<?= htmlspecialchars($formAction) ?>" method="post" class="d-flex align-items-center gap-1">
+                                            <?= e3dcCsrfInput() ?>
+                                            <input type="hidden" name="update_custom_car_power" value="<?= htmlspecialchars($car['id'] ?? '') ?>">
+                                            <input type="number" name="custom_car_power" min="0.1" max="100" step="any" required class="form-control form-control-sm" style="width: 6rem" aria-label="Ladeleistung in kW" value="<?= htmlspecialchars((string)($car['power'] ?? '')) ?>">
+                                            <span>kW</span>
+                                            <button type="submit" class="btn btn-outline-success btn-sm" title="Ladeleistung speichern" aria-label="Ladeleistung speichern"><i class="fas fa-save"></i></button>
+                                        </form>
+                                    </td>
                                     <td class="border-secondary-subtle">
                                         <?php $carPhases = wallboxVehicleMaxPhases($car); ?>
                                         <form action="<?= htmlspecialchars($formAction) ?>" method="post" class="d-flex align-items-center gap-1">
                                             <?= e3dcCsrfInput() ?>
                                             <input type="hidden" name="update_custom_car_phases" value="<?= htmlspecialchars($car['id'] ?? '') ?>">
-                                            <select name="custom_car_max_phases" class="form-select form-select-sm" aria-label="Phasenzahl für <?= htmlspecialchars($car['name'] ?? 'Fahrzeug') ?>" title="<?= $carPhases === '' ? 'Phasenzahl fehlt – ohne Wert gilt das Fahrzeug als 3p-fähig' : 'Maximale Phasenzahl des Fahrzeugs' ?>">
+                                            <select name="custom_car_max_phases" class="form-select form-select-sm" aria-label="Phasenzahl für <?= htmlspecialchars($car['name'] ?? 'Fahrzeug') ?>" title="<?= $carPhases === '' ? 'Phasenzahl eintragen; ohne Wert bleibt eine openWB Pro bei 16 A einphasig.' : 'Maximale Phasenzahl des Fahrzeugs' ?>">
                                                 <?php if ($carPhases === ''): ?><option value="" selected>--</option><?php endif; ?>
                                                 <?php foreach ([1, 2, 3] as $phaseOption): ?>
                                                     <option value="<?= $phaseOption ?>" <?= (int)$carPhases === $phaseOption ? 'selected' : '' ?>><?= $phaseOption ?>p</option>
@@ -5227,6 +5288,7 @@ if ($hasWb2) {
                                             </select>
                                             <button type="submit" class="btn btn-outline-success btn-sm" title="Phasenzahl speichern" aria-label="Phasenzahl speichern"><i class="fas fa-save"></i></button>
                                         </form>
+                                        <?php if ($carPhases === ''): ?><div class="form-text small">Phasenzahl eintragen; ohne Wert bleibt eine openWB Pro bei 16 A einphasig.</div><?php endif; ?>
                                     </td>
                                     <td class="border-secondary-subtle">
                                         <form action="<?= htmlspecialchars($formAction) ?>" method="post" class="d-flex align-items-center gap-1">
@@ -5239,7 +5301,7 @@ if ($hasWb2) {
                                             <button type="submit" class="btn btn-outline-success btn-sm" title="CP-Wakeup speichern" aria-label="CP-Wakeup speichern"><i class="fas fa-save"></i></button>
                                         </form>
                                     </td>
-                                    <td class="border-secondary-subtle"><code class="small"><?= htmlspecialchars($car['vehicle_id'] ?? '') ?></code></td>
+                                    <td class="border-secondary-subtle"><code class="small"><?= htmlspecialchars(compactVehicleIdentifierWallbox($car['vehicle_id'] ?? '') !== '' ? $car['vehicle_id'] : '') ?></code></td>
                                     <td class="text-end pe-3 border-secondary-subtle">
                                         <form action="<?= htmlspecialchars($formAction) ?>" method="post" style="display:inline;">
                                             <?= e3dcCsrfInput() ?>
@@ -5274,13 +5336,13 @@ if ($hasWb2) {
                             </div>
                             <div class="col-12 col-md-6">
                                 <label class="form-label text-muted small fw-bold mb-1">Passwort</label>
-                                <input type="password" name="bluelink_password" class="form-control form-control-sm rounded-pill" autocomplete="new-password" spellcheck="false"
-                                       value="<?= htmlspecialchars($wallboxConfig['bluelink_password'] ?? '') ?>">
+                                <input type="password" name="bluelink_password" class="form-control form-control-sm rounded-pill" spellcheck="false"
+                                       value="" <?= e3dc_config_editor_secret_attributes('bluelink_password') ?>><?= e3dc_config_editor_secret_notice('bluelink_password', ['bluelink_password' => (string)($wallboxConfig['bluelink_password'] ?? '') !== '']) ?>
                             </div>
                             <div class="col-6 col-md-3">
                                 <label class="form-label text-muted small fw-bold mb-1">PIN (optional)</label>
-                                <input type="password" name="bluelink_pin" class="form-control form-control-sm rounded-pill" inputmode="numeric" pattern="[0-9]*" autocomplete="off"
-                                       value="<?= htmlspecialchars($wallboxConfig['bluelink_pin'] ?? '') ?>">
+                                <input type="password" name="bluelink_pin" class="form-control form-control-sm rounded-pill" inputmode="numeric" pattern="[0-9]*"
+                                       value="" <?= e3dc_config_editor_secret_attributes('bluelink_pin') ?>><?= e3dc_config_editor_secret_notice('bluelink_pin', ['bluelink_pin' => (string)($wallboxConfig['bluelink_pin'] ?? '') !== '']) ?>
                             </div>
                             <div class="col-6 col-md-3">
                                 <label class="form-label text-muted small fw-bold mb-1">Marke</label>

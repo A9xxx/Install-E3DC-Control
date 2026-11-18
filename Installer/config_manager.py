@@ -60,10 +60,8 @@ def _is_secret_config_key(key):
 V4_BLOCK_CONNECTION = {
     'server_ip', 'server_port',
     'e3dc_user', 'e3dc_password', 'aes_password',
-    'wurzelzaehler', 'wurzelzaehler_invertiert',
-    'live_grid_pm_delta_debounce_enable', 'live_grid_pm_delta_soft_threshold_w',
-    'live_grid_pm_delta_hard_threshold_w', 'live_grid_pm_delta_persist_count',
-    'live_grid_pm_delta_persist_window_s',
+    'wurzelzaehler',
+    'live_grid_pm_delta_soft_threshold_w',
     # Zusatzwechselrichter per Modbus TCP (nur lesend, Diagnose;
     # die Regelung nutzt weiterhin den E3DC-Messwert Ext_PV_Power).
     'ext_inverter_type', 'ext_inverter_ip', 'ext_inverter_port',
@@ -128,8 +126,7 @@ V4_BLOCK_TARIFF = {
     'market_autarky_first_enable', 'market_autarky_low_soc_pct',
     'market_autarky_horizon_buffer_wh',
     'market_target_hysteresis_pct', 'market_owner_dwell_s',
-    'market_late_fill_enable', 'market_late_fill_buffer_pct',
-    'market_late_fill_safety_min', 'market_late_fill_min_delay_min',
+    'market_late_fill_buffer_pct', 'market_late_fill_safety_min',
     'market_battery_grid_charge_enable', 'market_battery_hold_enable',
     'market_wallbox_enable',
     'market_heatpump_enable', 'market_heater_enable',
@@ -596,7 +593,7 @@ V4_BLOCK_HA = {
 
 # --- Block 11: Web-UI & System ---
 V4_BLOCK_UI = {
-    'darkmode', 'web_pin', 'matter_bridge',
+    'darkmode', 'web_pin', 'web_remote_pin_optout', 'matter_bridge',
     'pvatmosphere', 'show_forecast', 'frontend_variant', 'frontend_detail_mode',
     'config_secret_protection_mode',
     'check_updates', 'auto_update_enable', 'auto_update_time',
@@ -1194,7 +1191,7 @@ def cleanup_v4_config(dry_run: bool = False) -> bool:
         k = key.lower()
         if k in V4_BLACKLIST:
             removed_blacklist.append(key)
-        elif k not in V4_ALL_KEYS:
+        elif k not in V4_ALL_KEYS and k != 'wurzelzaehler_invertiert':
             removed_unknown.append(key)
         else:
             kept[k] = val

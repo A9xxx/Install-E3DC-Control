@@ -523,6 +523,8 @@ class RscpTag:
     PM_POWER_L2                                 = 0x05800002
     PM_POWER_L3                                 = 0x05800003
     PM_REQ_DATA                                 = 0x05040000
+    PM_REQ_TYPE                                = 0x05000014
+    PM_TYPE                                    = 0x05800014
     PM_REQ_POWER_L1                             = 0x05000001
     PM_REQ_POWER_L2                             = 0x05000002
     PM_REQ_POWER_L3                             = 0x05000003
@@ -634,6 +636,7 @@ class RscpTag:
 # den explizit typisierten Uint16-Index tragen. Response-Mitglieder sind nie
 # zulässige ausgehende Tags.
 PROVISIONAL_READ_ONLY_REQUEST_TAG_NAMES = frozenset({
+    "PM_REQ_TYPE",
     "BAT_REQ_FCC",
     "BAT_REQ_SPECIFICATION",
     "BAT_REQ_USABLE_CAPACITY",
@@ -641,6 +644,7 @@ PROVISIONAL_READ_ONLY_REQUEST_TAG_NAMES = frozenset({
     "EMS_REQ_GET_WB_DISCHARGE_BAT_UNTIL",
 })
 PROVISIONAL_READ_ONLY_RESPONSE_TAG_NAMES = frozenset({
+    "PM_TYPE",
     "BAT_FCC",
     "BAT_SPECIFICATION",
     "BAT_SPECIFIED_CAPACITY",
@@ -655,6 +659,10 @@ PROVISIONAL_READ_ONLY_TAG_PROVENANCE = {
         | PROVISIONAL_READ_ONLY_RESPONSE_TAG_NAMES
     )
 }
+
+# PM_REQ_TYPE/PM_TYPE: eba RscpTags.h und lesende Feldaufnahme;
+# Antworttyp Uint16 (0x05), ROOT=1 und ADDITIONAL=2 beobachtet.
+# Die Registrierung attestiert keine Schreibfreigabe.
 
 # Zusätzliche RSCPGui-/Feld-Tags vor 2024 bleiben read-only und werden bewusst
 # nicht in einen herstellerkanonischen Status hochgestuft.

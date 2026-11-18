@@ -75,14 +75,13 @@ Nahe der Kurve wird der Aufholterm gedämpft. Dadurch soll der Speicher ruhig
 entlang der Kurve laufen, statt bei jedem kleinen Rückstand auf Vollgas zu
 springen und danach wieder hart zu bremsen.
 
-## Kontroll-SoC
+## Gemeldeter Ladestand
 
-Der echte SoC kommt vom E3DC und bleibt maßgeblich. Für die Regelung nutzt der
-Manager zusätzlich einen `curve_control_soc`, der die gemessene
-Batterieleistung integriert. Dadurch werden kleine Messsprünge nicht sofort als
-neuer Regelauftrag interpretiert.
-
-Wenn der Kontrollwert zu weit vom echten SoC abweicht, wird er zurückgesetzt.
+Kurve und Notstromreserve verwenden direkt den vom E3DC gemeldeten SoC.
+Ein zusätzlicher aus der Batterieleistung integrierter Kontrollwert entfällt.
+SoC-Sprünge erscheinen nur als Hinweis „vermutete Kalibrierung“; sie ändern
+weder den Messwert noch die Regelentscheidung. Eine aktive Reservesperre
+verlangt weiterhin die bestätigte Erholung mit frischen gültigen Proben.
 
 ## Pre-Dump
 

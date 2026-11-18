@@ -24,7 +24,7 @@ Die Schlüssel werden automatisch erzeugt. Das Skript `Installer/generate_vapid.
 
 1. Browser registriert den Service Worker `sw.js`.
 2. Browser erzeugt ein Push-Abonnement.
-3. `webpush_api.php` speichert das Abonnement in der SQLite-Datenbank.
+3. `webpush_api.php` speichert das Abonnement in der SQLite-Datenbank. Endpunkte müssen HTTPS und einen öffentlichen Dienstnamen mit Punkt verwenden; IP-Literale und nicht auflösbare Namen sind ungültig. Alle aufgelösten IPv4- und IPv6-Adressen müssen außerhalb von Loopback, unbestimmten Adressen, Link-local, privaten Netzen, CGNAT, IPv6-ULA und Multicast liegen. Dieselbe Prüfung läuft vor jedem Versand; ungültige Einträge werden übersprungen und gezählt.
 4. Backend-Dienste senden bei Ereignissen Push-Nachrichten.
 
 ## Typische Ereignisse

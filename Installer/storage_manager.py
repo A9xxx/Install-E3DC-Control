@@ -13,8 +13,25 @@ parallel storage regulator.
 
 from __future__ import annotations
 
+try:
+    from Installer.Storage.ladepunkt_leser import (cfg_bool, runtime_input_age_s, live_with_managed_vehicle_phases, _wallbox_status_sample_fresh, wallbox_data_outage_context, storage_inputs_without_failed_wallboxes, _wallbox_detail_power_w, _wallbox_slot_types, _wallbox_detail_measurement, _external_wallbox_power_snapshot, wallbox_actual_power_snapshot as _wallbox_actual_power_snapshot)
+except ModuleNotFoundError:
+    from Storage.ladepunkt_leser import (cfg_bool, runtime_input_age_s, live_with_managed_vehicle_phases, _wallbox_status_sample_fresh, wallbox_data_outage_context, storage_inputs_without_failed_wallboxes, _wallbox_detail_power_w, _wallbox_slot_types, _wallbox_detail_measurement, _external_wallbox_power_snapshot, wallbox_actual_power_snapshot as _wallbox_actual_power_snapshot)
+
+
+try:
+    from Installer.Storage.handauftrag_leser import (manual_override_max_age_s, manual_override_expired as _manual_override_expired, storage_emergency_status)
+except ModuleNotFoundError:
+    from Storage.handauftrag_leser import (manual_override_max_age_s, manual_override_expired as _manual_override_expired, storage_emergency_status)
+
+
 import datetime
 import copy
+try:
+    from Installer.Storage.quellenrahmen import dc_quellenvertrag, DC_QUELLENVERTRAG_VERSION
+except ModuleNotFoundError:
+    from Storage.quellenrahmen import dc_quellenvertrag, DC_QUELLENVERTRAG_VERSION
+
 import json
 import logging
 import math
@@ -22,9 +39,10 @@ import os
 import signal
 import sys
 import time
+import hashlib
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, replace as dataclass_replace
 from typing import Any, Dict, List, Optional, Tuple
 
 
@@ -33,6 +51,15 @@ REPO_ROOT = os.path.dirname(SCRIPT_DIR)
 for _path in (REPO_ROOT, SCRIPT_DIR):
     if _path and _path not in sys.path:
         sys.path.insert(0, _path)
+
+try:
+    from Installer.Storage.zyklus_leser import (
+        lese_zyklus_konfiguration, lese_zyklus_live, lese_zyklus_eingaenge,
+    )
+except ModuleNotFoundError:
+    from Storage.zyklus_leser import (
+        lese_zyklus_konfiguration, lese_zyklus_live, lese_zyklus_eingaenge,
+    )
 
 try:
     from .house_fuse import resolve_house_fuse, house_fuse_config, system_house_fuse
@@ -103,9 +130,9 @@ from runtime_logging import EventLogLimiter, configure_service_logger  # noqa: E
 from config_validator import write_config_validation  # noqa: E402
 from market_economics import (  # noqa: E402
     MARKET_CHARGE_BANDS, MARKET_CHARGE_MAX_AGE_S,
-    MARKET_CHARGE_CHANGE_W, MARKET_CHARGE_CHANGE_RATIO, MARKET_CHARGE_REDUCE_S,
+    MARKET_CHARGE_CHANGE_W,
     MARKET_CHARGE_MODE_DWELL_S, MARKET_CHARGE_MODE_BAND_W,
-    market_charge_profile, market_charge_rate_w, market_charge_target_ts,
+    market_charge_profile, market_charge_schedule, market_charge_target_ts, market_grid_charge_room_w,
     PLAN_STALE_GRACE_MS as MARKET_PLAN_STALE_GRACE_MS,  # Eine Stale-Definition
     SLOT_MS as MARKET_HOLD_SLOT_BRIDGE_SLOT_MS,  # Ein gemeinsames Slotraster
     cfg_bool as market_cfg_bool,
@@ -129,15 +156,18 @@ from ems_decision_diagnostics import (  # noqa: E402
     write_decision_surface_record,
 )
 from data_models import (  # noqa: E402
+    LIVE_SAMPLE_MAX_AGE_S,
     LiveDataSnapshot,
     StoragePlanSnapshot,
     WallboxStatusSnapshot,
     live_power_plausibility,
 )
 try:
-    from Installer.Storage import backup_hold
+    from Installer.Storage import backup_hold, kern, kern_adapter, kern_uebergabe, kern_projektion, schatten
+    from Installer.Storage.quellenrahmen import schatten_fortschreiben as schatten_quellen_fortschreiben
 except ImportError:
-    from Storage import backup_hold
+    from Storage import backup_hold, kern, kern_adapter, kern_uebergabe, kern_projektion, schatten
+    from Storage.quellenrahmen import schatten_fortschreiben as schatten_quellen_fortschreiben
 
 try:
     from Installer.storage_dispatch_contract import (  # noqa: E402
@@ -274,6 +304,7 @@ try:
         predump_wallbox_block_window,
         predump_wallbox_floor_hold_decision,
         predump_wallbox_minimum_power_w,
+        smooth_house_heatpump_discharge_cap_w,
         stabilize_predump_request,
     )
 except ModuleNotFoundError:
@@ -305,6 +336,7 @@ except ModuleNotFoundError:
         predump_wallbox_block_window,
         predump_wallbox_floor_hold_decision,
         predump_wallbox_minimum_power_w,
+        smooth_house_heatpump_discharge_cap_w,
         stabilize_predump_request,
     )
 try:
@@ -472,7 +504,7 @@ DIRECT_MARKETING_POLICY_CHARGE_STATES = {
 DIRECT_MARKETING_POLICY_PASSIVE_STATES = {"HOLD", "NORMAL"}
 DIRECT_MARKETING_POLICY_ACTIVE_STATES = set(DIRECT_MARKETING_ACTIVE_TARGETS)
 DIRECT_MARKETING_EXPORT_EXECUTION_SCHEMA = "direct_marketing_export_execution_v1"
-STORAGE_DC_FIRST_CHARGE_LIMIT_CONTRACT_VERSION = 2
+STORAGE_DC_FIRST_CHARGE_LIMIT_CONTRACT_VERSION = DC_QUELLENVERTRAG_VERSION
 STORAGE_FORECAST_SHORTFALL_AUX_AC_CONTRACT_VERSION = 1
 STORAGE_FORECAST_SHORTFALL_AUX_AC_ACTION_SCHEMA = (
     "storage_forecast_shortfall_aux_ac_action_v1"
@@ -524,6 +556,8 @@ LIVE_F = os.path.join(RAMDISK, "live_data_py.json")
 PLAN_F = os.path.join(RAMDISK, "storage_plan.json")
 DISPATCH_RUNTIME_F = os.path.join(RAMDISK, "storage_dispatch_runtime.json")
 STATE_F = os.path.join(RAMDISK, "storage_manager_state.json")
+SCHATTEN_F = os.path.join(RAMDISK, "speicherkern_schatten.json")
+SCHATTEN_AGGREGAT_F = os.path.join(RAMDISK, "speicherkern_schatten_aggregate.json")
 STORAGE_OWNER_LOCK_F = STORAGE_MANAGER_LOCK_PATH
 PEAK_SHAVING_STATE_F = os.path.join(RAMDISK, "peak_shaving_interval_state.json")
 WB_F = os.path.join(RAMDISK, "wb_pv_budget.json")
@@ -616,13 +650,6 @@ def ep_reserve_soc(cfg: Dict[str, Any], live: Optional[Dict[str, Any]] = None) -
     return effective_ep_reserve_pct(cfg, live or {}, default=8.0)
 
 
-def cfg_bool(cfg: Dict[str, Any], key: str, default: bool = False) -> bool:
-    raw = cfg.get(key, default)
-    if isinstance(raw, bool):
-        return raw
-    return str(raw).strip().lower() in ("1", "true", "yes", "on", "ja", "ein")
-
-
 def auto_limit_heartbeat_enabled(cfg: Dict[str, Any]) -> bool:
     return cfg_bool(cfg, "storage_auto_limit_heartbeat_enable", True)
 
@@ -631,31 +658,8 @@ def auto_limit_heartbeat_s(cfg: Dict[str, Any]) -> float:
     return max(1.0, min(3.0, safe_float(cfg.get("storage_auto_limit_heartbeat_s"), 2.0)))
 
 
-def manual_override_max_age_s(cfg: Dict[str, Any]) -> int:
-    hours = safe_float(cfg.get("storage_manual_override_max_age_h"), 12.0)
-    return int(max(1.0, min(24.0, hours)) * 3600)
-
-
-def manual_override_expired(
-    manual_override: Dict[str, Any],
-    now_s: Optional[float] = None,
-    max_age_s: Optional[float] = None,
-) -> bool:
-    if not manual_override:
-        return False
-    now = time.time() if now_s is None else float(now_s)
-    deadlines: List[float] = []
-    expires_ts = safe_float(manual_override.get("expires_ts"), 0.0)
-    if expires_ts > 0:
-        deadlines.append(expires_ts)
-    if max_age_s is not None:
-        ts = safe_float(manual_override.get("ts"), safe_float(manual_override.get("created_ts"), 0.0))
-        if ts <= 0 or ts > now + 300.0:
-            return True
-        deadlines.append(ts + max(1.0, float(max_age_s)))
-    if not deadlines:
-        return False
-    return now >= min(deadlines)
+def manual_override_expired(manual_override, now_s=None, max_age_s=None):
+    return _manual_override_expired(manual_override, time.time() if now_s is None else now_s, max_age_s)
 
 
 def discharge_block_auto_limit(cfg: Dict[str, Any], max_charge_w: int, reason: str) -> Dict[str, Any]:
@@ -1289,10 +1293,6 @@ def storage_protection_path_contract(
     live_glitch = any(
         _contract_bool(payload.get(key))
         for key in (
-            "live_plausibility_preserved_auto_limit",
-            "live_plausibility_preserved_wbminsoc_contract",
-            "live_plausibility_preserved_discharge_owner",
-            "live_plausibility_preserved_charge_owner",
             "live_plausibility_manual_override_kept",
         )
     )
@@ -1425,6 +1425,7 @@ def storage_budget_readiness_contract(
     data_valid = bool(
         not _contract_bool(payload.get("live_stale"))
         and _contract_bool(payload.get("live_sample_valid", True))
+        and _contract_bool(payload.get("pv_power_valid", True))
         and _contract_bool(payload.get("home_power_valid", True))
         and _contract_bool(payload.get("grid_power_valid", True))
     )
@@ -1432,6 +1433,9 @@ def storage_budget_readiness_contract(
     blockers: List[str] = []
     if not data_valid:
         blockers.append("data_quality")
+    budget_unknown = not bool(payload.get("pv_power_valid", True) and payload.get("home_power_valid", True))
+    if budget_unknown:
+        blockers.append("pv_or_home_missing")
     if grid_import_w > 500 and free_for_consumers_w <= 0:
         blockers.append("grid_import_guard")
     if storage_reserved_w > 0 and free_for_consumers_w <= 0:
@@ -1472,6 +1476,7 @@ def storage_budget_readiness_contract(
         "readiness_class": readiness_class,
         "balance_class": balance_class,
         "data_valid": data_valid,
+        "reason": "pv_or_home_missing" if budget_unknown else ("data_quality" if not data_valid else "valid"),
         "blockers": blockers,
         "grid_w": grid_w,
         "grid_export_w": grid_export_w,
@@ -2460,7 +2465,7 @@ def ems_budget_runtime_contract(
 
     if not enabled:
         add_blocker("runtime_disabled")
-    if bool(payload.get("live_stale")) or safe_float(payload.get("live_age_s"), 0.0) > 10.0:
+    if bool(payload.get("live_stale")) or safe_float(payload.get("live_age_s"), 0.0) > LIVE_SAMPLE_MAX_AGE_S:
         add_blocker("live_stale")
     if not bool(payload.get("live_sample_valid", True)):
         add_blocker("live_sample_invalid")
@@ -3192,16 +3197,6 @@ def storage_decision_path_contract(
     }
 
 
-
-
-
-
-
-
-
-
-
-
 def configured_kw_or_w(value: Any) -> int:
     raw = safe_float(value, 0.0)
     if raw <= 0.0:
@@ -3225,8 +3220,6 @@ def configured_export_target_w(cfg: Dict[str, Any], live: Dict[str, Any]) -> int
     return 0
 
 
-
-
 def direct_marketing_local_deficit_w(live: Dict[str, Any]) -> int:
     """PV-uncovered local load that must be covered before market export."""
     wallbox_w = abs(safe_float(live.get("Wallbox_Power"), 0.0))
@@ -3246,7 +3239,7 @@ def direct_marketing_export_import_guard(
     planned_discharge_w: int,
 ) -> Dict[str, int]:
     grid_w = safe_int(live.get("Grid_Power"), 0)
-    grid_ema_w = safe_int(live.get("Grid_EMA_W", grid_w), grid_w)
+    grid_ema_w = grid_w
     grid_import_w = max(0, grid_w, grid_ema_w)
     import_guard_w = max(
         0,
@@ -3286,7 +3279,7 @@ def direct_marketing_export_control_w(
         safe_int(cfg.get("direct_marketing_netpoint_release_margin_w"), 80),
     )
     grid_w = safe_int(live.get("Grid_Power"), 0)
-    grid_ema_w = safe_int(live.get("Grid_EMA_W", grid_w), grid_w)
+    grid_ema_w = grid_w
     current_discharge_w = max(0, -safe_int(live.get("Battery_Power"), 0))
     local_deficit_w = direct_marketing_local_deficit_w(live)
     grid_error_w = max(0, grid_w + min_export_w - deadband_w, grid_ema_w + min_export_w - deadband_w)
@@ -3338,14 +3331,6 @@ def direct_marketing_export_control_w(
     }
 
 
-
-
-
-
-
-
-
-
 def bind_configured_power_limits(ctrl, cfg, live, *, now_s=None):
     """Bindet auch explizite Freigabe und Fehler-Rückfall an dieselbe Grenze."""
     limits = effective_power_limit_cfg(cfg, live, now_s=now_s)
@@ -3389,8 +3374,6 @@ def load_cfg(path: str = V4_CFG) -> Dict[str, Any]:
         return cfg
     except Exception:
         return {}
-
-
 
 
 def _json_cache_copy(value: Any) -> Any:
@@ -4639,7 +4622,7 @@ def augment_consumer_live(
             elif split_mode in ("0", "false", "no", "off", "separate", "excluded", "home_excludes_wp"):
                 home_includes_wp = False
             else:
-                home_includes_wp = raw_home_w >= max(500, int(wp_power_w * 0.55))
+                home_includes_wp = True
             if home_includes_wp:
                 merged["Home_Power_Raw"] = raw_home_w
                 merged["Home_Power"] = max(0, raw_home_w - wp_power_w)
@@ -4915,10 +4898,7 @@ def augment_consumer_live(
                 ):
                     home_includes_wp = False
                 else:
-                    home_includes_wp = raw_home_w >= max(
-                        500,
-                        int(wp_power_w * 0.55),
-                    )
+                    home_includes_wp = True
                 merged["WP_Power"] = wp_power_w
                 merged["WP_Power_Source"] = "shelly_3em"
                 if home_includes_wp:
@@ -4955,7 +4935,6 @@ def augment_consumer_live(
             live.get("WP_Power_Valid") is True
             and type(live.get("WP_Power")) is int
             and live.get("WP_Power") >= 0
-            and not bool(live.get("wp_producer_detected"))
         )
         merged["Heatpump_Provider"] = "e3dc_pm"
         merged["Heatpump_Provider_Bound"] = pm_valid
@@ -4992,10 +4971,7 @@ def augment_consumer_live(
             ):
                 home_includes_wp = False
             else:
-                home_includes_wp = raw_home_w >= max(
-                    500,
-                    int(wp_power_w * 0.55),
-                )
+                home_includes_wp = True
             if home_includes_wp:
                 merged["Home_Power_Raw"] = raw_home_w
                 merged["Home_Power"] = max(0, raw_home_w - wp_power_w)
@@ -5058,32 +5034,9 @@ def augment_consumer_live(
     return merged
 
 
-
-
-def runtime_input_age_s(timestamp: Any, now_s: float) -> Optional[float]:
-    """Alter gelesener Laufzeitdaten; bis 2 s Vorlauf nach ms-Normalisierung.
-
-    Ein Erzeuger kann zwischen Zyklusbeginn und Dateilesen publizieren.
-    Größerer Vorlauf, fehlende und nicht endliche Zeitstempel sind ungültig.
-    Frischeobergrenzen und interne Regleruhren bestimmt weiterhin der Aufrufer.
-    """
-    if type(timestamp) not in (int, float) or type(now_s) not in (int, float):
-        return None
-    stamp, now = float(timestamp), float(now_s)
-    if not math.isfinite(stamp) or not math.isfinite(now) or stamp <= 0.0:
-        return None
-    if stamp > 100_000_000_000.0:
-        stamp /= 1000.0
-    age_s = now - stamp
-    return max(0.0, age_s) if age_s >= -2.0 else None
-
-
 def live_data_age_s(live: Dict[str, Any], now_s: Optional[float] = None) -> float:
     now_s = time.time() if now_s is None else float(now_s)
-    ts = safe_float(live.get("_ts"), 0.0)
-    if ts <= 0.0:
-        return 0.0
-    age_s = runtime_input_age_s(ts, now_s)
+    age_s = runtime_input_age_s(live.get("_ts"), now_s)
     return age_s if age_s is not None else float("inf")
 
 
@@ -5133,7 +5086,11 @@ def storage_live_stale_decision(
     max_charge_w: int,
     now_s: float,
 ) -> Optional[Dict[str, Any]]:
-    """Return the data guard decision for stale live data, if it must own the cycle."""
+    """Messausfall gibt ohne vorherige Reservesperre an E3DC zurück.
+
+    Dabei greift die E3DC-eigene Reserve. Eine bereits aktive Reservesperre
+    hält der bestehende Reservekontext bis zur bestätigten Erholung.
+    """
 
     if not live_stale:
         return None
@@ -5145,9 +5102,9 @@ def storage_live_stale_decision(
             "val": max_charge_w,
             "priority": "data_guard",
             "reason": (
-                "Live-Daten %.0fs alt: keine neue aktive Speicher-Vorgabe, E3DC autonom" % live_age_s_value
+                "Messzeit: Live-Daten %.0fs alt; E3DC autonom" % live_age_s_value
                 if math.isfinite(live_age_s_value) else
-                "Live-Zeitstempel ungültig: keine neue aktive Speicher-Vorgabe, E3DC autonom"
+                "Messzeit fehlt oder ist ungültig: E3DC autonom"
             ),
             "protected": False,
             "storage_req_w": 0,
@@ -5404,208 +5361,24 @@ def storage_live_plausibility_decision(
     now_s: float,
     previous_state: Optional[Dict[str, Any]] = None,
 ) -> Optional[Dict[str, Any]]:
-    """Return a data guard decision for explicitly invalid live power frames."""
-
-    if bool(plausibility.get("sample_valid", True)):
+    """Ungültige Regelwerte benutzen denselben AUTO-Ausgang wie Messausfall."""
+    triggers = []
+    if not bool(plausibility.get("sample_valid", True)):
+        triggers.append("RSCP-Fehler")
+    if plausibility.get("soc_valid") is False:
+        triggers.append("Ladestand")
+    if plausibility.get("emergency_status_valid") is False:
+        triggers.append("Notstrom-Status")
+    if not triggers:
         return None
-    curve_soc, target_soc, target_ts = current_curve(plan, now_s)
-    reasons = plausibility.get("reasons") if isinstance(plausibility.get("reasons"), list) else []
-    reason_text = ", ".join(str(item) for item in reasons if str(item or "").strip())
-    if not reason_text:
-        invalid_parts = []
-        if not bool(plausibility.get("home_valid", True)):
-            invalid_parts.append("Home_Power")
-        if not bool(plausibility.get("grid_valid", True)):
-            invalid_parts.append("Grid_Power")
-        reason_text = ", ".join(invalid_parts) or "Live-Plausibilität"
-    previous_state = previous_state or {}
-    previous_auto_limit = (
-        previous_state.get("auto_limit")
-        if isinstance(previous_state.get("auto_limit"), dict)
-        else {}
-    )
-    preserve_auto_limit = bool(previous_auto_limit.get("enabled")) and not bool(
-        previous_auto_limit.get("release")
-    )
-    preserved_auto_limit = dict(previous_auto_limit) if preserve_auto_limit else None
-    if preserved_auto_limit is not None:
-        preserved_auto_limit["max_discharge_w"] = _whole_discharge_limit_w(preserved_auto_limit.get("max_discharge_w"))
-        preserved_auto_limit["reason"] = (
-            str(preserved_auto_limit.get("reason") or "Vorherige EMS-Ladegrenze")
-            + "; Live-Frame unplausibel, letzte aktive EMS-Grenze wird gehalten"
-        )[:220]
-    decision = {
-        "state": "live_plausibility_auto",
-        "mode": MODE_AUTO,
-        "val": (
-            max(0, safe_int(preserved_auto_limit.get("max_charge_w"), max_charge_w))
-            if preserved_auto_limit is not None
-            else max_charge_w
-        ),
-        "priority": "data_guard",
-        "reason": "Live-Frame unplausibel (%s): %s"
-        % (
-            reason_text,
-            (
-                "letzte aktive EMS-Grenze bleibt gehalten"
-                if preserved_auto_limit is not None
-                else "keine neue aktive Speicher-Vorgabe, E3DC autonom"
-            ),
-        ),
-        "protected": False,
-        "storage_req_w": 0,
-        "budget_w": 0,
-        "live_sample_invalid": True,
-        "live_plausibility": plausibility,
-    }
-    if preserved_auto_limit is not None:
-        decision["auto_limit"] = preserved_auto_limit
-        decision["live_plausibility_preserved_auto_limit"] = True
-    dc_first_anchor = storage_dc_first_charge_recovery_anchor(
-        cfg or {},
-        previous_state,
-        now_s,
-    )
-    if dc_first_anchor.get("valid"):
-        # Der Datenwächter übernimmt keinen DC-first-Sollwert. Er trägt nur
-        # den letzten gültigen Rampenanker durch das begrenzte Hold-Fenster.
-        decision.update(
-            {
-                "storage_dc_first_charge_limit_enabled": True,
-                "storage_dc_first_charge_limit_contract_version": (
-                    STORAGE_DC_FIRST_CHARGE_LIMIT_CONTRACT_VERSION
-                ),
-                "storage_dc_first_charge_limit_source_valid": False,
-                "storage_dc_first_charge_limit_blocker": (
-                    "live_plausibility_guard"
-                ),
-                "storage_dc_first_charge_last_confirmed_limit_w": max(
-                    0,
-                    safe_int(dc_first_anchor.get("limit_w"), 0),
-                ),
-                "storage_dc_first_charge_last_confirmed_ts": safe_float(
-                    dc_first_anchor.get("confirmed_ts"),
-                    0.0,
-                ),
-                "storage_dc_first_charge_recovery_hold_active": True,
-                "storage_dc_first_charge_recovery_anchor_used": False,
-                "storage_dc_first_charge_recovery_anchor_age_s": safe_float(
-                    dc_first_anchor.get("age_s"),
-                    0.0,
-                ),
-                "storage_dc_first_charge_recovery_hold_s": safe_float(
-                    dc_first_anchor.get("hold_s"),
-                    0.0,
-                ),
-                "storage_dc_first_charge_recovery_remaining_s": safe_float(
-                    dc_first_anchor.get("remaining_s"),
-                    0.0,
-                ),
-                "storage_dc_first_charge_confirmation_candidate_w": None,
-                "storage_dc_first_charge_confirmation_candidate_ts": None,
-                "storage_dc_first_charge_confirmation_status": (
-                    "held_confirmed_anchor_during_live_guard"
-                ),
-                "storage_dc_first_charge_confirmation_readback_age_s": None,
-            }
-        )
-    preserved_discharge = storage_live_plausibility_preserved_discharge_owner(
-        cfg=cfg or {},
-        plan=plan,
-        plausibility=plausibility,
-        reason_text=reason_text,
-        now_s=now_s,
-        previous_state=previous_state,
-    )
-    preserved_charge = None
-    if preserved_discharge is None:
-        preserved_charge = storage_live_plausibility_preserved_charge_owner(
-            cfg=cfg or {},
-            plan=plan,
-            plausibility=plausibility,
-            reason_text=reason_text,
-            now_s=now_s,
-            previous_state=previous_state,
-        )
-    if preserved_discharge is not None:
-        decision = preserved_discharge
-    elif preserved_charge is not None:
-        decision = preserved_charge
-    if str(previous_state.get("state") or "") == "unmanaged_wallbox_wbminsoc_hold":
-        previous_mode = safe_int(previous_state.get("mode"), MODE_AUTO)
-        previous_pv_charge_w = max(0, safe_int(previous_state.get("planned_grid_pv_charge_w"), 0))
-        previous_storage_req_w = max(0, safe_int(previous_state.get("storage_req_w"), 0))
-        previous_active_charge = bool(
-            previous_mode == MODE_CHRG
-            or previous_pv_charge_w > 0
-            or previous_storage_req_w > 0
-        )
-        if (
-            bool(previous_state.get("scheduled_grid_charge"))
-            and bool(previous_state.get("unmanaged_wallbox_wbminsoc_hold"))
-        ):
-            hold_w = 0
-            if previous_active_charge:
-                hold_w = max(
-                    0,
-                    min(
-                        max_charge_w,
-                        previous_pv_charge_w
-                        or previous_storage_req_w
-                        or safe_int(previous_state.get("val"), 0),
-                    ),
-                )
-            hold_auto_limit = preserved_auto_limit
-            if hold_auto_limit is None:
-                previous_limit = previous_state.get("auto_limit") if isinstance(previous_state.get("auto_limit"), dict) else {}
-                hold_auto_limit = dict(previous_limit) if previous_limit else None
-            if hold_auto_limit is None:
-                hold_auto_limit = {
-                    "enabled": True,
-                    "release": False,
-                    "max_charge_w": max_charge_w,
-                    "max_discharge_w": 0,
-                    "discharge_start_w": 0,
-                    "heartbeat_s": 2.0,
-                    "reason": "Vorheriger Wallbox-Entladungsschutz",
-                }
-            hold_auto_limit["max_discharge_w"] = 0
-            hold_auto_limit["max_charge_w"] = max(0, safe_int(hold_auto_limit.get("max_charge_w"), max_charge_w))
-            hold_auto_limit["release"] = False
-            hold_auto_limit["enabled"] = True
-            hold_auto_limit["reason"] = (
-                str(hold_auto_limit.get("reason") or "Vorheriger Wallbox-Entladungsschutz")
-                + "; Live-Frame unplausibel, geplanter Wallbox-Schutzvertrag bleibt gehalten"
-            )[:220]
-            decision.update(
-                {
-                    "state": "unmanaged_wallbox_wbminsoc_hold",
-                    "mode": MODE_CHRG if hold_w > 0 else MODE_AUTO,
-                    "val": hold_w if hold_w > 0 else max_charge_w,
-                    "priority": "safety",
-                    "reason": "Live-Frame unplausibel (%s): geplanter Wallbox-Netzlade-Schutzvertrag bleibt gehalten"
-                    % reason_text,
-                    "protected": True,
-                    "storage_req_w": hold_w,
-                    "budget_w": 0,
-                    "unmanaged_wallbox_wbminsoc_hold": True,
-                    "scheduled_grid_charge": True,
-                    "wbminsoc_pv_charge_active": hold_w > 0,
-                    "planned_grid_pv_charge_w": hold_w,
-                    "planned_grid_pv_surplus_w": hold_w,
-                    "auto_limit": hold_auto_limit,
-                    "live_plausibility_preserved_wbminsoc_contract": True,
-                    "live_plausibility_preserved_auto_limit": True,
-                }
-            )
-    return {
-        "decision": decision,
-        "curve_soc": curve_soc,
-        "target_soc": target_soc,
-        "target_ts": target_ts,
-        "i_fc_w": 0,
-        "i_min_lade_w": 0,
-    }
+    result = storage_live_stale_decision(cfg=cfg or {}, plan=plan,
+        live_age_s_value=0.0, live_stale=True, max_charge_w=max_charge_w, now_s=now_s)
+    decision = result["decision"]
+    decision.update(state="live_plausibility_auto",
+        reason=", ".join(triggers) + ": keine neue aktive Speicher-Vorgabe, E3DC autonom",
+        live_sample_invalid=not bool(plausibility.get("sample_valid", True)),
+        live_plausibility=plausibility)
+    return result
 
 
 def storage_invalid_frame_has_emergency_priority(value: Any) -> bool:
@@ -5622,414 +5395,6 @@ def storage_invalid_frame_has_emergency_priority(value: Any) -> bool:
         if digits and all("0" <= char <= "9" for char in digits):
             return text.lstrip("+").lstrip("0") in ("1", "4")
     return False
-
-
-def protected_mode_hold_age(previous_state: Dict[str, Any], now_s: float) -> float:
-    """Wandzeit darf den flüchtigen, monoton begrenzten Halt nur verkürzen."""
-    age_s = max(0.0, now_s - safe_float(previous_state.get("protected_mode_hold_anchor_ts"), 0.0))
-    anchor_mono = previous_state.get("_protected_mode_hold_anchor_monotonic_s")
-    if isinstance(anchor_mono, (int, float)) and not isinstance(anchor_mono, bool) and math.isfinite(anchor_mono):
-        age_s = max(age_s, max(0.0, time.monotonic() - anchor_mono))
-    return age_s
-
-
-def storage_live_plausibility_preserved_discharge_owner(
-    *,
-    cfg: Dict[str, Any],
-    plan: Dict[str, Any],
-    plausibility: Dict[str, Any],
-    reason_text: str,
-    now_s: float,
-    previous_state: Optional[Dict[str, Any]] = None,
-) -> Optional[Dict[str, Any]]:
-    """Hält einen gerade aktiven Entladepfad durch einen kurzen Messwertaussetzer."""
-
-    previous_state = previous_state or {}
-    previous_name = str(previous_state.get("state") or "")
-    previous_mode = safe_int(previous_state.get("mode"), MODE_AUTO)
-    previous_w = max(0, safe_int(previous_state.get("val"), 0))
-    if previous_mode != MODE_DISCH or previous_w < 300 or not bool(previous_state.get("protected")):
-        return None
-
-    hold_s = max(0.0, safe_float(cfg.get("storage_live_glitch_discharge_hold_s"), 20.0))
-    if hold_s <= 0.0:
-        return None
-    previous_ts = safe_float(previous_state.get("protected_mode_hold_anchor_ts"), 0.0)
-    if previous_ts <= 0.0:
-        return None
-    age_s = protected_mode_hold_age(previous_state, now_s)
-    if age_s > hold_s:
-        return None
-
-    hold_owner = ""
-    if previous_name.startswith("direct_marketing_eco_plus_export"):
-        direct = direct_marketing_plan(plan)
-        policy_ctx = direct_marketing_policy_context(direct)
-        executor_gate = direct_marketing_policy_executor_gate(
-            direct,
-            policy_ctx,
-            now_s,
-            plan,
-        )
-        previous_gate = (
-            previous_state.get("direct_marketing_policy_executor_gate")
-            if isinstance(
-                previous_state.get("direct_marketing_policy_executor_gate"),
-                dict,
-            )
-            else {}
-        )
-        previous_phase5 = (
-            previous_state.get("storage_dispatch_phase5")
-            if isinstance(
-                previous_state.get("storage_dispatch_phase5"),
-                dict,
-            )
-            else {}
-        )
-        canonical = validate_canonical_plan(
-            plan,
-            int(float(now_s) * 1000.0),
-        )
-        phase5_forecast_fallback_continuation = bool(
-            _phase5_economic_export_binding_valid(previous_phase5)
-            and previous_phase5.get("selected_action")
-            == "ECONOMIC_EXPORT"
-            and previous_phase5.get("commands_allowed") is True
-            and canonical.get("valid") is True
-            and previous_phase5.get("plan_id") == canonical.get("plan_id")
-            and previous_phase5.get("slot_id") == canonical.get("slot_id")
-        )
-        legacy_policy_continuation = bool(
-            executor_gate.get("allowed")
-            and policy_ctx.get("target_state") == "FORCE_EXPORT"
-            and all(
-                previous_gate.get(key) == executor_gate.get(key)
-                for key in ("plan_id", "slot_id", "canonical_action_id")
-            )
-        )
-        if not (
-            legacy_policy_continuation
-            or phase5_forecast_fallback_continuation
-        ):
-            return None
-        previous_action = str(previous_state.get("direct_marketing_action") or "")
-        if (
-            previous_action
-            and previous_action != "policy_force_export"
-            and not phase5_forecast_fallback_continuation
-        ):
-            return None
-        reserve_floor = safe_float(previous_state.get("direct_marketing_reserve_floor_soc_pct"), 0.0)
-        previous_soc = safe_float(previous_state.get("soc"), 0.0)
-        if reserve_floor > 0.0 and previous_soc <= reserve_floor + 0.5:
-            return None
-        hold_owner = "Direktvermarktungs-Export"
-    elif previous_name.startswith("pre_discharge"):
-        previous_soc = safe_float(previous_state.get("soc"), 0.0)
-        floor_soc = safe_float(
-            previous_state.get("predump_floor_soc"),
-            safe_float(previous_state.get("predump_target_soc"), 0.0),
-        )
-        if floor_soc > 0.0 and previous_soc <= floor_soc + 0.5:
-            return None
-        if not (
-            bool(previous_state.get("predump_active"))
-            or bool(previous_state.get("predump_grid_fallback"))
-            or bool(previous_state.get("predump_hard_predump"))
-        ):
-            return None
-        hold_owner = "Pre-Dump-Entladung"
-    else:
-        return None
-
-    decision = dict(previous_state)
-    decision.update({
-        "state": previous_name,
-        "mode": MODE_DISCH,
-        "val": previous_w,
-        "priority": str(previous_state.get("priority") or "data_guard"),
-        "protected": True,
-        "reason": (
-            "Live-Frame unplausibel (%s): %s bleibt %.0fs gehalten; "
-            "keine neue Leistungsberechnung aus dem ungültigen Frame"
-        ) % (reason_text, hold_owner, age_s),
-        "live_sample_invalid": True,
-        "live_plausibility": plausibility,
-        "live_plausibility_preserved_discharge_owner": True,
-        "live_plausibility_preserved_discharge_state": previous_name,
-        "live_plausibility_preserved_discharge_age_s": round(age_s, 1),
-        "live_plausibility_preserved_discharge_hold_s": round(hold_s, 1),
-    })
-    return decision
-
-
-def storage_live_plausibility_preserved_charge_owner(
-    *,
-    cfg: Dict[str, Any],
-    plan: Dict[str, Any],
-    plausibility: Dict[str, Any],
-    reason_text: str,
-    now_s: float,
-    previous_state: Optional[Dict[str, Any]] = None,
-) -> Optional[Dict[str, Any]]:
-    """Hält einen gerade aktiven PV-Speicherpfad durch einen kurzen Messwertaussetzer."""
-
-    previous_state = previous_state or {}
-    previous_name = str(previous_state.get("state") or "")
-    previous_mode = safe_int(previous_state.get("mode"), MODE_AUTO)
-    previous_w = max(0, safe_int(previous_state.get("val"), 0))
-    if (
-        previous_mode != MODE_CHRG
-        or previous_w < 300
-        or not bool(previous_state.get("protected"))
-    ):
-        return None
-
-    hold_s = max(
-        0.0,
-        safe_float(
-            cfg.get("storage_live_glitch_charge_hold_s"),
-            safe_float(cfg.get("storage_live_glitch_owner_hold_s"), 20.0),
-        ),
-    )
-    if hold_s <= 0.0:
-        return None
-    previous_ts = safe_float(previous_state.get("protected_mode_hold_anchor_ts"), 0.0)
-    if previous_ts <= 0.0:
-        return None
-    age_s = protected_mode_hold_age(previous_state, now_s)
-    if age_s > hold_s:
-        return None
-
-    hold_owner = ""
-    hold_mode = MODE_CHRG
-    if previous_name != "direct_marketing_eco_plus_pv_store":
-        return None
-    direct = direct_marketing_plan(plan)
-    policy_ctx = direct_marketing_policy_context(direct)
-    executor_gate = direct_marketing_policy_executor_gate(
-        direct,
-        policy_ctx,
-        now_s,
-        plan,
-    )
-    previous_gate = (
-        previous_state.get("direct_marketing_policy_executor_gate")
-        if isinstance(
-            previous_state.get("direct_marketing_policy_executor_gate"),
-            dict,
-        )
-        else {}
-    )
-    if not bool(
-        executor_gate.get("allowed")
-        and policy_ctx.get("target_state") == "FORCE_CHARGE_PV"
-        and all(
-            previous_gate.get(key) == executor_gate.get(key)
-            for key in ("plan_id", "slot_id", "canonical_action_id")
-        )
-    ):
-        return None
-    previous_action = str(previous_state.get("direct_marketing_action") or "")
-    if previous_action and previous_action != "policy_force_charge_pv":
-        return None
-
-    target_soc = safe_float(
-        previous_state.get("direct_marketing_target_soc_pct"),
-        safe_float(
-            (executor_gate.get("plan_window") or {}).get(
-                "target_soc_pct"
-            ),
-            0.0,
-        ),
-    )
-    previous_soc = safe_float(previous_state.get("soc"), 0.0)
-    if target_soc > 0.0 and previous_soc >= target_soc - 0.5:
-        return None
-
-    import_guard_w = max(
-        0,
-        safe_int(previous_state.get("direct_marketing_pv_store_import_guard_w"), 80),
-    )
-    grid_import_w = max(0, safe_int(previous_state.get("direct_marketing_pv_store_grid_import_w"), 0))
-    if grid_import_w > import_guard_w:
-        return None
-
-    dc_only = bool(previous_state.get("direct_marketing_pv_store_dc_only"))
-    previous_surplus_w = max(0, safe_int(previous_state.get("direct_marketing_pv_store_surplus_w"), 0))
-    previous_dc_surplus_w = max(0, safe_int(previous_state.get("direct_marketing_pv_store_dc_surplus_w"), 0))
-    previous_offer_w = max(
-        0,
-        safe_int(previous_state.get("direct_marketing_pv_store_offer_w"), 0),
-        safe_int(previous_state.get("direct_marketing_pv_store_pv_safe_cap_w"), 0),
-    )
-    safe_source_w = previous_dc_surplus_w if dc_only else max(previous_surplus_w, previous_offer_w)
-    if safe_source_w > 0 and safe_source_w + 100 < previous_w:
-        return None
-    hold_owner = "Direktvermarktungs-PV-Speichern"
-
-    decision = dict(previous_state)
-    decision.update({
-        "state": previous_name,
-        "mode": hold_mode,
-        "val": previous_w,
-        "priority": str(previous_state.get("priority") or "data_guard"),
-        "protected": True,
-        "reason": (
-            "Live-Frame unplausibel (%s): %s bleibt %.0fs gehalten; "
-            "keine neue Leistungsberechnung aus dem ungültigen Frame"
-        ) % (reason_text, hold_owner, age_s),
-        "live_sample_invalid": True,
-        "live_plausibility": plausibility,
-        "live_plausibility_preserved_charge_owner": True,
-        "live_plausibility_preserved_charge_state": previous_name,
-        "live_plausibility_preserved_charge_age_s": round(age_s, 1),
-        "live_plausibility_preserved_charge_hold_s": round(hold_s, 1),
-    })
-    return decision
-
-
-def soc_jump_guard_context(
-    cfg: Dict[str, Any],
-    live: Dict[str, Any],
-    previous_state: Optional[Dict[str, Any]],
-    now_s: float,
-) -> Dict[str, Any]:
-    """Detect physically impossible SoC frames before safety owners act on them."""
-
-    if not cfg_bool(cfg, "storage_soc_jump_guard_enable", True):
-        return {"invalid": False}
-
-    previous_state = previous_state or {}
-    raw_soc = safe_float(live.get("SOC"), -1.0)
-    if raw_soc < 0.0 or raw_soc > 100.0:
-        return {
-            "invalid": True,
-            "reason": "SoC %.1f%% außerhalb des gültigen Bereichs" % raw_soc,
-            "raw_soc": raw_soc,
-            "last_valid_soc": previous_state.get("last_valid_soc"),
-            "drop_pct": None,
-            "allowed_drop_pct": None,
-        }
-
-    last_valid_soc = previous_state.get("last_valid_soc")
-    if last_valid_soc is None or str(last_valid_soc).strip() == "":
-        last_valid_soc = previous_state.get("soc")
-    last_valid = safe_float(last_valid_soc, -1.0)
-    if last_valid < 0.0 or last_valid > 100.0:
-        return {"invalid": False, "last_valid_soc": raw_soc, "last_valid_soc_ts": now_s}
-
-    last_ts = safe_float(
-        previous_state.get("last_valid_soc_ts"),
-        safe_float(previous_state.get("ts"), 0.0),
-    )
-    elapsed_s = max(0.0, min(3600.0, now_s - last_ts)) if last_ts > 0.0 else 0.0
-    drop_pct = last_valid - raw_soc
-    if drop_pct <= 0.0:
-        return {
-            "invalid": False,
-            "last_valid_soc": raw_soc,
-            "last_valid_soc_ts": now_s,
-            "drop_pct": round(drop_pct, 2),
-        }
-
-    reserve_soc = ep_reserve_soc(cfg, live)
-    min_drop_pct = max(3.0, safe_float(cfg.get("storage_soc_jump_guard_min_drop_pct"), 8.0))
-    capacity_kwh = max(
-        1.0,
-        safe_float(
-            live.get("bat_full_cap_kwh"),
-            safe_float(live.get("battery_capacity_kwh"), safe_float(cfg.get("speichergroesse"), 10.0)),
-        ),
-    )
-    max_discharge_w = max(
-        250.0,
-        safe_float(
-            live.get("user_discharge_limit_w"),
-            safe_float(cfg.get("maximaleentladeleistung"), safe_float(cfg.get("maximumladeleistung"), 5000.0)),
-        ),
-    )
-    physical_drop_pct = (max_discharge_w * max(elapsed_s, 60.0) / 3600.0) / (capacity_kwh * 1000.0) * 100.0
-    fallback_drop_pct = max(
-        0.5,
-        safe_float(cfg.get("storage_soc_jump_guard_max_drop_pct_per_min"), 1.0),
-    ) * max(1.0, elapsed_s / 60.0)
-    base_margin_pct = max(1.0, safe_float(cfg.get("storage_soc_jump_guard_base_margin_pct"), 2.0))
-    allowed_drop = base_margin_pct + min(physical_drop_pct, fallback_drop_pct)
-    # Near the reserve floor, do not hide a real empty-battery situation.
-    protect_floor_margin_pct = max(1.0, safe_float(cfg.get("storage_soc_jump_guard_reserve_margin_pct"), 3.0))
-    high_enough_to_reject = bool(last_valid > reserve_soc + protect_floor_margin_pct)
-    invalid = bool(
-        high_enough_to_reject
-        and drop_pct >= min_drop_pct
-        and drop_pct > allowed_drop
-    )
-    if not invalid:
-        return {
-            "invalid": False,
-            "last_valid_soc": raw_soc,
-            "last_valid_soc_ts": now_s,
-            "drop_pct": round(drop_pct, 2),
-            "allowed_drop_pct": round(allowed_drop, 2),
-        }
-
-    zero_power_frame = bool(
-        raw_soc <= 0.1
-        and abs(safe_float(live.get("PV_Power"), 0.0)) <= 1.0
-        and abs(safe_float(live.get("Grid_Power"), 0.0)) <= 1.0
-        and abs(safe_float(live.get("Home_Power"), 0.0)) <= 1.0
-        and abs(safe_float(live.get("Battery_Power"), 0.0)) <= 1.0
-    )
-    reason = (
-        "Unplausibler SoC-Sprung %.1f%% -> %.1f%% in %.0fs "
-        "(Abfall %.1f Prozentpunkte, erlaubt %.1f); Live-Frame verworfen"
-    ) % (last_valid, raw_soc, elapsed_s, drop_pct, allowed_drop)
-    if zero_power_frame:
-        reason += "; gleichzeitiger 0W-Frame erkannt"
-    return {
-        "invalid": True,
-        "reason": reason,
-        "raw_soc": round(raw_soc, 2),
-        "last_valid_soc": round(last_valid, 2),
-        "last_valid_soc_ts": last_ts,
-        "drop_pct": round(drop_pct, 2),
-        "allowed_drop_pct": round(allowed_drop, 2),
-        "physical_drop_pct": round(physical_drop_pct, 2),
-        "capacity_kwh": round(capacity_kwh, 2),
-        "max_discharge_w": round(max_discharge_w, 1),
-        "elapsed_s": round(elapsed_s, 1),
-        "reserve_soc": round(reserve_soc, 2),
-        "zero_power_frame": zero_power_frame,
-    }
-
-
-def storage_soc_jump_guard_decision(
-    cfg: Dict[str, Any],
-    plan: Dict[str, Any],
-    guard: Dict[str, Any],
-    max_charge_w: int,
-    now_s: float,
-) -> Dict[str, Any]:
-    curve_soc, target_soc, target_ts = current_curve(plan, now_s)
-    return {
-        "decision": {
-            "state": "live_soc_unrealistic_auto",
-            "mode": MODE_AUTO,
-            "val": max_charge_w,
-            "priority": "data_guard",
-            "reason": str(guard.get("reason") or "Unplausibler SoC-Sprung; E3DC autonom")[:220],
-            "protected": False,
-            "storage_req_w": 0,
-            "budget_w": 0,
-            "soc_jump_guard": guard,
-        },
-        "curve_soc": curve_soc,
-        "target_soc": target_soc,
-        "target_ts": target_ts,
-        "i_fc_w": 0,
-        "i_min_lade_w": 0,
-    }
 
 
 def atomic_write(path: str, payload: Dict[str, Any], *, indent: Optional[int] = None) -> None:
@@ -8156,7 +7521,7 @@ MARKET_TARGET_HYSTERESIS_PCT = 1.0
 # sind kein Grenzbeleg. Gemeinsame Faktoren und Zeitwerte in market_economics.
 MARKET_OBSERVED_CHARGE_EWMA_ALPHA = 0.2
 # Bei niedrigem SoC läuft der Akku erst nach Minuten hoch; das ist keine Grenze.
-# Kürzer als MARKET_CHARGE_REDUCE_S, damit volle Leistung vor der Absenkung lernt.
+# Hochlaufproben dürfen die beobachtete Ladefähigkeit nicht sofort absenken.
 MARKET_OBSERVED_CHARGE_DWELL_S = 240.0
 MARKET_OWNER_DWELL_S = 600.0
 MARKET_GRID_ACTIONS = {"grid_charge", "negative_price_absorb"}
@@ -8254,7 +7619,7 @@ def hard_mode_justification_errors(live: Dict[str, Any], decision: Dict[str, Any
     val_w = max(0, safe_int(decision.get("val"), 0))
     protected = bool(decision.get("protected"))
     grid_w = safe_int(live.get("Grid_Power"), 0)
-    grid_ema_w = safe_int(live.get("Grid_EMA_W", grid_w), grid_w)
+    grid_ema_w = grid_w
     import_w = max(grid_w, grid_ema_w)
     errors: List[str] = []
     heatpump_owner = heatpump_pv_output_binding_valid(
@@ -8487,7 +7852,7 @@ def ep_reserve_recovery_context(
     soc = safe_float(live.get("SOC"), float("nan"))
     numeric_soc = math.isfinite(soc) and 0.0 <= soc <= 100.0
     source_ts = safe_float(live.get("_ts"), 0.0)
-    max_age_s = max(2.0, min(30.0, safe_float(cfg.get("storage_live_stale_guard_s"), 10.0)))
+    max_age_s = LIVE_SAMPLE_MAX_AGE_S
     fresh = bool(
         sample_valid and numeric_soc and source_ts > 0.0
         and ((_input_age_s := runtime_input_age_s(source_ts, now_s)) is not None and _input_age_s <= max_age_s)
@@ -8993,7 +8358,9 @@ def storage_regulation_now(payload: Dict[str, Any]) -> Dict[str, Any]:
     result.update(kind=kind, label=label, valid=True, reason=state)
     if not safety and state in {"market_grid_wait", "market_grid_pv_wait", "market_discharge_hold", "market_grid_done_hold", "market_grid_charge"}:
         if state == "market_grid_charge":
-            result["description"] = str(payload.get("reason") or "Speicher sanft aus dem Netz laden")
+            result["description"] = str(payload.get("reason") or "Speicher mit voller zulässiger Leistung aus dem Netz laden")
+        elif state == "market_grid_wait" and (payload.get("market_grid_charge_control") or {}).get("phase") == "wait":
+            result["description"] = str(payload.get("reason") or "Speicher halten, PV lädt frei")
         elif payload.get("direct_marketing_grid_blocked"):
             result["description"] = "PV in den Speicher laden; Netzladen durch den externen Speicherbesitzer zurückgestellt"
         elif state == "market_grid_wait" and not payload.get("market_live_pv_first") and not payload.get("market_late_fill_latest_start_ts"):
@@ -9120,7 +8487,6 @@ def build_display(payload: Dict[str, Any], *, now_s: Optional[float] = None) -> 
         "tl_autodump": "Kurven-Entladung",
         "live_stale_auto": "Live-Daten verzögert",
         "live_plausibility_auto": "Live-Daten unplausibel",
-        "live_soc_unrealistic_auto": "SoC-Sprung verworfen",
         "storm_guard_grid": "Unwetter-Netzladen",
         "storm_guard_grid_wait": "Unwetter-Schutz wartet",
         "price_boost_grid": "Preis-Netzladen",
@@ -9174,13 +8540,11 @@ def build_display(payload: Dict[str, Any], *, now_s: Optional[float] = None) -> 
         "parallel_auto": "AUTO",
         "bev_bridge_3p_min": "BEV-Brücke",
         "no_config": "Keine Konfiguration",
-        "no_data": "Keine Live-Daten",
         "stopped": "Gestoppt",
     }
     control_owners = {
         "live_stale_auto": "E3DC",
         "live_plausibility_auto": "E3DC",
-        "live_soc_unrealistic_auto": "E3DC",
         "parallel_auto": "E3DC",
         "parallel_curve_auto_no_surplus": "E3DC",
         "parallel_grid_relief_auto": "E3DC",
@@ -9624,33 +8988,8 @@ def build_display(payload: Dict[str, Any], *, now_s: Optional[float] = None) -> 
             f"Pre-Dump-Untergrenze erreicht: SoC {soc:.1f}% liegt am Schutzboden. "
             "Wallbox wird gestoppt; Hausversorgung und normale Batterieentladung bleiben freigegeben."
         )
-    elif state == "live_stale_auto":
-        age = safe_float(payload.get("live_age_s"), 0.0)
-        reason = (
-            f"Live-Daten sind {age:.0f}s alt; E3DC bleibt autonom, "
-            "bis frische Messwerte vorliegen."
-        )
-    elif state == "live_plausibility_auto":
-        plausibility = payload.get("live_plausibility") if isinstance(payload.get("live_plausibility"), dict) else {}
-        reasons = plausibility.get("reasons") if isinstance(plausibility.get("reasons"), list) else []
-        reason_txt = ", ".join(str(item) for item in reasons if str(item or "").strip())
-        if not reason_txt:
-            reason_txt = str(plausibility.get("home_source") or "Messwert-Plausibilität")
-        reason = (
-            f"Live-Frame unplausibel ({reason_txt}); keine neue aktive Speicher-Vorgabe. "
-            "E3DC bleibt autonom bis ein gültiger RSCP-Frame vorliegt."
-        )
-    elif state == "live_soc_unrealistic_auto":
-        guard = payload.get("soc_jump_guard") if isinstance(payload.get("soc_jump_guard"), dict) else {}
-        raw_soc = safe_float(guard.get("raw_soc"), safe_float(payload.get("soc"), 0.0))
-        last_soc = safe_float(guard.get("last_valid_soc"), raw_soc)
-        drop_pct = safe_float(guard.get("drop_pct"), max(0.0, last_soc - raw_soc))
-        allowed_pct = safe_float(guard.get("allowed_drop_pct"), 0.0)
-        reason = (
-            f"Unplausibler SoC-Sprung {last_soc:.1f}% -> {raw_soc:.1f}% "
-            f"({drop_pct:.1f} Prozentpunkte, plausibel {allowed_pct:.1f}) verworfen; "
-            "keine neue aktive Speicher-Vorgabe, E3DC bleibt autonom bis plausible Live-Daten vorliegen."
-        )
+    elif state in ("live_stale_auto", "live_plausibility_auto"):
+        reason = str(payload.get("reason") or "Messzeit: frische gültige Live-Daten fehlen; E3DC autonom")
     elif state in ("price_plan_house_discharge", "parallel_price_house_discharge"):
         reason = "Geplantes Laden: Auto darf Netz nutzen, Haus/WP wird begrenzt aus dem Speicher gestützt."
     elif state == "parallel_planned_load_hold":
@@ -9776,22 +9115,8 @@ def current_slot_is_low_price(plan: Dict[str, Any], now_s: float) -> bool:
     return current_price <= min(future_prices) + 1.0
 
 
-def grid_charge_room_w(cfg: Dict[str, Any], live: Dict[str, Any]) -> int:
-    amps = safe_float(cfg.get("grid_max_amps"), 0.0)
-    if not math.isfinite(amps) or amps <= 0:
-        return 0
-    if not _live_numeric_present(live, "Grid_Power") or live.get("Grid_Power_Valid") is False:
-        return 0
-    reserve_amp = max(0.0, safe_float(cfg.get("grid_max_reserve_amp"), 2.0))
-    max_import_w = max(0.0, (amps - reserve_amp) * 230.0 * 3.0)
-    grid_w = max(0.0, safe_float(live.get("Grid_Power"), 0.0))
-    # E3DC-Batterieleistung ist beim Laden positiv und beim Entladen negativ.
-    # Für einen neuen GRID-Rahmen muss beides aus dem gemessenen Netzpunkt
-    # herausgerechnet werden: laufendes Laden erhöht, laufendes Entladen senkt
-    # den aktuellen Netzbezug.
-    battery_w = safe_float(live.get("Battery_Power"), 0.0)
-    base_import_w = max(0.0, grid_w - battery_w)
-    return int(max(0.0, max_import_w - base_import_w))
+def grid_charge_room_w(cfg: Dict[str, Any], live: Dict[str, Any], now_s: Optional[float] = None) -> int:
+    return market_grid_charge_room_w(cfg, live, now_s=now_s)
 
 
 def grid_charge_wait_reason(cfg: Dict[str, Any], live: Dict[str, Any], fallback: str) -> str:
@@ -9997,10 +9322,7 @@ def storage_charge_path_contract(
     )
 
     now_value = time.time() if now_s is None else float(now_s)
-    max_age_s = max(
-        1.0,
-        min(30.0, safe_float(cfg.get("storage_live_stale_guard_s"), 10.0)),
-    )
+    max_age_s = LIVE_SAMPLE_MAX_AGE_S
     raw_ts = live.get("_ts")
     timestamp_valid = bool(
         isinstance(raw_ts, (int, float))
@@ -10248,148 +9570,9 @@ def curve_floor_full_charge_context(
     }
 
 
-def storage_dc_first_live_source_contract(
-    cfg: Dict[str, Any],
-    live: Dict[str, Any],
-    now_s: Optional[float] = None,
-) -> Dict[str, Any]:
-    """Bindet den sanften Laderahmen ausschließlich an einen frischen PV-Split."""
-
-    live = live or {}
-    now_value = time.time() if now_s is None else float(now_s)
-    max_age_s = max(
-        1.0,
-        min(30.0, safe_float(cfg.get("storage_live_stale_guard_s"), 10.0)),
-    )
-    live_ts = safe_float(live.get("_ts"), 0.0)
-    live_age_s = now_value - live_ts if live_ts > 0.0 else float("inf")
-    max_future_skew_s = 5.0
-    total_raw = live.get("PV_Power")
-    external_raw = live.get("Ext_PV_Power")
-    grid_raw = live.get("Grid_Power")
-    battery_raw = live.get("Battery_Power")
-    values_typed = bool(
-        isinstance(total_raw, (int, float))
-        and not isinstance(total_raw, bool)
-        and isinstance(external_raw, (int, float))
-        and not isinstance(external_raw, bool)
-        and math.isfinite(float(total_raw))
-        and math.isfinite(float(external_raw))
-    )
-    grid_battery_typed = bool(
-        isinstance(grid_raw, (int, float))
-        and not isinstance(grid_raw, bool)
-        and isinstance(battery_raw, (int, float))
-        and not isinstance(battery_raw, bool)
-        and math.isfinite(float(grid_raw))
-        and math.isfinite(float(battery_raw))
-    )
-    values_nonnegative = bool(
-        values_typed
-        and float(total_raw) >= 0.0
-        and float(external_raw) >= 0.0
-    )
-    total_pv_w = max(0, int(round(float(total_raw)))) if values_typed else 0
-    external_ac_pv_w = max(0, int(round(float(external_raw)))) if values_typed else 0
-    sample_valid = live.get("RSCP_Sample_Valid") is True
-    decision_usable = live.get("Power_Decision_Usable") is True
-    split_valid = live.get("Ext_PV_Power_Valid") is True
-    grid_valid = live.get("Grid_Power_Valid", sample_valid) is True
-    battery_valid = live.get("Battery_Power_Valid", sample_valid) is True
-    source_fresh = bool(
-        live_ts > 0.0
-        and -max_future_skew_s <= live_age_s <= max_age_s
-    )
-    source_valid = bool(
-        values_nonnegative
-        and grid_battery_typed
-        and sample_valid
-        and decision_usable
-        and split_valid
-        and grid_valid
-        and battery_valid
-        and source_fresh
-        and external_ac_pv_w <= total_pv_w
-    )
-    blocker = ""
-    if not values_typed:
-        blocker = "pv_split_untyped"
-    elif float(total_raw) < 0.0:
-        blocker = "pv_total_negative"
-    elif float(external_raw) < 0.0:
-        blocker = "external_pv_negative"
-    elif not grid_battery_typed:
-        blocker = "grid_or_battery_power_untyped"
-    elif not sample_valid:
-        blocker = "rscp_sample_invalid"
-    elif not decision_usable:
-        blocker = "power_decision_unusable"
-    elif not split_valid:
-        blocker = "external_pv_split_invalid"
-    elif not grid_valid:
-        blocker = "grid_power_invalid"
-    elif not battery_valid:
-        blocker = "battery_power_invalid"
-    elif live_age_s < -max_future_skew_s:
-        blocker = "pv_split_future"
-    elif not source_fresh:
-        blocker = "pv_split_stale"
-    elif external_ac_pv_w > total_pv_w:
-        blocker = "external_pv_exceeds_total"
-    e3dc_pv_w = (
-        max(0, total_pv_w - external_ac_pv_w)
-        if source_valid
-        else 0
-    )
-    grid_w = int(round(float(grid_raw))) if grid_battery_typed else 0
-    battery_power_w = (
-        int(round(float(battery_raw)))
-        if grid_battery_typed
-        else 0
-    )
-    no_import_margin_w = max(
-        0,
-        safe_int(cfg.get("storage_dc_first_no_import_margin_w"), 100),
-    )
-    # Positiver Battery_Power bedeutet laufendes Laden, negativer Wert
-    # Entladen. Die Differenz zum Netzpunkt ist damit die maximal zulässige
-    # Gesamtladung, ohne aus dem Netz nachzuziehen. Eine kleine Exportmarge
-    # fängt Messlatenz und Rundung ab.
-    raw_no_import_cap_w = (
-        max(0, battery_power_w - grid_w)
-        if source_valid
-        else 0
-    )
-    no_import_cap_w = max(0, raw_no_import_cap_w - no_import_margin_w)
-    e3dc_dc_surplus_w = min(e3dc_pv_w, no_import_cap_w)
-    return {
-        "contract_version": STORAGE_DC_FIRST_CHARGE_LIMIT_CONTRACT_VERSION,
-        "valid": source_valid,
-        "blocker": blocker,
-        "live_ts": live_ts if live_ts > 0.0 else None,
-        "age_s": round(live_age_s, 3) if math.isfinite(live_age_s) else None,
-        "max_age_s": max_age_s,
-        "max_future_skew_s": max_future_skew_s,
-        "sample_valid": sample_valid,
-        "decision_usable": decision_usable,
-        "external_split_valid": split_valid,
-        "grid_valid": grid_valid,
-        "battery_valid": battery_valid,
-        "total_pv_w": total_pv_w,
-        "external_ac_pv_w": external_ac_pv_w,
-        "e3dc_pv_w": e3dc_pv_w,
-        "grid_w": grid_w if grid_battery_typed else None,
-        "battery_power_w": (
-            battery_power_w
-            if grid_battery_typed
-            else None
-        ),
-        "no_import_margin_w": no_import_margin_w,
-        "raw_no_import_cap_w": raw_no_import_cap_w,
-        "no_import_cap_w": no_import_cap_w,
-        "e3dc_dc_surplus_w": e3dc_dc_surplus_w,
-        "source": str(live.get("Ext_PV_Power_Source") or "unavailable"),
-    }
+def storage_dc_first_live_source_contract(cfg, live, now_s=None):
+    """Bestehender Quellenvertrag über die gemeinsame reine Rechnung."""
+    return dc_quellenvertrag(cfg, live, time.time() if now_s is None else now_s)
 
 
 def storage_forecast_shortfall_marginal_horizon_diagnostic(
@@ -12691,10 +11874,7 @@ def direct_marketing_external_derating_context(
     live_ts = safe_float(live.get("_ts"), 0.0)
     timestamp_known = live_ts > 0.0
     live_age_s = live_data_age_s(live, now_s)
-    max_age_s = max(
-        1.0,
-        min(30.0, safe_float(cfg.get("storage_live_stale_guard_s"), 10.0)),
-    )
+    max_age_s = LIVE_SAMPLE_MAX_AGE_S
     sample_valid = _contract_bool(
         live.get("RSCP_Sample_Valid", live.get("live_sample_valid", True))
     )
@@ -12779,7 +11959,7 @@ def direct_marketing_export_execution_contract(
     )
 
     grid_values = []
-    for key in ("Grid_Power", "Grid_EMA_W"):
+    for key in ("Grid_Power",):
         raw_value = live.get(key)
         try:
             value = float(raw_value)
@@ -13158,10 +12338,7 @@ def _direct_marketing_live_ac_gate(
         and math.isfinite(float(raw_ts))
         and float(raw_ts) > 0.0
     )
-    max_age_s = max(
-        1.0,
-        min(30.0, safe_float(cfg.get("storage_live_stale_guard_s"), 10.0)),
-    )
+    max_age_s = LIVE_SAMPLE_MAX_AGE_S
     age_s = now_value - float(raw_ts) if timestamp_valid else None
     fresh = bool(
         timestamp_valid
@@ -13205,8 +12382,8 @@ def _direct_marketing_live_ac_gate(
             blockers.append(reason)
 
     grid_w = safe_float(live.get("Grid_Power"), 0.0) if grid_present else None
-    grid_ema_present = _live_numeric_present(live, "Grid_EMA_W")
-    grid_ema_w = safe_float(live.get("Grid_EMA_W"), 0.0) if grid_ema_present else grid_w
+    grid_ema_present = _live_numeric_present(live, "Grid_Power")
+    grid_ema_w = safe_float(live.get("Grid_Power"), 0.0) if grid_ema_present else grid_w
     grid_import_w = (
         max(0.0, grid_w or 0.0, grid_ema_w or 0.0)
         if grid_w is not None
@@ -13745,7 +12922,7 @@ def direct_marketing_pv_store_control_w(
             **source_diag,
         }
     grid_w = safe_float(live.get("Grid_Power"), 0.0)
-    grid_ema_w = safe_float(live.get("Grid_EMA_W", grid_w), grid_w)
+    grid_ema_w = grid_w
     grid_import_w = max(0, int(round(max(grid_w, grid_ema_w, 0.0))))
     grid_export_w = max(0, int(round(max(-grid_w, -grid_ema_w, 0.0))))
     external_derating = direct_marketing_external_derating_context(live, cfg, now_s)
@@ -17242,6 +16419,15 @@ MARKET_PLAN_GRACE_STATES = frozenset({
     "market_discharge_hold", "market_grid_wait", "market_grid_pv_wait",
     "market_grid_charge", "market_grid_done_hold",
 })
+
+
+def market_plan_grace_carrier(decision):
+    """Zustand, dessen Marktvertrag die Planübergangs-Karenz an der Slotgrenze kurz weiterverwenden darf: die
+    Marktzustände und das WB-Halten, auf dem die Marktsperre liegt (sonst fällt die Sperre dort für einen Takt weg)."""
+    decision = decision or {}
+    state = str(decision.get("state") or "")
+    return state in MARKET_PLAN_GRACE_STATES or (
+        state == "unmanaged_wallbox_wbminsoc_hold" and decision.get("market_discharge_lock_applied") is True)
 def market_plan_interrupted(quality):
     """Planquelle unterbrochen; Befugnisentzug und fachliches Ende bleiben sofort."""
     return (quality.get("status") in {"invalid_contract", "unreadable_plan"}
@@ -17262,7 +16448,7 @@ def market_plan_grace_source(cfg, plan, previous_state, now_s):
     previous = previous_state or {}
     memory = previous.get("market_plan_grace") or {}
     quality = market_plan_quality(plan, now_s, cfg.get("_market_plan_read_reason"))
-    if (previous.get("state") not in MARKET_PLAN_GRACE_STATES
+    if (not market_plan_grace_carrier(previous)
             or not memory or not market_plan_interrupted(quality)
             or not cfg.get("_market_plan_grace_source")
             or not storage_regulation_enabled(cfg)
@@ -17298,7 +16484,7 @@ def market_end_fields(cfg, plan, decision, previous_state, now_s):
     previous = previous_state or {}
     state = str(decision.get("state") or "")
     grace = copy.deepcopy(decision.get("market_plan_grace") or {})
-    if (state not in MARKET_PLAN_GRACE_STATES or decision.get("direct_marketing_grid_blocked")
+    if (not market_plan_grace_carrier(decision) or decision.get("direct_marketing_grid_blocked")
             or decision.get("backup_reserve_grid_active")
             or ((decision.get("market_economics_contract") or {}).get("economics") or {}).get("charge_profile") == "reserve"):
         grace = {}
@@ -17447,12 +16633,19 @@ def market_economics_contract_decision(
         contract = copy.deepcopy((previous_state or {}).get("market_economics_contract"))
         quality = dict(quality, status="active_contract")
     if not reserve_active and quality["status"] in {"unreadable_plan", "invalid_contract", "other_owner"}:
-        return market_economics_release_decision(cfg, live, market, contract, max_charge_w,
+        # Hält der Speicher nach erreichtem Netzladejob ohne Vertrag, überbrückt der Fertig-Latch den
+        # Planwechsel an der Viertelstundengrenze wie die Planübergangs-Gnade bei Verträgen; die
+        # Stale-Frist des Plans im Latch (market_economics_contract_errors) begrenzt das auf 20 s.
+        held = (market_grid_latched_hold_decision(cfg, live, market, contract, max_charge_w, previous_state, now_s)
+                if quality.get("reason") == "PLAN_SLOT_EXPIRED"
+                and (previous_state or {}).get("state") == "market_grid_done_hold" else None)
+        return held or market_economics_release_decision(cfg, live, market, contract, max_charge_w,
                                                 max_discharge_w, previous_state, now_s=now_s)
     # Der Fertig-Latch hält bis zum Fensterende auch dann, wenn der Planer nach dem Replan
     # keinen Netzladevertrag mehr liefert (Raum am Fensterende durch PV gefüllt / Bedarf gedeckt) oder auf einen
     # Haltevertrag wechselt – sonst würde der Speicher im günstigen Fenster entladen. Negativpreis-Aufnahme
-    # und ein neuer Netzladevertrag laufen weiter durch den regulären Zweig; fehlender/abgelaufener Plan hält nicht.
+    # und ein neuer Netzladevertrag laufen weiter durch den regulären Zweig; ein fehlender Plan hält nicht,
+    # ein abgelaufener Slot nur bis zur Stale-Frist (oben).
     latched_hold = None if reserve_active else market_grid_latched_hold_decision(cfg, live, market, contract, max_charge_w, previous_state, now_s)
     if latched_hold is not None:
         return latched_hold
@@ -17648,7 +16841,7 @@ def market_economics_contract_decision(
             )
         if action == "grid_charge" and planned_grid_charge_w < 300:
             reason = (
-                "Markt-Netzladeplan ohne gültige energieproportionale Ladeleistung; "
+                "Markt-Netzladeplan ohne gültige zulässige Ladeleistung; "
                 "Netzladen bleibt gesperrt, Entladung bleibt für die Hausversorgung frei"
             )
             result = {
@@ -17666,7 +16859,8 @@ def market_economics_contract_decision(
             result.update(common)
             return result
         live_pv_guard = market_grid_charge_live_pv_guard(live)
-        if not live_pv_guard.get("frame_usable", True):
+        if not (live_pv_guard["sample_valid"] and live_pv_guard["decision_usable"]
+                and not live_pv_guard["frame_stale"]):
             return None
         late_fill = forecast.get("late_fill") if isinstance(forecast.get("late_fill"), dict) else {}
         job = forecast.get("grid_charge_job") if isinstance(forecast.get("grid_charge_job"), dict) else {}
@@ -17674,19 +16868,13 @@ def market_economics_contract_decision(
         start = safe_int(late_fill.get("latest_start_ts"), 0)
         previous = previous_state if isinstance(previous_state, dict) else {}
         control = previous.get("market_grid_charge_control")
+        if not isinstance(control, dict) or control.get("window_end_ts") != window_end:
+            control = job.get("charge_control")
         control = dict(control) if isinstance(control, dict) and control.get("window_end_ts") == window_end else {}
-        # Altplan-Leser, entfällt mit 5.5.7
-        waiting = (action == "grid_charge" and not reserve_active and not control
-                   and late_fill.get("wait_active") and start > now_s * 1000.0)
-        if waiting:
-            reason = grid_charge_wait_reason(cfg, live, "PV ungedrosselt in den Speicher laden; Entladung bis zum Netzladestart für den Hochtarif zurückhalten")
-            return dict(common, state="market_grid_wait", mode=MODE_AUTO, val=max_charge_w,
-                reason=reason, storage_req_w=0, budget_w=0,
-                auto_limit=discharge_block_auto_limit(cfg, max_charge_w, reason),
-                market_late_fill_latest_start_ts=start, market_late_fill_window_end_ts=window_end,
-                market_late_fill_wait_active=True, market_live_pv_first=live_pv_guard)
         charge_w = max_charge_w
-        room_w = grid_charge_room_w(cfg, live)
+        room_w = grid_charge_room_w(cfg, live, now_s=now_s)
+        if not _live_numeric_present(live, "Grid_Power") or not live_pv_guard["grid_valid"]:
+            room_w = 0
         charge_w = min(charge_w, room_w)
         max_market_w = safe_int(cfg.get("market_battery_max_w"), 0)
         if max_market_w <= 0:
@@ -17719,48 +16907,48 @@ def market_economics_contract_decision(
             if profile["0"]["samples"] == 0 and legacy["market_grid_observed_charge_w"] >= 300:
                 profile["0"].update(factor=max(0.1, min(1.0, legacy["market_grid_observed_charge_w"]/device)))
 
-            rate = market_charge_rate_w(capacity, soc, target_soc,
-                (target_ts - now_s*1000)/1000.0, charge_w, device, profile)
-            old_rate = max(0, safe_int(control.get("rate_w"), 0))
-            old_ts = safe_float(control.get("rate_ts"), now_s)
-            difference = abs(rate - old_rate)
-            enough = difference >= MARKET_CHARGE_CHANGE_W and difference >= old_rate*MARKET_CHARGE_CHANGE_RATIO
-            # Aufholen ist die höhere neu berechnete Rate; harte Grenzen gehen
-            # unmittelbar vor. Absenkungen höchstens alle fünf Minuten.
-            catch_up = (rate > old_rate and old_rate > 0
-                and safe_float(live.get("Battery_Power"), old_rate) < old_rate * 0.9)
-            if old_rate > 0 and old_rate <= charge_w and (
-                    (rate > old_rate and not enough and not catch_up)
-                    or (rate <= old_rate and (not enough or now_s-old_ts < MARKET_CHARGE_REDUCE_S))):
-                rate = old_rate
-            if rate != old_rate:
-                old_ts = now_s
+            window_start = safe_int(control.get("window_start_ts"),
+                safe_int(job.get("window_start_ts"), int(now_s*1000)))
+            charge_w = min(charge_w, device)
+            schedule = market_charge_schedule(capacity, soc, target_soc, charge_w,
+                device, profile, int(now_s*1000), window_start, window_end, target_ts,
+                control, job_storage_wh=safe_float(job.get("job_grid_wh"),
+                    max(0.0, target_soc-soc)*capacity/100.0) *
+                    safe_float(economics.get("roundtrip_efficiency_pct"), 100.0)/100.0)
+            common["market_grid_charge_control"] = dict(control, **schedule)
+            start = schedule["latest_start_ts"]
+            if schedule["phase"] == "wait":
+                start_text = datetime.datetime.fromtimestamp(start/1000).strftime("%H:%M")
+                reason = ("Netzladen startet spätestens um %s mit voller Leistung (%s kW); "
+                    "bis dahin Speicher halten, PV lädt frei" %
+                    (start_text, ("%.1f" % (charge_w/1000)).replace(".", ",")))
+                return dict(common, state="market_grid_wait", mode=MODE_AUTO, val=max_charge_w,
+                    reason=reason, storage_req_w=0, budget_w=0,
+                    auto_limit=discharge_block_auto_limit(cfg, max_charge_w, reason),
+                    market_late_fill_latest_start_ts=start, market_late_fill_window_end_ts=window_end,
+                    market_late_fill_wait_active=True, market_live_pv_first=live_pv_guard)
+            rate = int(charge_w)
             old_mode = safe_int(control.get("output_mode"), MODE_GRID)
             mode_ts = safe_float(control.get("mode_ts"), now_s)
             # Akku minus Netz ist der gemessene PV-Überschuss nach ALLEN Lasten.
             # Externe Wallboxen stecken bereits in der Netzbilanz; kein Zusatzabzug.
             battery = safe_float(live.get("Battery_Power"), float("nan"))
             grid = safe_float(live.get("Grid_Power"), float("nan"))
-            surplus = (max(0.0, battery - grid) if math.isfinite(battery) and math.isfinite(grid)
-                       and live.get("Battery_Power_Valid") is not False
-                       and live.get("Grid_Power_Valid") is not False else None)
+            # Ungültige Leistungsdaten laufen bereits durch den Nullrahmenzweig.
+            surplus = max(0.0, battery - grid)
             output_mode = old_mode
-            if surplus is None:
-                # Unbekannter Überschuss gibt kein Netzladen frei; PV bleibt frei.
+            if old_mode == MODE_GRID and surplus > rate:
+                # PV sofort freigeben; nur der Wiedereintritt nach PV wartet.
                 output_mode = MODE_AUTO
-            if surplus is not None:
-                if old_mode == MODE_GRID and surplus > rate:
-                    # PV sofort freigeben; nur der Wiedereintritt ins Netzladen wartet.
-                    output_mode = MODE_AUTO
-                elif (old_mode == MODE_AUTO and surplus <= rate - MARKET_CHARGE_MODE_BAND_W
-                      and now_s - mode_ts >= MARKET_CHARGE_MODE_DWELL_S):
-                    output_mode = MODE_GRID
+            elif (old_mode == MODE_AUTO and surplus <= rate - MARKET_CHARGE_MODE_BAND_W
+                  and now_s - mode_ts >= MARKET_CHARGE_MODE_DWELL_S):
+                output_mode = MODE_GRID
             if output_mode != old_mode:
                 mode_ts = now_s
-            # GRID folgt ausschließlich der geglätteten Rate. AUTO nimmt PV frei auf.
+            # GRID lädt mit voller zulässiger Leistung; AUTO nimmt PV frei auf.
             charge_w = min(charge_w, rate) if output_mode == MODE_GRID else max_charge_w
-            common["market_grid_charge_control"] = dict(window_end_ts=window_end, target_ts=target_ts,
-                rate_w=rate, rate_ts=old_ts, output_mode=output_mode, mode_ts=mode_ts, device_w=device)
+            common["market_grid_charge_control"] = dict(schedule,
+                rate_w=rate, output_mode=output_mode, mode_ts=mode_ts, device_w=device)
             target_text = datetime.datetime.fromtimestamp(target_ts/1000).strftime("%H:%M")
             reason = ("PV lädt den Speicher; Netzladen ab Bedarf" if output_mode == MODE_AUTO else
                 "Speicher lädt aus dem Netz mit %s kW, Ziel %.0f %% gegen %s (%g min vor Fensterende)" % (("%.1f" % (charge_w/1000)).replace(".", ","), target_soc, target_text, (window_end-target_ts)/60000.0))
@@ -18119,7 +17307,7 @@ def direct_marketing_monitor(
                 safe_int(flags.get("max_grid_charge_w"), max_charge_w),
                 safe_int(current_window.get("max_power_w"), max_charge_w),
             )
-            room_w = grid_charge_room_w(cfg, live)
+            room_w = grid_charge_room_w(cfg, live, now_s=now_s)
             charge_w = min(charge_w, room_w)
             if room_w < 300:
                 blockers.add("house_connection_limited")
@@ -19421,38 +18609,6 @@ def controlled_wallbox_real_power_active(
     return observed_w >= real_min_w
 
 
-def _wallbox_status_sample_fresh(
-    status: Dict[str, Any],
-    *,
-    now_s: float,
-    max_age_s: float,
-) -> bool:
-    """Prüft native Leistungsbelege ohne Legacy-Default auf "gültig"."""
-
-    if not isinstance(status, dict):
-        return False
-    published = published_measurement_valid(status, now_s, max_age_s)
-    if published is not None:
-        return published
-    sample_ts = status.get("driver_status_last_sample_ts")
-    if type(sample_ts) not in (int, float) or not math.isfinite(float(sample_ts)):
-        return False
-    sample_value = float(sample_ts)
-    # Die zentrale Altersprüfung normalisiert genau einmal.
-    return bool(
-        status.get("driver_status_valid") is True
-        and status.get("driver_status_stale") is False
-        and status.get("driver_status_degraded") is False
-        and status.get("driver_status_glitch") is False
-        and status.get("driver_status_plausible") is True
-        and sample_value > 0.0
-        and math.isfinite(float(now_s))
-        and math.isfinite(float(max_age_s))
-        and float(max_age_s) > 0.0
-        and ((_input_age_s := runtime_input_age_s(sample_value, float(now_s))) is not None and _input_age_s <= float(max_age_s))
-    )
-
-
 def ep_reserve_wallbox_running_minimum_contract(
     cfg: Dict[str, Any],
     wb_intent: Dict[str, Any],
@@ -20225,161 +19381,6 @@ def observed_wallbox_controlled_intent(wb_intent, observed_ids):
     return result
 
 
-def wallbox_data_outage_context(cfg, intent, native, now_s, previous=None):
-    """Bewertet jeden externen Messpunkt, ohne Last oder Freigaben zu erfinden."""
-    previous = previous or {}
-    rows = {safe_int(r.get("wb_id"), 0): r for r in intent.get("car_energy_needs", []) if isinstance(r, dict)}
-    details = {safe_int(d.get("id"), 0): d for d in native.get("wb_details", []) if isinstance(d, dict)}
-    prior = {p.get("id"): p for p in previous.get("points", []) if isinstance(p, dict)}
-    points = []
-    vehicle_present = dict(previous.get("vehicle_present") or {})
-    if "wb_native_enable" in cfg and not cfg_bool(cfg, "wb_native_enable", False):
-        return {"active": False, "points": []}
-    for cid, key in ((1, "wb_native_type"), (2, "wb_native_type2")):
-        kind = str(cfg.get(key) or "").strip().lower()
-        if key not in cfg:
-            # Altverträge können die Typbindung am einzelnen Ladepunkt tragen.
-            kind = next((str(p.get("type") or "").strip().lower()
-                         for p in intent.get("wallbox_storage_points", [])
-                         if isinstance(p, dict) and safe_int(p.get("id"), 0) == cid), "")
-            kind = kind or str(details.get(cid, {}).get("type") or "").strip().lower()
-            if not kind and cid == 1 and cid in (intent.get("openwb_primary_pv_mode_ids") or [1]) and (
-                    intent.get("openwb_primary_pv_mode_active") or intent.get("openwb_primary_observe_only")):
-                kind = "openwb"
-        if kind in ("", "none", "off", "disabled", "0", "false", "aus", "no", "nein", "deaktiviert", "keine", "keine_wallbox", "no_wallbox", "-1") or wallbox_type_is_e3dc(kind):
-            continue
-        row, detail = rows.get(cid), details.get(cid, {})
-        observation = detail.get("observation") or {}
-        published = published_measurement_valid(detail, now_s, WALLBOX_STATUS_SAMPLE_MAX_AGE_S)
-        if published is not None:
-            power = (observation.get("values") or {}).get("power_w")
-            valid = bool(published and type(power) in (int, float) and math.isfinite(power) and power >= 0)
-        else:
-            if row is not None:
-                power = row.get("car_power_w")
-                ts = row.get("car_charging_last_valid_ts", intent.get("ts"))
-                valid = (row.get("car_power_valid") is True and ts is not None
-                         and ((_input_age_s := runtime_input_age_s(safe_float(ts, 0), now_s)) is not None and _input_age_s <= WALLBOX_STATUS_SAMPLE_MAX_AGE_S)
-                         and ((_input_age_s := runtime_input_age_s(safe_float(intent.get("ts"), 0), now_s)) is not None and _input_age_s <= 60))
-            else:
-                power = (observation.get("values") or {}).get("power_w") if observation else detail.get("power_w")
-                valid = (((_input_age_s := runtime_input_age_s(safe_float(intent.get("ts"), 0), now_s)) is not None and _input_age_s <= 60)
-                         and _wallbox_status_sample_fresh(detail, now_s=now_s, max_age_s=WALLBOX_STATUS_SAMPLE_MAX_AGE_S))
-            if row is not None and not valid and observation.get("valid") is True:
-                power = (observation.get("values") or {}).get("power_w")
-                valid = (((_input_age_s := runtime_input_age_s(safe_float(intent.get("ts"), 0), now_s)) is not None and _input_age_s <= 60)
-                         and _wallbox_status_sample_fresh(detail, now_s=now_s, max_age_s=WALLBOX_STATUS_SAMPLE_MAX_AGE_S))
-            valid = bool(valid and type(power) in (int, float) and math.isfinite(power) and power >= 0)
-            if detail:
-                valid = bool(valid and _wallbox_status_sample_fresh(detail, now_s=now_s, max_age_s=WALLBOX_STATUS_SAMPLE_MAX_AGE_S)
-                             and (not observation or observation.get("valid") is True))
-        if valid:
-            values = observation.get("values") or {}
-            vehicle_present[str(cid)] = bool(
-                (row or {}).get("connected") is True or values.get("plug") is True
-                or detail.get("plug") is True or detail.get("charging") is True
-                or (type(power) in (int, float) and power > 500))
-        if (row or {}).get("connected") is False:
-            vehicle_present[str(cid)] = False
-        if valid:
-            continue
-        # Diagnose enthält nur bekannte neutrale Codes, niemals URLs oder Fahrzeugdaten.
-        raw_reason = str(observation.get("reason") or detail.get("driver_status_reason") or "")
-        allowed = {"openwb_tls_required", "openwb_pin_changed", "openwb_target_changed",
-                   "openwb_tls_pin_mismatch", "openwb_certificate_expired", "openwb_auth_rejected",
-                   "openwb_acl_missing", "openwb_unavailable", "connection_refused", "status_timeout",
-                   "http_error", "partial_measurement", "last_good_within_grace", "openwb_redirect_rejected",
-                   "openwb_address_invalid", "openwb_mqtt_unavailable", "openwb_mqtt_waiting",
-                   "openwb_cleartext_credentials"}
-        reason = raw_reason if raw_reason in allowed else "wallbox_measurement_missing_or_stale"
-        since = prior.get(cid, {}).get("since_ts")
-        since = since if type(since) in (int, float) and 0 < since <= now_s else now_s
-        points.append({"id": cid, "since_ts": since, "reason": reason,
-                       "vehicle_present": vehicle_present.get(str(cid), False),
-                       "regulation": "Unterhalb der Hausakku-Untergrenze bleibt die Speicherentladung für die Wallbox begrenzt"})
-    return {"active": bool(points), "points": points, "vehicle_present": vehicle_present}
-
-
-def storage_inputs_without_failed_wallboxes(cfg, intent, native, outage):
-    """Entfernt ausgefallene Punkte ausschließlich aus der internen Regelungssicht.
-
-    Der gemessene Hausverbrauch bleibt vollständig erhalten. Ein separater
-    E3DC-Messpunkt und alle anderen Schutzkonfigurationen bleiben maßgeblich.
-    """
-    failed = {p["id"] for p in outage.get("points", [])}
-    if not failed:
-        return cfg, intent, native
-    cfg, native = dict(cfg), dict(native)
-    for cid in failed:
-        cfg["wb_native_type" if cid == 1 else "wb_native_type2"] = "none"
-        cfg[f"wb{cid}_mode"] = MODE_OFF
-        cfg[f"wb{cid}_observe_storage_policy"] = ""
-        cfg[f"wb{cid}_storage_observe_policy"] = ""
-    points = [p for p in intent.get("wallbox_storage_points", [])
-              if isinstance(p, dict) and safe_int(p.get("id"), 0) not in failed]
-    rows = [r for r in intent.get("car_energy_needs", [])
-            if isinstance(r, dict) and safe_int(r.get("wb_id"), 0) not in failed]
-    details = [d for d in native.get("wb_details", [])
-               if isinstance(d, dict) and safe_int(d.get("id"), 0) not in failed]
-    for key in ("wb_possible_power_w", "wb_max_amp", "wb_global_max_amp"):
-        native.pop(key, None)
-    native["wb_details"] = details
-    native["total_power_w"] = sum(max(0, safe_float(d.get("power_w"), 0)) for d in details)
-    native["charging_active"] = any(d.get("charging") for d in details)
-    if not points and not rows and details and intent:
-        # Beim Altschema bleiben einzeln belegte andere Ladepunkte erhalten.
-        primary_ids = intent.get("openwb_primary_pv_mode_ids") or [1]
-        for detail in details:
-            cid = safe_int(detail.get("id"), 0)
-            if cid <= 0:
-                continue
-            primary = cid in primary_ids and bool(intent.get("openwb_primary_pv_mode_active")
-                                                  or intent.get("openwb_primary_observe_only"))
-            points.append(dict(id=cid, configured=True, enabled=True, type=detail.get("type"),
-                mode=normalize_wb_mode(cfg.get(f"wb{cid}_mode", intent.get("wb_mode_active", 0))),
-                role="primary" if primary else "controlled",
-                observe_storage_policy=cfg.get(f"wb{cid}_observe_storage_policy", intent.get("observe_storage_policy")),
-                active=bool(detail.get("plug") or detail.get("charging")),
-                car_active=bool(detail.get("plug") or detail.get("charging")),
-                charging_active=bool(detail.get("charging")), power_w=detail.get("power_w")))
-    if not points and not rows:
-        return cfg, {}, native
-    filtered = dict(intent, wallbox_storage_points=points, car_energy_needs=rows)
-    # Aufträge einer ausgefallenen Box dürfen auch in Mischanlagen keinen
-    # Start- oder Phasenrahmen reservieren. Gebundene Gruppen mit einem
-    # ausgefallenen Mitglied müssen neu qualifiziert werden.
-    allowed = {safe_int(p.get("id"), 0) for p in points} | {safe_int(r.get("wb_id"), 0) for r in rows}
-    starts = [item for item in intent.get("start_hold_requests", [])
-              if isinstance(item, dict) and safe_int(item.get("wb_id"), 0) in allowed
-              and not any(safe_int(member.get("wb_id"), 0) in failed
-                          for member in item.get("group_members", []) if isinstance(member, dict))]
-    filtered["start_hold_requests"] = starts
-    filtered["start_hold_requested_group_minimum_w"] = max(
-        (max(0, safe_int(item.get("group_minimum_w"), 0)) for item in starts), default=0)
-    phases = [item for item in intent.get("phase_transition_reservations", [])
-              if isinstance(item, dict) and safe_int(item.get("wb_id"), 0) in allowed]
-    filtered["phase_transition_reservations"] = phases
-    filtered["phase_transition_active"] = any(item.get("active") for item in phases)
-    filtered["phase_transition_reserved_w"] = sum(max(0, safe_int(item.get("requested_w"), 0)) for item in phases)
-    filtered["phase_transition_charger_ids"] = [safe_int(item.get("wb_id"), 0) for item in phases]
-    filtered.pop("phase_transition_reservation", None)
-    for key in ("active", "car_active", "charging_active", "grid_allowed", "price_opt_active",
-                "scheduled_slot_active", "price_boost_active", "predump_wallbox_active"):
-        filtered[key] = any(p.get(key) for p in points)
-    filtered["connected"] = any(r.get("connected") is True for r in rows)
-    filtered["plugged"] = filtered["connected"]
-    filtered["wb_power_w"] = (sum(max(0, safe_float(r.get("car_power_w"), 0)) for r in rows)
-                                if rows else native["total_power_w"])
-    filtered["wb_mode_active"] = max((normalize_wb_mode(p.get("mode", 0)) for p in points), default=0)
-    filtered["wb_control_mode"] = controller_mode(filtered["wb_mode_active"])
-    primary = [p["id"] for p in points if p.get("role") == "primary"]
-    filtered["openwb_primary_pv_mode_ids"] = primary
-    filtered["openwb_primary_pv_mode_active"] = bool(primary)
-    filtered["openwb_primary_observe_only"] = bool(primary)
-    filtered["external_wallbox_manager"] = bool(primary) and len(primary) == len(points)
-    return cfg, filtered, native
-
-
 def _whole_discharge_limit_w(value):
     """Gültige gebrochene Wattwerte aus einem Vorzyklus sicher abrunden."""
     if type(value) is float and math.isfinite(value) and value >= 0:
@@ -20460,7 +19461,10 @@ def observed_wallbox_discharge_context(cfg, live, wb_intent, wb_native, now_s,
             disconnected = disconnected or bool(published and (observation.get("values") or {}).get("plug") is False)
             valid = bool(published and type(raw_w) in (int, float) and math.isfinite(raw_w) and raw_w >= 0)
             return valid, float(raw_w) if valid else None, disconnected
-        if row is not None:
+        if row is not None and not detail:
+            # Nur ohne Boxdetail trägt die Absichtszeile: Externe Boxen ohne Detail hat der
+            # Ausfallkontext schon entfernt, es bleiben E3DC-Ladepunkte. Mit Detail gilt
+            # allein dessen Gültigkeit, keine zweite Sicht aus derselben Probe.
             raw_w = row.get("car_power_w")
             sample_ts = row.get("car_charging_last_valid_ts", intent.get("ts"))
             valid = (fresh and row.get("car_power_valid") is True and sample_ts is not None
@@ -20472,8 +19476,6 @@ def observed_wallbox_discharge_context(cfg, live, wb_intent, wb_native, now_s,
             valid = fresh and live_fresh and _wallbox_status_sample_fresh(detail, now_s=now_s, max_age_s=WALLBOX_STATUS_SAMPLE_MAX_AGE_S)
         valid = bool(valid and not disconnected and type(raw_w) in (int, float)
                      and math.isfinite(raw_w) and raw_w >= 0)
-        if detail:
-            valid = valid and _wallbox_status_sample_fresh(detail, now_s=now_s, max_age_s=WALLBOX_STATUS_SAMPLE_MAX_AGE_S)
         return valid, float(raw_w) if valid else None, disconnected
     cap_points = list(points)
     # Geregelte Ladepunkte erhalten bei Messlücken denselben Haus-/WP-Schutz.
@@ -20885,7 +19887,9 @@ def unmanaged_wallbox_wbminsoc_hold_decision(
             cfg, live, now_s, max_discharge_w,
             previous_state.get("observed_wallbox_discharge") or {}, wb_intent)["cap_w"]
     house_wp_cap_raw_w = house_wp_cap_w
-    house_wp_cap_w = smooth_house_heatpump_discharge_cap_w(cfg, house_wp_cap_w, previous_state)
+    # Den halben Schritt braucht nur die Grenze aus der Hausbilanz (verspäteter Akkuwert); die Lückenregel rechnet ohne
+    # Bilanz und folgt nach dem Halteband sofort, damit eine abgelaufene letzte Grenze nicht nachwirkt.
+    house_wp_cap_w = smooth_house_heatpump_discharge_cap_w(cfg, house_wp_cap_w, previous_state, half_step=not gap_active)
     intent_reason = str(wb_intent.get("reason") or "").strip()
     scheduled_grid_charge = bool(
         request == "hold_discharge"
@@ -20978,6 +19982,15 @@ def unmanaged_wallbox_wbminsoc_hold_decision(
         )
     else:
         pv_charge_available_w = pv_house_surplus_w
+        previous_surplus_w = safe_float(previous_state.get("planned_grid_pv_surplus_w"), -1.0)
+        if (scheduled_grid_charge and previous_name == "unmanaged_wallbox_wbminsoc_hold"
+                and previous_state.get("scheduled_grid_charge") is True
+                and previous_age_s <= 15.0 and previous_surplus_w >= 0.0):
+            # Der Hauswert des E3DC ist eine Bilanz mit dem einen Takt später gemeldeten Akkuwert: Jeder
+            # Ladesprung erscheint einen Takt lang als Hauslast und senkt den Überschuss um genau diesen
+            # Sprung. Der volle Schritt auf den neuen Wert schaukelt sich so im Zweitakt auf (Laden und
+            # Halten im Wechsel); der halbe Schritt klingt ab und folgt echten PV-Änderungen in wenigen Takten.
+            pv_charge_available_w = int(round(previous_surplus_w + 0.5 * (pv_house_surplus_w - previous_surplus_w)))
     charge_enter_delay_s = max(
         0.0,
         safe_float(
@@ -21045,7 +20058,7 @@ def unmanaged_wallbox_wbminsoc_hold_decision(
             reason = (
                 "Geplante Netzladung unter Kurve/wbminSoC %.1f%% (SoC %.1f%%, Kurve %s): "
                 "PV-Überschuss nach Haus/WP %.0fW lädt Speicher, Wallbox nutzt Netz"
-            ) % (floor_soc, soc, curve_txt, pv_house_surplus_w)
+            ) % (floor_soc, soc, curve_txt, pv_charge_available_w)
         elif observe_storage_floor:
             reason = (
                 "Beobachten + PV + Akku bis Untergrenze %.1f%% (SoC %.1f%%, Kurve %s): "
@@ -21209,6 +20222,7 @@ def unmanaged_wallbox_wbminsoc_hold_decision(
         "wb_discharge_measurement_gap": gap_active,
         "auto_limit": auto_limit,
         "scheduled_grid_charge": scheduled_grid_charge,
+        "planned_grid_pv_surplus_w": pv_charge_available_w if scheduled_grid_charge else None,
         "controlled_wallbox_wbminsoc_pause": controlled_wallbox_no_grid,
         "wbminsoc_owner_grace_active": previous_hold_grace,
         "wbminsoc_real_wallbox_confirmed": wallbox_charging,
@@ -21236,63 +20250,12 @@ def unmanaged_wallbox_wbminsoc_hold_decision(
     }
 
 
-def curve_control_soc_estimate(
-    raw_soc: float,
-    bat_w: int,
-    storage_kwh: float,
-    previous_state: Dict[str, Any],
-    now_s: float,
-    cfg: Dict[str, Any],
-) -> float:
-    if safe_int(cfg.get("storage_curve_control_soc_enable"), 1) == 0:
-        return raw_soc
-    capacity_wh = max(1000.0, safe_float(storage_kwh, 0.0) * 1000.0)
-    prev_ts = safe_float(
-        previous_state.get("curve_control_soc_ts"),
-        safe_float(previous_state.get("ts"), 0.0),
-    )
-    if "curve_control_soc" in previous_state:
-        prev_control = safe_float(previous_state.get("curve_control_soc"), raw_soc)
-    else:
-        prev_control = raw_soc
-        prev_target_soc = safe_float(previous_state.get("target_soc", previous_state.get("tl_soc_target")), -1.0)
-        prev_target_ts = safe_float(previous_state.get("target_ts", previous_state.get("tl_ts_target")), 0.0)
-        prev_ifc_w = max(0, safe_int(previous_state.get("iFc_w"), 0))
-        if prev_target_soc >= 0.0 and prev_target_ts > prev_ts and prev_ifc_w > 0:
-            prev_hours = max(0.05, (prev_target_ts - prev_ts) / 3600.0)
-            inferred = prev_target_soc - (float(prev_ifc_w) * prev_hours / capacity_wh * 100.0)
-            band_pct = max(0.2, min(1.2, safe_float(cfg.get("storage_curve_control_soc_band_pct"), 0.95)))
-            if raw_soc - band_pct <= inferred <= raw_soc + band_pct:
-                prev_control = inferred
-    if prev_ts <= 0.0 or now_s <= prev_ts:
-        return raw_soc
-    prev_raw = safe_float(previous_state.get("curve_control_raw_soc"), previous_state.get("soc", raw_soc))
-    hard_reset_pct = max(1.2, min(5.0, safe_float(cfg.get("storage_curve_control_soc_reset_pct"), 2.0)))
-    if abs(raw_soc - prev_raw) >= hard_reset_pct:
-        return raw_soc
-    elapsed_s = max(0.0, min(90.0, now_s - prev_ts))
-    prev_bat_w = safe_int(previous_state.get("bat_w"), bat_w)
-    avg_bat_w = (float(prev_bat_w) + float(bat_w)) / 2.0
-    delta_pct = (avg_bat_w * elapsed_s / 3600.0) / capacity_wh * 100.0
-    estimate = prev_control + delta_pct
-    band_pct = max(0.2, min(1.2, safe_float(cfg.get("storage_curve_control_soc_band_pct"), 0.95)))
-    return max(0.0, min(100.0, max(raw_soc - band_pct, min(raw_soc + band_pct, estimate))))
-
-
 def curve_release_ts_s(plan: Dict[str, Any]) -> float:
     meta = plan.get("target_curve_meta") if isinstance(plan.get("target_curve_meta"), dict) else {}
     raw = safe_float(plan.get("ladeende_ts"), 0.0) or safe_float(meta.get("curve_end_ts"), 0.0)
     if raw <= 0:
         return 0.0
     return raw / 1000.0 if raw > 10000000000.0 else raw
-
-
-def curve_release_active(plan: Dict[str, Any], now_s: Optional[float] = None) -> bool:
-    release_ts = curve_release_ts_s(plan)
-    if release_ts <= 0:
-        return False
-    now = time.time() if now_s is None else float(now_s)
-    return now >= release_ts
 
 
 def evening_release_latch_context(
@@ -21800,7 +20763,7 @@ def apply_wallbox_start_hold_decision(
     now_s: float,
     live_stale: bool,
     live_sample_invalid: bool,
-    soc_unrealistic: bool,
+    live_control_invalid: bool,
     max_charge_w: int,
     max_discharge_w: int,
     phase_transition_active: bool,
@@ -21828,8 +20791,8 @@ def apply_wallbox_start_hold_decision(
         hard_blockers.append("live_stale")
     if live_sample_invalid:
         hard_blockers.append("live_sample_invalid")
-    if soc_unrealistic:
-        hard_blockers.append("soc_unrealistic")
+    if live_control_invalid:
+        hard_blockers.append("live_control_invalid")
     if phase_transition_active:
         hard_blockers.append("phase_transition_active")
     if reserve_soc > 0.0 and soc <= reserve_soc + 0.2:
@@ -22041,7 +21004,7 @@ def apply_wallbox_fixed_start_sources(
     prior_auto = result.get("auto_limit") or {}
     if isinstance(prior_auto, dict) and prior_auto.get("enabled") is True:
         house_cap = min(house_cap, max(0, safe_int(prior_auto.get("max_discharge_w"), 0)))
-    grid_room = grid_charge_room_w(cfg, live)
+    grid_room = grid_charge_room_w(cfg, live, now_s=now_s)
     grid_power = max(0.0, values.get("Grid_Power", 0.0))
     amps = max(0.0, safe_float(cfg.get("grid_max_amps"), 0.0))
     actual_grid_room = max(0.0, (amps - max(0.0, safe_float(cfg.get("grid_max_reserve_amp"), 2.0))) * 690.0 - grid_power)
@@ -22118,10 +21081,8 @@ def wallbox_possible_power(cfg: Dict[str, Any], wb_intent: Dict[str, Any], wb_na
         if not active:
             continue
         amp = safe_int(detail.get("max_amp", detail.get("amp")), 0)
-        phases = safe_int(
-            detail.get("phases_target", detail.get("phases_in_use", detail.get("phases_actual"))),
-            0,
-        )
+        phases = next((value for key in ("phases_target", "phases_in_use", "phases_actual")
+                       if (value := safe_int(detail.get(key), 0)) in (1, 2, 3)), 0)
         if phases not in (1, 2, 3):
             phases = 1
         capability = detail.get("wallbox_capability")
@@ -23218,7 +22179,7 @@ def heatpump_pv_source_contract(
         battery_available_w = 0.0
     peak = decision.get("peak_shaving") or {}
     grid_headroom_w = number(peak.get("grid_import_headroom_w")) if isinstance(peak, dict) else None
-    house_grid_room_w = grid_charge_room_w(cfg, live)
+    house_grid_room_w = grid_charge_room_w(cfg, live, now_s=now_s)
     # Viertelstunden-Headroom ist keine momentane Anschlussgrenze. Der
     # vorhandene Hausanschlussrahmen begrenzt zusätzlich; ohne Profil kein Netzgrant.
     actual_grid_room_w = max(0.0,
@@ -23435,6 +22396,9 @@ def build_flexible_consumer_budget_contract(
 ) -> Dict[str, Any]:
     """Projiziert Anlagenzustand auf genau einen flexiblen Wattvertrag."""
 
+    source = LiveDataSnapshot.from_dict(live, now_s=now_s)
+    source_valid = source.pv_valid and source.home_valid
+    evidence_valid = bool(evidence_valid and source_valid)
     previous = previous_state if isinstance(previous_state, dict) else {}
     previous_budget = (
         previous.get("budget") if isinstance(previous.get("budget"), dict) else {}
@@ -27244,15 +26208,10 @@ def build_flexible_consumer_budget_contract(
     contract["heatpump_start_request_w"] = hp_req_w
     contract["authorized_heatpump_budget_w"] = hp_cmd_w
 
+    if not source_valid:
+        contract = cap_consumer_budget_contract(contract, {"heatpump": 0, "wallbox": 0, "heater": 0})
+        contract.update(valid=False, reason_code="pv_or_home_missing")
     return contract
-
-
-def _wallbox_detail_power_w(detail: Dict[str, Any]) -> float:
-    for key in ("power_w", "phase_power_sum_w", "meter_power_w", "charge_power_w"):
-        power = abs(safe_float(detail.get(key), 0.0))
-        if power > 0:
-            return power
-    return 0.0
 
 
 def _external_openwb_primary_power_evidence(
@@ -27352,314 +26311,11 @@ def _external_openwb_primary_power_evidence(
     }
 
 
-def _wallbox_slot_types(cfg, wb_intent):
-    """Explizite Konfiguration vor der slotgebundenen Manager-Veröffentlichung."""
-    cfg = cfg or {}
-    types = {}
-    for point in (wb_intent or {}).get("wallbox_storage_points") or []:
-        if isinstance(point, dict) and type(point.get("id")) is int and point["id"] > 0:
-            types[point["id"]] = str(point.get("type") or "").strip().lower()
-    for cid, key in ((1, "wb_native_type"), (2, "wb_native_type2")):
-        kind = str(cfg.get(key) or "").strip().lower()
-        if kind:
-            types[cid] = kind
-    return types
-
-
-def _wallbox_detail_measurement(detail, *, now_s, sample_age_limit_s,
-                                require_fresh_evidence, external_slot):
-    """Ein Messvertrag für Gesamtleistung und externen Hausanteil."""
-    power = _wallbox_detail_power_w(detail)
-    detail_status_usable = (
-        _wallbox_status_sample_fresh(
-            detail,
-            now_s=now_s,
-            max_age_s=sample_age_limit_s,
-        )
-        if require_fresh_evidence
-        else bool(
-            detail.get("driver_status_valid") is not False
-            and detail.get("driver_status_stale") is not True
-            and detail.get("driver_status_degraded") is not True
-            and detail.get("driver_status_glitch") is not True
-        )
-    )
-    published = published_measurement_valid(detail, now_s, sample_age_limit_s)
-    if published is not None:
-        detail_status_usable = bool(detail_status_usable and published)
-    if external_slot:
-        detail_status_usable = bool(detail_status_usable and _wallbox_status_sample_fresh(
-            detail, now_s=now_s, max_age_s=sample_age_limit_s))
-    observation = detail.get("observation")
-    if isinstance(observation, dict):
-        measured_power = (observation.get("values") or {}).get("power_w")
-        detail_status_usable = bool(detail_status_usable and observation.get("valid") is True
-            and type(measured_power) in (int, float) and math.isfinite(measured_power))
-    if not detail_status_usable:
-        return dict(usable=False, known=False, power_w=power, running=False)
-    known = any(
-        isinstance(detail.get(key), (int, float))
-        and not isinstance(detail.get(key), bool)
-        and math.isfinite(float(detail.get(key)))
-        for key in (
-            "power_w",
-            "phase_power_sum_w",
-            "meter_power_w",
-            "charge_power_w",
-        )
-    )
-    if require_fresh_evidence and power > 250.0 and not (
-        detail.get("plug") is True
-        and detail.get("charging") is True
-    ):
-        return dict(usable=False, known=known, power_w=power, running=False)
-    return dict(usable=True, known=known, power_w=power,
-                running=bool(detail.get("charging")) or power > 250.0)
-
-
-def _external_wallbox_power_snapshot(wb_native, types, now_s, max_age_s, *, require_fresh_evidence=False):
-    """Hausanteil aus dem gemeinsamen Messvertrag aller externen Ladepunkte."""
-    types = types or {}
-    details = wb_native.get("wb_details")
-    off_types = {"none", "off", "aus", "disabled", "0", "false", "no", "nein",
-                 "deaktiviert", "keine", "keine_wallbox", "no_wallbox", "-1"}
-    expected = {cid for cid, kind in types.items()
-                if kind and kind not in off_types and not wallbox_type_is_e3dc(kind)}
-    external_w, seen = 0.0, set()
-    separate_box_present = any(wallbox_type_is_e3dc(kind) for kind in types.values())
-    if not isinstance(details, list):
-        details = []
-    for detail in details:
-        if not isinstance(detail, dict):
-            return dict(external_w=None, external_reason="wallbox_type_unknown")
-        cid = detail.get("id")
-        if type(cid) is not int or cid <= 0 or cid in seen:
-            return dict(external_w=None, external_reason="wallbox_type_unknown")
-        seen.add(cid)
-        kind = types.get(cid, "")
-        if kind in off_types or wallbox_type_is_e3dc(kind):
-            continue
-        measurement = _wallbox_detail_measurement(
-            detail, now_s=now_s, sample_age_limit_s=max_age_s,
-            require_fresh_evidence=require_fresh_evidence, external_slot=True)
-        if not kind:
-            if (measurement["usable"] and measurement["known"]
-                    and measurement["power_w"] <= 250.0 and not bool(detail.get("charging"))):
-                continue
-            return dict(external_w=None, external_reason="wallbox_type_unknown")
-        if (not measurement["usable"] or not measurement["known"]
-                or wb_native.get("driver_status_valid") is False
-                or any(wb_native.get(k) is True for k in
-                       ("driver_status_stale", "driver_status_degraded", "driver_status_glitch"))):
-            return dict(external_w=None, external_reason="external_measurement_invalid")
-        external_w += measurement["power_w"]
-    if expected - seen or not (seen or types):
-        return dict(external_w=None, external_reason="wallbox_details_incomplete")
-    return dict(external_w=external_w, external_reason="measured_external_slots",
-                home_includes_wallbox=bool(external_w > 0 and not separate_box_present))
-
-
-def wallbox_actual_power_snapshot(
-    live: Dict[str, Any],
-    wb_native: Optional[Dict[str, Any]] = None,
-    *,
-    now_s: Optional[float] = None,
-    max_age_s: float = 45.0,
-    require_fresh_evidence: bool = False,
-    cfg: Optional[Dict[str, Any]] = None,
-    sample_max_age_s: Optional[float] = None,
-    external_types: Optional[Dict[int, str]] = None,
-) -> Dict[str, Any]:
-    """Summiert belegte Ladepunkte; ein separater E3DC-Wert ersetzt keinen externen Slot."""
-    wb_native = wb_native or {}
-    now_value = time.time() if now_s is None else float(now_s)
-    # max_age_s gilt für die E3DC-Livedaten, sample_max_age_s für Wallbox-Statusproben (ohne Angabe wie max_age_s).
-    sample_age_limit_s = min(WALLBOX_STATUS_SAMPLE_MAX_AGE_S,
-                             float(max_age_s if sample_max_age_s is None else sample_max_age_s))
-    # Ein angereicherter Rahmen trägt die Summe in Wallbox_Power. Der
-    # separate E3DC-Messpunkt bleibt im Ursprungsfeld erhalten; erneutes Lesen
-    # darf den externen Anteil nicht wieder dem Haus zuschlagen.
-    live_raw = (live.get("Wallbox_Live_Power") if "Wallbox_Live_Power" in live
-                and live.get("Wallbox_Power_Source") in ("wallbox_native", "live_data", "unknown")
-                else live.get("Wallbox_Power"))
-    live_power_known = bool(
-        isinstance(live_raw, (int, float))
-        and not isinstance(live_raw, bool)
-        and math.isfinite(float(live_raw))
-    )
-    live_w = abs(float(live_raw)) if live_power_known else 0.0
-    live_sample_ts = live.get("_ts")
-    live_sample_fresh = bool(
-        type(live_sample_ts) in (int, float)
-        and math.isfinite(float(live_sample_ts))
-        and float(live_sample_ts) > 0.0
-        and ((_input_age_s := runtime_input_age_s(float(live_sample_ts), now_value)) is not None and _input_age_s <= float(max_age_s))
-        and live_power_plausibility(live).get("sample_valid") is True
-        and live.get("Power_Decision_Usable", True) is not False
-    )
-    live_status_usable = bool(
-        live_power_known
-        and (live_sample_fresh if require_fresh_evidence else True)
-    )
-    native_status_usable = (
-        _wallbox_status_sample_fresh(
-            wb_native,
-            now_s=now_value,
-            max_age_s=sample_age_limit_s,
-        )
-        if require_fresh_evidence
-        else bool(
-            wb_native.get("driver_status_valid") is not False
-            and wb_native.get("driver_status_stale") is not True
-            and wb_native.get("driver_status_degraded") is not True
-            and wb_native.get("driver_status_glitch") is not True
-        )
-    )
-    native_root_status_marked = any(
-        key in wb_native
-        for key in (
-            "driver_status_valid",
-            "driver_status_stale",
-            "driver_status_degraded",
-            "driver_status_glitch",
-            "driver_status_plausible",
-            "driver_status_last_sample_ts",
-        )
-    )
-    native_root_explicitly_invalid = bool(
-        require_fresh_evidence
-        and native_root_status_marked
-        and not native_status_usable
-    )
-    # Der Typkontext für den Hausanteil verändert keine bestehende Quellenvalidierung.
-    external = _external_wallbox_power_snapshot(
-        wb_native, _wallbox_slot_types(cfg, {}) if external_types is None else external_types,
-        now_value, sample_age_limit_s, require_fresh_evidence=require_fresh_evidence)
-    native_details_w = 0.0
-    native_details_known = False
-    native_details_complete = True
-    native_running_details = 0
-    details = wb_native.get("wb_details") or []
-    expected_external_ids = set()
-    if cfg and ("wb_native_enable" not in cfg or cfg_bool(cfg, "wb_native_enable", False)):
-        for cid, key in ((1, "wb_native_type"), (2, "wb_native_type2")):
-            kind = str(cfg.get(key) or "").strip().lower()
-            if kind not in ("", "none", "off", "aus", "disabled", "0", "false", "no", "nein", "deaktiviert", "keine", "keine_wallbox", "no_wallbox", "-1") and not wallbox_type_is_e3dc(kind):
-                expected_external_ids.add(cid)
-    present_ids = {safe_int(d.get("id"), 0) for d in details if isinstance(d, dict)} if isinstance(details, list) else set()
-    missing_external_ids = expected_external_ids - present_ids
-    if require_fresh_evidence and not isinstance(details, list):
-        native_details_complete = False
-    if native_root_explicitly_invalid:
-        native_details_complete = False
-    if isinstance(details, list) and not native_root_explicitly_invalid and (
-        require_fresh_evidence or native_status_usable
-    ):
-        for detail in details:
-            if not isinstance(detail, dict):
-                native_details_complete = False
-                continue
-            measurement = _wallbox_detail_measurement(
-                detail, now_s=now_value, sample_age_limit_s=sample_age_limit_s,
-                require_fresh_evidence=require_fresh_evidence,
-                external_slot=safe_int(detail.get("id"), 0) in expected_external_ids)
-            if measurement["known"]:
-                native_details_known = True
-            if not measurement["usable"]:
-                native_details_complete = False
-                continue
-            if measurement["running"]:
-                native_details_w += measurement["power_w"]
-                if measurement["power_w"] > 250.0:
-                    native_running_details += 1
-
-    external_measurement_missing = bool(missing_external_ids or (details and not native_details_complete))
-    if external_measurement_missing:
-        native_details_w = 0.0
-        native_details_known = False
-        native_running_details = 0
-
-    native_total_raw = native_total_power_w(wb_native)
-    native_total_known = bool(
-        native_status_usable
-        and not external_measurement_missing
-        and isinstance(native_total_raw, (int, float))
-        and not isinstance(native_total_raw, bool)
-        and math.isfinite(float(native_total_raw))
-    )
-    native_total_w = abs(float(native_total_raw)) if native_total_known else 0.0
-    native_power_known = bool(
-        (native_details_known and native_details_complete)
-        or native_total_known
-    )
-    has_native_charge_flag = "charging_active" in wb_native
-    native_charging = bool(wb_native.get("charging_active", False))
-    native_total_valid = native_total_w > 250.0 and (
-        native_charging
-        or native_details_w > 250.0
-        or not has_native_charge_flag
-    )
-    native_w = native_details_w if native_details_w > 50.0 else (native_total_w if native_total_valid else 0.0)
-    if native_w > max(250.0, live_w):
-        return {
-            "power_w": native_w,
-            "source": "wallbox_native",
-            "power_known": True,
-            "live_w": live_w,
-            "native_w": native_w,
-            "home_includes_wallbox": bool(external.get("home_includes_wallbox", False)),
-            **external,
-            "measurement_valid": True,
-            "live_evidence_valid": bool(live_status_usable),
-            "native_evidence_valid": True,
-            "native_details_complete": bool(native_details_complete),
-            "running_detail_count": int(native_running_details),
-        }
-    if live_status_usable and not external_measurement_missing:
-        return {
-            "power_w": live_w,
-            "source": "live_data",
-            "power_known": True,
-            "live_w": live_w,
-            "native_w": native_w,
-            "home_includes_wallbox": bool(external.get("home_includes_wallbox", False)),
-            **external,
-            "measurement_valid": True,
-            "live_evidence_valid": True,
-            "native_evidence_valid": bool(native_power_known),
-            "native_details_complete": bool(native_details_complete),
-            "running_detail_count": int(native_running_details),
-        }
-    if native_power_known:
-        return {
-            "power_w": native_w,
-            "source": "wallbox_native",
-            "power_known": True,
-            "live_w": 0.0,
-            "native_w": native_w,
-            "home_includes_wallbox": bool(external.get("home_includes_wallbox", False)),
-            **external,
-            "measurement_valid": True,
-            "live_evidence_valid": bool(live_status_usable),
-            "native_evidence_valid": True,
-            "native_details_complete": bool(native_details_complete),
-            "running_detail_count": int(native_running_details),
-        }
-    return {
-        "power_w": None,
-        "source": "unknown",
-        "reason": "wallbox_measurement_invalid",
-        "power_known": False,
-        "live_w": live_w if live_status_usable else 0.0,
-        "native_w": 0.0,
-        "home_includes_wallbox": bool(external.get("home_includes_wallbox", False)),
-        **external,
-        "measurement_valid": False,
-        "live_evidence_valid": bool(live_status_usable),
-        "native_evidence_valid": False,
-        "native_details_complete": bool(native_details_complete),
-        "running_detail_count": 0,
-    }
+def wallbox_actual_power_snapshot(live, wb_native=None, *, now_s=None, max_age_s=45.0,
+        require_fresh_evidence=False, cfg=None, sample_max_age_s=None, external_types=None):
+    return _wallbox_actual_power_snapshot(live, wb_native, now_s=time.time() if now_s is None else now_s,
+        max_age_s=max_age_s, require_fresh_evidence=require_fresh_evidence, cfg=cfg,
+        sample_max_age_s=sample_max_age_s, external_types=external_types)
 
 
 def wallbox_actual_power(live: Dict[str, Any], wb_native: Optional[Dict[str, Any]] = None) -> float:
@@ -27703,6 +26359,8 @@ def physical_controllable_power_ceiling_contract(
             0,
         ),
     )
+    if live.get("Ext_PV_Power_Valid") is not True:
+        ext_ac_pv_w = 0
     raw_pv_w = max(0, safe_int(live.get("PV_Power", 0), 0))
     dc_pv_w = max(0, raw_pv_w - ext_ac_pv_w)
     max_bat_dis_w = max(
@@ -27779,42 +26437,6 @@ def live_with_wallbox_native_balance(live: Dict[str, Any], wb_native: Optional[D
     if "bat_w_raw" in wb_native:
         enriched["Wallbox_Battery_Power_Raw"] = safe_float(wb_native.get("bat_w_raw"), 0.0)
     return enriched
-
-
-def smooth_house_heatpump_discharge_cap_w(
-    cfg: Dict[str, Any],
-    current_cap_w: int,
-    previous_state: Optional[Dict[str, Any]],
-) -> int:
-    previous_state = previous_state or {}
-    previous_name = str(previous_state.get("state") or "")
-    if previous_name not in (
-        "unmanaged_wallbox_wbminsoc_hold",
-        "wallbox_wbminsoc_curve_charge",
-        "parallel_curve_auto_hold",
-        "parallel_curve_auto_no_surplus",
-        "parallel_curve_charge",
-        "parallel_curve_charge_cap",
-        "parallel_wb_auto",
-        "wallbox_predump_floor_hold",
-    ):
-        return current_cap_w
-
-    prev_cap = previous_state.get("house_heatpump_discharge_cap_w")
-    if prev_cap is None and isinstance(previous_state.get("auto_limit"), dict):
-        prev_cap = previous_state["auto_limit"].get("max_discharge_w")
-    prev_cap_w = safe_int(prev_cap, -1)
-    if prev_cap_w < 0:
-        return current_cap_w
-
-    hold_band_w = max(300, safe_int(cfg.get("storage_wbminsoc_house_cap_hold_band_w"), 800))
-    step_w = max(300, safe_int(cfg.get("storage_wbminsoc_house_cap_step_w"), 1000))
-    delta_w = current_cap_w - prev_cap_w
-    if delta_w <= 0:
-        return max(0, current_cap_w)
-    if delta_w <= hold_band_w:
-        return max(0, prev_cap_w)
-    return max(0, min(current_cap_w, prev_cap_w + step_w))
 
 
 def pv_surplus_after_house_heatpump_w(live: Dict[str, Any], wallbox_w: float) -> int:
@@ -29182,7 +27804,8 @@ def build_wallbox_budget_context(
         wallbox_w = live_wallbox_w
     home_includes_wallbox = bool(wb_power.get("home_includes_wallbox"))
 
-    live_with_wallbox = dict(live)
+    live_with_wallbox = live_with_managed_vehicle_phases(
+        live, wb_intent if wb_intent_fresh else {}, now_s)
     live_with_wallbox["Wallbox_Power"] = wallbox_w if wallbox_power_known else None
     live_with_wallbox["Wallbox_Power_Source"] = wallbox_power_source
     live_with_wallbox["Wallbox_Power_Known"] = wallbox_power_known
@@ -29377,6 +28000,37 @@ def runtime_hardening_contracts(
     return contracts_bundle
 
 
+def manual_charge_progress_stalled(manual_override, soc, *, now_s=None):
+    """Fortschritt des Ladeauftrags in der vorhandenen Ankerdatei halten."""
+    manual_ts = safe_int(manual_override.get("ts"), 0)
+    if soc < 95.0 or manual_ts <= 0:
+        return False
+    target = safe_float(manual_override.get("target_soc"), 0.0)
+    anchor = read_json_file(MANUAL_ANCHOR_F)
+    progress = anchor.get("charge_progress") or {}
+    sample = control_time.sample(wall_ts=now_s)
+    matching = (progress.get("manual_ts") == manual_ts
+                and progress.get("target_soc") == target)
+    if not matching or soc >= safe_float(progress.get("soc"), soc) + 1.0:
+        progress = {
+            "manual_ts": manual_ts, "target_soc": target,
+            "soc": soc, "ts": sample["wall_ts"],
+            "guard": control_time.begin_guard(
+                600.0, sample, minimum_s=0.0,
+                epoch_mode=control_time.EPOCH_MODE_SAME_BOOT_MONOTONIC),
+        }
+    else:
+        progress = dict(progress, guard=control_time.evaluate_guard(
+            progress.get("guard"), sample, minimum_s=0.0))
+    # Den bestehenden Abschlussanker für die Prognose unverändert erhalten.
+    anchor["charge_progress"] = progress
+    try:
+        atomic_write(MANUAL_ANCHOR_F, anchor, indent=2)
+    except Exception as exc:
+        log.warning("Fortschrittsanker des Ladeauftrags nicht gespeichert: %s", exc)
+        return False
+    return progress["guard"].get("active") is False
+
 
 def manual_override_storage_decision(
     cfg: Dict[str, Any],
@@ -29385,6 +28039,7 @@ def manual_override_storage_decision(
     max_charge_w: int,
     max_discharge_w: int,
     previous_state: Optional[Dict[str, Any]] = None,
+    now_s: Optional[float] = None,
 ) -> Optional[Dict[str, Any]]:
     soc = safe_float(live.get("SOC"), 0.0)
     mode = str(manual_override.get("mode", "") or "").lower()
@@ -29405,6 +28060,7 @@ def manual_override_storage_decision(
             "budget_w": 0,
             "auto_limit": charge_block_auto_limit(cfg, max_discharge_w, reason),
         }
+    charge_stalled = False
     if mode == "charge" and (target <= 0 or soc < target - 0.2):
         charge_w = max(0, int(max_charge_w))
         charge_live_valid = bool(
@@ -29415,45 +28071,52 @@ def manual_override_storage_decision(
             and live_power_plausibility(live).get("sample_valid") is True
             and live.get("Power_Decision_Usable") is not False
         )
-        room_w = grid_charge_room_w(cfg, live)
-        # Auch ein manueller Auftrag bleibt im belegten Anschlussrahmen.
-        charge_w = min(charge_w, room_w)
-        if not charge_live_valid:
-            charge_w = 0
-        if charge_w < EMS_POWER_SETTINGS_NONZERO_MIN_W:
-            reason = grid_charge_wait_reason(cfg, live,
-                "Manuelles Laden wartet: frische gültige Leistungsdaten erforderlich"
-                if not charge_live_valid else "Manuelles Laden wartet: kein freier Hausanschlussrahmen")
+        if charge_live_valid and live_data_age_s(live, now_s) <= LIVE_SAMPLE_MAX_AGE_S:
+            charge_stalled = manual_charge_progress_stalled(manual_override, soc, now_s=now_s)
+        if not charge_stalled:
+            room_w = grid_charge_room_w(cfg, live, now_s=now_s)
+            # Auch ein manueller Auftrag bleibt im belegten Anschlussrahmen.
+            charge_w = min(charge_w, room_w)
+            if not charge_live_valid:
+                charge_w = 0
+            if charge_w < EMS_POWER_SETTINGS_NONZERO_MIN_W:
+                reason = grid_charge_wait_reason(cfg, live,
+                    "Manuelles Laden wartet: frische gültige Leistungsdaten erforderlich"
+                    if not charge_live_valid else "Manuelles Laden wartet: kein freier Hausanschlussrahmen")
+                return {
+                    "state": "manual_override_charge_wait",
+                    "mode": MODE_AUTO,
+                    "val": 0,
+                    "priority": "manual",
+                    "reason": reason,
+                    "protected": True,
+                    "storage_req_w": 0,
+                    "budget_w": 0,
+                    "auto_limit": discharge_block_auto_limit(cfg, 0, reason),
+                }
             return {
-                "state": "manual_override_charge_wait",
-                "mode": MODE_AUTO,
-                "val": 0,
+                "state": "manual_override_grid",
+                # Der bewusste Handauftrag erlaubt PV+Netz. CHRG allein kann auf
+                # DC-Systemen auf PV begrenzt sein; GRID ist der Netzladevertrag.
+                "mode": MODE_GRID,
+                "val": charge_w,
                 "priority": "manual",
-                "reason": reason,
+                "reason": "Manuell laden aus PV und Netz",
                 "protected": True,
-                "storage_req_w": 0,
+                "storage_req_w": charge_w,
                 "budget_w": 0,
-                "auto_limit": discharge_block_auto_limit(cfg, 0, reason),
             }
-        return {
-            "state": "manual_override_grid",
-            # Der bewusste Handauftrag erlaubt PV+Netz. CHRG allein kann auf
-            # DC-Systemen auf PV begrenzt sein; GRID ist der Netzladevertrag.
-            "mode": MODE_GRID,
-            "val": charge_w,
-            "priority": "manual",
-            "reason": "Manuell laden aus PV und Netz",
-            "protected": True,
-            "storage_req_w": charge_w,
-            "budget_w": 0,
-        }
     if (
         mode == "charge"
-        and target > 0
-        and soc >= target - 0.2
+        and ((target > 0 and soc >= target - 0.2) or charge_stalled)
         and not (previous_manual_done and previous_manual_release_mode in (MODE_CHRG, MODE_GRID))
     ):
-        reason = "Manuell laden beendet: Ziel %.1f%% erreicht (SoC %.1f%%); E3DC AUTO freigeben" % (target, soc)
+        reason = (
+            "Manuell laden beendet: Speicher steigt ab 95 %% seit 10 min nicht mehr "
+            "um 1 Prozentpunkt (SoC %.1f%%); E3DC AUTO freigeben" % soc
+            if charge_stalled else
+            "Manuell laden beendet: Ziel %.1f%% erreicht (SoC %.1f%%); E3DC AUTO freigeben" % (target, soc)
+        )
         return {
             "state": "manual_override_done",
             "mode": MODE_AUTO,
@@ -29572,14 +28235,7 @@ def predump_curve_floor_guard(
             safe_float(live.get("bat_full_cap_kwh"), 10.0),
         ),
     )
-    control_soc = curve_control_soc_estimate(
-        raw_soc,
-        safe_int(live.get("Battery_Power"), 0),
-        storage_kwh,
-        previous_state or {},
-        now_s,
-        cfg,
-    )
+    control_soc = raw_soc
     lookahead_h = max(0.25, safe_float(cfg.get("tl_lookahead_h"), 1.0))
     curve = adaptive_curve_context(
         plan,
@@ -29589,6 +28245,17 @@ def predump_curve_floor_guard(
         allow_before_start=False,
     )
     floor_soc = curve.get("floor_soc")
+    # Der aktuelle Plan liefert das vorhandene Landeband. Ein alter
+    # Wallboxzustand begründet weder den Boden noch eine Stoppautorität.
+    current_predump = predump_request_from_plan(
+        cfg, live, plan, now_s,
+        max(0, safe_int(cfg.get("maximaleentladeleistung"), 6000)), previous_state,
+    )
+    if (current_predump.get("active") and predump_allow_flags(cfg, current_predump).get("wallbox")):
+        predump_floor = safe_float(current_predump.get("consumer_landing_floor_soc"),
+            safe_float(current_predump.get("target_soc"), float("nan")))
+        if floor_soc is not None and math.isfinite(predump_floor) and 0.0 <= predump_floor <= 100.0:
+            floor_soc = min(float(floor_soc), max(ep_reserve_soc(cfg, live), predump_floor))
     if floor_soc is None:
         return {
             "active": False,
@@ -29639,7 +28306,7 @@ def protected_decision(
     max_charge_w = configured_charge_limit_w(cfg, live)
     max_discharge_w = configured_discharge_limit_w(cfg, live, max_charge_w)
     soc = safe_float(live.get("SOC"), 0.0)
-    emergency = safe_int(live.get("Notstrom_Status", live.get("ems_emergency_power_status")), 0)
+    emergency = storage_emergency_status(live)
     if emergency in (1, 4):
         return {
             "state": "emergency_power",
@@ -29652,8 +28319,11 @@ def protected_decision(
             "budget_w": 0,
         }
 
+    if emergency is None:
+        return None
+
     manual_decision = manual_override_storage_decision(
-        cfg, live, manual_override, max_charge_w, max_discharge_w, previous_state,
+        cfg, live, manual_override, max_charge_w, max_discharge_w, previous_state, now_s=now_s,
     )
     reserve_hold = ep_reserve_floor_decision(
         cfg, live, max_charge_w, previous_state,
@@ -29709,7 +28379,7 @@ def protected_decision(
         target_soc = safe_float(grid_plan.get("target_soc"), safe_float(plan.get("normal_target_soc", plan.get("planning_target_soc")), 95.0))
         hysteresis = max(0.1, safe_float(grid_plan.get("hysteresis_pct"), 0.5))
         charge_w = max(300, min(max_charge_w, safe_int(grid_plan.get("charge_w"), max_charge_w)))
-        room_w = grid_charge_room_w(cfg, live)
+        room_w = grid_charge_room_w(cfg, live, now_s=now_s)
         charge_w = min(charge_w, room_w)
         if soc < target_soc - hysteresis:
             if charge_w < 300:
@@ -29743,7 +28413,7 @@ def protected_decision(
         target_soc = safe_float(cheap.get("target_soc"), safe_float(plan.get("normal_target_soc", plan.get("planning_target_soc")), 95.0))
         hysteresis = max(0.1, safe_float(cheap.get("hysteresis_pct"), 0.5))
         charge_w = max(300, min(max_charge_w, safe_int(cheap.get("charge_w"), max_charge_w)))
-        room_w = grid_charge_room_w(cfg, live)
+        room_w = grid_charge_room_w(cfg, live, now_s=now_s)
         charge_w = min(charge_w, room_w)
         if soc < target_soc - hysteresis:
             if charge_w < 300:
@@ -29927,6 +28597,12 @@ def protected_decision(
             unmanaged_wb_floor_hold["auto_limit"]["reason"] = reason
             unmanaged_wb_floor_hold["reason"] = reason
             unmanaged_wb_floor_hold["market_discharge_lock_applied"] = True
+            # Vertrag und Karenzgedächtnis mitführen: Die Planübergangs-Karenz überbrückt so auch hier die
+            # Slotgrenze, statt die Sperre bis zum Folgeplan für einen Takt aufzuheben.
+            unmanaged_wb_floor_hold["market_economics_contract"] = copy.deepcopy(
+                market_grid_owner.get("market_economics_contract") or {})
+            unmanaged_wb_floor_hold["market_plan_grace"] = copy.deepcopy(
+                market_grid_owner.get("market_plan_grace") or {})
         return unmanaged_wb_floor_hold
 
     floor_intent_fresh = bool(wb_intent) and ((_input_age_s := runtime_input_age_s(safe_float(wb_intent.get("ts"), 0.0), now_s)) is not None and _input_age_s <= 90.0)
@@ -29954,15 +28630,14 @@ def protected_decision(
     floor_pv_wait = controlled_wallbox_floor_pv_wait_requested(cfg, live, wb_intent, wb_native, now_s)
     predump = (
         {}
-        if (
-            price_hold
-            or controlled_local_floor_regulation
-            or floor_pv_wait
-            or predump_curve_blocked
-            or predump_floor_reached
-        )
+        if price_hold or predump_curve_blocked or predump_floor_reached
         else predump_request_from_plan(cfg, live, plan, now_s, max_discharge_w, previous_state)
     )
+    # Das bestehende Boden-PV-Warten liest im Pre-Dump dessen Boden;
+    # es darf den eigenen, aktuellen Pre-Dump-Auftrag nicht verdrängen.
+    if ((controlled_local_floor_regulation or floor_pv_wait)
+            and not (predump.get("active") and predump_allow_flags(cfg, predump).get("wallbox"))):
+        predump = {}
     if predump.get("active"):
         discharge_w = max(300, min(max_discharge_w, safe_int(predump.get("discharge_w"), max_discharge_w)))
         allow = predump_allow_flags(cfg, predump)
@@ -29999,7 +28674,7 @@ def protected_decision(
                 now_s,
                 max_discharge_w,
                 wallbox_min_w,
-            )
+            ) if predump_actual_consumer_load_w(live, {"wallbox": True}) < 250 else {}
             bev_grid_fallback_due = bool(bev_timing.get("grid_fallback_due"))
             if bev_timing.get("waiting"):
                 other_devices = [
@@ -30077,10 +28752,10 @@ def protected_decision(
         elif consumer_shortfall and deadline_near:
             fallback_reason = "Verbraucher nimmt zu wenig Pre-Dump-Leistung an"
 
-        predump_floor_soc = predump.get(
-            "consumer_landing_floor_soc",
-            predump.get("target_soc"),
-        )
+        predump_floor_soc = safe_float(predump.get("consumer_landing_floor_soc"),
+            safe_float(predump.get("target_soc"), float("nan")))
+        predump_floor_soc = (max(ep_reserve_soc(cfg, live), predump_floor_soc)
+            if math.isfinite(predump_floor_soc) and 0.0 <= predump_floor_soc <= 100.0 else None)
         predump_common = {
             "priority": "predump",
             "protected": True,
@@ -30718,13 +29393,16 @@ def storage_observation_payload(
     charging. Subtract actual battery discharge so it cannot fund new loads.
     The existing allocator adds only measured consumer commitments back once.
     """
+    snapshot = LiveDataSnapshot.from_dict(live, now_s=now_s)
+    source_valid = snapshot.pv_valid and snapshot.home_valid
     valid = bool(
-        all(_live_numeric_present(live, key) for key in (
+        source_valid
+        and all(_live_numeric_present(live, key) for key in (
             "PV_Power", "Grid_Power", "Bat_Power", "Home_Power",
         ))
         and _live_numeric_present(live, "_ts")
         and 0 < safe_float(live.get("_ts"), 0)
-        and ((_input_age_s := runtime_input_age_s(safe_float(live.get("_ts"), 0), now_s)) is not None and _input_age_s <= 10)
+        and ((_input_age_s := runtime_input_age_s(safe_float(live.get("_ts"), 0), now_s)) is not None and _input_age_s <= LIVE_SAMPLE_MAX_AGE_S)
         and live_power_plausibility(live).get("sample_valid", True)
     )
     pv_w = max(0, safe_int(live.get("PV_Power"), 0))
@@ -30782,11 +29460,17 @@ def storage_observation_payload(
         "grid_w": live.get("Grid_Power"), "bat_w": live.get("Bat_Power"),
         "home_w": live.get("Home_Power"), "wallbox_w": wb.wallbox_w,
         "wallbox_power_source": wb.wallbox_power_source,
+        "pv_power_valid": snapshot.pv_valid, "home_power_valid": snapshot.home_valid,
         "live_sample_valid": valid, "live_stale": not valid,
         "rscp_command_path": "suppressed_storage_regulation_off",
         "rscp_request_transaction": {"send_called": False, "attempted": False,
             "issued": False, "confirmed": False, "reason": "storage_regulation_off"},
         "budget": {
+            "data_valid": source_valid,
+            "data_reason": "valid" if source_valid else "pv_or_home_missing",
+            "budget_pv_w": budget_w if valid else None, "budget_battery_w": 0 if valid else None,
+            "budget_pv_valid": valid,
+            "budget_pv_source": "storage_observation" if valid else "pv_or_home_missing" if not source_valid else "source_data_invalid",
             "state": "pv_surplus", "storage_state": "storage_observation",
             "budget_w": budget_w, "raw_iAVal_w": budget_w, "iAVal_w": budget_w,
             "consumer_budget_contract": contract, "reason": reason,
@@ -30913,6 +29597,18 @@ def backup_hold_closed_account(state):
     return copy.deepcopy(value) if isinstance(value, dict) else {}
 
 
+def vorhalte_markt_aufnahme(cfg, live, plan, now_s, previous_state):
+    """Unabhängigen Bestandsvertrag vor dem Reservegrund schlüsselbeschränkt binden."""
+    maximum = configured_charge_limit_w(cfg, live)
+    result = market_economics_decision(copy.deepcopy(dict(cfg, _backup_hold_control=None)),
+        copy.deepcopy(live), copy.deepcopy(plan), now_s, maximum,
+        configured_discharge_limit_w(cfg, live, maximum), copy.deepcopy(previous_state)) or {}
+    return {key: result[key] for key in (
+        'state', 'market_economics_contract', 'market_economics_forecast',
+        'market_economics_target_soc_pct', 'market_economics_planned_charge_w',
+        'market_grid_charge_control', 'market_late_fill_window_end_ts') if key in result}
+
+
 def backup_hold_prepare(cfg, live, plan, previous_state, manual, now_s):
     capacity = backup_hold.number(cfg.get('speichergroesse'))
     if capacity is None or capacity <= 0:
@@ -30926,13 +29622,13 @@ def backup_hold_prepare(cfg, live, plan, previous_state, manual, now_s):
         max_discharge_w=configured_discharge_limit_w(cfg, live, configured_charge_limit_w(cfg, live)),
         previous=previous_control)
     if context is None:
-        if (safe_int(live.get('Notstrom_Status', live.get('ems_emergency_power_status')), -1) in (1, 4)
+        if (storage_emergency_status(live) in (1, 4)
                 and previous_control.get('applied')):
             context = dict(active=False, valid=False, now_s=now_s, grid_job=None)
         else:
             return None
     manual_decision = manual_override_storage_decision(cfg, live, manual,
-        configured_charge_limit_w(cfg, live), configured_discharge_limit_w(cfg, live, 12000), previous_state)
+        configured_charge_limit_w(cfg, live), configured_discharge_limit_w(cfg, live, 12000), previous_state, now_s=now_s)
     direct = plan.get('direct_marketing') or {}
     flags = direct.get('flags') or {}
     hard_owner = bool(direct_marketing_hard_export_owner_binding(plan, now_s))
@@ -30950,7 +29646,7 @@ def backup_hold_prepare(cfg, live, plan, previous_state, manual, now_s):
         context.update(grid_job=None, grid_reason='backup_dc_only_grid_forbidden')
     if manual_decision is not None:
         context.update(active=False, reason='backup_manual_suspended', grid_job=None, grid_reason='backup_manual_suspended')
-    if safe_int(live.get('Notstrom_Status', live.get('ems_emergency_power_status')), -1) in (1, 4):
+    if storage_emergency_status(live) in (1, 4):
         context.update(active=False, reason='backup_island', grid_job=None, grid_reason='backup_island',
             island_release_pending=bool(previous_control.get('applied')),
             island_foreign_limits=copy.deepcopy(previous_control.get('independent_auto_limit') or {}))
@@ -30978,7 +29674,7 @@ def backup_hold_without_own_limits(previous_state):
 def apply_backup_hold_limits(cfg, live, payload, context, *, now_s=None, defer_output=False):
     """Beschränkung im selben Entscheider, auch nach allen Finalisierungen."""
     if context is None:
-        if safe_int(live.get('Notstrom_Status', live.get('ems_emergency_power_status')), -1) in (1, 4):
+        if storage_emergency_status(live) in (1, 4):
             payload['suppress_rscp_output'] = True
         return payload
     context = copy.deepcopy(context)
@@ -31005,7 +29701,8 @@ def apply_backup_hold_limits(cfg, live, payload, context, *, now_s=None, defer_o
     output_now = context['now_s'] if now_s is None else float(now_s)
     stamp = backup_hold.number(live.get('_ts'))
     reserve_output = payload.get('market_economics_charge_profile') == 'reserve'
-    if context.get('active') and (stamp is None or not 0 <= output_now - stamp < 30):
+    if context.get('active') and (payload.get('priority') == 'data_guard'
+            or stamp is None or not 0 <= output_now - stamp <= LIVE_SAMPLE_MAX_AGE_S):
         context.update(active=False, valid=False, grid_job=None, reason='backup_live_unknown_or_stale')
         if reserve_output:
             payload.update(mode=MODE_AUTO, val=configured_charge_limit_w(cfg, live), storage_req_w=0)
@@ -31035,7 +29732,7 @@ def apply_backup_hold_limits(cfg, live, payload, context, *, now_s=None, defer_o
             output_cap = job_contract['forecast']['grid_charge_planned_charge_w']
             if independent_grid:
                 output_cap = max(output_cap, safe_int(ordinary.get('val'), 0))
-            room = grid_charge_room_w(cfg, live)
+            room = grid_charge_room_w(cfg, live, now_s=now_s)
             output_cap = min(output_cap, room)
             payload['val'] = min(max(0, safe_int(payload.get('val'),0)), output_cap)
             payload['storage_req_w'] = payload['val']
@@ -31202,8 +29899,8 @@ def decide_next_cycle(
         payload["wallbox_data_outage"] = wallbox_outage
         return payload
 
-    backup_live_source = dict(live)
-    backup_context = backup_hold_prepare(cfg, live, plan, previous_state, manual_override, now_s)
+    backup_live_source = live_with_managed_vehicle_phases(live, wb_intent, now_s)
+    backup_context = backup_hold_prepare(cfg, backup_live_source, plan, previous_state, manual_override, now_s)
     previous_state = backup_hold_without_own_limits(previous_state)
     if backup_context is not None:
         cfg = dict(cfg, _backup_hold_control=backup_context)
@@ -31217,6 +29914,8 @@ def decide_next_cycle(
     )
     wb_native = input_snapshot.wallbox.to_legacy_dict()
     live_plausibility = live_model.plausibility if isinstance(live_model.plausibility, dict) else live_power_plausibility(live)
+    live_plausibility = dict(live_plausibility, soc_valid=live_model.soc_valid,
+        emergency_status_valid=storage_emergency_status(live) is not None)
     live_sample_invalid = not bool(live_plausibility.get("sample_valid", True))
 
     cfg = effective_power_limit_cfg(cfg, live)
@@ -31226,15 +29925,20 @@ def decide_next_cycle(
     curve_control_soc = soc
     pv_w = safe_int(live_model.pv_w, 0)
     grid_w = safe_int(live_model.grid_w, 0)
-    grid_ema_w = safe_int(live.get("Grid_EMA_W", grid_w), grid_w)
+    grid_ema_w = grid_w
     home_w = max(0, safe_int(live_model.home_w, 0))
     bat_w = safe_int(live_model.battery_w, 0)
     wp_w = max(0, safe_int(live_model.heatpump_w, 0))
     live_age_s = live_data_age_s(live, now_s)
-    live_stale_guard_s = max(0.0, safe_float(cfg.get("storage_live_stale_guard_s"), 10.0))
-    live_stale = bool(not math.isfinite(live_age_s) or (live_stale_guard_s > 0.0 and live_age_s > live_stale_guard_s))
-    soc_jump_guard = soc_jump_guard_context(cfg, live, previous_state, now_s)
-    soc_unrealistic = bool(soc_jump_guard.get("invalid"))
+    live_stale_guard_s = LIVE_SAMPLE_MAX_AGE_S
+    live_stale = bool(not math.isfinite(live_age_s) or (live_age_s > live_stale_guard_s))
+    live_control_invalid = not live_model.soc_valid or storage_emergency_status(live) is None
+    previous_soc = safe_float(previous_state.get("soc"), float("nan"))
+    soc_jump_hint = None
+    if live_model.soc_valid and math.isfinite(previous_soc) and abs(soc - previous_soc) >= 3.0:
+        # Nur Diagnose: Kurve und Reserve rechnen unverändert mit dem gemeldeten SoC.
+        soc_jump_hint = {"previous_soc": previous_soc, "soc": soc,
+            "delta_pp": round(soc - previous_soc, 3), "reason": "vermutete Kalibrierung"}
     wb_intent_fresh = bool(wb_intent) and ((_input_age_s := runtime_input_age_s(safe_float(wb_intent.get("ts"), 0.0), now_s)) is not None and _input_age_s <= 60.0)
     # Akkustützung nach Korridorlage: Meldet der Wallbox-Manager „unter dem
     # Kurvenkorridor, Kontingent aufgebraucht“, bekommt die Wallbox nur den
@@ -31320,6 +30024,8 @@ def decide_next_cycle(
     native_wallbox_w = wb_budget_context.native_wallbox_w
     home_includes_wallbox = wb_budget_context.home_includes_wallbox
     live_with_wallbox = wb_budget_context.live_with_wallbox
+    # Auch spätere Begrenzungen rechnen mit genau diesem gemessenen Anteil.
+    live["managed_vehicle_phases"] = live_with_wallbox["managed_vehicle_phases"]
     wb_car_present = (wb_budget_context.wb_car_present if not observed_wallbox else bool(
         wb_intent_fresh and controlled_intent
         and (controlled_intent.get("active") or controlled_intent.get("car_active"))
@@ -31424,8 +30130,11 @@ def decide_next_cycle(
     # Die Entladegrenze der PV-only-Klasse (Stufe 1 und 2) setzt eine tatsächlich
     # ladende Wallbox voraus. Aufgehoben wird sie nur mit Beleg je gestecktem
     # Ladepunkt (gültig, frisch, vollständig) unter 300 W über 45 s; ein ab
-    # 500 W sofort. Fehlende Wallboxdaten sind keine Freigabe der
-    # Akkuentladung für die Wallbox. Das PV-only-Budget bleibt davon unberührt.
+    # 500 W sofort. Fehlende Wallboxdaten einer Box in der Regelungssicht sind
+    # keine Freigabe der Akkuentladung für die Wallbox. Eine externe Box mit
+    # Datenausfall (ungültiges oder fehlendes Boxdetail) ist hier bereits aus der
+    # Regelungssicht genommen; für sie gilt Haus inkl. Verbraucher ohne diese Grenze.
+    # Das PV-only-Budget bleibt davon unberührt.
     wallbox_pv_only_discharge_evidence_snapshot = wallbox_pv_only_discharge_evidence(
         live,
         wb_native,
@@ -31495,7 +30204,7 @@ def decide_next_cycle(
     peak_shaving_sample_valid = bool(
         not live_stale
         and not live_sample_invalid
-        and not soc_unrealistic
+        and not live_control_invalid
         and live_model.ts > 0.0
         and bool(live_plausibility.get("grid_valid", True))
     )
@@ -31520,7 +30229,7 @@ def decide_next_cycle(
             sample_valid=peak_shaving_sample_valid,
             pv_source_valid=peak_pv_source_valid,
             heartbeat_s=auto_limit_heartbeat_s(cfg),
-            house_grid_charge_room_w=grid_charge_room_w(cfg, live_with_wallbox),
+            house_grid_charge_room_w=grid_charge_room_w(cfg, live_with_wallbox, now_s=now_s),
         )
     except Exception as exc:
         # Diagnose bleibt passiv: Ein Auswertungsfehler darf nie Eigentümer
@@ -31542,13 +30251,11 @@ def decide_next_cycle(
 
     reserve_recovery = ep_reserve_recovery_context(
         cfg, live_with_wallbox, previous_state, now_s,
-        sample_valid=not (live_stale or live_sample_invalid or soc_unrealistic),
+        sample_valid=not (live_stale or live_sample_invalid or live_control_invalid),
     )
     protected = None if (
-        (live_stale or live_sample_invalid or soc_unrealistic)
-        and not storage_invalid_frame_has_emergency_priority(live_with_wallbox.get(
-            "Notstrom_Status", live_with_wallbox.get("ems_emergency_power_status"),
-        ))
+        (live_stale or live_sample_invalid or live_control_invalid)
+        and not storage_invalid_frame_has_emergency_priority(storage_emergency_status(live_with_wallbox))
     ) else protected_decision(
         cfg,
         live_with_wallbox,
@@ -31570,40 +30277,6 @@ def decide_next_cycle(
             # Ein anderer Besitzer hält tatsächlich 0 W: Seine Episode bleibt
             # bis zur bestehenden SoC-Erholung gesperrt.
             reserve_recovery["reason_code"] = "reserve_reached"
-    manual_invalid_sample_decision = None
-    manual_override_mode = str(manual_override.get("mode", "") or "").lower()
-    if (
-        live_sample_invalid
-        and not live_stale
-        and not soc_unrealistic
-        and not storage_invalid_frame_has_emergency_priority(live_with_wallbox.get(
-            "Notstrom_Status", live_with_wallbox.get("ems_emergency_power_status"),
-        ))
-        and manual_override_mode in ("charge", "discharge")
-    ):
-        # Ein Leistungsglitch löscht den manuellen Auftrag nicht. Netzladen
-        # wartet dabei auf gültige Leistungsdaten; die gehaltene Reserve
-        # bleibt auch in diesem Sonderpfad vor Entladung und AUTO-Freigabe.
-        manual_invalid_sample_decision = manual_override_storage_decision(
-            cfg,
-            live_with_wallbox,
-            manual_override,
-            max_charge_w,
-            max_discharge_w,
-            previous_state,
-        )
-        if manual_invalid_sample_decision is not None:
-            manual_invalid_sample_decision = dict(manual_invalid_sample_decision)
-            manual_invalid_sample_decision["live_plausibility_manual_override_kept"] = True
-            manual_reserve_veto = ep_reserve_floor_decision(
-                cfg, live_with_wallbox, max_charge_w, previous_state,
-                now_s=now_s, recovery_context=reserve_recovery,
-            )
-            manual_invalid_sample_decision = manual_decision_with_reserve_floor(
-                manual_invalid_sample_decision, manual_reserve_veto,
-            )
-            if manual_reserve_veto is not None:
-                reserve_recovery = manual_reserve_veto["ep_reserve_recovery"]
     decision = None
     stale_guard = storage_live_stale_decision(
         cfg=cfg,
@@ -31628,20 +30301,10 @@ def decide_next_cycle(
         decision = stale_guard["decision"]
     else:
         plausibility_guard = None
-        if manual_invalid_sample_decision is not None:
-            curve_soc, target_soc, target_ts = current_curve(plan, now_s)
-            i_fc_w = safe_int(manual_invalid_sample_decision.get("storage_req_w"), 0)
-            i_min_lade_w = i_fc_w
-            decision = manual_invalid_sample_decision
-        else:
-            plausibility_guard = storage_live_plausibility_decision(
-                cfg=cfg,
-                plan=plan,
-                plausibility=live_plausibility,
-                max_charge_w=max_charge_w,
-                now_s=now_s,
-                previous_state=previous_state,
-            )
+        plausibility_guard = storage_live_plausibility_decision(
+            cfg=cfg, plan=plan, plausibility=live_plausibility,
+            max_charge_w=max_charge_w, now_s=now_s, previous_state=previous_state,
+        )
         if decision is None and plausibility_guard is not None:
             curve_soc = plausibility_guard["curve_soc"]
             target_soc = plausibility_guard["target_soc"]
@@ -31649,14 +30312,6 @@ def decide_next_cycle(
             i_fc_w = plausibility_guard["i_fc_w"]
             i_min_lade_w = plausibility_guard["i_min_lade_w"]
             decision = plausibility_guard["decision"]
-        elif soc_unrealistic:
-            soc_guard = storage_soc_jump_guard_decision(cfg, plan, soc_jump_guard, max_charge_w, now_s)
-            curve_soc = soc_guard["curve_soc"]
-            target_soc = soc_guard["target_soc"]
-            target_ts = soc_guard["target_ts"]
-            i_fc_w = soc_guard["i_fc_w"]
-            i_min_lade_w = soc_guard["i_min_lade_w"]
-            decision = soc_guard["decision"]
         elif protected is not None:
             decision = protected
             i_fc_w = safe_int(decision.get("storage_req_w"), 0)
@@ -31669,9 +30324,9 @@ def decide_next_cycle(
         decision is not None
         and reserve_recovery.get("active") is True
         and str(decision.get("state") or "") in (
-            "live_stale_auto", "live_plausibility_auto", "live_soc_unrealistic_auto",
+            "live_stale_auto", "live_plausibility_auto",
         )
-        and safe_int(live_with_wallbox.get("Notstrom_Status", live_with_wallbox.get("ems_emergency_power_status")), 0) not in (1, 4)
+        and storage_emergency_status(live_with_wallbox) not in (1, 4)
     ):
         # Datenverlust bestätigt keine Reserve-Erholung. Ein zwischenzeitlicher
         # Ladeowner muss keine auto_limit tragen; deshalb die bestehende Sperre
@@ -31682,7 +30337,7 @@ def decide_next_cycle(
             held_charge_w = min(max_charge_w, max(0, safe_int(previous_limit.get("max_charge_w"), max_charge_w)))
         reserve_reason = "Live-Daten nicht freigegeben; bestehende Notstrom-Entladesperre bleibt bis zur bestätigten Erholung erhalten"
         decision.update(
-            reason=reserve_reason, protected=True, discharge_allowed=False,
+            reason=str(decision.get("reason") or "") + "; " + reserve_reason, protected=True, discharge_allowed=False,
             export_allowed=False, budget_w=0, ep_reserve_floor_hold=True,
             auto_limit=discharge_block_auto_limit(cfg, held_charge_w, reserve_reason),
         )
@@ -31723,7 +30378,7 @@ def decide_next_cycle(
         )
         d1_corridor = d1_corridor_residual_context(plan, live, wb_intent, previous_state,
             now_s, adaptive_curve, max_charge_w,
-            protected=live_stale or live_sample_invalid or soc_unrealistic)
+            protected=live_stale or live_sample_invalid or live_control_invalid)
         adaptive_curve_active = bool(adaptive_curve.get("active"))
         adaptive_curve_relation = str(adaptive_curve.get("relation") or "")
         adaptive_floor_soc = adaptive_curve.get("floor_soc")
@@ -31742,7 +30397,7 @@ def decide_next_cycle(
         target_soc = adaptive_curve.get("target_soc")
         target_ts = adaptive_curve.get("target_ts")
         storage_kwh = max(1.0, safe_float(cfg.get("speichergroesse"), safe_float(live.get("bat_full_cap_kwh"), 10.0)))
-        curve_control_soc = curve_control_soc_estimate(soc, bat_w, storage_kwh, previous_state, now_s, cfg)
+        curve_control_soc = soc
         can_reach_target = storage_curve_can_reach_target(plan)
         normal_target_can_reach = bool(plan.get("normal_target_can_reach", plan.get("can_reach_target", True)))
         awattar_mode = safe_int(plan.get("awattar_mode"), 1)
@@ -32265,7 +30920,8 @@ def decide_next_cycle(
                 )),
             ),
             "live_sample_valid": bool(live_plausibility.get("sample_valid", True)),
-            "home_power_valid": bool(live_plausibility.get("home_valid", True)),
+            "pv_power_valid": live_model.pv_valid,
+            "home_power_valid": live_model.home_valid,
             "grid_power_valid": bool(live_plausibility.get("grid_valid", True)),
             "home_power_source": live_plausibility.get("home_source"),
             "home_power_balance_w": safe_int(live_plausibility.get("home_balance_w"), 0),
@@ -33854,7 +32510,7 @@ def decide_next_cycle(
         and decision.get("predump_active") is not True
         and str(decision.get("state") or "").startswith("parallel_")
         and str(decision.get("state") or "") not in AUTO_LIMIT_REQUIRED_STATES
-        and not live_stale and not live_sample_invalid and not soc_unrealistic
+        and not live_stale and not live_sample_invalid and not live_control_invalid
     ):
         minimum = predump_wallbox_minimum_power_w(cfg, controlled_intent, controlled_native)
         central_power = wallbox_actual_power_snapshot(
@@ -34055,7 +32711,7 @@ def decide_next_cycle(
             observed_discharge.update(last_valid_cap_w=decision["house_heatpump_discharge_cap_w"],
                                       last_valid_cap_ts=now_s)
     decision["observed_wallbox_discharge"] = observed_discharge
-    if observed_discharge.get("policy") and not (live_stale or live_sample_invalid or soc_unrealistic):
+    if observed_discharge.get("policy") and not (live_stale or live_sample_invalid or live_control_invalid):
         decision = apply_observed_wallbox_discharge_cap(
             cfg, decision, observed_discharge, max_charge_w, max_discharge_w,
         )
@@ -34101,7 +32757,7 @@ def decide_next_cycle(
         now_s=now_s,
         live_stale=live_stale,
         live_sample_invalid=live_sample_invalid,
-        soc_unrealistic=soc_unrealistic,
+        live_control_invalid=live_control_invalid,
         max_charge_w=max_charge_w,
         max_discharge_w=max_discharge_w,
         phase_transition_active=bool(wallbox_phase_transition.get("active")),
@@ -34352,7 +33008,7 @@ def decide_next_cycle(
     )
     reserve_grid_ema_w = (
         grid_ema_w
-        if _live_numeric_present(live, "Grid_EMA_W")
+        if _live_numeric_present(live, "Grid_Power")
         else grid_w
     )
     reserve_pv_source_evidence_valid = bool(
@@ -34445,7 +33101,7 @@ def decide_next_cycle(
         and not bool(decision.get("protected"))
         and not live_stale
         and not live_sample_invalid
-        and not soc_unrealistic
+        and not live_control_invalid
         and soc > running_hold_floor_soc + 0.2
     ):
         # Ausschließlich die frisch gemessene Istleistung halten. Der aktuelle
@@ -34491,7 +33147,7 @@ def decide_next_cycle(
         and not bool(decision.get("force_wallbox_stop"))
         and not live_stale
         and not live_sample_invalid
-        and not soc_unrealistic
+        and not live_control_invalid
         and soc > wallbox_start_support_floor_soc
         and wallbox_start_support_limit_w >= CONSUMER_MIN_W["wallbox"]
     ):
@@ -34757,8 +33413,6 @@ def decide_next_cycle(
     # batterieneutralen PV-Rahmen. Der Speicher stützt nicht (kein Stütz- oder
     # Startrahmen aus dem Akku) und lädt nicht vorrangig (kein Abzug des
     # Kurvenbedarfs vom Restbudget); er lädt, was die Wallbox nicht abnimmt.
-    # Das Wolken-Wh-Kontingent hält die laufende Wallboxleistung bei kurzen
-    # Schwankungen, solange die Akkuentladung sie tatsächlich tragen darf.
     # Unter dem Band bleibt die Kurvenregel, darüber die Stützung bis zur
     # Untergrenze. Die Entladegrenze der PV-only-Klasse bleibt unverändert.
     _hold_zone_previous_budget = (
@@ -34782,7 +33436,6 @@ def decide_next_cycle(
             and not bool(decision.get("protected"))
             and not bool(decision.get("force_wallbox_stop"))
             and decision.get("predump_active") is not True
-            and not ep_reserve_hold_active
             and not external_wallbox_manager_active
             and not wb_intent_bev_full_blocked
             and wb_intent.get("manual_pause") is not True
@@ -34793,7 +33446,7 @@ def decide_next_cycle(
             and not bool(wb_intent.get("predump_wallbox_active"))
             and not live_stale
             and not live_sample_invalid
-            and not soc_unrealistic
+            and not live_control_invalid
         ),
         soc=soc,
         floor_soc=wb_intent.get("effective_wb_floor_soc", wb_intent.get("wbminsoc")),
@@ -34811,19 +33464,11 @@ def decide_next_cycle(
             and wb_budget_context.wallbox_power_known
         ),
         residual_w=pv_after_fixed_signed_w,
-        battery_w=bat_w,
-        support_wh_limit=wallbox_decision.curve_floor_support_wh_limit(
-            cfg.get("wb_curve_floor_support_wh"),
-            cfg.get("speichergroesse"),
-        ),
-        # Begrenzt die PV-only-Entladegrenze den Akku auf das Haus, kann er
-        # die Wallbox nicht überbrücken; dann gilt nur der aktuelle Rahmen.
-        bridge_allowed=not wallbox_curve_pv_only_discharge_cap_active,
         previous=_hold_zone_previous_budget.get("wallbox_wbminsoc_hold_zone"),
         now_s=now_s,
     )
     if wbminsoc_hold_zone.get("active") is True:
-        _hold_zone_frame_w = max(0, safe_int(wbminsoc_hold_zone.get("hold_frame_w"), 0))
+        _hold_zone_frame_w = max(0, safe_int(wbminsoc_hold_zone.get("frame_w"), 0))
         # Restbudget ohne Vorrang des Kurvenbedarfs: PV minus alle laufenden
         # Verbraucher; die laufende Wallbox zählt der Verbrauchervertrag dazu.
         # Die physische Wechselrichter-Obergrenze gilt weiter.
@@ -34834,8 +33479,7 @@ def decide_next_cycle(
             wallbox_exclusive_start_support_w,
             _hold_zone_frame_w,
         )
-        # Laufende Wallbox: gehalten wird höchstens der (bei kurzer Schwankung
-        # aus dem Kontingent überbrückte) batterieneutrale Rahmen, nie eine
+        # Laufende Wallbox: höchstens der batterieneutrale Rahmen, nie eine
         # vorher aus dem Akku gestützte höhere Leistung.
         wallbox_running_hold_support_w = (
             min(observed_wallbox_commitment_w, _hold_zone_frame_w)
@@ -34845,14 +33489,6 @@ def decide_next_cycle(
         decision["battery_support_authorized"] = False
         decision["battery_support_reason"] = "wbminsoc_hold_zone"
         decision["wbminsoc_hold_zone_active"] = True
-        # Die Speicherfreigabe gilt vor einer noch offenen Wallbox-Absicht.
-        # Der bestehende Haltezonenentscheid sperrt nur die Wallboxstützung;
-        # das ungedeckte Haus samt WP behält seinen Entladerahmen.
-        if controlled_wb_auto_freerun and isinstance(decision.get("auto_limit"), dict):
-            decision["auto_limit"]["max_discharge_w"] = min(
-                safe_int(decision["auto_limit"].get("max_discharge_w"), 0),
-                house_heatpump_discharge_cap_w(live_with_wallbox, wallbox_w, max_discharge_w),
-            )
     phase_transition_grants = wallbox_phase_transition_policy.arbitrate_grants(
         wallbox_phase_transition.get("reservations", []),
         available_w=(
@@ -34949,10 +33585,11 @@ def decide_next_cycle(
     consumer_source_evidence_valid = bool(
         not live_stale
         and not live_sample_invalid
-        and not soc_unrealistic
+        and not live_control_invalid
         and live_model.ts > 0.0
-        and bool(live_plausibility.get("home_valid", True))
-        and bool(live_plausibility.get("grid_valid", True))
+        and live_model.pv_valid
+        and live_model.home_valid
+        and live_model.grid_valid
     )
     predump_allow = (
         decision.get("predump_allow")
@@ -35240,6 +33877,10 @@ def decide_next_cycle(
             contract_revision=f"padd_{int(now_s)}_{_predump_target_w}",
         )
         predump_discharge_add_w = predump_discharge_allocations_w.get("wallbox", 0)
+        if predump_allow.get("wallbox") is True and predump_discharge_add_w > 0:
+            # Die Zusatzquelle öffnet; ohne Anteil bleibt die normale Stützentscheidung.
+            decision["battery_support_authorized"] = True
+            decision["battery_support_reason"] = "Pre-Dump"
 
     consumer_budget_contract["predump_discharge_add_contract"] = predump_discharge_contract
     # Der Ladeanspruch gehört zum Speicherzustand, auch vor dem Wallboxstart
@@ -35264,7 +33905,7 @@ def decide_next_cycle(
     _source_soc = safe_float(live.get("SOC", live.get("Battery_SoC")), float("nan"))
     _source_claim_valid = bool(
         math.isfinite(_source_soc) and 0 <= _source_soc <= 100
-        and not soc_unrealistic and bool(plan)
+        and not live_control_invalid and bool(plan)
         and math.isfinite(safe_float(target_soc, float("nan")))
         and (not (_source_auto_limit.get("enabled") is True
                   and not _source_auto_limit.get("release"))
@@ -35288,11 +33929,21 @@ def decide_next_cycle(
     pv_wallbox_frame_w = pv_after_fixed_signed_w + int(_source_wallbox_w)
     pv_source_w = (max(0, safe_int(ep_reserve_wallbox_budget.get("pv_offer_w"), 0))
         if ep_reserve_wallbox_budget.get("active") is True else
+        # Die Haltezone hat keinen vorrangigen Ladeanspruch. Ihr bereits
+        # bilanzierter PV-Rahmen ist das Angebot;
+        # die laufende Box wird weder erneut abgezogen noch rückaddiert.
+        safe_int(wbminsoc_hold_zone.get("frame_w"), 0)
+        if wbminsoc_hold_zone.get("active") is True else
         max(0, pv_wallbox_frame_w - storage_pv_claim_w)
         if storage_pv_claim_w is not None else None)
     pv_parts_valid = bool(not live_stale and not live_sample_invalid
                           and effective_wallbox_power_known and _source_claim_valid)
     budget = {
+        "grid_charge_phase_count": (1 if live_with_wallbox.get("pvi_ac_max_phase_count_valid") is True
+            and not isinstance(live_with_wallbox.get("pvi_ac_max_phase_count"), bool)
+            and live_with_wallbox.get("pvi_ac_max_phase_count") == 1 else 3),
+        "data_valid": bool(live_model.pv_valid and live_model.home_valid),
+        "data_reason": "valid" if live_model.pv_valid and live_model.home_valid else "pv_or_home_missing",
         "heatpump_pv_contract": copy.deepcopy(consumer_budget_contract.get("heatpump_pv_contract") or {}),
         "budget_w": budget_w,
         "budget_pv_w": min(int(budget_w), int(pv_source_w)) if pv_parts_valid else None,
@@ -36240,44 +34891,11 @@ def decide_next_cycle(
         "live_sample_valid": bool(live_plausibility.get("sample_valid", True)),
         "live_sample_invalid": live_sample_invalid,
         "live_plausibility": live_plausibility,
-        "live_plausibility_preserved_auto_limit": bool(
-            decision.get("live_plausibility_preserved_auto_limit")
-        ),
-        "live_plausibility_preserved_wbminsoc_contract": bool(
-            decision.get("live_plausibility_preserved_wbminsoc_contract")
-        ),
         "live_plausibility_manual_override_kept": bool(
             decision.get("live_plausibility_manual_override_kept")
         ),
-        "live_plausibility_preserved_discharge_owner": bool(
-            decision.get("live_plausibility_preserved_discharge_owner")
-        ),
-        "live_plausibility_preserved_discharge_state": decision.get(
-            "live_plausibility_preserved_discharge_state"
-        ),
-        "live_plausibility_preserved_discharge_age_s": safe_float(
-            decision.get("live_plausibility_preserved_discharge_age_s"),
-            0.0,
-        ),
-        "live_plausibility_preserved_discharge_hold_s": safe_float(
-            decision.get("live_plausibility_preserved_discharge_hold_s"),
-            0.0,
-        ),
-        "live_plausibility_preserved_charge_owner": bool(
-            decision.get("live_plausibility_preserved_charge_owner")
-        ),
-        "live_plausibility_preserved_charge_state": decision.get(
-            "live_plausibility_preserved_charge_state"
-        ),
-        "live_plausibility_preserved_charge_age_s": safe_float(
-            decision.get("live_plausibility_preserved_charge_age_s"),
-            0.0,
-        ),
-        "live_plausibility_preserved_charge_hold_s": safe_float(
-            decision.get("live_plausibility_preserved_charge_hold_s"),
-            0.0,
-        ),
-        "home_power_valid": bool(live_plausibility.get("home_valid", True)),
+        "pv_power_valid": live_model.pv_valid,
+        "home_power_valid": live_model.home_valid,
         "grid_power_valid": bool(live_plausibility.get("grid_valid", True)),
         "home_power_source": live_plausibility.get("home_source"),
         "home_power_balance_w": safe_int(live_plausibility.get("home_balance_w"), 0),
@@ -36390,7 +35008,10 @@ def decide_next_cycle(
         budget["predump_allow_heatpump"] = bool(predump_allow.get("heatpump"))
         budget["predump_allow_heater"] = bool(predump_allow.get("heater"))
         budget["predump_target_soc"] = decision.get("predump_target_soc")
-        budget["predump_floor_soc"] = decision.get("predump_floor_soc", decision.get("predump_target_soc"))
+        _predump_floor = safe_float(decision.get("predump_floor_soc"),
+            safe_float(decision.get("predump_target_soc"), float("nan")))
+        budget["predump_floor_soc"] = (max(ep_reserve_soc(cfg, live), _predump_floor)
+            if math.isfinite(_predump_floor) and 0.0 <= _predump_floor <= 100.0 else None)
         budget["predump_consumer_landing_under_pct"] = decision.get("predump_consumer_landing_under_pct")
         budget["predump_consumer_landing_under_wh"] = decision.get("predump_consumer_landing_under_wh")
         budget["predump_no_grid"] = bool(decision.get("predump_no_grid"))
@@ -36520,10 +35141,8 @@ def decide_next_cycle(
         # Die Reservebindung überlebt auch erlaubtes Netzladen oder einen
         # anderen Schutzpfad; unbeobachtete Erholungszeit zählt dabei nicht.
         "ep_reserve_recovery": reserve_recovery,
-        "soc": soc,
-        "curve_control_soc": curve_control_soc,
-        "curve_control_raw_soc": soc,
-        "curve_control_soc_ts": now_s,
+        "soc": live_model.soc,
+        "curve_control_soc": curve_control_soc if live_model.soc is not None else None,
         "pv_w": pv_w,
         "grid_w": grid_w,
         "home_w": home_w,
@@ -36566,52 +35185,17 @@ def decide_next_cycle(
         "live_sample_valid": bool(live_plausibility.get("sample_valid", True)),
         "live_sample_invalid": live_sample_invalid,
         "live_plausibility": live_plausibility,
-        "live_plausibility_preserved_auto_limit": bool(
-            decision.get("live_plausibility_preserved_auto_limit")
-        ),
-        "live_plausibility_preserved_wbminsoc_contract": bool(
-            decision.get("live_plausibility_preserved_wbminsoc_contract")
-        ),
         "live_plausibility_manual_override_kept": bool(
             decision.get("live_plausibility_manual_override_kept")
         ),
-        "live_plausibility_preserved_discharge_owner": bool(
-            decision.get("live_plausibility_preserved_discharge_owner")
-        ),
-        "live_plausibility_preserved_discharge_state": decision.get(
-            "live_plausibility_preserved_discharge_state"
-        ),
-        "live_plausibility_preserved_discharge_age_s": safe_float(
-            decision.get("live_plausibility_preserved_discharge_age_s"),
-            0.0,
-        ),
-        "live_plausibility_preserved_discharge_hold_s": safe_float(
-            decision.get("live_plausibility_preserved_discharge_hold_s"),
-            0.0,
-        ),
-        "live_plausibility_preserved_charge_owner": bool(
-            decision.get("live_plausibility_preserved_charge_owner")
-        ),
-        "live_plausibility_preserved_charge_state": decision.get(
-            "live_plausibility_preserved_charge_state"
-        ),
-        "live_plausibility_preserved_charge_age_s": safe_float(
-            decision.get("live_plausibility_preserved_charge_age_s"),
-            0.0,
-        ),
-        "live_plausibility_preserved_charge_hold_s": safe_float(
-            decision.get("live_plausibility_preserved_charge_hold_s"),
-            0.0,
-        ),
-        "home_power_valid": bool(live_plausibility.get("home_valid", True)),
+        "pv_power_valid": live_model.pv_valid,
+        "home_power_valid": live_model.home_valid,
         "grid_power_valid": bool(live_plausibility.get("grid_valid", True)),
         "home_power_source": live_plausibility.get("home_source"),
         "home_power_balance_w": safe_int(live_plausibility.get("home_balance_w"), 0),
         "home_power_delta_w": safe_int(live_plausibility.get("home_delta_w"), 0),
-        "soc_unrealistic": soc_unrealistic,
-        "soc_jump_guard": soc_jump_guard if soc_unrealistic else None,
-        "last_valid_soc": soc_jump_guard.get("last_valid_soc", soc),
-        "last_valid_soc_ts": soc_jump_guard.get("last_valid_soc_ts", now_s),
+        "soc_valid": live_model.soc_valid,
+        "soc_jump_hint": soc_jump_hint,
         **power_limit_state(cfg, live, previous_state, now_s=now_s),
         "ems_power_limits_active": bool(live.get("power_limits_active")) if "power_limits_active" in live else None,
         "ems_power_settings_read": live.get("ems_power_settings_read") is True,
@@ -36772,7 +35356,8 @@ def decide_next_cycle(
         # Override-Diagnose top-level (Zustandsfile/Decision-Record lesen das
         # payload-Dict; bisher nur im budget-Dict -> dort immer False).
         "market_live_pv_first_overridden": bool(decision.get("market_live_pv_first_overridden")),
-        "market_grid_charge_control": copy.deepcopy(decision.get("market_grid_charge_control") or {}),
+        "market_grid_charge_control": copy.deepcopy(decision.get("market_grid_charge_control") or
+            ((previous_state or {}).get("market_grid_charge_control") or {})),
         "device_max_charge_power_w": live.get("device_max_charge_power_w"),
         # Fertig-Latch des Markt-Netzladejobs überlebt den Zyklus nur über dieses
         # payload-Dict (previous_state = payload). Entscheidet ein anderer Besitzer, bleibt der Latch aus dem
@@ -37372,6 +35957,8 @@ def decide_next_cycle(
         budget["wallbox_curve_reserve_w"] = central_split["battery_share_w"]
         budget["storage_curve_budget_active"] = True
         budget["budget_w"] = central_split["frame_w"]
+    if budget.get("data_valid") is False:
+        budget.update(_apply_consumer_budget_contract_projection(budget))
     payload["smartcharge_external_veto"] = storage_smartcharge_external_veto_contract(
         live,
         payload,
@@ -37412,7 +35999,6 @@ def decide_next_cycle(
             payload[key] = decision[key]
     enforce_direct_marketing_grid_owner(payload)
     return apply_backup_hold_limits(cfg, backup_live_source, payload, backup_context, defer_output=True)
-
 
 
 def write_predump_consumer_plan(
@@ -39535,8 +38121,6 @@ def write_state(payload: Dict[str, Any], plan: Dict[str, Any]) -> None:
         "ep_reserve_recovery": copy.deepcopy(payload.get("ep_reserve_recovery")),
         "ep_reserve_mode": payload.get("ep_reserve_mode"),
         "curve_control_soc": payload.get("curve_control_soc"),
-        "curve_control_raw_soc": payload.get("curve_control_raw_soc"),
-        "curve_control_soc_ts": payload.get("curve_control_soc_ts"),
         "ladeende": safe_float(plan.get("planning_target_soc", plan.get("target_soc")), 95.0),
         "tl_soc_now": payload.get("curve_soc"),
         "tl_soc_target": payload.get("target_soc"),
@@ -39647,10 +38231,8 @@ def write_state(payload: Dict[str, Any], plan: Dict[str, Any]) -> None:
         ),
         "live_age_s": payload.get("live_age_s"),
         "live_stale": bool(payload.get("live_stale")),
-        "soc_unrealistic": bool(payload.get("soc_unrealistic")),
-        "soc_jump_guard": payload.get("soc_jump_guard") if isinstance(payload.get("soc_jump_guard"), dict) else None,
-        "last_valid_soc": payload.get("last_valid_soc"),
-        "last_valid_soc_ts": payload.get("last_valid_soc_ts"),
+        "soc_valid": payload.get("soc_valid"),
+        "soc_jump_hint": payload.get("soc_jump_hint"),
         "ems_power_limits_active": payload.get("ems_power_limits_active"),
         "ems_max_charge_power_w": payload.get("ems_max_charge_power_w"),
         "ems_max_discharge_power_w": payload.get("ems_max_discharge_power_w"),
@@ -39933,15 +38515,6 @@ def write_state(payload: Dict[str, Any], plan: Dict[str, Any]) -> None:
         "direct_marketing_aux_inverter_shelly": payload.get("direct_marketing_aux_inverter_shelly") if isinstance(payload.get("direct_marketing_aux_inverter_shelly"), dict) else None,
         "auto_limit": payload.get("auto_limit") if isinstance(payload.get("auto_limit"), dict) else None,
         "protected_mode_hold_anchor_ts": payload.get("protected_mode_hold_anchor_ts"),
-        "live_plausibility_preserved_wbminsoc_contract": bool(payload.get("live_plausibility_preserved_wbminsoc_contract")),
-        "live_plausibility_preserved_discharge_owner": bool(payload.get("live_plausibility_preserved_discharge_owner")),
-        "live_plausibility_preserved_discharge_state": payload.get("live_plausibility_preserved_discharge_state"),
-        "live_plausibility_preserved_discharge_age_s": payload.get("live_plausibility_preserved_discharge_age_s"),
-        "live_plausibility_preserved_discharge_hold_s": payload.get("live_plausibility_preserved_discharge_hold_s"),
-        "live_plausibility_preserved_charge_owner": bool(payload.get("live_plausibility_preserved_charge_owner")),
-        "live_plausibility_preserved_charge_state": payload.get("live_plausibility_preserved_charge_state"),
-        "live_plausibility_preserved_charge_age_s": payload.get("live_plausibility_preserved_charge_age_s"),
-        "live_plausibility_preserved_charge_hold_s": payload.get("live_plausibility_preserved_charge_hold_s"),
         "manual_target_soc": payload.get("manual_target_soc"),
         "manual_release_mode": payload.get("manual_release_mode"),
         "force_wallbox_stop": bool(payload.get("force_wallbox_stop")),
@@ -40018,6 +38591,7 @@ def write_peak_shaving_interval_state(payload: Dict[str, Any]) -> None:
 
 
 _WB_BUDGET_CONTROL_KEYS = {
+    "data_valid", "data_reason",
     "budget_pv_w", "budget_battery_w", "budget_pv_valid", "budget_pv_source",
     "state", "storage_state", "budget_w", "raw_iAVal_w", "iAVal_w", "ungated_budget_w",
     "wallbox_ifc_ungated_candidate_w",
@@ -40048,7 +38622,7 @@ _WB_BUDGET_CONTROL_KEYS = {
     "curve_wb_relief", "curve_ref_soc", "curve_excess_pct", "curve_gap_pct",
     "adaptive_curve_relation", "direct_marketing_active", "direct_marketing_policy_target_state",
     "force_wallbox_stop", "predump_active", "predump_allow_wallbox", "predump_floor_hold",
-    "predump_target_soc", "predump_bev_block_w", "predump_discharge_allocations_w", "predump_discharge_add_w",
+    "predump_target_soc", "predump_floor_soc", "predump_bev_block_w", "predump_discharge_allocations_w", "predump_discharge_add_w",
     "predump_discharge_contract", "heatpump_start_funding", "heatpump_pv_contract",
     "live_sample_invalid", "phase_contract",
     "phases", "budget_ready", "can_start_or_hold", "real_charging", "switch_to_1p_ready",
@@ -40197,14 +38771,18 @@ def _wb_budget_producer_identity(
 def _apply_consumer_budget_contract_projection(
     budget: Dict[str, Any],
 ) -> Dict[str, Any]:
-    """Projiziert genau den gültigen Gesamtvertrag; jede Lücke bleibt 0 W."""
+    """Projiziert den Gesamtvertrag; unbekannte Quellen bleiben None ohne Freigabe."""
 
     result = dict(budget or {})
+    source_valid = result.get("data_valid", True) is not False
     contract = (
         copy.deepcopy(result.get("consumer_budget_contract"))
         if isinstance(result.get("consumer_budget_contract"), dict)
         else {}
     )
+    if not source_valid:
+        contract = cap_consumer_budget_contract(contract, {"heatpump": 0, "wallbox": 0, "heater": 0})
+        contract.update(valid=False, reason_code="pv_or_home_missing")
     validation = validate_consumer_budget_contract(contract)
     command_validation = validate_consumer_command_allocations(contract)
     command_eligible = dict(contract.get("command_eligible") or {}) if isinstance(contract, dict) else {}
@@ -40314,6 +38892,11 @@ def _apply_consumer_budget_contract_projection(
     )
     result["budget_w"] = wallbox_w
     _cap_wallbox_source_parts(result)
+    if not source_valid:
+        result.update(budget_w=0, budget_pv_w=None, budget_battery_w=None,
+            budget_pv_valid=False, budget_pv_source="pv_or_home_missing",
+            budget_amp_1ph=0, budget_amp_3ph=0,
+            consumer_budget_contract_reason="pv_or_home_missing")
     result["consumer_budget_reallocated"] = bool(command_allocation_reallocated)
     # Alle drei vom Wallbox Manager als Deckel gelesenen Felder tragen den
     # gleichen absoluten Gruppenrahmen. Ein residualer Vorwert würde sonst im
@@ -40382,6 +38965,18 @@ def _wb_budget_control_payload(
     control["d1_corridor_residual"] = budget.get("d1_corridor_residual", {})
     control["schema_version"] = "wb_pv_budget_control_v2"
     control["diagnostic_surface"] = os.path.basename(WB_DIAGNOSTIC_F)
+    # Ausschließlich der endgültige ausführbare GRID-Auftrag erhält einen Anteil.
+    decision = decision_payload if isinstance(decision_payload, dict) else {}
+    stamp = safe_float(budget.get("ts"), time.time())
+    active = bool(decision.get("mode") == MODE_GRID
+        and not decision.get("suppress_rscp_output") and safe_float(decision.get("val"), 0) > 0)
+    contract = decision.get("market_economics_contract") or {}
+    end = safe_float(contract.get("end_ts"), (stamp + 45) * 1000) / 1000
+    control["grid_charge_phase_budget"] = dict(active=active, ts=stamp,
+        valid_until_ts=min(stamp + 45, end),
+        target_w=max(0, safe_int(decision.get("val"), 0)) if active else None,
+        phase_count=budget.get("grid_charge_phase_count", 3),
+        reason="grid_job" if active else "no_grid_job")
     control["ts"] = safe_int(budget.get("ts"), int(time.time()))
     control["budget_w"] = max(0, safe_int(control.get("budget_w"), 0))
     if isinstance(budget.get("central_pv_split"), dict):
@@ -40397,6 +38992,11 @@ def _wb_budget_control_payload(
         control["raw_iAVal_w"] = control["budget_w"]
         control["iAVal_w"] = control["budget_w"]
     _cap_wallbox_source_parts(control)
+    if budget.get("data_valid") is False:
+        control.update(budget_w=0, budget_pv_w=None, budget_battery_w=None, raw_iAVal_w=0, iAVal_w=0,
+            budget_pv_valid=False, budget_pv_source=budget.get("budget_pv_source", "pv_or_home_missing"))
+        if isinstance(control.get("central_pv_split"), dict):
+            control["central_pv_split"]["frame_w"] = 0
     payload = decision_payload if isinstance(decision_payload, dict) else budget
     if (
         str(payload.get("state") or control.get("storage_state") or "")
@@ -40597,9 +39197,9 @@ def write_wb_budget(payload: Dict[str, Any]) -> None:
     if readback_gate:
         budget["wallbox_ifc_readback_gate"] = copy.deepcopy(readback_gate)
     budget["ts"] = int(time.time())
-    budget = _apply_consumer_budget_contract_projection(budget)
     if isinstance(payload.get("central_pv_split"), dict):
         budget.update(copy.deepcopy(payload["budget"]))
+    budget = _apply_consumer_budget_contract_projection(budget)
     w = max(0, safe_int(budget.get("budget_w"), 0))
     if not (isinstance(budget.get("central_pv_split"), dict) and budget["central_pv_split"].get("frame_w") is None):
         budget["budget_w"] = w
@@ -40665,7 +39265,7 @@ def write_storage_decision_surface(payload: Dict[str, Any]) -> None:
 
 def write_safe_start_state(
     *,
-    state: str = "no_data",
+    state: str = "live_stale_auto",
     reason: str = "Keine Live-Daten",
     mode: int = MODE_AUTO,
 ) -> None:
@@ -40723,8 +39323,6 @@ def write_safe_start_state(
         indent=2,
     )
     write_storage_decision_surface(payload)
-
-
 
 
 def _phase5_legacy_fallback(
@@ -42931,10 +41529,7 @@ def _phase5_pv_store_live_dc_fallback_contract(
         if live_ts_valid
         else None
     )
-    live_max_age_s = max(
-        1.0,
-        min(30.0, safe_float(cfg.get("storage_live_stale_guard_s"), 10.0)),
-    )
+    live_max_age_s = LIVE_SAMPLE_MAX_AGE_S
     live_numeric = all(
         isinstance(live.get(key), (int, float))
         and not isinstance(live.get(key), bool)
@@ -42981,7 +41576,7 @@ def _phase5_pv_store_live_dc_fallback_contract(
         ),
     )
     grid_w = safe_int(source.get("grid_w"), 0)
-    grid_ema_raw = live.get("Grid_EMA_W", grid_w)
+    grid_ema_raw = grid_w
     grid_ema_w = (
         int(round(float(grid_ema_raw)))
         if isinstance(grid_ema_raw, (int, float))
@@ -45441,6 +44036,7 @@ def _phase5_passive_normal_curve_charge_contract(
             live,
             configured_charge_w,
         )
+        snapshot = LiveDataSnapshot.from_dict(live, now_s=now_s)
         result.update({
             "valid": True,
             "reason": "passive_normal_preserves_sealed_auto_freilauf",
@@ -45451,10 +44047,10 @@ def _phase5_passive_normal_curve_charge_contract(
             "state": state,
             "preserved_charge_w": configured_charge_w,
             "preserved_discharge_w": configured_discharge_w,
-            "soc_pct": round(float(live.get("SOC", 0.0)), 3),
+            "soc_pct": round(snapshot.soc, 3) if snapshot.soc_valid else None,
             "curve_soc_pct": round(float(legacy.get("curve_soc", 0.0)), 3) if legacy.get("curve_soc") is not None else None,
             "target_soc_pct": round(float(legacy.get("target_soc", 100.0)), 3) if legacy.get("target_soc") is not None else None,
-            "grid_export_w": max(0, int(round(-float(live.get("Grid_Power", 0.0))))),
+            "grid_export_w": max(0, -int(round(snapshot.grid_w))) if snapshot.grid_valid else None,
             "live_age_s": round(float(now_s) - float(live.get("_ts", now_s)), 3),
         })
         return result
@@ -45544,10 +44140,7 @@ def _phase5_passive_normal_curve_charge_contract(
         result["reason"] = "live_measurement_contract_invalid"
         return result
     live_age_s = runtime_input_age_s(live_ts_raw, now_s)
-    live_max_age_s = max(
-        1.0,
-        min(30.0, safe_float(cfg.get("storage_live_stale_guard_s"), 10.0)),
-    )
+    live_max_age_s = LIVE_SAMPLE_MAX_AGE_S
     grid_w = float(live.get("Grid_Power"))
     battery_w = float(live.get("Battery_Power"))
     grid_export_w = max(0, int(round(-grid_w)))
@@ -48371,7 +46964,7 @@ def wallbox_ifc_readback_gate_contract(
         if evidence_ts > 100_000_000_000.0:
             evidence_ts /= 1000.0
     evidence_age_s = now_value - evidence_ts if evidence_ts is not None else None
-    freshness_limit_s = 5.0
+    freshness_limit_s = LIVE_SAMPLE_MAX_AGE_S
     future_timestamp = bool(evidence_age_s is not None and evidence_age_s < 0.0)
     fresh = bool(
         evidence_age_s is not None
@@ -49098,6 +47691,182 @@ def storage_cycle_fault_payload(payload: Dict[str, Any], note: Dict[str, Any]) -
     return payload
 
 
+def schatten_funktionsstatus_werte(cfg, live, plan, energy, jetzt):
+    """Die gelesenen Fachanforderungen liefern ausschließlich boolesche Werte."""
+    pre = predump_request_from_plan(cfg, live, plan, jetzt, configured_discharge_limit_w(cfg, live), {})
+    window = kern_adapter.predump_time_window(cfg, plan)
+    pre_window = bool(window.get("valid") and window["start_ts"] <= jetzt < window["deadline_ts"]
+        and (plan.get("predump_curve_active") or (plan.get("target_curve_meta") or {}).get("predump_curve_active")))
+    heat = kern_adapter.tariff_window(cfg, jetzt)
+    decision = (energy or {}).get("decision") or {}
+    heat_request = decision.get("heat_tariff_shift") or {}
+    heat_active = (heat.get("valid") is True and heat_request.get("active") is True
+        and schatten.zahl(energy.get("ts")) and 0 <= jetzt - energy["ts"] <= 30)
+    boost = kern_adapter.grid_boost_active(cfg, energy, jetzt)
+    hold = cfg.get("_kern_vorhalt") or {}
+    hold_control = hold.get("context") or {}
+    dm = plan.get("direct_marketing") or {}
+    statuses = (
+        ("Pre-Dump", cfg_bool(cfg, "predump_enable", True),
+            cfg_bool(cfg, "predump_enable", True) and (pre.get("active") is True or pre_window)),
+        ("Wärme-Tarif", str(cfg.get("heat_tariff_shift_mode", "off")).lower() not in ("off", "aus", "0") or cfg_bool(cfg, "price_boost_enable"),
+            bool(heat_active or boost)),
+        ("Lastspitzen", cfg_bool(cfg, "peak_shaving_enable"), bool((cfg.get("_peak_shaving") or {}).get("candidate"))),
+        ("Direktvermarktung", cfg_bool(cfg, "direct_marketing_enable"),
+            bool(dm.get("enabled") is True and direct_marketing_current_window(dm, jetzt))),
+        ("Preis-Boost", cfg_bool(cfg, "cheap_grid_battery_enable") or cfg_bool(cfg, "awattar_mode"), cheap_grid_charge_active(plan, int(jetzt*1000))),
+        ("Vorhaltung", safe_int(cfg.get("storage_backup_hold_enable"), 0) == 2,
+            bool(hold_control.get("active") or hold_control.get("grid_job"))),
+    )
+    return {name: dict(konfiguriert=bool(configured), angefordert=bool(requested), wirksam=None)
+            for name, configured, requested in statuses}
+
+
+def schatten_kalender(jetzt):
+    local = datetime.datetime.fromtimestamp(jetzt).astimezone()
+    return int(local.replace(minute=0, second=0, microsecond=0).timestamp()), int(local.strftime("%Y%m%d"))
+
+
+def schatten_datei_lesen(path, maximum):
+    # Begrenzte Bytes vor JSON und begrenzte Form vor der Rekonstruktion.
+    try:
+        with open(path, "rb") as stream:
+            data = stream.read(maximum+1)
+    except FileNotFoundError:
+        return None
+    if len(data) > maximum:
+        raise ValueError("DIAGNOSEGROESSE")
+    return json.loads(data)
+
+
+def schatten_datei_schreiben(path, data, maximum):
+    # Die harte Größenbegrenzung gilt für die Bytes des vorhandenen Schreibers.
+    if len(json.dumps(data, ensure_ascii=False, allow_nan=False).encode("utf-8")) > maximum:
+        raise ValueError("DIAGNOSEGROESSE")
+    atomic_write_on_change(path, data, force_interval_s=15)
+
+
+def schatten_zyklus(zustand, fault_state, *, start, cycle_s, ctrl=None, payload=None,
+                    uebergabe=None, bindefehler=None, grund=None, ende=False):
+    """Abgeschlossener Diagnoseblock hinter sämtlichen produktiven Schreibern."""
+    t0 = time.monotonic()
+    neu = zustand
+    stunde, tag, boot_id = int(start // 3600 * 3600), 0, None
+    before_payload = None
+    before_ctrl = None
+    ueberwachen = False
+    def fingerabdruck():
+        return (ctrl.power_settings_diagnostics().get("set_requests"), ctrl._mode) if ctrl is not None else None
+    def payload_bytes():
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    def schreiben(z, aggregate=False):
+        if aggregate or ende or z.gespeichert_s is None or start-z.gespeichert_s >= 30:
+            schatten_datei_schreiben(SCHATTEN_F, schatten.ramdisk_projektion(z, boot_id=boot_id), schatten.ZUSTAND_BYTES)
+            z.gespeichert_s = start
+        if aggregate:
+            schatten_datei_schreiben(SCHATTEN_AGGREGAT_F, schatten.aggregat_projektion(z), schatten.AGGREGAT_BYTES)
+    try:
+        stunde, tag = schatten_kalender(start)
+        boot_id = control_time.sample().get("boot_id")
+        before_payload = payload_bytes()
+        before_ctrl = fingerabdruck()
+        ueberwachen = True
+        old_hour = (zustand.gedaechtnis.get("stunde") or {}).get("beginn")
+        args = dict(jetzt=start, stunde=stunde, tag=tag)
+        if ende:
+            schreiben(zustand, aggregate=True)
+            return zustand
+        if zustand.gesperrt:
+            neu = schatten.ausgelassen(zustand, "gesperrt", **args)
+        elif grund:
+            neu = schatten.ausgelassen(zustand, grund, **args)
+        elif time.time() - start >= 0.5 * cycle_s:
+            neu = schatten.ausgelassen(zustand, "zeitbudget", **args)
+        elif bindefehler is not None:
+            raise bindefehler
+        elif uebergabe is None:
+            neu = schatten.ausgelassen(zustand, "produktpfad_ohne_vergleich:ausgang", **args)
+        else:
+            eingang, quellen = kern_adapter.eingang_und_quellen_bauen(uebergabe,
+                zustand.quellen_vorzustand, kern_vorzustand=zustand.kern_zustand)
+            ergebnis = kern.schritt(eingang, zustand.kern_zustand)
+            projektion, projektionszustand = kern_projektion.projizieren(ergebnis.soll,
+                kern_projektion.projektionsstart(uebergabe, eingang, zustand.projektionszustand), start)
+            captured_status = kern_uebergabe.auftauen(uebergabe.eingaenge.funktionsstatus)
+            status = {name: captured_status.get(name) or dict(konfiguriert=None, angefordert=None, wirksam=None)
+                for name in schatten.FUNKTIONEN}
+            raw = kern_uebergabe.auftauen(uebergabe.ergebnis)
+            state = str(raw.get("state") or "")
+            wirksam = {"Pre-Dump": state.startswith(("predump", "pre_discharge")) or raw.get("predump_active") is True,
+                "Unwetter": state.startswith("storm_guard"), "Wärme-Tarif": (raw.get("heat_tariff_shift") or {}).get("active") is True,
+                "Lastspitzen": raw.get("peak_shaving_active") is True or (raw.get("peak_shaving") or {}).get("applied") is True,
+                "Direktvermarktung": state.startswith("direct_marketing") or (raw.get("storage_dispatch_phase5") or {}).get("applied") is True,
+                "Preis-Boost": state == "price_boost_grid", "Vorhaltung": (raw.get("backup_hold_control") or {}).get("applied") is True}
+            status = {name: dict(row, wirksam=wirksam[name]) for name, row in status.items()}
+            for name, field in (("Lastspitzen", "peak_shaving"), ("Direktvermarktung", "storage_dispatch_phase5"),
+                    ("Vorhaltung", "backup_hold_control")):
+                request = raw.get(field) or {}
+                # Der Phase-5-Vertrag liefert sein Kandidatenobjekt in jedem Zyklus, auch wenn die Direktvermarktung
+                # nicht anwendbar ist (abgeschaltet); dann ist es keine Anforderung.
+                if request.get("applicable") is False:
+                    request = {}
+                status[name]["angefordert"] = bool(status[name]["angefordert"] or wirksam[name]
+                    or request.get("candidate") or request.get("grid_job") or request.get("active")
+                    or name == "Lastspitzen" and raw.get("peak_shaving_candidate_action_class"))
+            memory = copy.deepcopy(zustand.gedaechtnis.get("vergleich", {"nach_neustart": zustand.neustart}))
+            if old_hour != stunde:
+                memory.update(real_n=0, hyp_n=0)
+            vergleich, memory = schatten.vergleichen(uebergabe, eingang, ergebnis, projektion,
+                memory, status, neustart=zustand.neustart)
+            if time.time() - start >= 0.5 * cycle_s:
+                neu = schatten.ausgelassen(zustand, "zeitbudget", **args,
+                    laufzeit_ms=(time.monotonic() - t0) * 1000)
+            else:
+                neu = schatten.fortschreiben(zustand, vergleich, **args,
+                    laufzeit_ms=(time.monotonic() - t0) * 1000, e=eingang, r=ergebnis,
+                    projektionszustand=projektionszustand,
+                    quellen=schatten_quellen_fortschreiben(quellen, ergebnis, start),
+                    gedaechtnis=memory, funktionsstatus=status)
+        schreiben(neu, aggregate=old_hour != stunde)
+        fault_state.clear()
+        if old_hour is not None and old_hour != stunde:
+            row = dict(zip(schatten.STUNDEN_SPALTEN, neu.stunden[-1]))
+            log.info("Neue Speicherregelung im Vergleichsbetrieb: %d/%d, A0 %d, A1 %d, A2 %d, A3 %d, A4 %d, p95 %s ms",
+                row["vergleichbar"], row["zyklen"], *row["klassen"][1:6], row["laufzeit_ms"][0])
+    except Exception as exc:
+        note = storage_cycle_fault_note(fault_state, exc, start, stage="speicherkern_schatten")
+        # Weder Ausnahmefreitext noch Konfigurationswerte gelangen in die Diagnose.
+        if note.get("log_traceback"):
+            log.error("Neue Speicherregelung im Vergleichsbetrieb: Diagnosefehler (%d in Folge)", note["count"])
+        try:
+            neu = schatten.ausgelassen(zustand, "schattenfehler", jetzt=start, stunde=stunde, tag=tag)
+            neu.fehler = {"count": note["count"], "code": "SCHATTENFEHLER"}
+            schreiben(neu)
+        except Exception:
+            neu = zustand
+    finally:
+        try:
+            if ueberwachen and (before_ctrl != fingerabdruck() or payload_bytes() != before_payload):
+                if payload is not None and before_payload is not None:
+                    payload.clear()
+                    payload.update(json.loads(before_payload))
+                neu = schatten.fortschreiben(zustand,
+                    dict(klasse="A4", code="SCHREIBWEG", moduspaar=(
+                    neu.letzter_zyklus.get("moduspaar") if neu.ts == start else None)),
+                    jetzt=start, stunde=stunde, tag=tag, laufzeit_ms=(time.monotonic() - t0)*1000)
+                log.error("Neue Speicherregelung im Vergleichsbetrieb: Schreibweg erkannt; Vergleich stillgelegt")
+                schreiben(neu, aggregate=True)
+        except Exception:
+            neu.gesperrt = "SCHREIBWEG"
+        # Die vollständige Blockdauer einschließlich beider Schreiber bleibt messbar.
+        if not ende:
+            try:
+                schatten.laufzeit_ergaenzen(neu, (time.monotonic() - t0)*1000)
+            except Exception:
+                pass
+    return neu
+
+
 def main() -> None:
     try:
         ownership = acquire_storage_manager_ownership(
@@ -49179,6 +47948,13 @@ def main() -> None:
         # Reine Planungsgröße: allein die sieben Tage je Band gelten, nicht die
         # kurze Altersgrenze der Steuerzustände. Die Ramdisk überlebt keinen Geräteneustart.
         previous_state.update(market_grid_observed_charge_fields(persisted_consumer_budget_state, now_s=time.time()))
+        # Der fenstergebundene Energieauftrag überlebt einen Dienstneustart.
+        control = persisted_consumer_budget_state.get("market_grid_charge_control")
+        if (isinstance(control, dict)
+                and safe_float(control.get("window_end_ts"), 0) > time.time()*1000
+                and 0 < safe_float(control.get("bound_ts"), 0) <= time.time()*1000):
+            previous_state["market_grid_charge_control"] = copy.deepcopy(control)
+
     pending_curve_cap_handover_state = (
         copy.deepcopy(persisted_consumer_budget_state)
         if isinstance(persisted_consumer_budget_state, dict)
@@ -49193,14 +47969,20 @@ def main() -> None:
     last_decision_log_sig: Optional[Tuple[Any, ...]] = None
     last_ha_admission_sig: Optional[Tuple[Any, ...]] = None
     cycle_fault_state: Dict[str, Any] = {}
+    schatten_fault_state: Dict[str, Any] = {}
+    try:
+        schatten_zustand = schatten.zustand_laden(schatten_datei_lesen(SCHATTEN_F, schatten.ZUSTAND_BYTES),
+            schatten_datei_lesen(SCHATTEN_AGGREGAT_F, schatten.AGGREGAT_BYTES), jetzt=time.time(), boot_id=control_time.sample().get("boot_id"))
+    except Exception:
+        schatten_zustand = schatten.Schatten()
     live: Dict[str, Any] = {}
     while not _stop:
         start = time.time()
         # The user's off switch must not wait for the old 60-second reload.
-        current_cfg = read_storage_regulation_config(V4_CFG)
-        requested_regulation = storage_regulation_enabled(current_cfg) if current_cfg is not None else None
-        if current_cfg is not None:
-            cfg = current_cfg
+        cfg, requested_regulation = lese_zyklus_konfiguration(
+            cfg, read_storage_regulation_config=read_storage_regulation_config,
+            storage_regulation_enabled=storage_regulation_enabled, V4_CFG=V4_CFG,
+        )
         new_settings = rscp_settings_from_cfg(cfg)
         if new_settings != rscp_settings:
             if ctrl:
@@ -49218,7 +48000,7 @@ def main() -> None:
         cycle_s = auto_limit_heartbeat_s(cfg) if auto_limit_heartbeat_enabled(cfg) else CYCLE_S
         ha_admission = evaluate_writer_admission()
         if requested_regulation is not True:
-            live = read_json_file(LIVE_F, max_age_s=30)
+            live = read_json_file(LIVE_F, max_age_s=None)
             heater_status = read_json_file(HEATER_STATUS_F, max_age_s=45)
             if heater_status:
                 try:
@@ -49284,6 +48066,8 @@ def main() -> None:
             atomic_write_on_change(DISPATCH_RUNTIME_F, payload["storage_dispatch_runtime"], force_interval_s=15, indent=2)
             write_wb_budget(payload)
             write_storage_decision_surface(payload)
+            schatten_zustand = schatten_zyklus(schatten_zustand, schatten_fault_state,
+                start=start, cycle_s=cycle_s, grund="produktpfad_ohne_vergleich:beobachtung")
             previous_state = payload
             time.sleep(max(0.2, min(3.0, cycle_s) - (time.time() - start)))
             continue
@@ -49329,6 +48113,8 @@ def main() -> None:
                 ),
                 mode=MODE_AUTO,
             )
+            schatten_zustand = schatten_zyklus(schatten_zustand, schatten_fault_state, start=start,
+                cycle_s=cycle_s, grund="produktpfad_ohne_vergleich:besitzer")
             time.sleep(cycle_s)
             continue
         if ha_admission_sig != last_ha_admission_sig:
@@ -49347,29 +48133,30 @@ def main() -> None:
                 mode=-1,
             )
             log.error("Unvollständige E3DC-RSCP-Konfiguration. Warte auf Ziel und Zugangsdaten.")
+            schatten_zustand = schatten_zyklus(schatten_zustand, schatten_fault_state, start=start,
+                cycle_s=cycle_s, grund="produktpfad_ohne_vergleich:konfiguration")
             time.sleep(cycle_s)
             continue
-        live = read_json_file(LIVE_F, max_age_s=30)
+        live, cycle_cfg = lese_zyklus_live(
+            cfg, read_json_file=read_json_file, house_fuse_config=house_fuse_config,
+            resolve_house_fuse=resolve_house_fuse, system_house_fuse=system_house_fuse,
+            LIVE_F=LIVE_F,
+        )
         if not live:
             prior_backup = previous_state.get('backup_hold_control') or {}
             if prior_backup.get('applied') or prior_backup.get('grid_job'):
-                # Auch ein fehlendes Livefile beendet ausschließlich den eigenen
-                # Anteil, am selben autorisierten Ausgang und ohne Alt-SoC.
-                fallback = storage_cycle_fault_limits(cfg, {}, previous_state, ctrl)
+                # Nur den eigenen Backup-Anteil am bestehenden Fehlerausgang beenden.
+                fallback = storage_cycle_fault_limits(cycle_cfg, {}, previous_state, ctrl)
+                fallback["reason"] = "Messzeit: Live-Datei fehlt; " + str(fallback.get("reason") or "")
                 execute_rscp_cycle(ctrl, fallback, ownership)
                 confirm_backup_hold_output(fallback)
                 write_state(fallback, {})
+                write_wb_budget(fallback)
                 previous_state = fallback
+                schatten_zustand = schatten_zyklus(schatten_zustand, schatten_fault_state, start=start,
+                    cycle_s=cycle_s, grund="produktpfad_ohne_vergleich:live_fehlt")
                 time.sleep(cycle_s)
                 continue
-            write_safe_start_state(
-                state="no_data",
-                reason="Keine Live-Daten: warte auf frische Messwerte von e3dc-live.",
-                mode=MODE_AUTO,
-            )
-            time.sleep(cycle_s)
-            continue
-        cycle_cfg = house_fuse_config(cfg, resolve_house_fuse(cfg, system_house_fuse(live)))
         if pending_curve_cap_handover_state is not None:
             handover = resolve_storage_curve_cap_handover(
                 pending_curve_cap_handover_state,
@@ -49433,6 +48220,8 @@ def main() -> None:
                         ),
                         mode=MODE_AUTO,
                     )
+                    schatten_zustand = schatten_zyklus(schatten_zustand, schatten_fault_state, start=start,
+                        cycle_s=cycle_s, grund="produktpfad_ohne_vergleich:handover")
                     time.sleep(cycle_s)
                     continue
             else:
@@ -49453,44 +48242,29 @@ def main() -> None:
             )
         except Exception as exc:
             log.debug("Config-Validierung konnte nicht geschrieben werden: %s", exc)
-        # Pro Zyklus genau eine stabile, statisch validierte Planrevision.
-        # Bei Replace, Hash- oder Generationsabweichung gibt es keinen Altplan-Fallback.
-        plan_read_diagnostic: Dict[str, Any] = {}
-        plan = load_validated_canonical_plan_snapshot(PLAN_F, max_age_s=1800, diagnostic=plan_read_diagnostic) or {}
-        cycle_cfg = dict(cycle_cfg, _market_plan_read_reason=plan_read_diagnostic.get("reason"),
-                         _market_plan_grace_source=market_plan_grace_source_memory)
-        wb_intent = read_json_file(WB_INTENT_F, max_age_s=90)
-        wb_native = read_json_file(WB_NATIVE_F, max_age_s=90)
-        manual_max_age_s = manual_override_max_age_s(cycle_cfg)
-        manual = read_json_file(MANUAL_OVERRIDE_F)
-        if manual and not regulation_switch.manual_allowed(
-            manual, safe_float(cycle_cfg.get("storage_regulation_changed_ts"), 0),
-        ):
-            manual = {}
-        if manual_override_expired(manual, start, manual_max_age_s):
-            log.info("Manueller Batterie-Override abgelaufen; Automatik übernimmt.")
-            try:
-                os.remove(MANUAL_OVERRIDE_F)
-            except FileNotFoundError:
-                pass
-            except Exception as exc:
-                log.debug("Abgelaufener Batterie-Override konnte nicht entfernt werden: %s", exc)
-            manual = {}
-        energy_decision = read_json_file(ENERGY_DECISION_F, max_age_s=45)
-        heater_status = read_json_file(HEATER_STATUS_F, max_age_s=45)
-        if heater_status:
-            try:
-                heater_status["_source_mtime_s"] = os.path.getmtime(
-                    HEATER_STATUS_F
-                )
-            except OSError:
-                heater_status = {}
-        live = augment_consumer_live(
-            live,
-            energy_decision,
-            cycle_cfg,
-            heater_status,
+        cycle_cfg, live, plan, plan_read_diagnostic, wb_intent, wb_native, manual, energy_decision = lese_zyklus_eingaenge(
+            cycle_cfg, live, start, market_plan_grace_source_memory, regulation_switch,
+            load_validated_canonical_plan_snapshot=load_validated_canonical_plan_snapshot,
+            read_json_file=read_json_file, augment_consumer_live=augment_consumer_live,
+            manual_override_max_age_s=manual_override_max_age_s,
+            manual_override_expired=manual_override_expired, safe_float=safe_float,
+            remove_manual=os.remove, getmtime=os.path.getmtime, log=log,
+            PLAN_F=PLAN_F, WB_INTENT_F=WB_INTENT_F, WB_NATIVE_F=WB_NATIVE_F,
+            MANUAL_OVERRIDE_F=MANUAL_OVERRIDE_F, ENERGY_DECISION_F=ENERGY_DECISION_F,
+            HEATER_STATUS_F=HEATER_STATUS_F, previous_state=previous_state,
+            owner_binding=direct_marketing_hard_export_owner_binding, markt_leser=vorhalte_markt_aufnahme,
         )
+        # Eingänge vor jeder produktiven Entscheidung tief einfrieren.
+        schatten_eingaenge = schatten_uebergabe = schatten_bindefehler = None
+        try:
+            schatten_eingaenge = kern_uebergabe.eingaenge_binden(live=live, plan=plan,
+                wb_native=wb_native, wb_intent=wb_intent, manual=manual, cycle_cfg=cycle_cfg,
+                start=start, zeitprobe=control_time.sample(wall_ts=start), regelung_an=requested_regulation,
+                rscp_fehler=not live["RSCP_Sample_Valid"] if type(live.get("RSCP_Sample_Valid")) is bool else None,
+                funktionsstatus=schatten_funktionsstatus_werte(cycle_cfg, live, plan, energy_decision, start),
+                house_fuse=cycle_cfg.get("_house_fuse"), energy_decision=energy_decision)
+        except Exception as schatten_exc:
+            schatten_bindefehler = schatten_exc
         try:
             payload = decide_next_cycle(cycle_cfg, live, plan, wb_intent, wb_native, manual, previous_state, start)
             cycle_fault_state = {}
@@ -49520,6 +48294,8 @@ def main() -> None:
                         log.error("Regelzyklus-Fallback: vorhandene Schutzgrenzen am gemeinsamen Ausgang erhalten")
                 except Exception as release_exc:
                     log.error("Regelzyklus-Fallback: AUTO-Freilauf nicht sendbar: %s", release_exc)
+                schatten_zustand = schatten_zyklus(schatten_zustand, schatten_fault_state, start=start,
+                    cycle_s=cycle_s, grund="produktpfad_ohne_vergleich:fallback")
                 time.sleep(max(1.0, cycle_s - (time.time() - start)))
                 continue
         payload["storage_regulation"] = dict(regulation_switch.status)
@@ -49569,7 +48345,10 @@ def main() -> None:
         payload = apply_heat_tariff_storage(
             cycle_cfg, live, payload, energy_decision, previous_state,
             now=start, reserve_pct=ep_reserve_soc(cycle_cfg, live))
-        payload = apply_backup_hold_limits(cycle_cfg, live, payload, backup_cycle_context, now_s=time.time())
+        backup_output_now = time.time()
+        payload = apply_backup_hold_limits(cycle_cfg,
+            live_with_managed_vehicle_phases(live, wb_intent, backup_output_now),
+            payload, backup_cycle_context, now_s=backup_output_now)
         # Finalisierungen dürfen die Besitzerbindung des gelesenen Plans nicht verlieren.
         payload.update(dv_owner_binding)
         enforce_direct_marketing_grid_owner(payload)
@@ -49611,6 +48390,21 @@ def main() -> None:
         # AUTO bleibt der einzige bewusst nicht ge-heartbeatete Freilaufpfad.
         checkpoint_heatpump_pv_grant(payload, now_s=start)
         execute_rscp_cycle(ctrl, payload, ownership)
+        # Ergebnis vor Bestätigern und Zustandsschreibern separat binden.
+        try:
+            if schatten_eingaenge is not None:
+                schatten_uebergabe = kern_uebergabe.ergebnisse_binden(schatten_eingaenge, payload,
+                    payload.get("rscp_power_settings") or {})
+                schatten_ergebnis = kern_uebergabe.auftauen(schatten_uebergabe.ergebnis)
+                schatten_ergebnis.update({key: payload.get(key) for key in (
+                    "peak_shaving_candidate_action_class", "peak_shaving_active")})
+                schatten_ergebnis["budget"] = {key: (payload.get("budget") or {}).get(key) for key in (
+                    "budget_pv_w", "budget_battery_w", "battery_support_authorized",
+                    "priority_running_reclaimable_w", "start_requested")}
+                schatten_uebergabe = dataclass_replace(schatten_uebergabe,
+                    ergebnis=kern_uebergabe.einfrieren(schatten_ergebnis))
+        except Exception as schatten_exc:
+            schatten_bindefehler = schatten_exc
         confirm_backup_hold_output(payload)
         confirm_heatpump_pv_start_source_output(payload)
         confirm_storage_dc_first_charge_recovery_anchor(
@@ -49731,6 +48525,11 @@ def main() -> None:
             write_storage_decision_surface(payload)
         except Exception as write_exc:
             log.exception("Zustandsschreiber write_storage_decision_surface fehlgeschlagen: %s", write_exc)
+        schatten_zustand = schatten_zyklus(schatten_zustand, schatten_fault_state,
+            start=start, cycle_s=cycle_s, ctrl=ctrl, payload=payload, uebergabe=schatten_uebergabe,
+            bindefehler=schatten_bindefehler, grund=("produktpfad_ohne_vergleich:fallback"
+                if payload.get("storage_cycle_fault") else "produktpfad_ohne_vergleich:ausgang"
+                if payload.get("suppress_rscp_output") else None))
         previous_state = payload
         decision_log_sig = (
             payload["mode"],
@@ -49740,12 +48539,12 @@ def main() -> None:
         )
         log_fn = log.info if decision_log_sig != last_decision_log_sig else log.debug
         log_fn(
-            "[%s] Speicher-Regelung: %s -> %s %dW SOC=%.1f%% Grid=%dW PV=%dW Budget=%dW | %s",
+            "[%s] Speicher-Regelung: %s -> %s %dW SOC=%s Grid=%dW PV=%dW Budget=%dW | %s",
             datetime.datetime.now().strftime("%H:%M"),
             log_safe_text(payload.get("state_label", payload["state"])),
             payload["mode_name"],
             payload["val"],
-            payload["soc"],
+            ("%.1f%%" % payload["soc"]) if payload.get("soc") is not None else "unbekannt",
             payload["grid_w"],
             payload["pv_w"],
             safe_int(payload.get("budget", {}).get("budget_w"), 0),
@@ -49757,6 +48556,7 @@ def main() -> None:
         last_decision_log_sig = decision_log_sig
         elapsed = time.time() - start
         time.sleep(max(0.2, cycle_s - elapsed))
+    schatten_zyklus(schatten_zustand, schatten_fault_state, start=time.time(), cycle_s=CYCLE_S, ende=True)
     stop_ts = int(time.time())
     persisted_terminal_state = read_json_file(STATE_F)
     checkpoint_heatpump_pv_grant(previous_state, now_s=stop_ts, force=True)
@@ -49794,7 +48594,7 @@ def main() -> None:
     try:
         reserve = previous_state.get("ep_reserve_recovery")
         backup = previous_state.get("backup_hold_control")
-        emergency_status = live.get("Notstrom_Status", live.get("ems_emergency_power_status"))
+        emergency_status = storage_emergency_status(live)
         if ctrl is None:
             release_reason = "release_controller_unavailable"
         elif ctrl_rebuilt:
@@ -49809,12 +48609,11 @@ def main() -> None:
             release_reason = "release_regulation_not_enabled"
         elif (not live or live.get("RSCP_Sample_Valid") is not True
                 or live.get("Power_Decision_Usable") is not True
-                or not 0 <= time.time() - safe_float(live.get("_ts"), 0) < 30):
+                or live_data_age_s(live) > LIVE_SAMPLE_MAX_AGE_S):
             release_reason = "release_live_unusable"
-        elif (isinstance(emergency_status, bool)
-                or not safe_float(emergency_status, float("nan")).is_integer()):
+        elif emergency_status is None:
             release_reason = "release_island_status_unreadable"
-        elif safe_int(live.get("Notstrom_Status", live.get("ems_emergency_power_status")), -1) in (1, 4):
+        elif storage_emergency_status(live) in (1, 4):
             release_reason = "release_island_active"
         elif (not isinstance(reserve, dict)
                 or reserve.get("schema") != "storage_ep_reserve_recovery_v1"

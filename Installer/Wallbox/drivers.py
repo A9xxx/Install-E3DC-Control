@@ -8,6 +8,8 @@ Enthaelt alle Treiber-Klassen:
   - E3DCCharger     (E3DC native Wallbox über RSCP)
   - create_charger() Factory-Funktion
 """
+from .decision import VEHICLE_IDENTIFIER_PLACEHOLDERS
+
 import os
 import json
 import time
@@ -53,6 +55,13 @@ def _get_mqtt_module():
             mqtt = None
             logger.debug(f"paho-mqtt nicht verfügbar: {e}")
     return mqtt
+
+
+def _openwb_vehicle_identifier(value):
+    """SimpleAPI-Platzhalter sind fehlende Kennungen, keine Fahrzeugidentität."""
+    if value is None or str(value).strip().lower() in VEHICLE_IDENTIFIER_PLACEHOLDERS:
+        return None
+    return value
 
 
 OPENWB_AUTONOMOUS_CHARGEMODES = {
@@ -1289,9 +1298,9 @@ class OpenWBCharger(WallboxDriver):
             "state_text_ts": time.time() if values["state_str"] is not None else None,
             "instant_charging_current": self._mqtt_status_value("evse_current", data.get("instant_charging_current")),
             "chargemode": data.get("chargemode"), "chargemode_str": data.get("chargemode"),
-            "vehicle_id": data.get("vehicle_id", data.get("connected_vehicle_id")),
-            "car_id": data.get("vehicle_id", data.get("connected_vehicle_id")),
-            "rfid_tag": data.get("rfid_tag", data.get("rfid")),
+            "vehicle_id": _openwb_vehicle_identifier(data.get("vehicle_id", data.get("connected_vehicle_id"))),
+            "car_id": _openwb_vehicle_identifier(data.get("vehicle_id", data.get("connected_vehicle_id"))),
+            "rfid_tag": _openwb_vehicle_identifier(data.get("rfid_tag", data.get("rfid"))),
         })
         if daily is None:
             self.state["session_kwh"] = None
@@ -3493,8 +3502,8 @@ class OpenWBCharger(WallboxDriver):
             cp_data.get("locked", cp_data.get("lock_state", cp_data.get("plug_locked"))),
             plug_state,
         )
-        live_vehicle_id = cp_data.get("vehicle_id", cp_data.get("connected_vehicle_id"))
-        live_rfid_tag = cp_data.get("rfid_tag", cp_data.get("rfid"))
+        live_vehicle_id = _openwb_vehicle_identifier(cp_data.get("vehicle_id", cp_data.get("connected_vehicle_id")))
+        live_rfid_tag = _openwb_vehicle_identifier(cp_data.get("rfid_tag", cp_data.get("rfid")))
         raw_power_w = self._float_value(cp_data.get("power", cp_data.get("charging_power")), 0.0)
         powers = cp_data.get("powers") if isinstance(cp_data.get("powers"), list) else []
         if powers:

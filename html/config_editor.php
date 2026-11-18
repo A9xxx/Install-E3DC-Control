@@ -50,6 +50,12 @@ if ($configEditorStatusRequest) {
     exit;
 }
 
+/** Der Verbindungsversuch löst leere Eingaben erst auf dem Server auf. */
+function e3dc_config_editor_test_value(array $posted, array $current, $key) {
+    $value = $posted[$key] ?? '';
+    return is_scalar($value) && trim((string)$value) !== '' ? (string)$value : (string)($current[$key] ?? '');
+}
+
 function e3dc_config_editor_wallbox_toggle_checked(array $config, $key) {
     $missingDefaults = ['wb1_e3dc_wbchar6_compat_enable' => '1', 'wb2_e3dc_wbchar6_compat_enable' => '1'];
     $value = array_key_exists($key, $config) ? ($config[$key]['value'] ?? '0') : ($missingDefaults[$key] ?? '0');
@@ -65,7 +71,7 @@ function e3dc_config_editor_text_only_key($key) {
     if (in_array($k, ['bluelink_user', 'bluelink_password', 'bluelink_pin', 'web_pin'], true)) {
         return true;
     }
-    return preg_match('/(password|passwort|pwd|token|secret|api[_-]?key|apikey|(^|[_-])pin$)/', $k) === 1;
+    return e3dc_config_editor_secret_key($k);
 }
 
 function e3dc_config_editor_store_posted_value($key, $value) {
@@ -296,14 +302,13 @@ if (!$is_writable && $configEditorRequestMethod === 'POST') {
 $defaults = [
     // E3DC Verbindung
     "server_ip" => "", "server_port" => "5033", "e3dc_user" => "", "e3dc_password" => "", "aes_password" => "",
-    "wurzelzaehler" => "0", "wurzelzaehler_invertiert" => "0",
-    "live_grid_pm_delta_debounce_enable" => "1", "live_grid_pm_delta_soft_threshold_w" => "250", "live_grid_pm_delta_hard_threshold_w" => "2000",
-    "live_grid_pm_delta_persist_count" => "2", "live_grid_pm_delta_persist_window_s" => "20",
+    "wurzelzaehler" => "0",
+    "live_grid_pm_delta_soft_threshold_w" => "250",
     "ext_inverter_type" => "none", "ext_inverter_ip" => "", "ext_inverter_port" => "502", "ext_inverter_unit_id" => "1", "ext_inverter_poll_s" => "10", // Zusatzwechselrichter (Modbus TCP, nur lesend)
     "check_updates" => "1", "auto_update_enable" => "0", "auto_update_time" => "23:00",
 
     // Webansicht
-    "show_forecast" => "1", "frontend_variant" => "classic", "frontend_detail_mode" => "normal", "wbcostpowers" => "7.2, 11.0, 22.0", "darkmode" => "1", "web_pin" => "", "matter_bridge" => "0", "config_secret_protection_mode" => "standard",
+    "show_forecast" => "1", "frontend_variant" => "classic", "frontend_detail_mode" => "normal", "wbcostpowers" => "7.2, 11.0, 22.0", "darkmode" => "1", "web_pin" => "", "web_remote_pin_optout" => "0", "matter_bridge" => "0", "config_secret_protection_mode" => "standard",
 
     // Speicher (nur Rückfallwerte für storage_manager.py)
     "speichergroesse" => "15",
@@ -537,7 +542,7 @@ $defaults = [
     "storage_backup_grid_price_limit_ct" => "",
     "storage_central_pv_split_enable" => "0",
     "storage_central_pv_split_gate_hold_s" => "60",
-    "storage_home_wp_split" => "auto", // Wärmepumpe im Hauswert (auto/include/separate), Alias-Tabelle in storage_manager.py
+    "storage_home_wp_split" => "include", // Feste Einbindung der Wärmepumpe im Hausverbrauch
     "wb_restart_delay_s" => "60", "wb_min_charge_time_s" => "300", "wb_cloud_stop_delay_s" => "180",
     "wb_pv_only_release_hold_s" => "120", "wb_pv_only_hold_stale_guard_s" => "45",
     "wb_grid_import_settle_s" => "10",
@@ -577,6 +582,7 @@ $defaults = [
 ];
 
 $tooltips = [
+    "ui_secret_clear" => "Den gespeicherten Wert dieses Felds ausdrücklich leeren: auswählen und speichern. Ein leeres Eingabefeld allein erhält den bestehenden Wert.",
     "wb1_openwb_username" => "Eigenes openWB-Konto für diesen Slot. Bleibt lokal; leer lassen erhält den gespeicherten Wert. Keine Übernahme vom anderen Slot.",
     "wb1_openwb_password" => "Passwort des openWB-Kontos für diesen Slot. Leer lassen erhält den Wert einschließlich Leerzeichen. Wird nur verschlüsselt übertragen.",
     "wb1_openwb_tls_binding" => "Lokal bestätigtes vollständiges openWB-Zertifikat mit SHA-256 und Zielbindung. Änderungen und Ablauf sperren die Verbindung; kein automatischer Austausch.",
@@ -616,7 +622,7 @@ $tooltips = [
     "storage_curve_charge_servo_step_down_w" => "Schrittweite zum Absenken der ruhigen Kurven-Ladeleistung in Watt. Standard und Rückfall bei leer: 350 W. Werte unter 50 W, auch 0, werden auf 50 W begrenzt.",
     "storage_curve_charge_servo_max_age_s" => "Maximales Alter des vorigen ruhigen Kurven-Ladezustands in Sekunden. Standard und Rückfall bei leer: 3600 s. 0 deaktiviert nur diese Altersprüfung, nicht die übrigen Gültigkeitsbedingungen.",
     "ui_wp_bridge_preset" => "Voreinstellung für die Überbrückung bei kurzzeitig fehlendem PV-Überschuss. „Eigene Werte aus der Feinabstimmung“ verwendet die individuell eingestellten Werte. Änderungen werden erst nach dem Speichern wirksam.",
-    "ui_battery_target_soc" => "Ziel-Ladezustand für den manuellen Batterieauftrag in Prozent. Ohne aktiven Auftrag zeigt der Regler 100 %. Einstellbar sind 5 bis 100 %; leer oder 0 ist über diesen Schieberegler nicht wählbar. Erst Laden oder Entladen startet den Auftrag.",
+    "ui_battery_target_soc" => "Ziel-Ladezustand für den manuellen Batterieauftrag in Prozent. Ohne aktiven Auftrag zeigt der Regler 100 %. Einstellbar sind 5 bis 100 %; leer oder 0 ist über diesen Schieberegler nicht wählbar. Erst Laden oder Entladen startet den Auftrag. Beim Laden das erreichte Ziel sofort freigeben; ab 95 % auch dann beenden und den Speicher freigeben, wenn der SoC zehn Minuten lang nicht um mindestens 1 Prozentpunkt steigt.",
     "ui_wallbox_budget" => "Anzeige des wirksamen Hausanschlussrahmens abzüglich Reserve. Ohne Hausabsicherung ist Netzladen nicht möglich; für PV-Laden bleibt der Ersatzrahmen 35 A je Phase minus Reserve. Der Systemwert zählt als ausdrücklich eingetragene Hausabsicherung.",
     "ui_market_day_basis" => "Datenbasis für die reine Beispielrechnung wählen: einen typischen trüben Wintertag oder die vorhandene Prognose. Beim Börsentarif nur zusammenhängend bekannte Preise ab der nächsten Viertelstunde verwenden; bei eigener Prognose am früheren Ende stoppen. Die Auswahl wird nicht gespeichert.",
     "ui_extra_parameter" => "Zusätzlicher Parameter ohne hinterlegte Feldbeschreibung. Wirkung, Einheit, Standardwert sowie die Bedeutung von leer oder 0 sind dem Editor nicht bekannt und hängen vom auswertenden Dienst ab.",
@@ -642,13 +648,8 @@ $tooltips = [
     "aes_password"           => "RSCP AES-Passwort – direkt am E3DC-Display unter Einstellungen vergeben.",
     "e3dc_user"              => "Benutzername für das E3DC-Myreserve-Portal (benötigt für RSCP-Authentifizierung).",
     "e3dc_password"          => "Passwort für das E3DC-Myreserve-Portal.",
-    "wurzelzaehler"          => "PM-Index des Wurzelzählers für die Phasenwerte des Hausanschlusses. 0 sucht automatisch nach einem PM mit Phasenwerten. Ohne gültige Phasenwerte warten Wallboxstarts; laufende Ladungen nutzen die vorhandene Datenfrist.",
-    "wurzelzaehler_invertiert" => "Invertiert die Phasenwerte des Wurzelzählers. Die Zuordnung und das Vorzeichen müssen zum Hausanschluss passen; der EMS-Netzwert bleibt unverändert.",
-    "live_grid_pm_delta_debounce_enable" => "Kurze Abweichungen zwischen E3DC-Netzwert und Zählersumme entprellen und die Dauer für den Hinweis mitzählen. Ausgeschaltet entfällt der Hinweis. Hinweis und Diagnose sind kein Wartegrund. Die Datenvalidität wird getrennt geprüft.",
-    "live_grid_pm_delta_soft_threshold_w" => "Weicher Schwellwert der Abweichung zwischen E3DC-Netzwert und Zählersumme in Watt. Bleibt die Abweichung 5 Minuten durchgehend darüber, erscheint sie als Hinweis, ohne Ladefreigaben zu sperren.",
-    "live_grid_pm_delta_hard_threshold_w" => "Schwellwert der Abweichung in Watt, ab dem die Diagnose eine Differenz zwischen E3DC-Netzwert und Zählersumme sofort als bestätigt führt. Der Hinweis hängt davon nicht ab. Kein zusätzlicher Wartegrund.",
-    "live_grid_pm_delta_persist_count" => "Anzahl auffälliger Proben, nach der die Diagnose eine Abweichung von E3DC-Netzwert und Zählersumme als bestätigt führt. Der Hinweis hängt davon nicht ab; kein zusätzlicher Wartegrund.",
-    "live_grid_pm_delta_persist_window_s" => "Zeitfenster in Sekunden, in dem die Diagnose wiederholte Abweichungen von E3DC-Netzwert und Zählersumme zur Bestätigung zählt. Der Hinweis hängt davon nicht ab; kein zusätzlicher Wartegrund.",
+    "wurzelzaehler"          => "Netzzähler des E3DC für die Phasenwerte des Hausanschlusses. 0 verwendet die Zuordnung aus dem E3DC; ein eingetragener Zählerindex übersteuert sie. Änderungen wirken nach einem Neustart des Live-Dienstes. Ohne gültige Phasenwerte warten Wallboxstarts; laufende Ladungen nutzen die vorhandene Datenfrist.",
+    "live_grid_pm_delta_soft_threshold_w" => "Schwellwert der Abweichung zwischen E3DC-Netzwert und Zählersumme in Watt. Bleibt die Abweichung 5 Minuten durchgehend darüber, erscheint sie als Hinweis, ohne Ladefreigaben zu sperren.",
     "ext_inverter_type" => "Zusatzwechselrichter: none = keine Direktlesung (Standard), sungrow_modbus = Sungrow-String-Wechselrichter (SG-Serie) per Modbus TCP nur lesend abfragen. Nur setzen, wenn ein zweiter Wechselrichter über LAN erreichbar ist; die Regelung nutzt weiterhin den E3DC-Messwert des externen Leistungsmessers, die Direktlesung liefert Phasen-/String-Daten und Diagnose in live_data_py.json (Block ext_inverter).",
     "ext_inverter_ip" => "IPv4-Adresse des Zusatzwechselrichters bzw. seines Kommunikationsmoduls (Modbus TCP). Ohne gültige Adresse bleibt die Direktlesung deaktiviert.",
     "ext_inverter_port" => "Modbus-TCP-Port des Zusatzwechselrichters (Standard 502).",
@@ -663,7 +664,8 @@ $tooltips = [
     "frontend_variant"       => "Wählt das Dashboard-Layout. Klassisch bleibt der stabile Rückfallpfad; Modern aktiviert das neue Grid-/Badge-Frontend.",
     "frontend_detail_mode"   => "Steuert die Informationsdichte der neuen Oberfläche: kompakt, normal oder detailreich.",
     "darkmode"               => "Dashboard-Darstellung: 1=Dunkel (Standard), 0=Hell.",
-    "web_pin" => "Optional. Mindestens 6 Zeichen empfohlen, Buchstaben und Ziffern erlaubt. Leer lassen = kein Schutz.",
+    "web_pin" => "Optional. Mindestens 6 Zeichen empfohlen, Buchstaben und Ziffern erlaubt. Leer lassen = unverändert. Zum Entfernen „Wert löschen“ wählen. Mit Web-PIN fragt die Oberfläche nach einer Pause ohne Aufruf (meist 24 Minuten) oder nach dem Schließen von Browser bzw. App erneut nach der PIN. Ab der nächsten Version ist der Zugriff über Domainnamen (eigene Domain, DynDNS, MyFRITZ, Reverse-Proxy) nur mit Web-PIN möglich.",
+    "web_remote_pin_optout" => "Nur ohne Web-PIN wirksam. Nein: Beim Zugriff über einen Domainnamen erscheint ein Hinweis; ab der nächsten Version ist dieser Zugriff nur mit Web-PIN möglich. Ja: bewusst ohne Web-PIN weiter wie bisher, kein Hinweis und keine spätere Sperre. Dann kann jede im Browser geöffnete Webseite, die einen Domainnamen auf die Anlage umleitet, die Oberfläche bedienen. IP-Adressen und lokale Namen sind nie betroffen.",
     "wbcostpowers"           => "Typische Wallbox-Ladeleistungen in kW (komma-getrennt), z.B. '7.2, 11.0, 22.0'. Wird für Kostenberechnung genutzt.",
     "matter_bridge"          => "Aktiviert die Matter Bridge für Apple Home / Google Home / Alexa (Node.js Dienst erforderlich).",
     "config_secret_protection_mode" => "Standard schützt e3dc_v4.json und Config-Backups mit 660 für Install-User:www-data. Kompatibilität erlaubt 664 für eigene externe Leser.",
@@ -923,14 +925,14 @@ $tooltips = [
     "direct_marketing_negative_price_charge_target_soc_pct" => "Optionales Ziel für billige/negative Ladefenster. Wird nur mit aktivem Arbitrage-Owner und allen Freigaben genutzt.",
     "direct_marketing_low_price_curtail_enable" => "Erlaubt als letzten Schritt das Unterbinden von Netzeinspeisung ausschließlich bei negativen Marktpreisen. Positive EEG-/Billigpreisfenster bleiben weich und erlauben PV-Einspeisung.",
     "direct_marketing_low_price_curtail_limit_w" => "Ziel-Netzexport in Watt während der harten Negativpreis-Sperre. 0 bedeutet möglichst keine Einspeisung; höhere Werte erlauben einen kleinen Restexport.",
-    "direct_marketing_market_value_solar_enable" => "Aktiviert den read-only Marktwert-Solar-Monitor. Er berechnet nur einen vorläufigen Monatswert-Trend aus Solar-Hochrechnung und Spotpreisen und hat keine Regelwirkung.",
-    "direct_marketing_market_value_solar_source" => "Datenquelle für den vorläufigen Marktwert-Solar-Trend. Aktuell vorgesehen: Netztransparenz Solar-Hochrechnung.",
+    "direct_marketing_market_value_solar_enable" => "Experimentellen Marktwert-Solar-Monitor aktivieren. Vorläufigen Monatswert-Trend aus Netztransparenz-Solarhochrechnung und Day-Ahead-Preisen DE/LU des Monats von SMARD berechnen; keine Regelwirkung.",
+    "direct_marketing_market_value_solar_source" => "Datenquelle für den vorläufigen Marktwert-Solar-Trend. Netztransparenz-Solarhochrechnung mit Day-Ahead-Preisen DE/LU des Monats von SMARD gewichten.",
     "direct_marketing_aux_inverter_shelly_override" => "Steuerung für einen ungeregelten AC-Zusatzwechselrichter über Shelly-Schütz. Local/off lässt das lokale Shelly-Skript als Fallback zuständig. Central/on schaltet per E3DC-Control bei negativen DV-Preisen.",
     "direct_marketing_aux_inverter_shelly_ip" => "IPv4-Adresse des Shelly-Aktors für den Zusatzwechselrichter. Nur relevant, wenn die zentrale Shelly-Steuerung aktiv ist.",
     "direct_marketing_aux_inverter_shelly_invert" => "Invertiert die Relaislogik für NC-Schütze: Shelly EIN schaltet den Wechselrichter aus, Shelly AUS lässt ihn laufen.",
     "direct_marketing_aux_inverter_shelly_dynamic_unblock_enable" => "Bewusste Freigabe: Gibt den Zusatzwechselrichter bei Negativpreis nur bei gültigen Messwerten und hoher lokaler Last wieder frei. Standard ist Aus. Eine feste 10-Minuten-Schaltsperre schützt Relais und Schütz vor Flattern.",
     "direct_marketing_aux_inverter_shelly_unblock_threshold_w" => "Lokale Last, ab der der gesperrte Zusatzwechselrichter bei Negativpreis wieder freigegeben werden darf. Der Wert muss zur WR-Leistung passen und garantiert allein keinen exportfreien Betrieb.",
-    "netztransparenz_client_id" => "Client-ID aus dem Netztransparenz WebAPI-Portal für die Solar-Hochrechnung. Wird lokal gespeichert und in Diagnosen redigiert.",
+    "netztransparenz_client_id" => "Client-ID aus dem Netztransparenz WebAPI-Portal nur für die Solar-Hochrechnung; Day-Ahead-Preise DE/LU kommen ohne diese Zugangsdaten von SMARD. Wird lokal gespeichert und in Diagnosen redigiert.",
     "netztransparenz_client_secret" => "Client-Secret aus dem Netztransparenz WebAPI-Portal. Wird lokal gespeichert, als Passwortfeld angezeigt und in Diagnosen redigiert.",
     "direct_marketing_eeg_enable" => "Aktiviert die EEG-/Marktprämien-Bewertung für förderfähige PV-Einspeisung. Gilt nicht für Netzstrom-Arbitrage.",
     "direct_marketing_eeg_commissioning_date" => "Inbetriebnahmedatum der EEG-Anlage. Dient nur zur Einordnung des Förderzeitraums.",
@@ -1019,7 +1021,7 @@ $tooltips = [
     "idm_pv_surplus_heartbeat_s" => "Spätestens nach dieser Zeit wird Register 74 erneut geschrieben, auch wenn sich der Wert kaum geändert hat.",
     "idm_pv_surplus_min_write_interval_s" => "Mindestabstand zwischen zwei Register-74-Schreibbefehlen. Schont die iDM-Schnittstelle und macht die Rampe ruhiger.",
     "idm_cooling_boost_min_at" => "Ab dieser gemittelten Außentemperatur darf E3DC-Control bei iDM zusätzlich Kühlung anfordern. Darunter bleibt der Sommer-Boost bei Warmwasser und Register-74-Überschuss.",
-    "auto_mode"              => "Automatik-Regelung: 1=Aktiv (Sys regelt), 0=Monitor-Modus (nur Logging, kein Eingriff).",
+    "auto_mode"              => "Automatik-Regelung: 1=Aktiv, 0=Automatik aus. Eigene Aufträge enden sofort; ein laufender Verdichter behält seine Mindestlaufzeit. Danach nimmt E3DC-Control eigene Freigaben einmal zurück. Die Messung läuft weiter.",
     "grid_start_limit"       => "Der Betrag legt das benötigte freie Verbraucherbudget nach Akkuladung fest, nicht die Einspeisung am Netzpunkt. Negativ eintragen: -4500 steht für 4500 W benötigtes Budget. Das Vorzeichen bleibt für die PV-Pause wichtig: Deren laufender Ende-Timer wird bei Netzleistung über Start-Grenze plus 500 W zurückgesetzt. Bei +4500 geschieht das erst über 5000 W Netzbezug, bei -4500 sobald die Einspeisung unter 4000 W fällt. Die Zuteilung benötigt mindestens 1500 W; mit kleinerem Betrag startet die WP nicht. Verbraucherprioritäten gelten weiterhin.",
     "pv_boost_delay"         => "Durchgehende Freigabe vor dem PV-Boost in Sekunden; schützt vor kurzen Wolkenlücken. Standard: 30 s. SG Ready reserviert mindestens 150 s, bei langen Verzögerungen mindestens Verzögerung plus 120 s. Ab dem normalen Reservierungsfenster weist die Konfigurationsprüfung auf die lange Budgetbindung hin.",
     "stop_delay_minutes"     => "Minuten nach denen der Boost gestoppt wird wenn das Limit unterschritten bleibt. Standard: 10 Min.",
@@ -1131,7 +1133,7 @@ $tooltips = [
     "storage_backup_grid_charge_enable" => "Eigener Schalter, Standard aus. Bei Beobachten nur Rechnung, bei Halten begrenzter Netzladeauftrag zum Bezugspreis. Gilt auch für feste und gleichpreisige Tarife. Preis- oder Tarifausfall verhindert Netzladen; der SoC muss frisch sein.",
     "storage_backup_grid_price_limit_ct" => "Explizite Obergrenze des vollständigen Bezugspreises in ct/kWh. Nur Preise streng unter der Grenze sind Kandidaten; bei Gleichstand zuerst die frühere Zeit. Feste Tarife sind zulässig. Keine behauptete Arbitrageersparnis; nur verbleibendes Defizit nach einmaligen Ladebeiträgen, ohne Mindestmenge.",
     "storage_central_pv_split_enable" => "Experimentell, Standard aus: Bereits bei gestecktem Fahrzeug berechnet der Speicher für eine geregelte Wallbox den PV-Rest nach seinem Kurvenbedarf als absoluten Wallboxrahmen. Reicht der Kandidat nicht für die Mindestleistung, bleibt die Box ohne zusätzliche Akkugrenze stehen. Ein ausreichender Kandidat kann den Akku für die Bestätigung des Startangebots begrenzen; im Zentralmodus endet ein erfolgloses Startangebot nicht von selbst. Der Experten-Schalter ist standardmäßig aus. Grundladung, Preis-/Slot-/Boostfenster, Pre-Dump und die Haltezone bleiben unverändert. Bei zu kleinem Rahmen bleibt die laufende Mindestladung zeitlich durch das Konto Kurvenrückstand begrenzt. An dessen Grenze folgt ein gedeckter Abstieg auf eine Phase oder Stop. Der Wiederanlauf verlangt einen stabil ausreichenden Rahmen mit Hysterese; Schutzregeln bleiben vorrangig. Zum Rückfall ausschalten.",
-    "storage_home_wp_split" => "Wärmepumpe im Hauswert: Sagt dem Speicher-Manager, ob die Leistung der Wärmepumpe schon im Hauswert des E3DC steckt. „Wärmepumpe steckt im Hauswert“ (include): Das E3DC misst die Wärmepumpe im Hausverbrauch mit – typisch ohne separaten Wurzelzähler, wenn die Wärmepumpe hinter dem E3DC-Hausanschluss hängt; die Regelung rechnet die gemeldete WP-Leistung aus dem Hauswert heraus und führt Haus und Wärmepumpe getrennt. „Wärmepumpe getrennt gemessen“ (separate): Die Wärmepumpe hängt an einem eigenen Zähler außerhalb des E3DC-Hauswerts und zählt zusätzlich dazu. „Automatisch“ (auto, Standard): Die Regelung rät je Messung – die Wärmepumpe gilt als im Hauswert enthalten, wenn der rohe Hauswert mindestens 500 W bzw. 55 % der WP-Leistung erreicht. Achtung: Bei kleiner Rohhauslast (z. B. Verdichterstopp, der Hauswert fällt vor der WP-Leistung) kann die Automatik zwischen beiden Sichten springen; wer seine Anlage kennt, wählt deshalb fest include oder separate.",
+    "storage_home_wp_split" => "Feste Einbindung der Wärmepumpe wählen: Im Hausverbrauch bedeutet, dass das E3DC die Wärmepumpe bereits mitmisst. Getrennt gemessen bedeutet, dass ihre Leistung außerhalb des E3DC-Hausverbrauchs liegt. Der bisherige automatische Wert gilt beim Lesen als im Hausverbrauch; die Auswahl beim nächsten Speichern bestätigen.",
     "grid_max_amps" => "Hausabsicherung/SLS in Ampere je Phase. Leer verwendet den Systemwert aus dem E3DC. Ein niedrigerer Nutzerwert gilt unmittelbar; ein höherer Wert erst nach Bestätigung. Ohne beide Werte ist Netzladen nicht möglich, PV-Laden bleibt mit Ersatzrahmen möglich. Zusatzsicherung je Phase und Reserve für übrige Hausverbraucher bleiben eigene Felder.",
     "grid_max_amps_confirmed" => "Bestätigung für genau den Nutzerwert der Hausabsicherung; Standard: leer. Leer oder 0 bestätigt keinen höheren Wert. Nach einer Änderung erneut bestätigen, damit ein höherer Nutzerwert statt des Systemwerts gilt.",
     "grid_max_amps_l1"       => "Optionales abweichendes Betriebslimit für Netzphase L1. Leer verwendet die globale Hausabsicherung. Nur einen tatsächlich bekannten Wert eintragen.",
@@ -1289,6 +1291,7 @@ function readConfig($file_path) {
                 $value = is_bool($val) ? ($val ? '1' : '0') : (string)$val;
                 $config[strtolower($key)] = ['value' => $value, 'commented' => false];
             }
+            unset($config['wurzelzaehler_invertiert']);
             return $config;
         }
     } catch (Exception $e) {}
@@ -1410,7 +1413,7 @@ function e3dc_openwb_account_values(array $posted, array $current, array $action
         unset($posted[$prefix . 'tls_binding']);
         foreach (['username', 'password'] as $field) {
             $key = $prefix . $field;
-            if (array_key_exists($key, $posted) && $posted[$key] === '') unset($posted[$key]);
+            if (array_key_exists($key, $posted) && $posted[$key] === '' && ($actions['clear_secrets'][$key] ?? '') !== '1') unset($posted[$key]);
             if (!empty($actions['openwb_clear_' . $slot])) $posted[$key] = '';
         }
         if (!empty($actions['openwb_copy_' . $slot])) {
@@ -1538,7 +1541,7 @@ function e3dc_config_auto_install_rules() {
         'live' => [
             'label' => 'E3DC Live Data',
             'service' => 'e3dc-live',
-            'config_keys' => ['server_ip', 'server_port', 'e3dc_user', 'e3dc_password', 'aes_password', 'wurzelzaehler', 'wurzelzaehler_invertiert'],
+            'config_keys' => ['server_ip', 'server_port', 'e3dc_user', 'e3dc_password', 'aes_password', 'wurzelzaehler'],
             'when' => ['all' => [['type' => 'address', 'key' => 'server_ip'], ['type' => 'nonempty', 'key' => 'e3dc_user'], ['type' => 'nonempty', 'key' => 'aes_password']]],
         ],
         'wallbox' => [
@@ -1942,15 +1945,7 @@ function e3dc_apply_config_backup_dir_permissions($path, $install_user, $data = 
 }
 
 function e3dc_config_sensitive_key($key) {
-    if (preg_match('/^wb[12]_openwb_tls_/', (string)$key)) return true;
-    $k = strtolower((string)$key);
-    // Wie ha_manager.is_secret_config_key und die Installationszentrale:
-    // *_pass, *_pw, *_pin und passwd sowie die Anmeldenamen von Geräte- und
-    // Dienstkonten sind Zugangsdaten.
-    if (preg_match('/(password|passwort|passwd|pwd|(?:^|[_-])pass(?:$|[_-])|(?:^|[_-])pw(?:$|[_-])|(?:^|[_-])pin$|token|secret|api[_-]?key|apikey|aes|private|chat[_-]?id|web[_-]?pin|refresh[_-]?token|bluelink[_-]?pin|bluelink[_-]?user|^(?:e3dc_user|mqtt_hub_user|wb2?_user|stiebel_isg_web_user)$|(?:^|[_-])username$)/', $k)) {
-        return true;
-    }
-    return in_array($k, ['hoehe', 'laenge', 'latitude', 'longitude', 'email'], true);
+    return e3dcIsSensitiveConfigKey($key);
 }
 
 function e3dc_config_redact_export_value($key, $value) {
@@ -2922,7 +2917,8 @@ function e3dc_config_import_keep_local_secrets(array $import, $current, bool $re
     $current = is_array($current) ? $current : [];
     $out = [];
     foreach ($import as $key => $value) {
-        if ($value === '***REDACTED***' || ($redactedExport && $value === [] && e3dc_config_sensitive_key($key))) {
+        if ($value === '***REDACTED***' || (e3dc_config_editor_secret_key($key) && ($value === '' || $value === null || $value === []))
+            || ($redactedExport && $value === [] && e3dc_config_sensitive_key($key))) {
             $local = array_key_exists($key, $current) ? $current[$key] : null;
             if (array_key_exists($key, $current)) $out[$key] = $local;
             if ($local === null || $local === '' || $local === [] || $local === '***REDACTED***') {
@@ -3694,8 +3690,7 @@ GRAPHQL;
         return ['success' => false, 'message' => 'Tibber API hat keine gültige JSON-Antwort geliefert.'];
     }
     if (!empty($decoded['errors']) && is_array($decoded['errors'])) {
-        $firstError = $decoded['errors'][0]['message'] ?? 'unbekannter API-Fehler';
-        return ['success' => false, 'message' => 'Tibber API Fehler: ' . (string)$firstError];
+        return ['success' => false, 'message' => 'Tibber API meldet einen Fehler. Zugang und Berechtigungen prüfen.'];
     }
 
     $homes = $decoded['data']['viewer']['homes'] ?? [];
@@ -3815,7 +3810,7 @@ if (in_array(($_GET['config_action'] ?? ''), ['download', 'download_redacted'], 
     if ($rawDownload && !e3dc_config_raw_download_pin_enabled($export_data)) {
         http_response_code(403);
         header('Content-Type: text/plain; charset=utf-8');
-        echo "Raw-Config-Download ist erst verfügbar, wenn eine Web-PIN gesetzt ist. Nutze bis dahin „Einstellungen ohne Zugangsdaten“.";
+        echo "Raw-Config-Download ist erst verfügbar, wenn eine Web-PIN gesetzt ist. Bis dahin „Einstellungen ohne Zugangsdaten“ verwenden.";
         exit;
     }
     if ($rawDownload && (string)($_GET['raw_confirm'] ?? '') !== '1') {
@@ -3900,7 +3895,8 @@ if ($configEditorRequestMethod === 'POST') {
         requireWebAuth(false);
         header('Content-Type: application/json; charset=utf-8');
         $postedValues = (isset($_POST['values']) && is_array($_POST['values'])) ? $_POST['values'] : [];
-        $token = $postedValues['tibber_api_token'] ?? ($_POST['tibber_api_token'] ?? '');
+        $currentData = e3dc_read_existing_v4_json($v4_config_file_path) ?? [];
+        $token = e3dc_config_editor_test_value($postedValues + $_POST, $currentData, 'tibber_api_token');
         $homeId = $postedValues['tibber_home_id'] ?? ($_POST['tibber_home_id'] ?? '');
         echo json_encode(e3dc_tibber_api_test($token, $homeId), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
         exit;
@@ -3908,7 +3904,8 @@ if ($configEditorRequestMethod === 'POST') {
         requireWebAuth(false);
         header('Content-Type: application/json; charset=utf-8');
         $postedValues = (isset($_POST['values']) && is_array($_POST['values'])) ? $_POST['values'] : [];
-        $token = $postedValues['entsoe_api_token'] ?? ($_POST['entsoe_api_token'] ?? '');
+        $currentData = e3dc_read_existing_v4_json($v4_config_file_path) ?? [];
+        $token = e3dc_config_editor_test_value($postedValues + $_POST, $currentData, 'entsoe_api_token');
         echo json_encode(e3dc_entsoe_api_test($token), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
         exit;
     } elseif (($_POST['config_action'] ?? '') === 'disable_legacy_heat_market') {
@@ -3956,7 +3953,9 @@ if ($configEditorRequestMethod === 'POST') {
             $telegramConfig = $currentData;
             foreach (['telegram_token', 'telegram_chat_id', 'telegram_device_name'] as $telegramKey) {
                 if (array_key_exists($telegramKey, $postedValues) && !is_array($postedValues[$telegramKey])) {
-                    $telegramConfig[$telegramKey] = trim((string)$postedValues[$telegramKey]);
+                    $telegramConfig[$telegramKey] = e3dc_config_editor_secret_key($telegramKey)
+                        ? e3dc_config_editor_test_value($postedValues, $currentData, $telegramKey)
+                        : trim((string)$postedValues[$telegramKey]);
                 }
             }
             require_once __DIR__ . '/send_status_telegram.php';
@@ -4119,6 +4118,8 @@ if ($configEditorRequestMethod === 'POST') {
                         $dropped = [];
                         $keptLocal = [];
                         $backup_data = e3dc_config_import_shadow_filter($backup_data, $boundCurrent, $dropped, $keptLocal, $haAnchorMode);
+                        $secretStats = [];
+                        $backup_data = e3dc_config_import_keep_local_secrets($backup_data, $boundCurrent, false, $secretStats);
                         $next = e3dc_config_preserve_local_keys($boundCurrent, $backup_data);
                         $next = e3dc_openwb_local_trust($boundCurrent, $next);
                         $next = e3dc_config_ha_off_after_confirmation($next, $haPartnerOffConfirmed, $haAnchorMode);
@@ -4247,7 +4248,12 @@ if ($configEditorRequestMethod === 'POST') {
         unset($v4_data['stop']);
         $old_v4_data = $v4_data;
 
+        $posted_values = e3dc_config_editor_secret_values(
+            is_array($posted_values) ? $posted_values : [],
+            is_array($_POST['clear_secrets'] ?? null) ? $_POST['clear_secrets'] : []
+        );
         $posted_values = e3dc_openwb_account_values($posted_values, $v4_data, $_POST);
+        unset($posted_values['wurzelzaehler_invertiert']);
 
         // Alle geposteten Werte übernehmen & Typen konvertieren
         $guard_warnings = [];
@@ -4287,11 +4293,7 @@ if ($configEditorRequestMethod === 'POST') {
 
         if (array_key_exists('shadow_snapshot_token', $posted_values)) {
             $shadowTokenPosted = trim((string)$posted_values['shadow_snapshot_token']);
-            if ($shadowTokenPosted === '') {
-                // Passwortfeld bleibt absichtlich leer und überschreibt ein
-                // vorhandenes Peer-Geheimnis nicht.
-                unset($posted_values['shadow_snapshot_token']);
-            } elseif (preg_match('/\A[0-9a-fA-F]{64}\z/D', $shadowTokenPosted) !== 1) {
+            if ($shadowTokenPosted !== '' && preg_match('/\A[0-9a-fA-F]{64}\z/D', $shadowTokenPosted) !== 1) {
                 unset($posted_values['shadow_snapshot_token']);
                 $config_validation_failed = true;
                 $guard_warnings[] = 'Shadow Snapshot Token nicht gespeichert: erforderlich sind exakt 64 Hex-Zeichen.';
@@ -4543,6 +4545,18 @@ if ($configEditorRequestMethod === 'POST') {
         }
         if ($fuseRejectedSwitches) $guard_warnings[] = e3dcHouseFuseMessage($fuseProblem);
 
+        foreach (array_keys($posted_values) as $key) {
+            $localKey = strtolower(trim((string)$key));
+            if (e3dc_config_editor_protected_extra_key($key)
+                && in_array($localKey, e3dc_config_import_local_keys(), true)) {
+                $posted = $posted_values[$key];
+                unset($posted_values[$key]);
+                if (!is_scalar($posted) || (string)$posted !== (string)($v4_data[$localKey] ?? '')) {
+                    $guard_warnings[] = 'Der Parameter ' . $key . ' wird nur vom Installer gesetzt.';
+                }
+            }
+        }
+
         foreach ($posted_values as $key => $value) {
             if (is_array($value) || is_object($value)) {
                 continue;
@@ -4613,7 +4627,10 @@ if ($configEditorRequestMethod === 'POST') {
         }
         if (!$config_load_failed && !$config_validation_failed) {
             $mutation = e3dcMutateV4ConfigDetailed(
-                static function($boundCurrent) use ($v4_data) {
+                static function($boundCurrent) use ($v4_data, $posted_values) {
+                    foreach ($boundCurrent as $key => $value) {
+                        if (e3dc_config_editor_secret_key($key) && !array_key_exists($key, $posted_values)) $v4_data[$key] = $value;
+                    }
                     return [
                         'success' => true,
                         'data' => e3dc_openwb_local_trust($boundCurrent, e3dc_storage_market_prepare_config(e3dc_aux_inverter_prepare_config($v4_data))),
@@ -4923,20 +4940,24 @@ $groups = [
         "shadow_master_url", "shadow_master_ip", "shadow_snapshot_token", "shadow_sync_interval_s", "shadow_fetch_timeout_s", "shadow_snapshot_max_age_s"
     ],
     "E3DC System-Verbindung" => [
-        "server_ip", "server_port", "e3dc_user", "e3dc_password", "aes_password", "wurzelzaehler", "wurzelzaehler_invertiert",
-        "live_grid_pm_delta_debounce_enable", "live_grid_pm_delta_soft_threshold_w", "live_grid_pm_delta_hard_threshold_w",
-        "live_grid_pm_delta_persist_count", "live_grid_pm_delta_persist_window_s"
+        "server_ip", "server_port", "e3dc_user", "e3dc_password", "aes_password", "wurzelzaehler",
+        "live_grid_pm_delta_soft_threshold_w"
     ],
     // Zusatzwechselrichter (Sungrow Modbus TCP, nur lesend) – generischer Renderer, Typ als Auswahl.
     "Zusatzwechselrichter" => [
         "ext_inverter_type", "ext_inverter_ip", "ext_inverter_port", "ext_inverter_unit_id", "ext_inverter_poll_s"
     ],
-    "Webansicht & Updates" => [
-        "frontend_variant", "frontend_detail_mode", "show_forecast", "darkmode", "web_pin", "config_secret_protection_mode", "check_updates", "auto_update_enable", "auto_update_time"
+    "Sicherheit, Webansicht & Updates" => [
+        "frontend_variant", "frontend_detail_mode", "show_forecast", "darkmode", "web_pin", "web_remote_pin_optout", "config_secret_protection_mode", "check_updates", "auto_update_enable", "auto_update_time"
     ],
     "Sonstiges" => []
 ];
 $frontendHiddenKeys = [
+    'storage_soc_jump_guard_enable', 'storage_soc_jump_guard_min_drop_pct',
+    'storage_soc_jump_guard_max_drop_pct_per_min', 'storage_soc_jump_guard_base_margin_pct',
+    'storage_soc_jump_guard_reserve_margin_pct', 'storage_curve_control_soc_enable',
+    'storage_curve_control_soc_band_pct', 'storage_curve_control_soc_reset_pct',
+    'wallbox_live_stale_guard_s',
     // Altlast ohne Wirkung; nach zwei Releases entfernbar.
     'tl_enable', 'storage_pv_floor_ratio', 'storage_pv_floor_threshold_w', 'storage_pv_floor_max_w',
     'wb_phase_down_delay_s', 'wb1_phase_down_delay_s', 'wb2_phase_down_delay_s',
@@ -5322,6 +5343,25 @@ if ($available_backups) {
 } else {
     $available_backups = [];
 }
+
+// Ab hier ausschließlich Darstellungsdaten: gespeicherte Geheimnisse verlassen den Server nicht.
+$configSecretStates = [];
+$secretStateData = e3dc_read_existing_v4_json($v4_config_file_path) ?? [];
+$rawConfigDownloadAllowed = e3dc_config_raw_download_pin_enabled($secretStateData);
+$openwbTrustConfigured = [];
+foreach ([1, 2] as $slot) {
+    $binding = $secretStateData['wb' . $slot . '_openwb_tls_binding'] ?? null;
+    if (is_string($binding)) $binding = json_decode($binding, true);
+    $openwbTrustConfigured[$slot] = is_array($binding) && !empty($binding['sha256']);
+}
+foreach (array_unique(array_merge(array_keys($defaults), array_keys($config), array_keys($secretStateData))) as $key) {
+    if (!e3dc_config_editor_secret_key($key)) continue;
+    $storedSecret = $secretStateData[$key] ?? ($config[$key]['value'] ?? '');
+    $configSecretStates[$key] = is_array($storedSecret) ? $storedSecret !== [] : (string)$storedSecret !== '';
+    if (isset($config[$key])) $config[$key]['value'] = '';
+    if (array_key_exists($key, $defaults)) $defaults[$key] = '';
+}
+
 ?>
 
 <script>
@@ -6468,7 +6508,7 @@ async function readConfirmedConfigJson(response) {
                         </div>
                         <div class="col-md-6">
                             <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['aes_password'] ?? '') ?>">RSCP Passwort</label>
-                            <input type="password" name="values[aes_password]" class="form-control config-input" data-simple-config-field value="<?= $simpleVal('aes_password') ?>">
+                            <input type="password" name="values[aes_password]" class="form-control config-input" data-simple-config-field value="<?= $simpleVal('aes_password') ?>" <?= e3dc_config_editor_secret_attributes('aes_password') ?>><?= e3dc_config_editor_secret_notice('aes_password', $configSecretStates) ?>
                         </div>
                     </div>
                 </section>
@@ -6529,7 +6569,7 @@ async function readConfirmedConfigJson(response) {
                         </div>
                         <div class="col-md-6 simple-tariff-entsoe" style="display: <?= ($simpleTariffType === 'tibber' || ($simpleTariffType === 'epex' && in_array($simpleRaw('tariff_provider', 'smard'), ['smard', 'entsoe'], true))) ? 'block' : 'none' ?>;">
                             <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['entsoe_api_token'] ?? '') ?>">ENTSO-E API-Token</label>
-                            <input type="password" name="values[entsoe_api_token]" class="form-control config-input" data-simple-config-field value="<?= $simpleVal('entsoe_api_token') ?>" autocomplete="off" placeholder="RESTful API Security Token">
+                            <input type="password" name="values[entsoe_api_token]" class="form-control config-input" data-simple-config-field value="<?= $simpleVal('entsoe_api_token') ?>" placeholder="RESTful API Security Token" <?= e3dc_config_editor_secret_attributes('entsoe_api_token') ?>><?= e3dc_config_editor_secret_notice('entsoe_api_token', $configSecretStates) ?>
                         </div>
                         <div class="col-12 simple-tariff-entsoe" style="display: <?= ($simpleTariffType === 'tibber' || ($simpleTariffType === 'epex' && in_array($simpleRaw('tariff_provider', 'smard'), ['smard', 'entsoe'], true))) ? 'block' : 'none' ?>;">
                             <div class="d-flex flex-wrap align-items-center gap-2">
@@ -6544,7 +6584,7 @@ async function readConfirmedConfigJson(response) {
                         </div>
                         <div class="col-md-6 simple-tariff-tibber" style="display: <?= $simpleTariffType === 'tibber' ? 'block' : 'none' ?>;">
                             <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['tibber_api_token'] ?? '') ?>">Tibber API-Token</label>
-                            <input type="password" name="values[tibber_api_token]" class="form-control config-input" data-simple-config-field value="<?= $simpleVal('tibber_api_token') ?>" autocomplete="off">
+                            <input type="password" name="values[tibber_api_token]" class="form-control config-input" data-simple-config-field value="<?= $simpleVal('tibber_api_token') ?>" <?= e3dc_config_editor_secret_attributes('tibber_api_token') ?>><?= e3dc_config_editor_secret_notice('tibber_api_token', $configSecretStates) ?>
                         </div>
                         <div class="col-md-6 simple-tariff-tibber" style="display: <?= $simpleTariffType === 'tibber' ? 'block' : 'none' ?>;">
                             <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['tibber_home_id'] ?? '') ?>">Tibber Home-ID</label>
@@ -6684,6 +6724,7 @@ async function readConfirmedConfigJson(response) {
                             <div class="form-check form-switch p-0 ps-5">
                                 <input class="form-check-input" type="checkbox" name="values[auto_mode]" value="1" id="simple_auto_mode" data-simple-config-field <?= $simpleBool('auto_mode', true) ? 'checked' : '' ?>>
                                 <label class="form-check-label config-label" for="simple_auto_mode" data-tooltip="<?= htmlspecialchars($tooltipMap['auto_mode'] ?? '') ?>">Automatik darf steuern</label>
+                                <small class="d-block text-muted">Beim Ausschalten: Auftrag sofort beendet. Ein laufender Verdichter läuft seine Mindestlaufzeit zu Ende.</small>
                             </div>
                         </div>
                         <div class="col-md-6">
@@ -6779,7 +6820,7 @@ async function readConfirmedConfigJson(response) {
         $allGroupKeys = array_map('strtolower', array_merge($frontendHiddenKeys, ...array_values($groups)));
 
         // Render-Funktion für eine Gruppe
-        $renderGroup = function($title, $keys) use ($config, $defaults, $tooltipMap, $eba_groups, $configValidationMarker, $peakEffectiveReservePct, $peakEffectiveStorageKwh, $peakReserveSourceLabel, $v4_config_file_path, $install_path, $configInstallCenterUrl, $pv_topology_raw_ui, $pv_topology_json_ui, $pv_topology_has_explicit_ui, $pv_topology_stored_valid_ui) {
+        $renderGroup = function($title, $keys) use ($config, $configSecretStates, $openwbTrustConfigured, $defaults, $tooltipMap, $eba_groups, $configValidationMarker, $peakEffectiveReservePct, $peakEffectiveStorageKwh, $peakReserveSourceLabel, $v4_config_file_path, $install_path, $configInstallCenterUrl, $pv_topology_raw_ui, $pv_topology_json_ui, $pv_topology_has_explicit_ui, $pv_topology_stored_valid_ui) {
             $items = [];
             $groupSearchText = htmlspecialchars(strtolower($title . ' ' . implode(' ', (array)$keys)));
 
@@ -6906,6 +6947,7 @@ async function readConfirmedConfigJson(response) {
                             <input type="hidden" name="values[auto_mode]" value="0">
                             <input class="form-check-input" type="checkbox" name="values[auto_mode]" value="1" id="conf_auto" <?= $isTrue('auto_mode') ? 'checked' : '' ?> style="transform: scale(1.2); margin-left: -2.5em;">
                             <label class="form-check-label ms-2 config-label" for="conf_auto" data-tooltip="<?= htmlspecialchars($tooltipMap['auto_mode'] ?? '') ?>">Automatik darf Geräte steuern</label>
+                                <small class="d-block text-muted">Beim Ausschalten: Auftrag sofort beendet. Ein laufender Verdichter läuft seine Mindestlaufzeit zu Ende.</small>
                         </div>
                         <div class="small text-muted mt-2">
                             <?= $wp_type_val === '7'
@@ -7089,7 +7131,7 @@ async function readConfirmedConfigJson(response) {
                                 </div>
                                 <div class="col-12 col-md-4">
                                     <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['stiebel_isg_web_password'] ?? '') ?>">Web Passwort</label>
-                                    <input type="password" name="values[stiebel_isg_web_password]" class="form-control config-input" value="<?= $val('stiebel_isg_web_password') ?>" placeholder="optional">
+                                    <input type="password" name="values[stiebel_isg_web_password]" class="form-control config-input" value="<?= $val('stiebel_isg_web_password') ?>" placeholder="optional" <?= e3dc_config_editor_secret_attributes('stiebel_isg_web_password') ?>><?= e3dc_config_editor_secret_notice('stiebel_isg_web_password', $configSecretStates) ?>
                                 </div>
                                 <div class="col-12 mt-2">
                                     <label class="config-label text-info fw-bold"><i class="fas fa-bolt me-1"></i>Externer Leistungsmesser</label>
@@ -7617,7 +7659,7 @@ async function readConfirmedConfigJson(response) {
                                         </div>
                                         <div class="col-12 col-md-4">
                                             <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['climate_toshiba_password'] ?? '') ?>">Toshiba Passwort</label>
-                                            <input type="password" name="values[climate_toshiba_password]" id="conf_climate_toshiba_password" class="form-control config-input" value="<?= $val('climate_toshiba_password') ?>" autocomplete="current-password">
+                                            <input type="password" name="values[climate_toshiba_password]" id="conf_climate_toshiba_password" class="form-control config-input" value="<?= $val('climate_toshiba_password') ?>" <?= e3dc_config_editor_secret_attributes('climate_toshiba_password') ?>><?= e3dc_config_editor_secret_notice('climate_toshiba_password', $configSecretStates) ?>
                                         </div>
                                         <div class="col-12 col-md-4">
                                             <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['climate_toshiba_device_ids'] ?? '') ?>">Geräteauswahl</label>
@@ -8240,7 +8282,6 @@ async function readConfirmedConfigJson(response) {
                     $prefix = 'wb' . $openwbSlot . '_openwb_';
                     $type = $openwbSlot === 1 ? $wbTypeDisplay : $wbType2;
                     if ($type !== 'openwb') continue;
-                    $trust = json_decode((string)$rawVal($prefix . 'tls_binding'), true);
                     $transportFile = '/var/www/html/ramdisk/openwb_data' . ($openwbSlot === 1 ? '' : '_wb2') . '.json';
                     $transportState = is_file($transportFile) && time() - filemtime($transportFile) < 30
                         ? json_decode((string)@file_get_contents($transportFile), true) : [];
@@ -8252,11 +8293,10 @@ async function readConfirmedConfigJson(response) {
                         <label class="config-label mt-2" data-tooltip="<?= htmlspecialchars($tooltipMap['wb1_openwb_username'] ?? '') ?>">openWB Benutzer</label>
                         <input type="text" class="form-control config-input" name="values[<?= $prefix ?>username]" value="" autocomplete="off" placeholder="<?= $rawVal($prefix . 'username') !== '' ? 'gesetzt – leer lassen zum Erhalten' : 'nicht gesetzt' ?>">
                         <label class="config-label mt-2" data-tooltip="<?= htmlspecialchars($tooltipMap['wb1_openwb_password'] ?? '') ?>">openWB Passwort</label>
-                        <input type="password" class="form-control config-input" name="values[<?= $prefix ?>password]" value="" autocomplete="new-password" placeholder="<?= $rawVal($prefix . 'password') !== '' ? 'gesetzt – leer lassen zum Erhalten' : 'nicht gesetzt' ?>">
+                        <input type="password" class="form-control config-input" name="values[<?= $prefix ?>password]" value="" placeholder="Leer lassen = unverändert" <?= e3dc_config_editor_secret_attributes($prefix . 'password') ?>><?= e3dc_config_editor_secret_notice($prefix . 'password', $configSecretStates, false) ?>
                         <label class="d-block small mt-2" data-tooltip="<?= htmlspecialchars($tooltipMap['ui_openwb_copy'] ?? '') ?>"><input type="checkbox" name="openwb_copy_<?= $openwbSlot ?>" value="1"> Bestehende HTTP-Zugangsdaten dieses Slots ausdrücklich übernehmen</label>
                         <label class="d-block small" data-tooltip="<?= htmlspecialchars($tooltipMap['ui_openwb_clear'] ?? '') ?>"><input type="checkbox" name="openwb_clear_<?= $openwbSlot ?>" value="1"> openWB-Konto dieses Slots löschen</label>
-                        <div class="mt-2">Zertifikat: <?= !empty($trust['sha256']) ? 'lokal bestätigt' : 'keine lokale Bindung (reguläre CA-Prüfung bleibt aktiv)' ?></div>
-                        <code><?= htmlspecialchars((string)($trust['sha256'] ?? ''), ENT_QUOTES, 'UTF-8') ?></code>
+                        <div class="mt-2">Zertifikat: <?= !empty($openwbTrustConfigured[$openwbSlot]) ? 'lokal bestätigt' : 'keine lokale Bindung (reguläre CA-Prüfung bleibt aktiv)' ?></div>
                         <button type="button" class="btn btn-sm btn-outline-info mt-2" onclick="openwbCertificate(<?= $openwbSlot ?>)">Zertifikat prüfen und bestätigen</button>
                         <div id="openwb_certificate_<?= $openwbSlot ?>" class="small mt-2" aria-live="polite"></div>
                         <div class="small mt-2">Adresse zuerst speichern. Mit Benutzerkonto oder Zertifikatsbindung ist HTTPS verbindlich. Ohne Konto und Zertifikatsbindung sind unverschlüsselte Altanlagen mit http:// oder einer bloßen Adresse möglich. Zugangsdaten werden niemals unverschlüsselt gesendet.</div>
@@ -8689,12 +8729,12 @@ async function readConfirmedConfigJson(response) {
                     </div>
                     <div class="col-12 col-md-6 config-item">
                         <label class="config-label text-info" data-tooltip="<?= htmlspecialchars($tooltipMap['bluelink_password'] ?? '') ?>">Passwort</label>
-                        <input type="password" name="values[bluelink_password]" class="form-control config-input" value="<?= $val('bluelink_password') ?>" autocomplete="new-password" spellcheck="false" placeholder="Passwort des Hyundai/Kia-Kontos">
+                        <input type="password" name="values[bluelink_password]" class="form-control config-input" value="<?= $val('bluelink_password') ?>" spellcheck="false" placeholder="Passwort des Hyundai/Kia-Kontos" <?= e3dc_config_editor_secret_attributes('bluelink_password') ?>><?= e3dc_config_editor_secret_notice('bluelink_password', $configSecretStates) ?>
                         <?= $configValidationMarker('bluelink_password') ?>
                     </div>
                     <div class="col-6 col-md-3 config-item">
                         <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['bluelink_pin'] ?? '') ?>">PIN</label>
-                        <input type="password" name="values[bluelink_pin]" class="form-control config-input" value="<?= $val('bluelink_pin') ?>" inputmode="numeric" pattern="[0-9]*" autocomplete="off" placeholder="Optional">
+                        <input type="password" name="values[bluelink_pin]" class="form-control config-input" value="<?= $val('bluelink_pin') ?>" inputmode="numeric" pattern="[0-9]*" placeholder="Optional" <?= e3dc_config_editor_secret_attributes('bluelink_pin') ?>><?= e3dc_config_editor_secret_notice('bluelink_pin', $configSecretStates) ?>
                         <?= $configValidationMarker('bluelink_pin') ?>
                     </div>
                     <div class="col-6 col-md-3 config-item">
@@ -9073,8 +9113,8 @@ async function readConfirmedConfigJson(response) {
                                    als eigene, vorausgewählte Option sichtbar (nichts wird stillschweigend verworfen). */
                                 $wpSplitRaw = trim($rawVal('storage_home_wp_split'));
                                 $wpSplitNorm = strtolower($wpSplitRaw);
-                                if ($wpSplitNorm === '' || $wpSplitNorm === 'auto') {
-                                    $wpSplitMode = 'auto';
+                                if ($wpSplitNorm === '') {
+                                    $wpSplitMode = 'include';
                                 } elseif (in_array($wpSplitNorm, ['1', 'true', 'yes', 'on', 'include', 'included', 'home_includes_wp'], true)) {
                                     $wpSplitMode = 'include';
                                 } elseif (in_array($wpSplitNorm, ['0', 'false', 'no', 'off', 'separate', 'excluded', 'home_excludes_wp'], true)) {
@@ -9082,16 +9122,16 @@ async function readConfirmedConfigJson(response) {
                                 } else {
                                     $wpSplitMode = 'unknown';
                                 }
-                                $wpSplitFlowLabels = ['auto' => 'Automatisch', 'include' => 'Wärmepumpe steckt im Hauswert', 'separate' => 'Wärmepumpe getrennt gemessen'];
-                                $wpSplitFlowLabel = $wpSplitMode === 'unknown' ? ('aktueller Wert „' . $wpSplitRaw . '“') : $wpSplitFlowLabels[$wpSplitMode];
+                                $wpSplitFlowLabels = ['include' => 'Wärmepumpe steckt im Hauswert', 'separate' => 'Wärmepumpe getrennt gemessen'];
+                                $wpSplitFlowLabel = $wpSplitMode === 'unknown' ? ('aktueller Wert „' . $wpSplitRaw . '“ – gilt als im Hausverbrauch bis zum nächsten Speichern') : $wpSplitFlowLabels[$wpSplitMode];
                             ?>
                             <div class="col-6 col-lg-3">
                                 <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['storage_home_wp_split'] ?? '') ?>">Wärmepumpe im Hauswert</label>
                                 <select class="form-select config-input" name="values[storage_home_wp_split]">
                                     <?php if ($wpSplitMode === 'unknown'): ?>
-                                    <option value="<?= htmlspecialchars($wpSplitRaw) ?>" selected>aktueller Wert „<?= htmlspecialchars($wpSplitRaw) ?>“ (unbekannt, wirkt wie Automatisch)</option>
+                                    <option value="<?= htmlspecialchars($wpSplitNorm === 'auto' ? 'include' : $wpSplitRaw) ?>" selected>aktueller Wert „<?= htmlspecialchars($wpSplitRaw) ?>“ (gilt als im Hausverbrauch bis zum nächsten Speichern)</option>
                                     <?php endif; ?>
-                                    <option value="auto" <?= ($wpSplitMode === 'auto') ? 'selected' : '' ?>>Automatisch (Heuristik)</option>
+
                                     <option value="include" <?= ($wpSplitMode === 'include') ? 'selected' : '' ?>>Wärmepumpe steckt im Hauswert</option>
                                     <option value="separate" <?= ($wpSplitMode === 'separate') ? 'selected' : '' ?>>Wärmepumpe getrennt gemessen</option>
                                 </select>
@@ -9105,7 +9145,7 @@ async function readConfirmedConfigJson(response) {
                                         <?= $flowStep('sky', '&#9728;', 'Netzpunkt-Ziel ' . $flowVal('wb_surplus_target_grid_w', '-125') . ' W', 'der schnelle Regler hält diese kleine Resteinspeisung; Schwankungen unter ' . $flowVal('wb_surplus_noise_w', '100') . ' W werden ignoriert, damit der Ladestrom nicht zappelt.') ?>
                                         <?= $flowStep('violet', '&#8646;', 'Phasenwechsel steht an', 'zusätzlich ' . $flowVal('phase_transition_safety_margin_w', '0') . ' W Reserve vorhalten (0 = automatisch berechnet).') ?>
                                         <?= $flowStep('amber', '&#9889;', 'Speicher unter der Ladekurve, Stützkontingent verbraucht', 'die Wallboxen bekommen nur echten PV-Überschuss; der Akku deckt Hauslast und Wärmepumpe plus ' . $flowVal('wb_curve_pv_only_house_reserve_w', '300') . ' W Reserve, nicht die Autos.') ?>
-                                        <?= $flowStep('violet', '&#9832;', 'Wärmepumpe im Hauswert: <span class="config-flow-value" data-flow-key="storage_home_wp_split" data-flow-fallback="Automatisch">' . htmlspecialchars($wpSplitFlowLabel) . '</span>', 'so trennt der Speicher-Manager Hauslast und Wärmepumpe: „Automatisch“ entscheidet je Messung nach der Rohhauslast, „steckt im Hauswert“ rechnet die Wärmepumpenleistung aus dem E3DC-Hauswert heraus, „getrennt gemessen“ zählt sie zusätzlich dazu.') ?>
+                                        <?= $flowStep('violet', '&#9832;', 'Wärmepumpe im Hauswert: <span class="config-flow-value" data-flow-key="storage_home_wp_split" data-flow-fallback="Wärmepumpe steckt im Hauswert">' . htmlspecialchars($wpSplitFlowLabel) . '</span>', 'Feste Einbindung wählen: „steckt im Hauswert“ führt die bereits enthaltene Wärmepumpe getrennt; „getrennt gemessen“ zählt ihre außerhalb gemessene Leistung dazu. Bisherige automatische und unbekannte Werte gelten als im Hausverbrauch bis zum nächsten Speichern.') ?>
                                         <?= $flowStep('green', '&#9208;', 'Wärmepumpe ist gerade angelaufen', 'für ' . $flowVal('heatpump_start_settle_s', '30') . ' s keine Wallbox-Aufregelung, damit der Verdichter seinen Strom sicher bekommt.', true) ?>
                                     </div>
                                 </div>
@@ -9421,7 +9461,7 @@ async function readConfirmedConfigJson(response) {
                                     </div>
                                     <div class="col-12 col-lg-6">
                                         <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['shadow_snapshot_token'] ?? '') ?>">Shadow Snapshot Token</label>
-                                        <input type="password" name="values[shadow_snapshot_token]" class="form-control config-input" value="" autocomplete="new-password" spellcheck="false" placeholder="<?= trim((string)$val('shadow_snapshot_token')) !== '' ? 'gesetzt – leer lassen = unverändert' : '64 Hex-Zeichen' ?>">
+                                        <input type="password" name="values[shadow_snapshot_token]" class="form-control config-input" value="" spellcheck="false" placeholder="64 Hex-Zeichen" <?= e3dc_config_editor_secret_attributes('shadow_snapshot_token') ?>><?= e3dc_config_editor_secret_notice('shadow_snapshot_token', $configSecretStates) ?>
                                     </div>
                                     <div class="col-12 col-md-6 col-lg-3">
                                         <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['shadow_master_ip'] ?? '') ?>">Shadow Master IP</label>
@@ -9612,7 +9652,7 @@ async function readConfirmedConfigJson(response) {
                 <div class="row g-3 mt-2" id="opt_entsoe_api" style="display: <?= $showEntsoeSettings ? 'flex' : 'none' ?>;">
                     <div class="col-md-7">
                         <label class="config-label text-secondary" data-tooltip="<?= htmlspecialchars($tooltipMap['entsoe_api_token'] ?? '') ?>">ENTSO-E API-Token <span class="text-muted">(SMARD-Fallback)</span></label>
-                        <input type="password" name="values[entsoe_api_token]" class="form-control config-input border-secondary-subtle" value="<?= $val('entsoe_api_token') ?>" autocomplete="off" placeholder="RESTful API Security Token">
+                        <input type="password" name="values[entsoe_api_token]" class="form-control config-input border-secondary-subtle" value="<?= $val('entsoe_api_token') ?>" placeholder="RESTful API Security Token" <?= e3dc_config_editor_secret_attributes('entsoe_api_token') ?>><?= e3dc_config_editor_secret_notice('entsoe_api_token', $configSecretStates) ?>
                         <?= $configValidationMarker('entsoe_api_token') ?>
                     </div>
                     <div class="col-md-3 d-flex align-items-end">
@@ -9631,7 +9671,7 @@ async function readConfirmedConfigJson(response) {
                 <div class="row g-3 mt-2" id="opt_tibber_api" style="display: <?= $showTibberSettings ? 'flex' : 'none' ?>;">
                     <div class="col-md-6">
                         <label class="config-label text-info" data-tooltip="<?= htmlspecialchars($tooltipMap['tibber_api_token'] ?? '') ?>">Tibber API-Token</label>
-                        <input type="password" name="values[tibber_api_token]" class="form-control config-input border-info-subtle" value="<?= $val('tibber_api_token') ?>" autocomplete="off" placeholder="Tibber Personal Access Token">
+                        <input type="password" name="values[tibber_api_token]" class="form-control config-input border-info-subtle" value="<?= $val('tibber_api_token') ?>" placeholder="Tibber Personal Access Token" <?= e3dc_config_editor_secret_attributes('tibber_api_token') ?>><?= e3dc_config_editor_secret_notice('tibber_api_token', $configSecretStates) ?>
                         <?= $configValidationMarker('tibber_api_token') ?>
                     </div>
                     <div class="col-md-4">
@@ -10285,7 +10325,7 @@ async function readConfirmedConfigJson(response) {
                             <div class="d-flex flex-wrap align-items-center justify-content-between gap-2">
                                 <div>
                                     <div class="fw-bold text-info"><i class="fas fa-chart-column me-2"></i>Marktwert Solar Monitor</div>
-                                    <div class="small text-muted mt-1">Read-only Trend aus Netztransparenz-Solarhochrechnung und Spotpreisen; keine Regelwirkung und kein Storage-Owner.</div>
+                                    <div class="small text-muted mt-1">Vorläufigen Trend aus der Solarhochrechnung von Netztransparenz und den Day-Ahead-Preisen DE/LU von SMARD anzeigen; keine Regelwirkung und kein Storage-Owner.</div>
                                 </div>
                                 <div class="form-check form-switch m-0">
                                     <input type="hidden" name="values[direct_marketing_market_value_solar_enable]" value="0">
@@ -10307,7 +10347,7 @@ async function readConfirmedConfigJson(response) {
                                 </div>
                                 <div class="col-md-4">
                                     <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['netztransparenz_client_secret'] ?? '') ?>">Netztransparenz Client-Secret</label>
-                                    <input type="password" name="values[netztransparenz_client_secret]" class="form-control config-input" value="<?= $val('netztransparenz_client_secret') ?>" autocomplete="off" placeholder="WebAPI Client-Secret">
+                                    <input type="password" name="values[netztransparenz_client_secret]" class="form-control config-input" value="<?= $val('netztransparenz_client_secret') ?>" placeholder="WebAPI Client-Secret" <?= e3dc_config_editor_secret_attributes('netztransparenz_client_secret') ?>><?= e3dc_config_editor_secret_notice('netztransparenz_client_secret', $configSecretStates) ?>
                                     <?= $configValidationMarker('netztransparenz_client_secret') ?>
                                 </div>
                                 <div class="col-12 small text-muted">
@@ -11107,7 +11147,7 @@ async function readConfirmedConfigJson(response) {
                 $val = function($k) use ($raw) {
                     return htmlspecialchars($raw($k), ENT_QUOTES, 'UTF-8');
                 };
-                $telegramConfigured = trim($raw('telegram_token')) !== '' && trim($raw('telegram_chat_id')) !== '';
+                $telegramConfigured = !empty($configSecretStates['telegram_token']) && !empty($configSecretStates['telegram_chat_id']);
                 $telegramEnabledCount = 0;
                 foreach (['telegram_status_enable', 'telegram_stats_enable', 'telegram_weekly_enable'] as $telegramKey) {
                     if ($isTrue($telegramKey)) $telegramEnabledCount++;
@@ -11155,11 +11195,11 @@ async function readConfirmedConfigJson(response) {
                                 <div class="row g-2">
                                     <div class="col-12">
                                         <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['telegram_token'] ?? '') ?>">Bot Token</label>
-                                        <input type="password" name="values[telegram_token]" class="form-control config-input" value="<?= $val('telegram_token') ?>" placeholder="123456:AbCd...">
+                                        <input type="password" name="values[telegram_token]" class="form-control config-input" value="<?= $val('telegram_token') ?>" placeholder="123456:AbCd..." <?= e3dc_config_editor_secret_attributes('telegram_token') ?>><?= e3dc_config_editor_secret_notice('telegram_token', $configSecretStates) ?>
                                     </div>
                                     <div class="col-12 col-md-6">
                                         <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['telegram_chat_id'] ?? '') ?>">Chat ID</label>
-                                        <input type="text" name="values[telegram_chat_id]" class="form-control config-input" value="<?= $val('telegram_chat_id') ?>" placeholder="12345678">
+                                        <input type="text" name="values[telegram_chat_id]" class="form-control config-input" value="<?= $val('telegram_chat_id') ?>" placeholder="12345678" <?= e3dc_config_editor_secret_attributes('telegram_chat_id') ?>><?= e3dc_config_editor_secret_notice('telegram_chat_id', $configSecretStates) ?>
                                     </div>
                                     <div class="col-12 col-md-6">
                                         <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['telegram_device_name'] ?? '') ?>">Gerätename</label>
@@ -11464,7 +11504,7 @@ async function readConfirmedConfigJson(response) {
                 "Schnittstellen & MQTT" => "fa-network-wired text-primary",
                 "HA Master/Slave Cluster" => "fa-server text-info",
                 "E3DC System-Verbindung" => "fa-solar-panel text-warning",
-                "Webansicht & Updates" => "fa-desktop text-primary",
+                "Sicherheit, Webansicht & Updates" => "fa-desktop text-primary",
                 "Zusatzwechselrichter" => "fa-solar-panel text-success",
                 "Sonstiges" => "fa-sliders-h text-secondary"
             ];
@@ -11481,7 +11521,7 @@ async function readConfirmedConfigJson(response) {
                 <?php
                 // Gruppen nur für den Assistenten: Generische Eingaben werden NICHT gerendert.
                 // Das Assistentenfeld weiter unten übernimmt hoehe/laenge/forecast*/solcast*/ml_home_cap_kw.
-                $wizardOnlyGroups = ["Standort & PV-Prognose", "Speicher & Konfiguration", "Erweitertes Feintuning", "Schnittstellen & MQTT", "E3DC System-Verbindung", "Webansicht & Updates"];
+                $wizardOnlyGroups = ["Standort & PV-Prognose", "Speicher & Konfiguration", "Erweitertes Feintuning", "Schnittstellen & MQTT", "E3DC System-Verbindung", "Sicherheit, Webansicht & Updates"];
                 $skipGeneric = in_array($title, $wizardOnlyGroups);
                 foreach ($items as $key => $itemWrapper):
                     if ($skipGeneric) continue; // Wizard rendert die Inputs
@@ -11508,11 +11548,11 @@ async function readConfirmedConfigJson(response) {
                                     <option value="sungrow_modbus" <?= (strtolower(trim((string)$data['value'])) === 'sungrow_modbus') ? 'selected' : '' ?>>Sungrow String-Wechselrichter (Modbus TCP, nur lesend)</option>
                                 </select>
                             <?php elseif (str_ends_with($key, '_time')): ?>
-                                <input type="time" name="values[<?= $key ?>]" class="form-control config-input" value="<?= htmlspecialchars($data['value']) ?>">
-                        <?php elseif ($key === 'web_pin' || $key === 'e3dc_password' || $key === 'aes_password' || $key === 'tibber_api_token' || $key === 'entsoe_api_token' || $key === 'netztransparenz_client_secret'): ?>
-                            <input type="password" name="values[<?= $key ?>]" class="form-control config-input" value="<?= htmlspecialchars($data['value']) ?>" placeholder="Kein Passwort gesetzt">
+                                <input type="time" name="values[<?= $key ?>]" class="form-control config-input" value="<?= htmlspecialchars($data['value']) ?>" <?= e3dc_config_editor_secret_attributes($key) ?>><?= e3dc_config_editor_secret_notice($key, $configSecretStates) ?>
+                        <?php elseif (e3dc_config_editor_secret_key($key)): ?>
+                            <input type="password" name="values[<?= $key ?>]" class="form-control config-input" value="<?= htmlspecialchars($data['value']) ?>" placeholder="Leer lassen = unverändert" <?= e3dc_config_editor_secret_attributes($key) ?>><?= e3dc_config_editor_secret_notice($key, $configSecretStates) ?>
                             <?php else: ?>
-                                <input type="text" name="values[<?= $key ?>]" class="form-control config-input" value="<?= htmlspecialchars($data['value']) ?>" placeholder="Standard: <?= $defaults[$key] ?? '' ?>">
+                                <input type="text" name="values[<?= $key ?>]" class="form-control config-input" value="<?= htmlspecialchars($data['value']) ?>" placeholder="Standard: <?= $defaults[$key] ?? '' ?>" <?= e3dc_config_editor_secret_attributes($key) ?>><?= e3dc_config_editor_secret_notice($key, $configSecretStates) ?>
                             <?php endif; ?>
                         </div>
                         <?php if ($title === "Zusatzwechselrichter") echo $configValidationMarker($key); ?>
@@ -11537,13 +11577,9 @@ async function readConfirmedConfigJson(response) {
                     $e3dcEsc = function($k) use ($e3dcRaw) {
                         return htmlspecialchars($e3dcRaw($k), ENT_QUOTES, 'UTF-8');
                     };
-                    $e3dcBool = function($k) use ($e3dcRaw) {
-                        return in_array(strtolower(trim($e3dcRaw($k))), ['1','true','yes','on','ja'], true);
-                    };
-                    $e3dcConfigured = trim($e3dcRaw('server_ip')) !== '' && trim($e3dcRaw('e3dc_user')) !== '' && trim($e3dcRaw('aes_password')) !== '';
-                    $e3dcPortalConfigured = trim($e3dcRaw('e3dc_password')) !== '';
+                    $e3dcConfigured = trim($e3dcRaw('server_ip')) !== '' && trim($e3dcRaw('e3dc_user')) !== '' && !empty($configSecretStates['aes_password']);
+                    $e3dcPortalConfigured = !empty($configSecretStates['e3dc_password']);
                     $e3dcPmIndex = trim($e3dcRaw('wurzelzaehler')) !== '' ? trim($e3dcRaw('wurzelzaehler')) : '0';
-                    $e3dcPmInvert = $e3dcBool('wurzelzaehler_invertiert');
                 ?>
                 <div class="webui-panel mt-1" data-e3dc-connection-panel>
                     <div class="d-flex flex-wrap justify-content-between align-items-start gap-2 mb-3">
@@ -11583,12 +11619,12 @@ async function readConfirmedConfigJson(response) {
                                     </div>
                                     <div class="col-12 col-md-6">
                                         <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['aes_password'] ?? '') ?>">RSCP AES-Passwort</label>
-                                        <input type="password" name="values[aes_password]" class="form-control config-input" value="<?= $e3dcEsc('aes_password') ?>" placeholder="Kein Passwort gesetzt">
+                                        <input type="password" name="values[aes_password]" class="form-control config-input" value="<?= $e3dcEsc('aes_password') ?>" placeholder="Leer lassen = unverändert" <?= e3dc_config_editor_secret_attributes('aes_password') ?>><?= e3dc_config_editor_secret_notice('aes_password', $configSecretStates) ?>
                                         <?= $configValidationMarker('aes_password') ?>
                                     </div>
                                     <div class="col-12">
                                         <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['e3dc_password'] ?? '') ?>">E3DC Portal-Passwort</label>
-                                        <input type="password" name="values[e3dc_password]" class="form-control config-input" value="<?= $e3dcEsc('e3dc_password') ?>" placeholder="Optional">
+                                        <input type="password" name="values[e3dc_password]" class="form-control config-input" value="<?= $e3dcEsc('e3dc_password') ?>" placeholder="Optional" <?= e3dc_config_editor_secret_attributes('e3dc_password') ?>><?= e3dc_config_editor_secret_notice('e3dc_password', $configSecretStates) ?>
                                         <?= $configValidationMarker('e3dc_password') ?>
                                     </div>
                                 </div>
@@ -11601,49 +11637,22 @@ async function readConfirmedConfigJson(response) {
                                 <div class="row g-2">
                                     <div class="col-12">
                                         <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['wurzelzaehler'] ?? '') ?>">Wurzelzähler / PM-Index</label>
-                                        <input type="text" name="values[wurzelzaehler]" class="form-control config-input" value="<?= $e3dcEsc('wurzelzaehler') ?>" placeholder="0 = Auto">
+                                        <input type="text" name="values[wurzelzaehler]" class="form-control config-input" value="<?= $e3dcEsc('wurzelzaehler') ?>" placeholder="0 = Zuordnung aus dem E3DC">
                                         <?= $configValidationMarker('wurzelzaehler') ?>
                                     </div>
-	                                    <div class="col-12">
-	                                        <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['wurzelzaehler_invertiert'] ?? '') ?>">Phasen invertieren</label>
-	                                        <select name="values[wurzelzaehler_invertiert]" class="form-select config-input">
-	                                            <option value="0" <?= !$e3dcPmInvert ? 'selected' : '' ?>>Nein</option>
-	                                            <option value="1" <?= $e3dcPmInvert ? 'selected' : '' ?>>Ja</option>
-	                                        </select>
-	                                        <?= $configValidationMarker('wurzelzaehler_invertiert') ?>
-	                                    </div>
-	                                    <div class="col-12">
-	                                        <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['live_grid_pm_delta_debounce_enable'] ?? '') ?>">Grid-PM-Delta entprellen</label>
-	                                        <select name="values[live_grid_pm_delta_debounce_enable]" class="form-select config-input">
-	                                            <option value="1" <?= $e3dcBool('live_grid_pm_delta_debounce_enable') ? 'selected' : '' ?>>Ein</option>
-	                                            <option value="0" <?= !$e3dcBool('live_grid_pm_delta_debounce_enable') ? 'selected' : '' ?>>Aus</option>
-	                                        </select>
-	                                    </div>
 	                                    <div class="col-6">
-	                                        <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['live_grid_pm_delta_soft_threshold_w'] ?? '') ?>">Soft (W)</label>
+	                                        <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['live_grid_pm_delta_soft_threshold_w'] ?? '') ?>">Hinweisschwelle (W)</label>
 	                                        <input type="number" min="0" step="10" name="values[live_grid_pm_delta_soft_threshold_w]" class="form-control config-input" value="<?= $e3dcEsc('live_grid_pm_delta_soft_threshold_w') ?>" placeholder="250">
 	                                    </div>
-	                                    <div class="col-6">
-	                                        <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['live_grid_pm_delta_hard_threshold_w'] ?? '') ?>">Hard (W)</label>
-	                                        <input type="number" min="0" step="50" name="values[live_grid_pm_delta_hard_threshold_w]" class="form-control config-input" value="<?= $e3dcEsc('live_grid_pm_delta_hard_threshold_w') ?>" placeholder="2000">
-	                                    </div>
-	                                    <div class="col-6">
-	                                        <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['live_grid_pm_delta_persist_count'] ?? '') ?>">Treffer</label>
-	                                        <input type="number" min="1" step="1" name="values[live_grid_pm_delta_persist_count]" class="form-control config-input" value="<?= $e3dcEsc('live_grid_pm_delta_persist_count') ?>" placeholder="2">
-	                                    </div>
-	                                    <div class="col-6">
-	                                        <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['live_grid_pm_delta_persist_window_s'] ?? '') ?>">Fenster (s)</label>
-	                                        <input type="number" min="0" step="1" name="values[live_grid_pm_delta_persist_window_s]" class="form-control config-input" value="<?= $e3dcEsc('live_grid_pm_delta_persist_window_s') ?>" placeholder="20">
-	                                    </div>
 	                                </div>
-	                                <div class="small text-muted mt-2">Aktuell: PM <?= htmlspecialchars($e3dcPmIndex, ENT_QUOTES, 'UTF-8') ?>, Invertierung <?= $e3dcPmInvert ? 'aktiv' : 'aus' ?>.</div>
+	                                <div class="small text-muted mt-2">Aktuell: PM <?= htmlspecialchars($e3dcPmIndex, ENT_QUOTES, 'UTF-8') ?>.</div>
 	                            </div>
 	                        </div>
                     </div>
                 </div>
                 <?php endif; ?>
 
-                <?php if ($title === "Webansicht & Updates"): ?>
+                <?php if ($title === "Sicherheit, Webansicht & Updates"): ?>
                 <?php
                     $webRaw = function($k) use ($config, $defaults) {
                         $v = $config[$k]['value'] ?? null;
@@ -11665,8 +11674,35 @@ async function readConfirmedConfigJson(response) {
                     $webCheckUpdates = $webBool('check_updates');
                     $webAutoUpdate = $webBool('auto_update_enable');
                     $webSecretMode = e3dc_config_secret_mode(['config_secret_protection_mode' => $webRaw('config_secret_protection_mode')]);
+                    $webRemoteWithoutPin = trim($webRaw('web_remote_pin_optout')) === '1';
                 ?>
                 <div class="webui-panel mt-1" data-webui-config-panel>
+                    <div class="rounded-3 border border-secondary border-opacity-25 p-3 mb-3" data-webui-security-panel>
+                        <div class="fw-bold mb-2"><i class="fas fa-lock me-2 text-warning"></i>Sicherheit</div>
+                        <div class="row g-2">
+                            <div class="col-12 col-lg-6">
+                                <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['web_pin'] ?? '') ?>">Web-PIN</label>
+                                <input type="password" name="values[web_pin]" class="form-control config-input" value="<?= $webEsc('web_pin') ?>" placeholder="Leer lassen = unverändert" <?= e3dc_config_editor_secret_attributes('web_pin') ?>><?= e3dc_config_editor_secret_notice('web_pin', $configSecretStates) ?>
+                            </div>
+                            <div class="col-12 col-lg-6">
+                                <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['web_remote_pin_optout'] ?? '') ?>">Domainzugriff ohne Web-PIN</label>
+                                <select name="values[web_remote_pin_optout]" class="form-select config-input">
+                                    <option value="0" <?= !$webRemoteWithoutPin ? 'selected' : '' ?>>Nein: ab der nächsten Version nur mit Web-PIN (empfohlen)</option>
+                                    <option value="1" <?= $webRemoteWithoutPin ? 'selected' : '' ?>>Ja, bewusst ohne Web-PIN (weiter wie bisher)</option>
+                                </select>
+                                <div class="text-muted mt-1" style="font-size:0.72rem;">Gilt nur ohne Web-PIN und nur für Domainnamen wie eigene Domain, DynDNS oder MyFRITZ. IP-Adressen und lokale Namen bleiben immer frei.</div>
+                            </div>
+                            <div class="col-12">
+                                <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['config_secret_protection_mode'] ?? '') ?>">Config-Schutz</label>
+                                <select name="values[config_secret_protection_mode]" class="form-select config-input">
+                                    <option value="standard" <?= $webSecretMode === 'standard' ? 'selected' : '' ?>>Standard: 660, Install-User:www-data</option>
+                                    <option value="compatibility" <?= $webSecretMode === 'compatibility' ? 'selected' : '' ?>>Kompatibilität: 664 für eigene externe Leser</option>
+                                </select>
+                                <div class="text-muted mt-1" style="font-size:0.72rem;">Standard startet nach Stromausfall automatisch und schützt gegen Web-/User-/Backup-Leaks. Kompatibilität nur wählen, wenn ein externer Dienst außerhalb von <code>www-data</code> direkt lesen muss.</div>
+                            </div>
+                        </div>
+                    </div>
+
                     <div class="d-flex flex-wrap justify-content-between align-items-start gap-2 mb-3">
                         <div>
                             <div class="fw-bold text-info"><i class="fas fa-desktop me-2"></i>Oberfläche</div>
@@ -11731,18 +11767,6 @@ async function readConfirmedConfigJson(response) {
                                             <option value="0" <?= !$webDarkmode ? 'selected' : '' ?>>Hell</option>
                                         </select>
                                     </div>
-	                                    <div class="col-12">
-	                                        <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['web_pin'] ?? '') ?>">Web-PIN</label>
-	                                        <input type="password" name="values[web_pin]" class="form-control config-input" value="<?= $webEsc('web_pin') ?>" placeholder="Kein Passwort gesetzt">
-	                                    </div>
-	                                    <div class="col-12">
-	                                        <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['config_secret_protection_mode'] ?? '') ?>">Config-Schutz</label>
-	                                        <select name="values[config_secret_protection_mode]" class="form-select config-input">
-	                                            <option value="standard" <?= $webSecretMode === 'standard' ? 'selected' : '' ?>>Standard: 660, Install-User:www-data</option>
-	                                            <option value="compatibility" <?= $webSecretMode === 'compatibility' ? 'selected' : '' ?>>Kompatibilität: 664 für eigene externe Leser</option>
-	                                        </select>
-	                                        <div class="text-muted mt-1" style="font-size:0.72rem;">Standard startet nach Stromausfall automatisch und schützt gegen Web-/User-/Backup-Leaks. Kompatibilität nur wählen, wenn ein externer Dienst außerhalb von <code>www-data</code> direkt lesen muss.</div>
-	                                    </div>
 	                                </div>
 	                            </div>
 	                        </div>
@@ -11884,7 +11908,7 @@ async function readConfirmedConfigJson(response) {
                             </div>
                             <div class="col-12 col-md-6">
                                 <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['mqtt_hub_pass'] ?? '') ?>">Passwort</label>
-                                <input type="password" name="values[mqtt_hub_pass]" class="form-control config-input" value="<?= $mv('mqtt_hub_pass') ?>" placeholder="optional">
+                                <input type="password" name="values[mqtt_hub_pass]" class="form-control config-input" value="<?= $mv('mqtt_hub_pass') ?>" placeholder="optional" <?= e3dc_config_editor_secret_attributes('mqtt_hub_pass') ?>><?= e3dc_config_editor_secret_notice('mqtt_hub_pass', $configSecretStates) ?>
                             </div>
                         </div>
                     </div>
@@ -11934,7 +11958,7 @@ async function readConfirmedConfigJson(response) {
                             </div>
                             <div class="col-12 col-md-6">
                                 <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['wb_pass'] ?? '') ?>">WB1 Passwort</label>
-                                <input type="password" name="values[wb_pass]" class="form-control config-input" value="<?= $mv('wb_pass') ?>" placeholder="optional">
+                                <input type="password" name="values[wb_pass]" class="form-control config-input" value="<?= $mv('wb_pass') ?>" placeholder="optional" <?= e3dc_config_editor_secret_attributes('wb_pass') ?>><?= e3dc_config_editor_secret_notice('wb_pass', $configSecretStates) ?>
                             </div>
                             <div class="col-12"><hr class="border-secondary-subtle my-2"></div>
                             <div class="col-12 col-md-4">
@@ -11951,7 +11975,7 @@ async function readConfirmedConfigJson(response) {
                             </div>
                             <div class="col-12 col-md-6">
                                 <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['wb2_pass'] ?? '') ?>">WB2 Passwort</label>
-                                <input type="password" name="values[wb2_pass]" class="form-control config-input" value="<?= $mv('wb2_pass') ?>" placeholder="optional">
+                                <input type="password" name="values[wb2_pass]" class="form-control config-input" value="<?= $mv('wb2_pass') ?>" placeholder="optional" <?= e3dc_config_editor_secret_attributes('wb2_pass') ?>><?= e3dc_config_editor_secret_notice('wb2_pass', $configSecretStates) ?>
                             </div>
                         </div>
                     </div>
@@ -12380,7 +12404,7 @@ async function readConfirmedConfigJson(response) {
                                 </div>
                                 <div class="small fw-bold text-success mb-1"><i class="fas fa-plug-circle-bolt me-1"></i>Pre-Dump: freigegebene Verbraucher</div>
                                 <div class="text-muted mb-2" style="font-size:0.74rem;">
-                                    Bevor Pre-Dump Energie einspeist, können lokale Verbraucher diese Leistung nutzen. Wallbox läuft dabei wie Sofortladen PV+Speicher ohne Netz. Beim Komfort-/Fixziel-Pre-Dump bleibt Netzentladen aus, solange der Netz-Fallback nicht ausdrücklich freigegeben ist.
+                                    Bevor Pre-Dump Energie einspeist, können lokale Verbraucher diese Leistung nutzen. Bei aktivem Pre-Dump und freigegebener Wallbox gilt für ihre Akkustützung der Pre-Dump-Boden statt wbminSoC, nie unter der Notstromreserve. Danach gilt wieder wbminSoC. Die Einstellung bleibt unverändert. Läuft die Mindestladezeit noch, lädt das Auto mit Mindeststrom zu Ende und stoppt über den normalen Unterdeckungsstopp. Der Akku kann dabei etwas unter das Pre-Dump-Ziel fallen, nie unter die Notstromreserve. Ins Fahrzeug lohnt sich Pre-Dump vor allem bei Abfahrt vor der PV-Spitze; bleibt das Fahrzeug angesteckt, verschiebt er Energie mit Umwandlungsverlust. Beim Komfort-/Fixziel-Pre-Dump bleibt Netzentladen aus, solange der Netz-Fallback nicht ausdrücklich freigegeben ist.
                                 </div>
                                 <div class="d-flex flex-wrap gap-3">
                                     <?php foreach ([
@@ -12943,6 +12967,13 @@ async function readConfirmedConfigJson(response) {
                         <label class="config-label fw-bold mb-2" style="color:#a5b4fc; font-size:0.82rem;">
                             <i class="fas fa-brain me-1"></i>ML-Modell &amp; Wetter-Backend
                         </label>
+                        <?php $consumptionForecastStatus = e3dcConsumptionForecastStatus(); ?>
+                        <div class="small text-body-secondary mb-2" role="status">
+                            <?= htmlspecialchars($consumptionForecastStatus['message'], ENT_QUOTES, 'UTF-8') ?>
+                            <?php if ($consumptionForecastStatus['integrity'] !== null): ?>
+                            <?= htmlspecialchars($consumptionForecastStatus['integrity'], ENT_QUOTES, 'UTF-8') ?>
+                            <?php endif; ?>
+                        </div>
                         <div class="row g-2 align-items-center">
                             <div class="col-12 col-md-6">
                                 <label style="font-size:0.68rem; color:#9ca3af;" data-tooltip="<?= htmlspecialchars($tooltipMap['ml_home_cap_kw'] ?? '') ?>">Maximaler Hausverbrauch für ML-Training (kW)
@@ -13117,7 +13148,7 @@ async function readConfirmedConfigJson(response) {
 
                         <!-- Solcast-Felder mit echtem name="values[...]" -> direkt beim Absenden des Formulars -->
                         <?php
-                        $solcastKey2Configured = trim((string)($config['solcast_api_key_2']['value'] ?? '')) !== '';
+                        $solcastKey2Configured = !empty($configSecretStates['solcast_api_key_2']);
                         $solcastLegacySecondarySlot = $solcastKey2Configured ? 2 : 1;
                         $solcastFc1Mapping = e3dc_config_editor_solcast_slot($config, 'solcast_api_slot_fc1', 1);
                         $solcastFc2Mapping = e3dc_config_editor_solcast_slot($config, 'solcast_api_slot_fc2', $solcastLegacySecondarySlot);
@@ -13132,17 +13163,17 @@ async function readConfirmedConfigJson(response) {
                             <div class="col-12 col-lg-5">
                                 <div class="mb-3">
                                     <label style="font-size:0.72rem; color:#f59e0b; font-weight:600;" data-tooltip="<?= htmlspecialchars($tooltipMap['solcast_api_key'] ?? '') ?>">API Key Konto 1</label>
-                                    <input type="password" name="values[solcast_api_key]" class="form-control form-control-sm config-input" autocomplete="off"
+                                    <input type="password" name="values[solcast_api_key]" class="form-control form-control-sm config-input"
                                         value="<?= htmlspecialchars($config['solcast_api_key']['value'] ?? '') ?>"
-                                        placeholder="Solcast API Key" style="font-size:0.8rem; font-family:monospace;">
+                                        placeholder="Solcast API Key" style="font-size:0.8rem; font-family:monospace;" <?= e3dc_config_editor_secret_attributes('solcast_api_key') ?>><?= e3dc_config_editor_secret_notice('solcast_api_key', $configSecretStates) ?>
                                 </div>
                                 <div>
                                     <label style="font-size:0.72rem; color:#9ca3af; font-weight:600;" data-tooltip="<?= htmlspecialchars($tooltipMap['solcast_api_key_2'] ?? '') ?>">
-                                        API Key Konto 2 <span class="badge bg-secondary ms-1" style="font-size:0.58em;">optional, leer lassen bei gleicher API</span>
+                                        API Key Konto 2 <span class="badge bg-secondary ms-1" style="font-size:0.58em;">optional; bei gleicher API „Wert löschen“ wählen</span>
                                     </label>
-                                    <input type="password" name="values[solcast_api_key_2]" class="form-control form-control-sm config-input" autocomplete="off"
+                                    <input type="password" name="values[solcast_api_key_2]" class="form-control form-control-sm config-input"
                                         value="<?= htmlspecialchars($config['solcast_api_key_2']['value'] ?? '') ?>"
-                                        placeholder="Zweiter API Key" style="font-size:0.8rem; font-family:monospace;">
+                                        placeholder="Zweiter API Key" style="font-size:0.8rem; font-family:monospace;" <?= e3dc_config_editor_secret_attributes('solcast_api_key_2') ?>><?= e3dc_config_editor_secret_notice('solcast_api_key_2', $configSecretStates) ?>
                                 </div>
                             </div>
                             <div class="col-12 col-lg-7">
@@ -13695,7 +13726,7 @@ async function readConfirmedConfigJson(response) {
                             ? '1'
                             : (
                                 account2KeyInput
-                                    ? (account2KeyInput.value.trim() ? '2' : '1')
+                                    ? ((account2KeyInput.value.trim() || (typeof CONFIG_SECRET_STATES !== 'undefined' && CONFIG_SECRET_STATES.solcast_api_key_2)) ? '2' : '1')
                                     : (accountSelect?.dataset.effectiveAccount || '1')
                             );
                         const account = accountSelect?.value || legacyAccount;
@@ -14086,7 +14117,7 @@ async function readConfirmedConfigJson(response) {
                 <i class="fas fa-chevron-down"></i>
             </summary>
             <div class="p-3 border-top border-secondary-subtle">
-                <div class="alert alert-secondary small py-2 mb-3 mx-1"><i class="fas fa-info-circle me-1"></i><strong>Tipp:</strong> Nicht benötigte Felder leer lassen. Sie werden dann automatisch aus der Datei gelöscht, um sie übersichtlich zu halten!</div>
+                <div class="alert alert-secondary small py-2 mb-3 mx-1"><i class="fas fa-info-circle me-1"></i><strong>Tipp:</strong> Weitere Parameter: Leere Geheimnisfelder unverändert lassen; gespeicherte Geheimnisse ausschließlich mit „Wert löschen“ entfernen. Andere nicht benötigte Werte können leer gespeichert werden.</div>
                 <?php foreach ($a9x_groups as $title) { $renderGroup($title, $groups[$title]); } ?>
             </div>
         </details>
@@ -14105,10 +14136,9 @@ async function readConfirmedConfigJson(response) {
 	                <i class="fas fa-chevron-down small position-absolute" style="right: 15px;"></i>
 	            </summary>
 	            <div class="p-3">
-	                <?php $rawConfigDownloadAllowed = e3dc_config_raw_download_pin_enabled($config); ?>
 	                <div class="alert alert-warning border-0 small py-2 px-3 mb-3 config-backup-warning">
 	                    <i class="fas fa-key me-1"></i>
-	                    „Einstellungen ohne Zugangsdaten“ enthält weiterhin IP-Adressen und Gerätekennungen und ist nicht zum Teilen gedacht. Für Forum und Support bitte nur das Diagnosepaket der Installationszentrale verwenden. Roh-Downloads enthalten Zugangsdaten, Tokens und RSCP-Passwörter, sind nur mit gesetzter Web-PIN verfügbar und sollten nur privat gespeichert werden. Import und Rollback behalten die Installationspfade und die HA-Rolle dieser Anlage bei.
+	                    „Einstellungen ohne Zugangsdaten“ enthält weiterhin IP-Adressen und Gerätekennungen und ist nicht zum Teilen gedacht. Für Forum und Support bitte nur das Diagnosepaket der Installationszentrale verwenden. Raw Download enthält Zugangsdaten, Tokens und RSCP-Passwörter. Nur mit gesetzter Web-PIN und nach Bestätigung herunterladen und ausschließlich privat speichern. Import und Rollback behalten die Installationspfade und die HA-Rolle dieser Anlage bei.
 	                </div>
 	                <div class="d-flex flex-wrap gap-2">
 	                    <button type="submit" name="config_action" value="create_manual_backup" class="btn btn-outline-success rounded-pill px-3 shadow-sm" formnovalidate title="Legt einen lokalen, von der automatischen Bereinigung ausgenommenen Konfigurationsstand an."><i class="fas fa-shield-halved me-1"></i> Dauerhaft lokal sichern</button>
@@ -14147,7 +14177,7 @@ async function readConfirmedConfigJson(response) {
                             <?php /* Keine „Auskommentieren“-Checkbox (siehe Hauptraster). */ ?>
                         </div>
                         <div class="input-group input-group-sm">
-                            <input type="text" name="values[<?= htmlspecialchars((string)$key, ENT_QUOTES, 'UTF-8') ?>]" class="form-control config-input" value="<?= htmlspecialchars($data['value']) ?>">
+                            <input type="<?= e3dc_config_editor_secret_key($key) ? 'password' : 'text' ?>" name="values[<?= htmlspecialchars((string)$key, ENT_QUOTES, 'UTF-8') ?>]" class="form-control config-input" value="<?= htmlspecialchars($data['value']) ?>" <?= e3dc_config_editor_secret_attributes($key) ?>><?= e3dc_config_editor_secret_notice($key, $configSecretStates) ?>
                             <?php if ($restKeyDeletable): ?>
                             <button type="submit" name="delete_key" value="<?= htmlspecialchars((string)$key, ENT_QUOTES, 'UTF-8') ?>" class="btn btn-outline-secondary border-secondary-subtle" title="Zusätzlichen Parameter löschen" data-config-isolated-action formnovalidate onclick="return window.confirm('Diesen zusätzlichen Parameter wirklich löschen? Die übrigen Formularwerte werden dabei nicht gespeichert.');"><i class="fas fa-trash text-danger"></i></button>
                             <?php endif; ?>
@@ -14330,9 +14360,12 @@ foreach (e3dc_config_auto_install_known_modules() as $module => $info) {
 }
 foreach (array_unique($configAutoInstallKeys) as $key) {
     $normalizedKey = strtolower((string)$key);
-    $configAutoInstallBaseline[$key] = (string)($config[$normalizedKey]['value'] ?? '');
+    $configAutoInstallBaseline[$key] = e3dc_config_editor_secret_key($key)
+        ? (!empty($configSecretStates[$normalizedKey]) ? 'gesetzt' : '')
+        : (string)($config[$normalizedKey]['value'] ?? '');
 }
 ?>
+const CONFIG_SECRET_STATES = <?= json_encode($configSecretStates, JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT) ?>;
 const CONFIG_AUTO_INSTALL_MODULES = <?= json_encode($configAutoInstallCatalog, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_HEX_TAG | JSON_HEX_APOS | JSON_HEX_AMP | JSON_HEX_QUOT) ?>;
 const CONFIG_AUTO_INSTALL_BASELINE = <?= json_encode($configAutoInstallBaseline, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_HEX_TAG | JSON_HEX_APOS | JSON_HEX_AMP | JSON_HEX_QUOT) ?>;
 window.MARKET_DAY_FLOW_COLORS = <?= json_encode(getEnergyFlowUiConfig()['colors'], JSON_UNESCAPED_SLASHES | JSON_HEX_TAG | JSON_HEX_APOS | JSON_HEX_AMP | JSON_HEX_QUOT) ?>;
@@ -14361,6 +14394,11 @@ const CONFIG_REQUIREMENT_BASELINE = <?= json_encode($configRequirementBaseline, 
 
 function configAutoInstallFieldValue(form, key, baseline = CONFIG_AUTO_INSTALL_BASELINE) {
     if (!form || !key) return '';
+    if (baseline === CONFIG_AUTO_INSTALL_BASELINE && Object.prototype.hasOwnProperty.call(CONFIG_SECRET_STATES, key)) {
+        const cleared = Array.from(form.elements || []).some(field => field.name === `clear_secrets[${key}]` && !field.disabled && field.checked);
+        const entered = configAutoInstallFieldValue(form, key, {});
+        return cleared ? '' : (entered || (CONFIG_SECRET_STATES[key] ? 'gesetzt' : ''));
+    }
     const fieldName = `values[${key}]`;
     const activeFields = Array.from(form.elements || [])
         .filter((field) => field.name === fieldName && !field.disabled);
@@ -14629,6 +14667,10 @@ function initHeatpumpPvReservationStatus() {
 function configAutoInstallModuleChanged(form, meta) {
     const keys = Array.isArray(meta.config_keys) ? meta.config_keys : [];
     return keys.some((key) => {
+        if (Object.prototype.hasOwnProperty.call(CONFIG_SECRET_STATES, key)) {
+            const cleared = Array.from(form.elements || []).some(field => field.name === `clear_secrets[${key}]` && !field.disabled && field.checked);
+            return (cleared && CONFIG_SECRET_STATES[key]) || configAutoInstallFieldValue(form, key, {}) !== '';
+        }
         const baseline = configAutoInstallComparableValue(CONFIG_AUTO_INSTALL_BASELINE[key] ?? '');
         const current = configAutoInstallComparableValue(configAutoInstallFieldValue(form, key));
         if (key === 'wp_type' && ['-1', '7'].includes(baseline) && ['-1', '7'].includes(current)) return false;
@@ -14950,10 +14992,6 @@ function setEntsoeTestStatus(message, className) {
 async function testTibberApi(button) {
     const token = getActiveConfigInputValue('values[tibber_api_token]').trim();
     const homeId = getActiveConfigInputValue('values[tibber_home_id]').trim();
-    if (!token) {
-        setTibberTestStatus('Bitte zuerst einen Tibber API-Token eintragen.', 'text-warning');
-        return;
-    }
     const oldHtml = button ? button.innerHTML : '';
     if (button) {
         button.disabled = true;
@@ -14986,10 +15024,6 @@ async function testTibberApi(button) {
 
 async function testEntsoeApi(button) {
     const token = getActiveConfigInputValue('values[entsoe_api_token]').trim();
-    if (!token) {
-        setEntsoeTestStatus('Bitte zuerst einen ENTSO-E API-Token eintragen.', 'text-warning');
-        return;
-    }
     const oldHtml = button ? button.innerHTML : '';
     if (button) {
         button.disabled = true;

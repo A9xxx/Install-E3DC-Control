@@ -166,10 +166,12 @@ Netzladerahmens. Die Live-Daten nennen Wert, Gültigkeit
 und Quelle; ein unbekannter Wert wird nicht durch eine Phasenzahl ersetzt.
 Enthaltene Verbraucher werden nicht zusätzlich abgezogen. Ohne vollständige,
 gültige und höchstens zehn Sekunden alte Phasenwerte beginnt kein Netzladen.
-Bei ungültiger Akku- oder Netzleistung geht ein laufender Marktauftrag in AUTO,
+Bei ungültiger Akkuleistung geht ein laufender Marktauftrag in AUTO,
 PV lädt frei und die Entladung bleibt gesperrt. Im ersten gültigen Takt darf der
 gebundene Auftrag wieder Netzladen; die Modusuhr wird durch den Datenstopp nicht
-neu gestartet. Die Neuberechnung erfolgt im Managertakt. Ein Lastsprung darf bis
+neu gestartet. Ein fehlender oder ungültiger Netzwert unterbricht weder
+marktgeführtes noch manuelles Netzladen, solange gültige Phasenwerte vorliegen;
+der Netzwert dient der Bilanz, nicht dem Hausanschluss. Die Neuberechnung erfolgt im Managertakt. Ein Lastsprung darf bis
 zum nächsten Takt plus Messfrist und Gerätewirkzeit überschreiten; der schnelle
 Phasenschutz der Wallboxen bleibt bestehen.
 
@@ -599,11 +601,13 @@ Datenwächter behalten Vorrang.
   480 s.
 - Phasenfähigkeit der Wallbox, erlaubtes Schaltziel und tatsächlich vom
   Fahrzeug genutzte Phasen werden getrennt geführt. Eine Ladepause oder
-  fehlende Leistung belegt keinen Phasenverlust. Die begrenzte
-  6-A-Phasenerkennung gilt nur im stromgeregelten E3DC-Festphasenpfad; die
-  zentrale Quellenfreigabe und die gemeinsamen persistenten Wh-/Zeitwächter
-  bleiben erhalten (siehe `doc/Native_Wallbox.md`, „Phasenerkennung an einer
-  festen Wallbox“).
+  fehlende Leistung belegt keinen Phasenverlust. E3DC-Control startet eine
+  feste E3DC-Wallbox vor der ersten Messung mit drei Phasen, bei einem
+  gewählten Profil mit dem kleineren Wert. Danach gilt die höchste vollständig
+  und frisch gemessene Phasenzahl bis zum bestätigten Abstecken. Nach einem
+  Dienstneustart misst das System neu. Start, Strom und Stopp entscheidet allein
+  der Regelkern (siehe `doc/Native_Wallbox.md`, „Phasenerkennung an einer festen
+  Wallbox“).
 - Geplante Ladefenster starten mit der maximal erlaubten Leistung unter
   Beachtung der Hausabsicherung und enden hart mit 0 W.
 - `wbminsoc` begrenzt die Unterstützung der Wallbox aus dem Hausakku. Echter
@@ -992,9 +996,13 @@ Wichtige Schutzlogik:
 - openWB-Pro-Bereitschaft nach Fahrzeug-Ladeende bleibt an dieselbe
   Stecksession gebunden. Das Quellenbudget des aktiven Modus muss die
   Mindestleistung der gehaltenen oder erwarteten Phasen tragen; der
-  Ladepunktrahmen allein ist dafür kein Maß. Kurze Budgeteinbrüche werden mit
-  `openwb_pro_start_hold_s` überbrückt (Standard 180 s, 60–600 s, bestehender
-  HLC-Faktor 2). Danach folgt einmal `ampere=0`; die Budgetrückkehr bietet
+  Ladepunktrahmen allein ist dafür kein Maß. Ist das eigenständige
+  Pro-Startfenster eröffnet, überbrückt es kurze Budgeteinbrüche für
+  `openwb_pro_start_hold_s` (Standard 180 s, 60–600 s, bestehender
+  HLC-Faktor 2), ohne Akkureservierung. Der reguläre PV-Start eröffnet dieses
+  Fenster nicht; er wartet auf 60 Sekunden ausreichendes Budget, eine laufende
+  Ladung folgt der Mindestladezeit und der Unterdeckungsprüfung. Nach Ablauf
+  des Fensters folgt einmal `ampere=0`; die Budgetrückkehr bietet
   nach den bestehenden Schutzfristen nur den Mindeststrom an, ohne CP-,
   Phasen- oder Startwiederholung. Für Mindestleistung und Ausgang gelten
   die frischen Phasen; bei Abweichung zum Ladeendebeleg der größere Bedarf.
@@ -1411,7 +1419,7 @@ freigegebene Diagnosefelder. Details stehen in [Luxtronik](Luxtronik.md).
 
 ## Preislogik
 
-Der netzdienliche Eco-Modus und der Negativpreis-/Preis-Boost sind Opt-in-Pfade.
+Der Marktpfad und der Negativpreis-/Preis-Boost sind Opt-in-Pfade.
 Unbekannte externe Dauerlasten werden nicht geraten. Wenn ein BEV, eine
 Wärmepumpe oder ein anderer großer Verbraucher regelrelevant sein soll, muss
 seine Leistung eingebunden oder geplant sein.
@@ -1776,12 +1784,16 @@ steuert keine Geräte. Die bestehende Regelung sendet weiterhin sämtliche Befeh
 und versorgt Wallbox und Wärme mit ihren bisherigen Budgets.
 
 Der Vergleich betrachtet Speichermodus, Lade- und Entladegrenze, Netzladesoll,
-Verbraucherbudget sowie gesendete und hypothetische Teilvorgaben. Die Klassen
-bedeuten:
+Verbraucherbudget sowie gesendete und hypothetische Teilvorgaben. Den
+Speichermodus leitet er auf beiden Seiten aus den wirksamen Grenzen ab: Eine
+freie Vorgabe mit gesperrter Entladung zählt wie bei der bestehenden Regelung
+als Halten, etwa an der Notstromreserve. Alle Reservezustände der bestehenden
+Regelung gelten als Reserveschutz, außer der E3DC hält die Reserve selbst.
+Die Klassen bedeuten:
 
 - **gleich:** Die verglichenen Werte liegen innerhalb der Toleranz.
 - **U:** Der Zyklus ist mit genanntem Grund unvergleichbar, etwa bei Neustart,
-  fehlender Funktionsabdeckung, Datenfehler im Vergleich oder verbrauchtem Zeitbudget.
+  fehlender Funktionsabdeckung (mit der nicht abgedeckten Funktion), Datenfehler im Vergleich oder verbrauchtem Zeitbudget.
 - **A0:** Eine vorab benannte gewollte Abweichung trifft zu, etwa das gröbere Zeitraster.
 - **A1:** Eine geringe Abweichung oder ein strengerer Vorschlag liegt vor.
 - **A2:** Eine funktionale oder länger andauernde Abweichung liegt vor.
@@ -1789,12 +1801,55 @@ bedeuten:
 - **A4:** Der Vergleich erkennt einen tatsächlichen Schreibweg und legt sich bis
   zum Dienstneustart still.
 
-Die Installationszentrale zeigt Stand, letzten Vergleich, Tagesanteile,
-Schrankenkonflikte und Schreibwege, Funktionsabdeckung und Laufzeit. E3DC-Control
+Ein U-Zyklus nennt seine Ursache als festen Code (etwa Neustart, nicht gebundener
+Eingang oder die nicht abgedeckte Funktion) und zählt fehlende Teilfunktionen
+einzeln. Ein Schrankenkonflikt, der in einem U-Zyklus auftritt, bleibt als
+verdeckter Konflikt sichtbar.
+
+Die neue Regelung rechnet ihre Vorgaben aus Eingängen, die vor der Entscheidung
+der bestehenden Regelung gebunden sind, und übernimmt keine Ergebnisse der
+bestehenden Regelung. Sie berechnet selbst:
+
+- **Direktvermarktung:** Ladesperre und Platzhalten bis zu einem Exportfenster,
+  Batterieeinspeisung mit dem Exportbudget als Obergrenze und derselben
+  Mindesteinspeisung am Netzpunkt (deckt das Budget den Hausbedarf nicht, endet
+  die Einspeisung), PV-Speichern aus dem eigenen PV-Überschuss mit Rampe und
+  Haltezeit über kleine Einbrüche, Preisformung der Kurvenladung. Ohne
+  vollständige Lage gibt sie nichts frei.
+- **Pre-Dump-Netzrückfall:** Wartezeit des Verbraucherpfads, späteste Startzeit
+  des Fahrzeugs, Exportgrenze, Komfortgrenze und Anhebung in Schritten; an der
+  Notstromreserve und ohne gültige Netzmessung beginnt kein Rückfall.
+- **Platzschaffen:** Boden aus Notstromreserve, Kurve, Planziel und hartem Boden,
+  Ein- und Halteabstand, Kühlzeit, Druck, Zielplateau, Leistung mit Rampe,
+  Restenergie je Plan und Planslot sowie Tagesgrenze je Kalendertag.
+- **Handaufträge:** Laden und Entladen bis zum Ziel; Laden endet zusätzlich, wenn
+  der Speicher ab 95 % zehn Minuten nicht um einen Prozentpunkt steigt. Ein
+  Auftrag ohne gültiges Ziel löst keine Aktion aus.
+- **Lastspitzen:** eigene abrechnungsfeste Viertelstunde, Entladekappe ohne
+  Einspeisung, Pufferhalten und Nachladen aus dem Netz im Anschlussrahmen.
+- **Preis-Boost** aus dem Preisfenster des Plans und **geplante Lasten** als
+  Entladekappe der normalen Regelung.
+- **Verbraucherbudget:** Betriebsrecht und Zusatzbudget getrennt (laufende Wärme
+  ohne eigenen Akkuvertrag darf weiterlaufen, bekommt aber kein zweites Budget),
+  Startangebote mit Annahme über die Messung und Wartezeit, Wärme-Nachlauf nach
+  einem Prioritätswechsel auf monotoner Uhr, Phasenumschaltungen und
+  Datenausfälle der Wallbox mit eigenem Gedächtnis.
+- **Diagnose:** Smart-Charge-Sperre aus dem eigenen Ladeangebot.
+
+Abweichungen dieser Teile zur bestehenden Regelung zählen als Diagnose oder
+Klasse, nicht als Wirkung. Der gleitende Prognosehorizont (Option) ist nicht
+nachgebildet; ist er eingeschaltet, bleiben die Zyklen unvergleichbar.
+
+Die Installationszentrale zeigt Stand, letzten Vergleich, Tagesanteile mit den
+Ursachen unvergleichbarer Zyklen, Schrankenkonflikte und Schreibwege,
+Funktionsabdeckung und Laufzeit. E3DC-Control
 speichert den Vergleichszustand ausschließlich in der Ramdisk. Ein Bootwechsel
 beginnt ohne altes Reservegedächtnis. Stunden- und Tageswerte bleiben höchstens
 vierzehn Tage erhalten. Feste Stundenzeilen enthalten Klassen, Abdeckung,
-Laufzeit und unerklärte Episoden; Zähler ersetzen einzelne Ereignisse.
+Laufzeit, unerklärte Episoden, verdeckte Schrankenkonflikte, fehlende
+Teilfunktionen und Diagnosezähler; Zähler ersetzen einzelne Ereignisse.
+Gedächtnisse der neuen Regelung (Viertelstunde der Lastspitzen, Startangebote,
+Nachlauf, Datenausfall) bleiben bei einem Dienstneustart im selben Boot erhalten.
 Die Diagnose enthält keine dauerhafte Aufzeichnung einzelner Regelzyklen.
 
 Für eine Rückmeldung das Diagnosepaket erstellen und zusätzlich die wählbare
@@ -1804,6 +1859,7 @@ bereits `speicherkern_schatten.json`. Beide Dateien gemeinsam weitergeben.
 Der Vergleich beschreibt Entscheidungen und keine gemessene Wirkung der neuen
 Regelung. Nicht abgedeckte Anforderungen bleiben sichtbar unvergleichbar.
 Verbraucherzuteilung, Netzfallback und Gerätewirkung benötigen weitere Abnahme;
-eine Umschaltung erfolgt durch den Vergleich nicht. Die Wirkzeit am Anschluss
+die Verbraucher lesen weiterhin ausschließlich das Budget der bestehenden
+Regelung. Eine Umschaltung erfolgt durch den Vergleich nicht. Die Wirkzeit am Anschluss
 ist noch ungemessen. Überschreitet die Berechnung das Zeitbudget, verwirft E3DC-Control das Vergleichsergebnis. Die Berechnung läuft im Speicherdienst und kann dessen nächsten Zyklus verzögern.
 

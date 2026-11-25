@@ -1,22 +1,17 @@
 """Quellenbuchung und hypothetische Verbraucherprojektion, ausschließlich im Speicher."""
 import json
+import math
 try:
-    from Installer import consumer_priority as cp
+    from Installer import consumer_priority as cp, control_time
+    from Installer.heatpump_pv_contract import heatpump_start_reservation_duration_s
     from Installer.storage_dispatch_contract import revision_hash
     from Installer.Storage.kern import waerme_hauslast
 except ModuleNotFoundError:
     import consumer_priority as cp
+    import control_time
+    from heatpump_pv_contract import heatpump_start_reservation_duration_s
     from storage_dispatch_contract import revision_hash
     from Storage.kern import waerme_hauslast
-
-
-UEBERNOMMENE_FELDER = (
-    "heatpump_pv_contract", "heatpump_start_funding", "authorized_heatpump_budget_w",
-    "heatpump_pause_request", "wallbox_phase_transition", "wallbox_phase_transition_grants",
-    "wallbox_phase_transition_reserved_w", "wallbox_start_hold_active", "wallbox_start_hold_w",
-    "wallbox_start_hold_until_ts",
-    "peak_shaving", "auto_limit", "force_wallbox_stop",
-)
 
 
 def _art(v):
@@ -25,8 +20,15 @@ def _art(v):
 
 
 def zuteilen(budget, *, order=None, now_s=0.0, previous_contract=None,
-             wp_runon_s=600.0, reservations_w=None, priority_changed_at_s=-999999.0):
-    """Ein bestehender Zuteiler, zwei Quellen innerhalb seiner Verbrauchsbuchung."""
+             wp_runon_s=600.0, reservations_w=None, priority_changed_at_s=-999999.0,
+             wp_runon_active=None, wartend=(), gehalten=()):
+    """Ein bestehender Zuteiler, zwei Quellen innerhalb seiner Verbrauchsbuchung.
+
+    Ein Verbraucher in der Wartezeit nach einem nicht angenommenen Startangebot fragt in diesem Zyklus nichts an; sein
+    Anteil geht an die übrigen (Rückforderung). Der Wärme-Nachlauf nach einem Prioritätswechsel kommt aus der
+    gemeinsamen monotonen Wachuhr (wp_runon_active), nicht aus der Wandzeit. Ein gehaltener Verbraucher (offenes
+    Startangebot, Phasenumschaltung) zählt wie ein laufender: Seine Reservierung wird vor der Reihenfolge gebucht,
+    höchstens in Höhe der eigenen Anfrage."""
     previous = previous_contract or {}
     requests = dict.fromkeys(cp.CONSUMERS, 0)
     minimums = dict(cp.CONSUMER_MIN_W)
@@ -36,7 +38,7 @@ def zuteilen(budget, *, order=None, now_s=0.0, previous_contract=None,
     for anteil in budget.verbraucher:
         v = anteil.verbraucher
         name = _art(v)
-        if name is None:
+        if name is None or name in wartend:
             continue
         # Laufende Hauslast steht bereits im Hausmesspunkt des Budgets: kein zweiter Anteil.
         if v.anfrage_w is None or v.gesperrt or v.laeuft and waerme_hauslast(v):
@@ -49,8 +51,13 @@ def zuteilen(budget, *, order=None, now_s=0.0, previous_contract=None,
         enabled[name] = True
         active[name] = active[name] or v.laeuft
         caps[name] += max(0, int(anteil.battery_w.wert_w or 0))
+    for name in gehalten:
+        active[name] = active[name] or enabled.get(name, False)
     if budget.haltezone and budget.haltezone["active"]:
         requests["wallbox"] = min(requests["wallbox"], budget.haltezone["frame_w"])
+    if reservations_w:
+        # Eine Reservierung bucht einen Teil der eigenen Anfrage, nie mehr (kein zweiter Lastabzug).
+        reservations_w = {name: min(max(0, int(w)), requests.get(name, 0)) for name, w in reservations_w.items()}
     pv = max(0, int(budget.pv_w.wert_w or 0))
     total = max(0, int(budget.rahmen_w or 0))
     pv = min(pv, total)
@@ -59,7 +66,7 @@ def zuteilen(budget, *, order=None, now_s=0.0, previous_contract=None,
         minimums_w=minimums, maximums_w={name: max(requests[name], minimums[name]) for name in cp.CONSUMERS},
         active=active, reservations_w=reservations_w,
         previous_active=previous.get("active"), priority_changed_at_s=priority_changed_at_s,
-        now_s=now_s, wp_runon_s=wp_runon_s, pv_pool_w=pv,
+        now_s=now_s, wp_runon_s=wp_runon_s, wp_runon_active_override=wp_runon_active, pv_pool_w=pv,
         battery_pool_w=total-pv, battery_caps_w=caps)
     contract.update(command_eligible=dict(enabled),
         command_allocations=dict(contract["allocations"]),
@@ -70,9 +77,125 @@ def zuteilen(budget, *, order=None, now_s=0.0, previous_contract=None,
         valid=accounting["valid"] and commands["valid"])
 
 
-def projektion(budget, zuteilung, eingang, jetzt, *, produkt=None, haltezone=None, intent=None):
-    """Erzeugt einen eigenständigen Draht-Snapshot ohne Datei- oder MQTT-Schreibweg."""
-    product = produkt or {}
+def betriebsrechte(budget, jetzt):
+    """Betriebsrecht je Verbrauchergruppe, getrennt vom Zusatzbudget.
+
+    Laufende Wärme ohne eigenen Akkuvertrag steckt im Hausmesspunkt: Sie darf weiterlaufen (Betriebsrecht), bekommt
+    aber keinen zweiten Budgetanteil (Zusatzbudget 0). Gesperrte oder pausierte Verbraucher haben kein Betriebsrecht.
+    Ohne laufenden Verbraucher entscheidet allein das Zusatzbudget über einen Start."""
+    rechte = dict.fromkeys(cp.CONSUMERS, False)
+    for anteil in budget.verbraucher:
+        v = anteil.verbraucher
+        name = _art(v)
+        if name is not None and v.laeuft and not v.gesperrt:
+            rechte[name] = True
+    return rechte
+
+
+def reservierungen(phasen):
+    """Laufende Phasenumschaltungen reservieren ihren Bedarf in derselben Zuteilung (kein zweiter Abzug).
+
+    Quelle ist der vor der Entscheidung gebundene Phasenvertrag des Produkts (Frische, Frist, Pause, Fahrzeug voll)."""
+    w = (phasen or {}).get("reserviert_w")
+    return dict(wallbox=int(w)) if (phasen or {}).get("aktiv") is True and type(w) in (int, float) and w > 0 else None
+
+
+# Schlanker Lease-Zustand. Ein Startangebot an einen stehenden Verbraucher bucht seinen
+# Anteil, bis die Messung den Start zeigt (Annahme), die Startgeneration wechselt oder die Frist abläuft; danach wartet
+# er eine Wartezeit, und sein Anteil geht an die übrigen. Fristen laufen auf der gemeinsamen monotonen Wachuhr.
+LEASE_ANGEBOT, LEASE_WARTEN = "angebot", "warten"
+
+
+def _zahl_oder(wert, std):
+    try:
+        zahl = float(wert)
+    except (TypeError, ValueError):
+        return std
+    return zahl if math.isfinite(zahl) else std
+
+
+def lease_regeln(cfg):
+    """Fristen aus derselben Konfiguration wie der Produkt-Zuteiler: WP nach Startsemantik, Box und Heizstab kurz."""
+    kurz = min(60.0, max(5.0, _zahl_oder(cfg.get("consumer_start_lease_duration_s"), 25.0)))
+    warte = min(120.0, max(1.0, _zahl_oder(cfg.get("consumer_start_lease_retry_s"), 15.0)))
+    return dict(heatpump=heatpump_start_reservation_duration_s(cfg), wallbox=kurz, heater=kurz), warte
+
+
+def _uhr(dauer_s, probe):
+    return control_time.begin_guard(dauer_s, probe, minimum_s=0.0, epoch_mode=control_time.EPOCH_MODE_SAME_BOOT_MONOTONIC)
+
+
+def _gruppe(budget, name):
+    return [a.verbraucher for a in budget.verbraucher if _art(a.verbraucher) == name]
+
+
+def leases_pruefen(budget, vorher, probe, generation, warte_s):
+    """Offene Angebote gegen Messung, Generation und Frist. Rückgabe (gebucht {Name: W}, wartend {Name}, Zustand)."""
+    gebucht, wartend, neu = {}, set(), {}
+    for name, lease in (vorher if isinstance(vorher, dict) else {}).items():
+        if name not in cp.CONSUMERS or not isinstance(lease, dict):
+            continue
+        uhr = control_time.evaluate_guard(lease.get("uhr"), probe, minimum_s=0.0)
+        gruppe = _gruppe(budget, name)
+        if lease.get("art") == LEASE_WARTEN:
+            # Nur ein stehender Verbraucher wartet; startet er doch noch, trägt ihn die Messung (späte Annahme).
+            if uhr["active"] and not any(v.laeuft for v in gruppe):
+                wartend.add(name)
+                neu[name] = dict(art=LEASE_WARTEN, uhr=uhr)
+            continue
+        if any(v.laeuft for v in gruppe):
+            continue                       # Annahme: die Messung zeigt den Start, die Last trägt der Messpunkt.
+        if not any((v.anfrage_w or 0) > 0 and not v.gesperrt for v in gruppe):
+            continue                       # Bedarf zurückgezogen oder Nutzer-Aus: kein Angebot mehr.
+        if name == "wallbox" and lease.get("generation") != generation:
+            continue                       # Neue Startgeneration: ein altes Angebot erlaubt keinen Start.
+        if uhr["active"]:
+            gebucht[name] = int(lease.get("w") or 0)
+            neu[name] = dict(lease, uhr=uhr)
+        else:
+            wartend.add(name)              # Frist ohne Annahme: Anteil an die übrigen, Wartezeit vor dem nächsten.
+            neu[name] = dict(art=LEASE_WARTEN, uhr=_uhr(warte_s, probe))
+    return gebucht, wartend, neu
+
+
+def leases_anbieten(budget, zuteilung, leases, probe, generation, dauern):
+    """Neues Angebot an stehende Verbraucher mit zugeteiltem Anteil; laufende tragen sich über die Messung."""
+    neu = dict(leases)
+    zuteilungen = zuteilung["commands"]["allocations"] if zuteilung["valid"] else {}
+    for name in cp.CONSUMERS:
+        w = int(zuteilungen.get(name) or 0)
+        if name in neu or w <= 0 or any(v.laeuft for v in _gruppe(budget, name)):
+            continue
+        neu[name] = dict(art=LEASE_ANGEBOT, w=w, generation=generation if name == "wallbox" else None,
+            uhr=_uhr(dauern[name], probe))
+    return neu
+
+
+def startfinanzierung(budget, zuteilung, leases, wartend):
+    """WP-Startfinanzierung im gemeinsamen Vertragsformat aus der eigenen Zuteilung und dem eigenen Lease."""
+    gruppe = _gruppe(budget, "heatpump")
+    erforderlich = max([cp.CONSUMER_MIN_W["heatpump"]] + [int(v.mindest_w) for v in gruppe])
+    gueltig = zuteilung["valid"]
+    gebucht = int((zuteilung["accounting"].get("allocations") or {}).get("heatpump") or 0) if gueltig else 0
+    befohlen = int(zuteilung["commands"]["allocations"].get("heatpump") or 0) if gueltig else 0
+    lease = leases.get("heatpump") or {}
+    if any(v.laeuft for v in gruppe):
+        zustand, grund = "running", "heatpump_running_measured"
+    elif "heatpump" in wartend:
+        zustand, grund = "retry_wait", "start_lease_expired_unaccepted"
+    elif lease.get("art") == LEASE_ANGEBOT:
+        zustand, grund = "start_offered", "start_lease_open"
+    else:
+        zustand, grund = "idle", "no_start_funding" if befohlen < erforderlich else "start_funded"
+    return cp.build_heatpump_start_funding_contract(required_start_w=erforderlich, accounting_allocated_w=gebucht,
+        command_authorized_w=befohlen, state=zustand, reason_code=grund)
+
+
+def projektion(budget, zuteilung, eingang, jetzt, *, haltezone=None, intent=None, leases=None, wartend=(),
+               phasen=None):
+    """Erzeugt einen eigenständigen Draht-Snapshot ohne Datei- oder MQTT-Schreibweg; kein Produktfeld wird
+    übernommen (die frühere Durchreichung entfällt). Betriebsrecht, Startangebote, WP-Startfinanzierung und
+    Phasenreservierung stammen aus der eigenen Zuteilung."""
     haltezone = budget.haltezone if haltezone is None else haltezone
     contract = zuteilung["contract"]
     valid = zuteilung["valid"]
@@ -80,9 +203,16 @@ def projektion(budget, zuteilung, eingang, jetzt, *, produkt=None, haltezone=Non
     accounting = dict(zuteilung["accounting"].get("allocations") or dict.fromkeys(cp.CONSUMERS, 0))
     wb = allocations["wallbox"]
     sources = (contract.get("source_allocations") or {}).get("wallbox") or dict(pv_w=0, battery_w=0)
-    result = {key: product[key] for key in UEBERNOMMENE_FELDER if key in product}
-    result["uebernommen_aus_produkt"] = sorted(result)
-    result["nicht_abgedeckt"] = ["G4b", "S5b", "G5", "G6"]
+    leases = leases or {}
+    result = dict(consumer_operating_rights=betriebsrechte(budget, jetzt),
+        consumer_start_leases={name: dict(art=lease.get("art"), w=lease.get("w"),
+            remaining_s=round(float((lease.get("uhr") or {}).get("remaining_s") or 0.0), 1))
+            for name, lease in sorted(leases.items())},
+        heatpump_start_funding=startfinanzierung(budget, zuteilung, leases, wartend),
+        wallbox_phase_transition_active=bool((phasen or {}).get("aktiv") is True),
+        # Gebuchte Phasenreservierung: höchstens die eigene Anfrage der Box (kein zweiter Lastabzug).
+        wallbox_phase_transition_reserved_w=int((contract.get("reservations_w") or {}).get("wallbox") or 0)
+            if (phasen or {}).get("aktiv") is True else 0)
     result.update(schema_version="wb_pv_budget_control_v2", ts=int(jetzt),
         data_valid=valid, live_sample_invalid=not valid, budget_w=wb,
         raw_iAVal_w=wb, iAVal_w=wb,
@@ -98,7 +228,7 @@ def projektion(budget, zuteilung, eingang, jetzt, *, produkt=None, haltezone=Non
         wallbox_wbminsoc_hold_zone=haltezone,
         energy_score=dict(free_for_limbs_w=wb, free_for_consumers_raw_w=budget.rahmen_w,
             bat_charge_request_w=budget.akkuanspruch_w, pv_surplus_w=budget.pv_w.wert_w,
-            consumer_allocations=allocations, consumer_accounting_allocations=accounting), state=product.get("state", "speicherkern_schatten"))
+            consumer_allocations=allocations, consumer_accounting_allocations=accounting), state="speicherkern_schatten")
     boxen = [a for a in budget.verbraucher if _art(a.verbraucher) == "wallbox"]
     if haltezone and haltezone.get("active"):
         result.update(battery_support_authorized=False, battery_support_reason="wbminsoc_hold_zone")

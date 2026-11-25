@@ -436,7 +436,9 @@ function wpv_build_state(array $conf, array $in): array
         $elecW = wpv_num($d['Leistung_Verdichter_W'] ?? null);
         if ($elecW === null && wpv_num($d['Leistungsaufnahme'] ?? null) !== null) $elecW = wpv_num($d['Leistungsaufnahme']) * 1000;
         // Bestätigter Verdichterstillstand: gemessene Aufnahme 0 (waermepumpe.php Z. 332–334)
-        if ($elecW !== null && $wpType !== 4 && empty($d['Verdichter_Ein']) && empty($d['Verdichter'])) $elecW = 0.0;
+        // Dimplex mit gelesenem Ausgang „Verdichter 1“: Die gemessene Leistung bleibt stehen.
+        if ($elecW !== null && $wpType !== 4 && ($d['dimplex_compressor_source'] ?? '') !== 'modbus_coil'
+            && empty($d['Verdichter_Ein']) && empty($d['Verdichter'])) $elecW = 0.0;
     } elseif ($success && $wpType === 6) {
         $elecW = wpv_num($d['WP_Power'] ?? null);
     } elseif ($success && $wpType !== 4) {

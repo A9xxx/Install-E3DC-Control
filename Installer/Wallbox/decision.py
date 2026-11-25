@@ -2544,7 +2544,7 @@ def phase_observation_contract(
         fixed_session.get("contract") == "fixed_phase_session_v1"
         and fixed_session.get("active") is True
         and str(fixed_session.get("session_id") or "")
-        and fixed_session.get("session_id") == cd.get("_fixed_phase_session_id")
+        and fixed_session.get("session_id") == cd.get("_wallbox_plug_episode_id")
         and str(cd.get("_wallbox_cycle_token") or "")
         and fixed_session.get("cycle_token") == cd.get("_wallbox_cycle_token")
         and not can_switch
@@ -2569,11 +2569,11 @@ def phase_observation_contract(
     )
 
     if fixed_session_bound:
-        effective = max(fixed_session_phases, actual_phases)
+        effective = fixed_session_phases
         phase_evidence_valid = fixed_session.get("confirmed") is True
         basis = "fixed_session_confirmed" if phase_evidence_valid else "fixed_session_start_upper_bound"
         reason_code = str(fixed_session.get("reason") or basis)
-        vehicle_phase_source = "session_stable_phase_measurement" if phase_evidence_valid else "fixed_session_start_upper_bound"
+        vehicle_phase_source = "session_phase_measurement" if phase_evidence_valid else "fixed_session_start_upper_bound"
     elif actual_phases:
         effective = actual_phases
         basis = actual_source
@@ -6132,90 +6132,6 @@ def phase_3p_budget_support_contract(
 
 
 PHASE_INDIVIDUAL_BUDGET_SCHEMA = "wallbox_phase_individual_budget_v1"
-
-
-IDLE_START_BUDGET_PROJECTION_SCHEMA = (
-    "wallbox_idle_start_budget_projection_v1"
-)
-
-
-def idle_start_budget_projection_contract(
-    *,
-    idle_phases: Any,
-    observed_phases: Any,
-    evse_phase_switch_capable: bool,
-    status_fresh: bool,
-    connected: bool,
-    start_attempt_consumed: bool,
-    authorized_budget_w: Any,
-    minimum_amp: Any = 6.0,
-    voltage_v: Any = 230.0,
-) -> Dict[str, Any]:
-    """Trennt die energetische Startprojektion von der elektrischen Reservierung.
-
-    Ein ruhender Ladepunkt ohne Istphasenbeleg wird konservativ dreiphasig
-    reserviert. Wird derselbe konservative Wert auch für die energetische
-    Projektion verwendet, fordert der Startanspruch genau das dreiphasige
-    Mindestbudget an. Reicht das autorisierte Budget nur für dieses Minimum,
-    entsteht ein geschlossener Kreis: Der Ladepunkt bekommt exakt sein
-    3p-Minimum, hält deshalb drei Phasen, kann dreiphasig nicht starten und
-    erneuert anschließend denselben Anspruch.
-
-    Dieser Vertrag erlaubt die energetische Bepreisung eines späteren
-    einphasigen Starts, ausschließlich nachdem der eine Startversuch dieser
-    Stecksession verbraucht ist und weiterhin keine Ladung läuft. Das
-    autorisierte Budget taugt dafür nicht als Auslöser: Es ist selbst das
-    Ergebnis des gestellten Anspruchs und entspricht dann genau dem
-    dreiphasigen Minimum. Die elektrische Reservierung bleibt konservativ: Eine
-    Zielphase wird nicht vor ihrer Hardwarebestätigung als verfügbare
-    elektrische Entlastung verbucht. Jeder Istphasenbeleg, eine fehlende
-    bestätigte Umschaltfähigkeit und jede unvollständige Evidenz halten den
-    Vertrag geschlossen.
-    """
-
-    conservative = valid_phase_count(idle_phases, 0) or 3
-    observed = valid_phase_count(observed_phases, 0)
-    amp = max(0.0, _safe_float(minimum_amp, 6.0)) or 6.0
-    voltage = max(200.0, min(260.0, _safe_float(voltage_v, 230.0)))
-    budget_w = max(0.0, _safe_float(authorized_budget_w, 0.0))
-    one_phase_w = amp * voltage
-    conservative_w = float(conservative) * amp * voltage
-    result = {
-        "contract": IDLE_START_BUDGET_PROJECTION_SCHEMA,
-        "apply": False,
-        "reason": "conservative_projection",
-        "energy_projection_phases": conservative,
-        "electrical_reservation_phases": conservative,
-        "one_phase_minimum_w": one_phase_w,
-        "conservative_minimum_w": conservative_w,
-        "authorized_budget_w": budget_w,
-        "observed_phases": observed,
-    }
-    if conservative < 3:
-        result["reason"] = "no_conservative_three_phase_reservation"
-        return result
-    if observed:
-        result["reason"] = "physical_phases_observed"
-        return result
-    if evse_phase_switch_capable is not True:
-        result["reason"] = "evse_phase_switch_not_confirmed"
-        return result
-    if status_fresh is not True or connected is not True:
-        result["reason"] = "status_evidence_missing"
-        return result
-    if start_attempt_consumed is not True:
-        # Der erste Startversuch dieser Stecksession bleibt unberührt. Erst
-        # wenn er verbraucht ist und weiterhin keine Ladung läuft, ist der
-        # dreiphasige Anspruch belegt gescheitert.
-        result["reason"] = "first_start_attempt_untouched"
-        return result
-    if budget_w + 1e-9 < one_phase_w:
-        result["reason"] = "budget_below_one_phase_minimum"
-        return result
-    result["apply"] = True
-    result["reason"] = "one_phase_start_projection"
-    result["energy_projection_phases"] = 1
-    return result
 
 
 DISPLAY_CAP_AMP_SCHEMA = "wallbox_display_cap_amp_v1"

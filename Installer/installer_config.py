@@ -36,6 +36,12 @@ WEB_CONFIG_START_DEFAULTS = {
     "forecast_diagnostics_enable": "0",
     "shadow_snapshot_token": "",
 }
+# Nur beim erstmaligen Anlegen der V4-Datei gespeichert: Marktpfad geschlossen und Speicher im Preis-Boost aus,
+# bis beides bewusst eingeschaltet wird. Bestehende Anlagen behalten ihre Einstellung.
+WEB_CONFIG_FIRST_INSTALL_DEFAULTS = {
+    "grid_friendly_mode": "0",
+    "cheap_grid_battery_enable": "0",
+}
 
 
 def apply_web_config_start_defaults(data, *, first_install=False):
@@ -47,6 +53,9 @@ def apply_web_config_start_defaults(data, *, first_install=False):
         value = result.get(key)
         if key not in result or value is None or value == "":
             result[key] = default
+    if first_install:
+        for key, default in WEB_CONFIG_FIRST_INSTALL_DEFAULTS.items():
+            result.setdefault(key, default)
     # Die Rolle darf ausschließlich beim erstmaligen Erzeugen der V4-Datei
     # vorbelegt werden. Bestehende Anlagen ohne Rollenbindung bleiben bewusst
     # fail-closed und werden nicht still als Einzelanlage umgedeutet.

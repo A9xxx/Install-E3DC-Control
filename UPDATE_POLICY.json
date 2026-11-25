@@ -1,9 +1,9 @@
 {
-  "version": "5.5.8",
+  "version": "5.5.9",
   "min_version": "4.0.0",
-  "stable_release": "v5.5.8",
-  "release_date": "2026-11-18",
-  "description": "v5.5.8 - Anschlussrahmen für Akku-Netzladen und Wallbox, Markt-Netzladen mit Puffer, Wallbox-Haltezone, PV-Prognose nach Erzeugungsstunden und geschützte Geheimnisfelder",
+  "stable_release": "v5.5.9",
+  "release_date": "2026-11-25",
+  "description": "v5.5.9 - Web-PIN für den Zugriff von außen, Dashboard im Heimnetz ohne Anmeldung, einfacherer Wallbox-Start, ruhigere Speicher- und Verkaufsregelung, Suche in Einstellungen und Dokumentation",
   "update_strategy": "backup_replace_restart_v1",
   "installer_requires": "python3",
   "sanitized_republication": false,

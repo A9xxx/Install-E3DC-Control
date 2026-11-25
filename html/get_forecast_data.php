@@ -31,7 +31,7 @@ if (PHP_SAPI !== 'cli') {
 }
 
 require_once __DIR__ . '/helpers.php';
-requireWebAuth(true);
+requireDashboardReadAuth(true);
 if (session_status() === PHP_SESSION_ACTIVE) {
     @session_write_close();
 }
@@ -1973,6 +1973,22 @@ function forecastDispatchGenerationDiagnostics($generation) {
     ];
 }
 
+// Planaktualisierung: Der Speicherplan gilt bis zum Ende der laufenden Viertelstunde, der Planer rechnet
+// an der Grenze neu, und die Laufzeitdatei zieht wenige Sekunden später nach. In der ersten Minute nach
+// dem Ablauf bzw. nach einem neuen Plan ist das eine Aktualisierung und kein Fehler.
+function forecastPlanRefreshPending($planMeta, $generation, $planFresh, $nowMs, $windowMs = 60000.0) {
+    $planMeta = is_array($planMeta) ? $planMeta : [];
+    $generation = is_array($generation) ? $generation : [];
+    if (empty($generation['plan_coherent']) || !forecastCanonicalDispatchPlanValid($planMeta)) {
+        return false;
+    }
+    if (!$planFresh) {
+        return e3dcPlanRefreshWindowOpen($planMeta['valid_until_ts_ms'] ?? 0, $nowMs, $windowMs);
+    }
+    return ($generation['reason_code'] ?? '') === 'RUNTIME_PLAN_MISMATCH'
+        && e3dcPlanRefreshWindowOpen($planMeta['generated_at_ts_ms'] ?? 0, $nowMs, $windowMs);
+}
+
 function forecastDirectMarketingSlotState($projection, $runtime, $runtimeMatchesSlot, $requiresPrice) {
     $projection = is_array($projection) ? $projection : [];
     $runtime = is_array($runtime) ? $runtime : [];
@@ -3883,6 +3899,12 @@ $data['storage_projection_status'] = array_merge(
     [
         'plan_fresh' => !empty($data['storage_plan_fresh']),
         'soc_curve_current' => $planCoherent && !empty($data['storage_plan_fresh']),
+        'plan_refresh_pending' => forecastPlanRefreshPending(
+            $storagePlanMeta,
+            $data['storage_dispatch_generation'],
+            !empty($data['storage_plan_fresh']),
+            $planNowMs
+        ),
     ]
 );
 

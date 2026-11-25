@@ -17,6 +17,34 @@ Diensten.
   entfernt nur die systemd-Unit und lässt Config, Historie, Logs und Scripts
   unangetastet.
 
+## Einrichtungsstand
+
+Die Karte „Einrichtungsstand“ fasst oben auf der Seite zusammen, was eingerichtet
+ist, was fehlt und was auffällt. Sie wertet nur Dienststatus, Moduldiagnose,
+Konfiguration und Zustandsdateien aus, die ohnehin vorliegen; sie schaltet und
+schreibt nichts.
+
+- `✓ in Ordnung`: Der Dienst läuft und schreibt („Dienst läuft, Lebenszeichen
+  vor …“). Das Lebenszeichen sagt nichts darüber, ob ein Gerät oder Konto dahinter
+  antwortet; das zeigen die Diagnose und die Seite der Funktion. Einzelne Zeilen
+  prüfen mehr: „Verbindung zum E3DC“ Alter und Fehler des letzten Abrufs, „MQTT /
+  Home Assistant“ den Verbindungszustand, „Strompreise“ die Preisdatei.
+- `⚠ auffällig`: Eine vorhandene Prüfung meldet eine Warnung, etwa eine fehlende
+  Web-PIN oder eine Warnung an einem Feld.
+- `✗ fehlt`: Die Funktion ist in der Konfiguration eingeschaltet, der Dienst ist
+  aber nicht installiert oder läuft nicht. `Einrichten` springt zur Modulkarte;
+  dort läuft die Einrichtung wie gewohnt.
+- `? unbekannt`: Eine Quelle fehlt, ist veraltet oder widerspricht einer anderen.
+  Daraus entsteht weder ein Haken noch ein Fehler.
+- `–`: ausgeschaltet oder ohne eigene Prüfung, ohne Wertung.
+
+`Zum Feld` öffnet die Einstellung in der erweiterten Ansicht des Config-Editors.
+Die Strompreise erscheinen nur bei einem Börsenpreistarif. Im Docker-Betrieb meldet
+die Karte keine fehlenden Dienste und keine neue Version; auf einem Slave oder einer
+Shadow-Instanz gelten angehaltene Dienste nicht als Fehler. Die Werkzeuge für die
+Fehlersuche (`Modulfreigabe prüfen`, `Freigabe-Plan`, `Sicherungsplan`, `Letzter
+Auftrag`) stehen eingeklappt unter „Wartung“.
+
 ## Standardaktionen
 
 - `Diagnose`: liest Dienststatus, Konfiguration, Alive-Datei, Logauszug und
@@ -81,10 +109,10 @@ die Installationszentrale ein.
   der vollständigen Dateiliste. Inhalte bleiben unverändert; kein Backup,
   Releasewechsel oder Dienstneustart.
 - `System reparieren`: startet denselben root-kontrollierten Systemjob wie
-  `System Update`: verifiziertes Vollbackup, kurzer Dienststopp,
-  Stable-Abgleich, Rechteprojektion und Dienstneustart. Lokale Inhaltsänderungen
-  werden vor dem Start angezeigt und benötigen eine ausdrückliche Freigabe.
-  Dieselbe Version kann erneut installiert werden.
+  `System Update`: verifiziertes Vollbackup, kurzer Dienststopp, Einspielen der
+  neuesten veröffentlichten Version (auch derselben erneut), Rechteprojektion
+  und Dienstneustart. Lokale Inhaltsänderungen werden vor dem Start angezeigt
+  und benötigen eine ausdrückliche Freigabe.
 
 Im Docker-Betrieb ist `System reparieren` deaktiviert. Produktdateien und
 Rechte kommen aus dem Image; bei Problemen erfolgt der Container-Neustart
@@ -231,7 +259,8 @@ starten beim nächsten Containerstart über die Container-Startlogik.
 ### Neue Speicherregelung im Vergleichsbetrieb
 
 Die Diagnosekarte zeigt den Stand des Vergleichs, die letzte Klasse mit Moduspaar,
-heutige Anteile, Schrankenkonflikte und Schreibwege, die Funktionsabdeckung sowie
+heutige Anteile mit den häufigsten Ursachen unvergleichbarer Zyklen,
+Schrankenkonflikte (auch verdeckte) und Schreibwege, die Funktionsabdeckung sowie
 die Laufzeit p95. E3DC-Control vergleicht Vorschläge; die neue Regelung steuert
 keine Geräte. „Forum kompakt“ enthält `speicherkern_schatten.json`.
 Für Rückmeldungen zusätzlich `speicherkern_schatten_aggregate.json` im

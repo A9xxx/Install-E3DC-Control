@@ -81,14 +81,14 @@ try:
     from .market_economics import (
         HORIZON_MS as MARKET_HORIZON_MS,
         WINDOW_REFERENCE_CLOCK_TOLERANCE_MS,
-        build_market_economics_plan, market_charge_projection, market_grid_charge_room_w,
+        build_market_economics_plan, market_charge_projection, market_grid_charge_room_result,
         _market_plan_contract_error,
     )
 except Exception:
     from market_economics import (
         HORIZON_MS as MARKET_HORIZON_MS,
         WINDOW_REFERENCE_CLOCK_TOLERANCE_MS,
-        build_market_economics_plan, market_charge_projection, market_grid_charge_room_w,
+        build_market_economics_plan, market_charge_projection, market_grid_charge_room_result,
         _market_plan_contract_error,
     )
 
@@ -930,7 +930,13 @@ def build_market_soc_trajectory(plan, live=None):
             and (hold_wh <= 0.001 or (contract or {}).get("action") == "hold_discharge"))
         if not horizon_only:
             schedule = []
-        if horizon_only:
+        future_only = not horizon_only and contract is None
+        if future_only:
+            # Belegte spätere Aufträge brauchen keine aktuelle Speicheraktion.
+            contract = {"start_ts": generated, "end_ts": plan.get("horizon_end_ts_ms")}
+            forecast = {}
+            action = "future_grid_charge"
+        elif horizon_only:
             contract = {"start_ts": generated, "end_ts": hold_end}
             forecast = {}
             policy = market.get("consumer_policy") or {}
@@ -990,7 +996,9 @@ def build_market_soc_trajectory(plan, live=None):
             return unavailable("market_projection_anchor_invalid")
         valid_from = int(number(plan.get("valid_from_ts_ms")))
         valid_until = int(number(plan.get("valid_until_ts_ms")))
-        if capacity <= 0 or not 0 <= reserve <= soc <= 100 or min(charge_cap, discharge_cap) < 0:
+        # Ein Ladestand knapp unter der Reserve (etwa auf der Gerätereserve) ist
+        # ein gültiger Startpunkt; Ladestand und Reserve werden nicht gegeneinander geprüft.
+        if capacity <= 0 or not 0 <= reserve <= 100 or not 0 <= soc <= 100 or min(charge_cap, discharge_cap) < 0:
             return unavailable("market_projection_limits_invalid")
         if not valid_from <= generated < valid_until or not isinstance(plan.get("slots"), list):
             return unavailable("market_projection_time_invalid")
@@ -1007,7 +1015,7 @@ def build_market_soc_trajectory(plan, live=None):
         efficiency = 1.0
         grid_budget_wh = 0.0
         target_soc = 100.0
-        if action == "hold_horizon":
+        if action in ("hold_horizon", "future_grid_charge"):
             efficiency = number((market.get("economics") or {}).get("roundtrip_efficiency_pct")) / 100.0
         elif action == "hold_discharge":
             selected.append({"action": "hold_economic", "phase": "hold", "origin": "hold_discharge",
@@ -1025,8 +1033,13 @@ def build_market_soc_trajectory(plan, live=None):
             if power < 300 or grid_budget_wh <= 0 or not 0 < efficiency <= 1 or not soc <= target_soc <= 100:
                 return unavailable("grid_charge_job_invalid")
             jobs = [dict(job, charge_efficiency=efficiency, target_end_soc_pct=target_soc)]
-        if action in ("grid_charge", "hold_horizon"):
+        if action in ("grid_charge", "hold_horizon", "future_grid_charge"):
             jobs.extend(future_projection_jobs(jobs[0] if jobs else None))
+        if future_only:
+            jobs = [job for job in jobs
+                if generated < job["window_start_ts"] < plan["horizon_end_ts_ms"]]
+            if not jobs:
+                return unavailable("no_market_actions")
         rows = {int(number(row.get("ts"))): row for row in plan.get("timeline") or []}
         forecast_rows = []
         for base in plan["slots"]:
@@ -1113,7 +1126,7 @@ def build_market_soc_trajectory(plan, live=None):
                         power = max(-discharge_cap, -number(allocation["battery_pv_supply_wh"]) / allocation_hours)
                     else:
                         power = max(0.0, base_power)
-                end_soc = max(reserve, min(100.0, soc + power * hours / capacity * 100.0))
+                end_soc = max(min(reserve, soc), min(100.0, soc + power * hours / capacity * 100.0))
                 actual_power = (end_soc - soc) * capacity / 100.0 / hours
                 net = forecast_by_start[base_start]["net_w"]
                 grid_w = -net + actual_power + grid_power * (1.0 - segment_efficiency)
@@ -6274,6 +6287,8 @@ class StorageSimulator:
         config_target_soc = float(self.target_soc)
         planning_target_soc = config_target_soc
         wallbox_target_soc, wallbox_target_intent = self._wallbox_target_curve_soc(config_target_soc)
+        # Phasenwerte und Fahrzeuganteil zählen mit ihrem Alter beim Lesen; die Rechenzeit danach altert sie nicht.
+        _market_read_at_s = time.time()
         wallbox_floor_soc_active = bool(
             wallbox_target_soc is not None and wallbox_target_soc < config_target_soc - 0.1
         )
@@ -9500,7 +9515,7 @@ class StorageSimulator:
         # Der Marktplan verwendet dieselben frischen Gerätegrenzen wie der Writer.
         # Ein allgemeiner Leistungsrückfall ist kein Beleg für spätere Netzenergie.
         _market_live = live_with_managed_vehicle_phases(
-            _live_d if isinstance(_live_d, dict) else {}, wallbox_target_intent, _live_read_at_s)
+            _live_d if isinstance(_live_d, dict) else {}, wallbox_target_intent, _market_read_at_s)
         _market_limits = effective_power_limit_cfg(self.v4_config, _market_live, now_s=_live_read_at_s)
         _market_limit_diagnostics = _market_limits.get("_power_limit_diagnostics") or {}
         _market_power_known = bool(
@@ -9547,7 +9562,12 @@ class StorageSimulator:
         _market_grid_cfg = house_fuse_config(self.v4_config,
             resolve_house_fuse(self.v4_config, system_house_fuse(_market_live)))
         if (_market_grid_cfg.get("_house_fuse") or {}).get("effective") is not None:
-            _market_economics_config["_market_grid_charge_room_w"] = market_grid_charge_room_w(_market_grid_cfg, _market_live)
+            # Ein unbekannter Rahmen ist keine 0 W: Dann gilt die eingestellte
+            # Leistung; das Laden begrenzt der Regler mit frischen Phasenwerten.
+            _market_room_w, _market_room_unknown = market_grid_charge_room_result(
+                _market_grid_cfg, _market_live, now_s=_market_read_at_s)
+            if _market_room_unknown is None:
+                _market_economics_config["_market_grid_charge_room_w"] = _market_room_w
             _market_phases = (1 if _market_live.get("pvi_ac_max_phase_count_valid") is True
                 and not isinstance(_market_live.get("pvi_ac_max_phase_count"), bool)
                 and _market_live.get("pvi_ac_max_phase_count") == 1 else 3)

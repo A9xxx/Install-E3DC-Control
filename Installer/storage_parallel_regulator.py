@@ -1733,14 +1733,12 @@ class ParallelStorageRegulator:
         curve_cap_relevant = druck.werte['curve_cap_relevant']
         curve_cap_target_w = druck.werte['curve_cap_target_w']
         curve_cap_tracking_active = druck.werte['curve_cap_tracking_active']
-        derate_hard_limit_w = druck.werte['derate_hard_limit_w']
         derate_limit_source = druck.werte['derate_limit_source']
-        derate_limit_w = druck.werte['derate_limit_w']
         derating_active = druck.werte['derating_active']
         derating_pressure_w = druck.werte['derating_pressure_w']
         ems_budget = druck.werte['ems_budget']
         ems_mandatory_charge_w = druck.werte['ems_mandatory_charge_w']
-        feed_export_threshold_w = druck.werte['feed_export_threshold_w']
+        feed_export_threshold_w = druck.werte['feed_export_threshold_w'] or 0
         grid_export_error_w = druck.werte['grid_export_error_w']
         grid_export_over_limit_w = druck.werte['grid_export_over_limit_w']
         grid_export_w = druck.werte['grid_export_w']
@@ -1753,7 +1751,7 @@ class ParallelStorageRegulator:
         meter_home_w = druck.werte['meter_home_w']
         pcc_limit_contract = druck.werte['pcc_limit_contract']
         previous_curve_cap_w = druck.werte['previous_curve_cap_w']
-        release_export_threshold_w = druck.werte['release_export_threshold_w']
+        release_export_threshold_w = druck.werte['release_export_threshold_w'] or 0
         settings_bounded_zero_confirmed = druck.werte['settings_bounded_zero_confirmed']
         settings_previous_curve_cap_confirmed = druck.werte['settings_previous_curve_cap_confirmed']
         settings_readback_valid = druck.werte['settings_readback_valid']
@@ -1761,7 +1759,6 @@ class ParallelStorageRegulator:
         curve_cap_export_room_w = int(curve_cap_pressure_w)
         curve_cap_excess_charge_w = max(0, int(bat_w) - int(curve_cap_export_room_w))
         projected_export_without_charge_w = int(grid_export_w)
-        projected_export_threshold_w = int(derate_limit_w) if derate_limit_w > 0 else int(feed_export_threshold_w)
         projected_export_over_limit_w = int(grid_export_over_limit_w)
         current_feed_pressure_w = int(grid_export_over_limit_w)
         curve_cap_hard_pressure_active = bool(
@@ -2865,10 +2862,10 @@ class ParallelStorageRegulator:
             "curve_cap_grid_export_over_limit_w": grid_export_over_limit_w,
             "curve_cap_current_feed_pressure_w": current_feed_pressure_w,
             "curve_cap_projected_export_without_charge_w": projected_export_without_charge_w,
-            "curve_cap_projected_export_threshold_w": projected_export_threshold_w,
+            "curve_cap_projected_export_threshold_w": pcc_limit_contract["limit_w"],
             "curve_cap_projected_export_over_limit_w": projected_export_over_limit_w,
-            "curve_cap_feed_export_threshold_w": feed_export_threshold_w,
-            "curve_cap_release_export_threshold_w": release_export_threshold_w,
+            "curve_cap_feed_export_threshold_w": pcc_limit_contract["limit_w"],
+            "curve_cap_release_export_threshold_w": release_export_threshold_w if pcc_limit_contract["active"] else None,
             "curve_cap_feed_buffer_w": self.curve_cap_feed_buffer_w,
             "curve_cap_release_band_w": self.curve_cap_release_band_w,
             "curve_cap_feedback_band_w": self.curve_cap_feedback_band_w,
@@ -2904,9 +2901,10 @@ class ParallelStorageRegulator:
             "curve_cap_below_threshold_w": curve_cap_below_threshold_w,
             "inverter_limit_w": inverter_limit_w,
             "inverter_pressure_w": inverter_pressure_w,
-            "derate_limit_w": derate_limit_w,
-            "derate_hard_limit_w": derate_hard_limit_w,
+            "derate_limit_w": pcc_limit_contract["limit_w"],
+            "derate_hard_limit_w": pcc_limit_contract["hard_limit_w"],
             "derate_limit_source": derate_limit_source,
+            "pcc_limit_contract": pcc_limit_contract,
             "configured_export_limit_w": configured_export_limit_w,
             "live_derate_limit_w": live_derate_limit_w,
             "derating_pressure_w": derating_pressure_w,
@@ -4023,10 +4021,10 @@ class ParallelStorageRegulator:
                 "curve_cap_grid_export_over_limit_w": grid_export_over_limit_w,
                 "curve_cap_current_feed_pressure_w": current_feed_pressure_w,
                 "curve_cap_projected_export_without_charge_w": projected_export_without_charge_w,
-                "curve_cap_projected_export_threshold_w": projected_export_threshold_w,
+                "curve_cap_projected_export_threshold_w": pcc_limit_contract["limit_w"],
                 "curve_cap_projected_export_over_limit_w": projected_export_over_limit_w,
-                "curve_cap_feed_export_threshold_w": feed_export_threshold_w,
-                "curve_cap_release_export_threshold_w": release_export_threshold_w,
+                "curve_cap_feed_export_threshold_w": pcc_limit_contract["limit_w"],
+                "curve_cap_release_export_threshold_w": release_export_threshold_w if pcc_limit_contract["active"] else None,
                 "curve_cap_feed_buffer_w": self.curve_cap_feed_buffer_w,
                 "curve_cap_release_band_w": self.curve_cap_release_band_w,
                 "curve_cap_feedback_band_w": self.curve_cap_feedback_band_w,
@@ -4062,9 +4060,10 @@ class ParallelStorageRegulator:
                 "curve_cap_below_threshold_w": curve_cap_below_threshold_w,
                 "inverter_limit_w": inverter_limit_w,
                 "inverter_pressure_w": inverter_pressure_w,
-                "derate_limit_w": derate_limit_w,
-                "derate_hard_limit_w": derate_hard_limit_w,
+                "derate_limit_w": pcc_limit_contract["limit_w"],
+                "derate_hard_limit_w": pcc_limit_contract["hard_limit_w"],
                 "derate_limit_source": derate_limit_source,
+                "pcc_limit_contract": pcc_limit_contract,
                 "configured_export_limit_w": configured_export_limit_w,
                 "live_derate_limit_w": live_derate_limit_w,
                 "derating_pressure_w": derating_pressure_w,

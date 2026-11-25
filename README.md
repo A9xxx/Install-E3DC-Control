@@ -1,12 +1,14 @@
 # E3DC-Control Web-Portal & Installer
 
-Ein hochperformantes, modulares Dashboard und Installations-System für die **native Python-Architektur** [A9xxx/Install-E3DC-Control](https://github.com/A9xxx/Install-E3DC-Control) <kbd>Version 5.5.8</kbd>. Es verwandelt das System in ein intelligentes Smart-Home-Zentrum mit moderner Web-Oberfläche, eigenem Energy Manager und proaktivem Systemschutz.
+Ein hochperformantes, modulares Dashboard und Installations-System für die **native Python-Architektur** [A9xxx/Install-E3DC-Control](https://github.com/A9xxx/Install-E3DC-Control) <kbd>Version 5.5.9</kbd>. Es verwandelt das System in ein intelligentes Smart-Home-Zentrum mit moderner Web-Oberfläche, eigenem Energy Manager und proaktivem Systemschutz.
 
 ![E3DC-Control Dashboard](html/app-icon-512.png)
 
 ## Aktuelle Version und Update
 
-Die aktuelle stabile Version ist **5.5.8**. Hinweise zum Web-, Konsolen- und Docker-Update sowie zur Wiederherstellung stehen in [doc/Update.md](doc/Update.md). Die vollständigen Änderungen dokumentieren [RELEASE_NOTES.md](RELEASE_NOTES.md) und [CHANGELOG.md](CHANGELOG.md). Der sanitierte Root **v5.3.2b** bleibt ausschließlich als Docker-Rückfall-Image verfügbar. Ein Bare-Metal-Programm-Rückfall auf diesen Stand wird nicht angeboten; dort bleibt die Wiederherstellung aus einem verifizierten Datei-Backup der sichere Rückweg.
+Die aktuelle stabile Version ist **5.5.9**. Hinweise zum Web-, Konsolen- und Docker-Update sowie zur Wiederherstellung stehen in [doc/Update.md](doc/Update.md). Die vollständigen Änderungen dokumentieren [RELEASE_NOTES.md](RELEASE_NOTES.md) und [CHANGELOG.md](CHANGELOG.md). Der sanitierte Root **v5.3.2b** bleibt ausschließlich als Docker-Rückfall-Image verfügbar. Ein Bare-Metal-Programm-Rückfall auf diesen Stand wird nicht angeboten; dort bleibt die Wiederherstellung aus einem verifizierten Datei-Backup der sichere Rückweg.
+
+5.5.9 ist ein Funktions- und Korrekturupdate: Der Zugriff über Domainnamen und öffentliche IP-Adressen verlangt jetzt eine Web-PIN (14 Tage Übergang, Heimnetz bleibt frei), mit Web-PIN ist das Dashboard im Heimnetz ohne Anmeldung sichtbar, der PV-Start der Wallbox kommt ohne Akkureservierung aus, und Config-Editor und Hilfeseite lassen sich vollständig durchsuchen. Bestehende Installationen aktualisieren wie gewohnt über **System Update** bzw. das Docker-Update; während des Updates kein Fahrzeug anstecken.
 
 5.5.8 ist ein Funktions- und Korrekturupdate: Akku-Netzladen und geregelte Fahrzeuge teilen sich das Phasenbudget mit Vorrang für den Akku, das Markt-Netzladen lädt zuerst einen Puffer und den Rest so spät wie möglich, und in der Haltezone über der Akku-Untergrenze führt E3DC-Control die Wallbox nach dem PV-Rahmen des Speichers. Gespeicherte Passwörter, PINs und Token gehen nicht mehr als Feldwerte an den Browser. Bestehende Installationen aktualisieren wie gewohnt über **System Update** bzw. das Docker-Update; während des Updates kein Fahrzeug anstecken. Wer die Oberfläche ohne Web-PIN über einen Domainnamen öffnet, sieht einen Hinweis: Ab der nächsten Version ist dieser Zugriff nur noch mit Web-PIN möglich.
 
@@ -63,6 +65,8 @@ sondern eine eindeutige Auswahl verlangt.
 > **Config-Schutz:** Standardinstallationen speichern `data/e3dc_v4.json` und lokale Config-Backups mit `660` für Install-User und `www-data`, damit WebUI und Dienste weiter automatisch starten, die Datei aber nicht mehr weltlesbar ist. Der normale Config-Download „Einstellungen ohne Zugangsdaten“ enthält keine Zugangsdaten, aber weiterhin IP-Adressen und Gerätekennungen und ist nicht zum Teilen gedacht; der Raw-Download enthält Zugangsdaten und wird nur mit gesetzter Web-PIN und nach Bestätigung angeboten. Im Config-Editor und auf der Wallbox-Seite bleiben Geheimnisfelder leer; leer speichern erhält den Wert, eine neue Eingabe ersetzt ihn und „Wert löschen“ leert ihn ausdrücklich. Der Kompatibilitätsmodus (`664`) ist nur für eigene externe Leser gedacht. Import, Rollback und normales Speichern im Config-Editor prüfen die fertig zusammengeführte JSON-Datei auf höchstens 64 KiB; eine bestandene Rollenprüfung beweist keinen laufenden Regelbetrieb. Für HA-Sicherungen und Ersatzhardware gilt [Rolle und Rollenanker](doc/High_Availability_Dokumentation.md#rolle-und-rollenanker).
 
 > **Bedienansichten:** Config-Editor und Wallbox-Seite unterscheiden zwischen einfacher Ansicht für Einrichtung und täglichen Betrieb sowie erweiterter Ansicht für alle Detailparameter. Die Logik und Abgrenzung sind in [doc/Frontend_Ansichten.md](doc/Frontend_Ansichten.md) dokumentiert.
+
+> **Neu in 5.5.9:** Web-PIN für den Zugriff von außen, Dashboard im Heimnetz ohne Anmeldung, einfacherer PV-Start der Wallbox, Start der E3DC-Wallbox mit Netzfreigabe ohne Phasenangabe, Netzladen mit Puffer und Pause auch auf langsameren Geräten, Suche in Einstellungen und Dokumentation, Einrichtungsstand, Marktpfad-Schalter mit Zustandszeile. Einzelheiten stehen in den [Release Notes](RELEASE_NOTES.md).
 
 > **Neu in 5.5.8:** Gemeinsamer Anschlussrahmen für Akku-Netzladen und Fahrzeuge, Markt-Netzladen mit Puffer und spätem Hauptblock, Wallbox-Haltezone über der Akku-Untergrenze, Pre-Dump in die Wallbox, Rücknahme bei Wärmepumpen-Automatik-Aus, PV-Prognose nach Erzeugungsstunden, Lücken statt Nullwerten bei fehlenden Messwerten, geschützte Geheimnisfelder und Hinweis zum Domainzugriff ohne Web-PIN. Einzelheiten stehen in den [Release Notes](RELEASE_NOTES.md).
 
@@ -576,7 +580,7 @@ sudo docker compose logs --tail=80 e3dc-control
 > `ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}`. Ohne Eintrag
 > folgt sie dem geprüften Stable-Tag `latest`. Ein fester Versions-Tag wechselt
 > bei `pull` absichtlich nicht; für einen bewussten Pin oder Rückfall wird
-> `E3DC_IMAGE_TAG=v5.5.8` in `.env` gesetzt und `sudo docker compose up -d`
+> `E3DC_IMAGE_TAG=v5.5.9` in `.env` gesetzt und `sudo docker compose up -d`
 > ausgeführt. `config --images` zeigt vor dem Pull das tatsächlich gewählte
 > Image.
 

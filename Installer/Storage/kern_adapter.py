@@ -23,7 +23,7 @@ except ModuleNotFoundError:
 from .vorab_leser import (cfg_bool, predump_time_window, predump_plan_is_hard,
     adaptive_gate, predump_trajectory_state, predump_wallbox_block_window)
 from .quellenrahmen import schatten_quellen
-from .leistungsleser import effective_power_limit_cfg, safe_float
+from .leistungsleser import effective_power_limit_cfg, safe_float, safe_int
 from .handauftrag_leser import (manual_override_deadline, manual_override_max_age_s,
                                manual_override_expired, storage_emergency_status)
 from .kurvenleser import adaptive_curve_context
@@ -88,24 +88,31 @@ def _kurve(plan, cfg, live, jetzt):
                    "plan, Raster; Kapazität " + quelle)
 
 
-def _bestand_auftrag(manual, ergebnis, cfg, soc, max_laden, jetzt, plan, lade_daten_gueltig, plan_revision=None):
+def _bestand_auftrag(manual, ergebnis, cfg, soc, max_laden, jetzt, plan, lade_daten_gueltig, plan_revision=None,
+                     markt=None):
     if manual and not manual_override_expired(manual, jetzt, manual_override_max_age_s(cfg)):
-        modus = manual.get("mode")
+        modus = str(manual.get("mode") or "").lower()      # wie im Produkt: Großschreibung ist kein anderer Modus
         ende = manual_override_deadline(manual, jetzt, manual_override_max_age_s(cfg))
         beginn = safe_float(manual.get("ts"), safe_float(manual.get("created_ts"), float("nan")))
         ziel = _konfigzahl(manual.get("target_soc"))
         if modus == "hold":
             return k.Auftrag("LADESP", beginn, ende, "manual"), None
         if modus == "charge":
-            # Nutzervertrag: Zielabschluss unverändert bei target - 0,2; kein Kern-Halten.
-            if _zahl(ziel) and ziel > 0 and _zahl(soc) and soc >= ziel - 0.2:
-                return None, None
-            if not _zahl(ziel):
+            # Nutzervertrag: Die Oberfläche setzt immer Ziel und Richtung; ohne gültiges Ziel kein Auftrag (kein
+            # Sonderfall). Zielabschluss unverändert bei target - 0,2; kein Kern-Halten.
+            if not _zahl(ziel) or not 0 < ziel <= 100:
                 return None, "manueller Auftrag ohne Ziel"
-            return k.Auftrag("NETZLADEN", beginn, ende, "manual", max_laden,
-                             100.0 if ziel <= 0 else ziel), None
+            if _zahl(soc) and soc >= ziel - 0.2:
+                return None, None
+            return k.Auftrag("NETZLADEN", beginn, ende, "manual", max_laden, ziel), None
         if modus == "discharge":
-            return None, "manuelles Entladen, Welle 2"
+            # B08: endliche Entladung mit Gerätemaximum bis Ziel + 0,2 (Akkuenergie bzw. SoC-Ziel); die Reserve
+            # bleibt Boden. Ohne gültiges Ziel kein Auftrag, nur Diagnose (kein Sonderfall).
+            if not _zahl(ziel) or not 0 < ziel <= 100:
+                return None, "manuelles Entladen ohne Ziel"
+            if _zahl(soc) and soc <= ziel + k.ENTLADE_ABSTAND_PP:
+                return None, None
+            return k.Auftrag("ENTLADEN", beginn, ende, "manual", None, ziel, energiebezug="akku"), None
         return None, "unbekannter Handauftrag"
     storm = plan.get("storm_grid_charge") or {}
     if (storm.get("active") is True
@@ -122,16 +129,22 @@ def _bestand_auftrag(manual, ergebnis, cfg, soc, max_laden, jetzt, plan, lade_da
             return k.Auftrag("NETZLADEN", beginn, min(ende, frist),
                 "produkt, Unwetter; " + str(revision), min(rate, max_laden), ziel,
                 konto="unwetter:" + str(storm["window_start"])), None
-    # Markt und Preis-Boost behalten ihre aufgelösten Dienstverträge.
-    state = ergebnis.get("state", "")
-    contract = ergebnis.get("market_economics_contract") or {}
+    # M05: Preis-Boost aus dem gebundenen Plan, in der Produktreihenfolge vor dem Markt (kein Dienstzustand).
+    boost, boost_hinweis = _boost_auftrag(plan, soc, max_laden, jetzt)
+    if boost is not None or boost_hinweis:
+        return boost, boost_hinweis
+    # Der Markt kommt aus dem vor der Entscheidung gebundenen Marktvertrag (Erzeuger), nicht aus dem
+    # Produktergebnis; nur ohne gebundene Aufnahme (ältere Aufrufer) bleibt das Ergebnis die Quelle.
+    quelle = ergebnis if markt is None else markt
+    state = quelle.get("state", "")
+    contract = quelle.get("market_economics_contract") or {}
     ende = _sekunden(contract.get("end_ts"))
     beginn = _sekunden(contract.get("start_ts"))
-    forecast = ergebnis.get("market_economics_forecast") or contract.get("forecast") or {}
+    forecast = quelle.get("market_economics_forecast") or contract.get("forecast") or {}
     if state in ("market_discharge_hold", "market_grid_done_hold", "market_grid_wait", "market_grid_pv_wait"):
-        ende = _sekunden(ergebnis.get("market_late_fill_window_end_ts")) or ende
+        ende = _sekunden(quelle.get("market_late_fill_window_end_ts")) or ende
         vertrag_ende = _sekunden(contract.get("end_ts"))
-        if (ergebnis.get("market_plan_grace") or {}).get("active") is True and vertrag_ende is not None:
+        if (quelle.get("market_plan_grace") or {}).get("active") is True and vertrag_ende is not None:
             # Planübergangs-Karenz des Produkts: Es hält den Vertrag an der Slotgrenze bis zum Folgeplan,
             # höchstens PLAN_STALE_GRACE_MS über das Vertragsende; der Kern hält im selben Fenster.
             ende = max(ende, vertrag_ende + PLAN_STALE_GRACE_MS / 1000.0)
@@ -139,26 +152,40 @@ def _bestand_auftrag(manual, ergebnis, cfg, soc, max_laden, jetzt, plan, lade_da
             return k.Auftrag("HALTEN", beginn, ende, "produkt, Marktvertrag"), None
         return None, "Markthalten ohne Vertragsfenster"
     if state in ("market_grid_charge", "market_negative_absorb_grid"):
-        ziel = ergebnis.get("market_economics_target_soc_pct", forecast.get("grid_charge_target_soc_pct"))
-        rate = (ergebnis.get("market_grid_charge_control") or {}).get("rate_w")
-        if rate is None:
-            rate = ergebnis.get("val") if state == "market_negative_absorb_grid" else ergebnis.get("market_economics_planned_charge_w", forecast.get("grid_charge_planned_charge_w"))
+        ziel = quelle.get("market_economics_target_soc_pct", forecast.get("grid_charge_target_soc_pct"))
+        rate = quelle.get("market_economics_planned_charge_w", forecast.get("grid_charge_planned_charge_w"))
+        if state == "market_negative_absorb_grid":
+            # Die Negativpreis-Aufnahme fordert die freigegebene Geräteleistung;
+            # val enthält bereits den eigenen Phasenrahmen und ist kein Auftrag.
+            maximum = safe_int(cfg.get("market_battery_max_w"), 0)
+            if maximum <= 0:
+                maximum = safe_int(cfg.get("cheap_grid_battery_max_w"), 0)
+            rate = min(max_laden, maximum) if maximum > 0 and _zahl(max_laden) else max_laden
         if all(_zahl(v) for v in (beginn, ende, ziel, rate)):
             return k.Auftrag("NETZLADEN", beginn, ende, "produkt, Marktvertrag", rate, ziel), None
         return None, "Marktladen ohne Ziel, Rate oder Fenster"
-    if state in ("price_boost_grid", "price_boost_grid_wait"):
-        cheap = plan.get("cheap_grid_charge") or {}
-        window = cheap.get("active_window") or {}
-        beginn = _sekunden(window.get("start_timestamp"))
-        ende = _sekunden(window.get("end_timestamp", cheap.get("window_end")))
-        ziel, rate = cheap.get("target_soc"), cheap.get("charge_w")
-        if (cheap.get("active") is True and all(_zahl(v) for v in (beginn, ende, ziel, rate, max_laden))
-                and beginn <= jetzt < ende and 0 <= ziel <= 100 and rate > 0):
-            rate = min(rate, max_laden)
-            return k.Auftrag("NETZLADEN", beginn, ende, "produkt, Preis-Boost", rate, ziel), None
-    if state.startswith("price_boost"):
-        return None, "Preis-Boost ohne aufgelösten vollständigen Auftrag"
     return None, None
+
+
+def _boost_auftrag(plan, soc, max_laden, jetzt):
+    """M05: Preis-Boost (aWATTar-Modus 2) wie im Produkt aus dem Preisfenster des Plans: Netzladen bis Ziel minus
+    Hysterese, Rate höchstens Gerätemaximum, mindestens 300 W; den Anschlussrahmen prüft der Kern. Ein aktives
+    Fenster ohne Ziel oder Rate ist eine Planlücke (Hinweis), kein erfundener Wert."""
+    cheap = plan.get("cheap_grid_charge") or {}
+    if _konfigzahl(plan.get("awattar_mode")) != 2 or cheap.get("active") is not True:
+        return None, None
+    window = cheap.get("active_window") or {}
+    beginn = _sekunden(window.get("start_timestamp"))
+    ende = _sekunden(window.get("end_timestamp", cheap.get("window_end")))
+    if not (_zahl(beginn) and _zahl(ende) and beginn <= jetzt < ende):
+        return None, None
+    ziel, rate = _konfigzahl(cheap.get("target_soc")), _konfigzahl(cheap.get("charge_w"))
+    hysterese = max(0.1, _konfigzahl(cheap.get("hysteresis_pct")) if _zahl(_konfigzahl(cheap.get("hysteresis_pct"))) else 0.5)
+    if not (_zahl(ziel) and 0 <= ziel <= 100 and _zahl(rate) and rate > 0 and _zahl(max_laden)):
+        return None, "Preis-Boost: Ziel oder Ladeleistung fehlt im Preisfenster"
+    if not (_zahl(soc) and soc < ziel - hysterese):
+        return None, None
+    return k.Auftrag("NETZLADEN", beginn, ende, "plan, Preis-Boost", max(300.0, min(rate, max_laden)), ziel), None
 
 
 def _hand_wirksam(manual, cfg, soc, max_laden, jetzt, plan, lade_daten_gueltig):
@@ -252,12 +279,14 @@ def _vorhalt(aufnahme, cfg, live, plan, hand_wirksam, jetzt, monoton, zeitbasis,
 
 def _vorhalte_auftrag(manual, ergebnis, cfg, soc, max_laden, jetzt, plan, lade_daten_gueltig,
              *, vorhalt=None, context=None, quelle=None, hand_wirksam=False, plan_revision=None):
-    # Die unabhängige Marktentscheidung wurde vor der Reserveentscheidung gebunden.
-    source = ergebnis
-    contract = ergebnis.get('market_economics_contract') or {}
-    if (contract.get('economics') or {}).get('charge_profile') == 'reserve':
-        source = (quelle or {}).get('markt') or {}
-    a, marker = _bestand_auftrag(manual, source, cfg, soc, max_laden, jetzt, plan, lade_daten_gueltig, plan_revision)
+    # Die unabhängige Marktentscheidung wurde vor der Produkt- und Reserveentscheidung gebunden (M01–M03).
+    # Ohne Marktleser (nur Aufrufer außerhalb des Dienstes) bleibt das Ergebnis die Quelle.
+    markt = (quelle or {}).get('markt') if isinstance(quelle, dict) else None
+    markt_fehler = isinstance(markt, dict) and markt.get('fehler') is True
+    a, marker = _bestand_auftrag(manual, ergebnis, cfg, soc, max_laden, jetzt, plan, lade_daten_gueltig, plan_revision,
+        markt={} if markt_fehler else markt)
+    if markt_fehler and a is None and marker is None:
+        marker = "Markt: Aufnahme fehlgeschlagen"
     if hand_wirksam:
         return a, marker
     if ((quelle or {}).get('hard_owner') is not False
@@ -340,22 +369,184 @@ def _vorab(plan, cfg, live, jetzt, verbraucher):
         max(0.0, (soc-target)*capacity/100)), "Pre-Dump"
 
 
+NETZPUNKT_FELDER = ("mindest_w", "totband_w", "importwaechter_w", "lastmarge_w", "auf_w", "ab_w", "marge_w",
+    "schritt_w")
+
+
+def _dv_auftrag(dv, cfg, jetzt):
+    """Direktvermarktung als eigener Kernauftrag aus der vor der Entscheidung gebundenen Lage (D01–D09).
+
+    Wirkungslose Lagen (beobachten, HOLD, NORMAL, gesperrte, ungebundene oder nicht freigegebene Aktion wie
+    DV-Netzladen) geben keinen Auftrag und sind abgedeckt. Der Ladeblock (CHARGE_BLOCK_WAIT) wird ein befristeter
+    LADEBLOCK am gebundenen Planslot; Hausversorgung bleibt reservebegrenzt. Noch nicht gebaute Wirkungen bleiben
+    ein fester Hinweis. Rückgabe: (Auftrag oder None, Hinweis oder None, Hinweis gilt nur ohne DV-Aktion)."""
+    if not cfg_bool(cfg, "direct_marketing_enable", False):
+        return None, None, False
+    if not dv or dv.get("aufnahmefehler") is True or dv.get("aktiv") not in (True, False):
+        return None, "Direktvermarktung: Aufnahme fehlt", False
+    if dv["aktiv"] is False:
+        return None, None, False
+    if dv.get("phase5_feld") is True:
+        return None, "Direktvermarktung: Phase 5", False
+    # Die Preisformung der normalen Kurve (D09) rechnet der Kern selbst (Eingang.kurvenformung).
+    formung = dv.get("kurvenformung")
+    passiv = None if formung is None or isinstance(formung, dict) else "Direktvermarktung: Kurvenformung unbekannt"
+    if not (dv.get("befehle") is True and not dv.get("fehler") and dv.get("gate") is True):
+        return None, passiv, True
+    ziel = dv.get("ziel")
+    # Headroom-Halten vor einem Exportfenster sperrt wie der Ladeblock nur das Laden (D04).
+    if ziel == "CHARGE_BLOCK_WAIT" or ziel == "HEADROOM_EXPORT" and dv.get("headroom_halten") is True:
+        beginn, ende = _sekunden(dv.get("beginn_ms")), _sekunden(dv.get("ende_ms"))
+        if not (_zahl(beginn) and _zahl(ende) and beginn <= jetzt < ende):
+            return None, "Direktvermarktung: Ladeblock ohne Fenster", False
+        return k.Auftrag("LADEBLOCK", beginn, ende,
+            "Direktvermarktung; " + str(dv.get("aktion_id") or dv.get("slot_id") or "")), None, False
+    if ziel in ("FORCE_EXPORT", "HEADROOM_EXPORT"):
+        # D05/D06: endliche Entladung am gebundenen Planslot. Rate ist das Exportbudget als Akkuleistung (Energiebezug
+        # Akku wie Planer und Produkt), begrenzt durch den Einspeiserahmen; Boden ist der DV-Reserveboden.
+        beginn, ende = _sekunden(dv.get("beginn_ms")), _sekunden(dv.get("ende_ms"))
+        rate, grenze = dv.get("export_w"), dv.get("export_grenze_w")
+        boden, netzpunkt = dv.get("reserve_boden_pct"), dv.get("netzpunkt") or {}
+        if not (_zahl(beginn) and _zahl(ende) and beginn <= jetzt < ende and _zahl(rate) and _zahl(boden)
+                and all(_zahl(netzpunkt.get(key)) for key in NETZPUNKT_FELDER)):
+            return None, "Direktvermarktung: Export ohne Fenster, Budget oder Boden", False
+        if dv.get("wallbox_laedt") is True:
+            return None, None, False      # Wie im Produkt: keine Batterieeinspeisung, solange die E3DC-Box lädt.
+        if _zahl(grenze):
+            rate = min(rate, grenze)
+        if rate < k.ENTLADE_MINDEST_W:
+            return None, None, False      # Wie im Produkt: unter 300 W keine Batterieeinspeisung.
+        return k.Auftrag("ENTLADEN", beginn, ende, "Direktvermarktung; " + str(dv.get("aktion_id") or ""),
+            rate, boden, energiebezug="akku", netzpunkt=k.Netzpunkt(**{key: float(netzpunkt[key])
+                for key in NETZPUNKT_FELDER})), None, False
+    if ziel == "FORCE_CHARGE_PV":
+        # D03: quellengebundenes PV-Laden am gebundenen Planslot; das Angebot rechnet der Kern aus eigenen Messwerten.
+        pv = dv.get("pv_laden") if isinstance(dv.get("pv_laden"), dict) else {}
+        if pv.get("dc_first") is True:
+            return None, "Direktvermarktung: PV-Speicher mit DC-first", False
+        beginn, ende = _sekunden(dv.get("beginn_ms")), _sekunden(dv.get("ende_ms"))
+        zahlen = ("ziel_pct", "hysterese_pct", "importwaechter_w", "mindest_w", "export_waechter_w")
+        if not (_zahl(beginn) and _zahl(ende) and beginn <= jetzt < ende and _zahl(dv.get("lade_w"))
+                and all(_zahl(pv.get(key)) for key in zahlen) and type(pv.get("nur_dc")) is bool):
+            return None, "Direktvermarktung: PV-Speicher ohne Fenster, Ziel oder Grenzen", False
+        if pv.get("messung_vollstaendig") is not True:
+            return None, None, False      # Wie im Produkt: ohne vollständige PV-/Hausmessung kein PV-Speichern.
+        rate = min(dv["lade_w"], pv["max_w"]) if _zahl(pv.get("max_w")) else dv["lade_w"]
+        if rate < k.ENTLADE_MINDEST_W:
+            return None, None, False      # Kein Ladebudget: das Produkt speichert ebenfalls nicht.
+        recht = k.PvLaderecht(float(pv["importwaechter_w"]), float(pv["mindest_w"]), float(pv["hysterese_pct"]),
+            pv["nur_dc"], float(pv["export_grenze_w"]) if _zahl(pv.get("export_grenze_w")) else None,
+            float(pv["export_waechter_w"]), float(pv["dc_ueberschuss_w"]) if _zahl(pv.get("dc_ueberschuss_w")) else None,
+            **{key: float(pv[key]) for key in ("rampe_w", "halte_s", "schritt_w") if _zahl(pv.get(key))})
+        return k.Auftrag("PVLADEN", beginn, ende, "Direktvermarktung; " + str(dv.get("aktion_id") or ""),
+            float(rate), float(pv["ziel_pct"]), energiebezug="akku", pv_laderecht=recht), None, False
+    return None, "Direktvermarktung: " + str(ziel)[:40], False
+
+
+PLATZ_ZAHLEN = ("beginn_s", "frist_s", "boden_pct", "rest_wh", "min_w", "max_w", "min_pv_w", "luecke_s",
+    "export_marge_w", "importwaechter_w")
+
+
+def _platz_auftrag(p, live, verbraucher, jetzt, messung_gueltig=False):
+    """N04: Platzschaffen als derselbe endliche Entladeauftrag (Restenergie Akku, eigenes Konto im Kern).
+
+    Ausführungsvertrag aus dem Plan (Restenergie, Frist, harter Boden); einfache Bedingungen wie im Regler: genug PV,
+    keine ladende Wallbox, Exportraum unter dem Einspeiseziel und kein Netzbezug über dem Wächter. Abregeldruck
+    prüft der Kern (Veto). Ohne Aufnahme (Aufrufer außerhalb des Dienstes) kein Auftrag. Boden aus Kurve und Ziel,
+    Slotkonto, Ein-/Haltehysterese, Kühlzeit, Plateau, Druckleistung mit Rampe und Ortstag rechnet der Kern aus der
+    gebundenen Regel; fehlt sie, bleibt das eine Fehlstelle."""
+    if not p:
+        return None, None
+    if p.get("aufnahmefehler") is True or p.get("aktiv") not in (True, False):
+        return None, "Platzschaffen: Aufnahme fehlt"
+    if p["aktiv"] is False:
+        return None, None
+    if not all(_zahl(p.get(key)) for key in PLATZ_ZAHLEN) or not isinstance(p.get("konto"), str):
+        return None, "Platzschaffen: Aufnahme unvollständig"
+    regel = _platzregel(p.get("regel"))
+    offen = None if regel is not None else "Platzschaffen: Regel fehlt"
+    pv, netz = live.get("PV_Power"), live.get("Grid_Power")
+    if not (messung_gueltig and _zahl(pv) and _zahl(netz) and _zahl(p.get("export_ziel_w"))) or pv < p["min_pv_w"]:
+        return None, offen
+    if any(v.art.startswith("wallbox_") and v.laeuft for v in verbraucher):
+        return None, offen
+    raum = p["export_ziel_w"] - max(0.0, -netz) - p["export_marge_w"]
+    if max(0.0, netz) > p["importwaechter_w"] or raum < p["min_w"]:
+        return None, offen
+    rate = min(p["max_w"], raum, p["rest_wh"] * 3600.0 / p["luecke_s"])
+    if rate < p["min_w"] or not p["beginn_s"] <= jetzt < p["frist_s"]:
+        return None, offen
+    return k.Auftrag("ENTLADEN", p["beginn_s"], p["frist_s"], "Platzschaffen; " + p["konto"], rate, p["boden_pct"],
+        rest_wh=p["rest_wh"], konto=p["konto"], energiebezug="akku", druckveto=True,
+        tagesgrenze_wh=p.get("tagesgrenze_wh") if _zahl(p.get("tagesgrenze_wh")) else None, platz=regel), offen
+
+
+PLATZREGEL_ZAHLEN = ("endziel_pct", "plateau_pct", "ein_pct", "halte_pct", "kuehl_s", "horizont_h", "schritt_w",
+    "druck_wh", "min_druck_wh", "kapazitaet_wh", "min_w")
+
+
+def _platzregel(r):
+    """Regel des Platzschaffens aus der gebundenen Aufnahme; unvollständig → None (Fehlstelle, keine Ersatzwerte)."""
+    if not isinstance(r, dict) or not all(_zahl(r.get(key)) for key in PLATZREGEL_ZAHLEN):
+        return None
+    if r["horizont_h"] <= 0 or r["kapazitaet_wh"] <= 0:
+        return None
+    wert = lambda key: float(r[key]) if _zahl(r.get(key)) else None
+    return k.Platzregel(wert("kurven_boden_pct"), wert("ausfuehrungsziel_pct"), wert("zielkurve_pct"),
+        *(float(r[key]) for key in PLATZREGEL_ZAHLEN), slot=str(r["slot"]) if r.get("slot") else None,
+        slot_rest_wh=wert("slot_rest_wh"), tag=r["tag"] if type(r.get("tag")) is int else None)
+
+
+def _netzrueckfall(n):
+    """Netzrückfall des Pre-Dump aus der gebundenen Aufnahme; (Rückfall oder None, Hinweis oder None).
+
+    Ohne Aufnahme (Aufrufer außerhalb des Dienstes) bleibt nur der Verbraucherauftrag; der Dienst bindet sie immer."""
+    if not n:
+        return None, None
+    if n.get("aufnahmefehler") is True or n.get("aktiv") not in (True, False):
+        return None, "Pre-Dump-Netzfallback: Aufnahme fehlt"
+    if n["aktiv"] is False:
+        return None, None
+    zahlen = ("rate_w", "last_w", "schwelle_w", "warte_s", "schritt_w", "rampe_w")
+    if not all(_zahl(n.get(key)) for key in zahlen) or not all(type(n.get(key)) is bool
+            for key in ("erlaubt", "faellig", "frist_nah", "verfuegbar", "bev_fenster", "bev_faellig", "waechter")):
+        return None, "Pre-Dump-Netzfallback: Aufnahme unvollständig"
+    return k.Netzrueckfall(n["erlaubt"], n["faellig"], n["frist_nah"], float(n["rate_w"]), n["verfuegbar"],
+        float(n["last_w"]), float(n["schwelle_w"]), float(n["warte_s"]),
+        float(n["export_grenze_w"]) if _zahl(n.get("export_grenze_w")) else None,
+        float(n["hard_grenze_w"]) if _zahl(n.get("hard_grenze_w")) else None, float(n["schritt_w"]),
+        n["bev_fenster"], n["bev_faellig"], n["waechter"], float(n["rampe_w"])), None
+
+
 def _auftrag(manual, ergebnis, cfg, soc, max_laden, jetzt, plan, lade_daten_gueltig,
-             *, live=None, verbraucher=(), intent=None, kern_vorzustand=None, **kwargs):
+             *, live=None, verbraucher=(), intent=None, kern_vorzustand=None, dv=None, platz=None,
+             platz_messung=False, **kwargs):
     a, marker = _vorhalte_auftrag(manual, ergebnis, cfg, soc, max_laden, jetzt, plan,
         lade_daten_gueltig, **kwargs)
     # Hand, Reserve, Unwetter und Preis-Boost bleiben vor dem Verbraucherpfad.
     if marker or a and a.quelle != "produkt, Marktvertrag":
         return a, marker
-    wallbox = _wallbox_auftrag(None, verbraucher, intent or {}, jetzt,
+    # Direktvermarktung steht wie im Produkt vor Markt und Wallbox; ohne DV-Aktion folgt der normale Weg.
+    dv_auftrag, dv_hinweis, passiv = _dv_auftrag(dv if isinstance(dv, dict) else {}, cfg, jetzt)
+    if dv_auftrag is not None or dv_hinweis and not passiv:
+        return dv_auftrag, dv_hinweis
+    wallbox = _wallbox_auftrag(verbraucher, intent or {}, jetzt,
         kwargs.get("hand_wirksam", False), kern_vorzustand)
     if wallbox is not None:
-        return wallbox, None
+        # Laufendes Akku-Netzladen aus dem Marktvertrag geht dem Haltewunsch einer
+        # netzladenden Wallbox vor; Markthalten und Pre-Dump bleiben unverändert.
+        markt = a is not None and a.modus == "NETZLADEN" and a.beginn_s <= jetzt < a.ende_s
+        return (a if markt else wallbox), dv_hinweis
     vorab, grund = _vorab(dict(plan, _vorab_revision=kwargs.get("plan_revision")),
         cfg, live or {}, jetzt, verbraucher)
     if grund.startswith("Pflichtfeld:"):
-        return None, "Pre-Dump: " + grund
-    return vorab or a, None
+        return None, "; ".join(filter(None, (dv_hinweis, "Pre-Dump: " + grund)))
+    if vorab or a:
+        return vorab or a, dv_hinweis
+    # Platzschaffen ist wie im Produkt die nachrangige Entladung der normalen Regelung.
+    platz_auftrag, platz_hinweis = _platz_auftrag(platz if isinstance(platz, dict) else {}, live or {}, verbraucher,
+        jetzt, platz_messung is True)
+    return platz_auftrag, "; ".join(filter(None, (dv_hinweis, platz_hinweis))) or None
 
 
 def _verbraucher(live, native, cfg, intent, jetzt, energy_decision=None):
@@ -487,13 +678,13 @@ def _box_kappe(intent):
     return max(werte) if werte else None
 
 
-def _wallbox_auftrag(a, verbraucher, intent, jetzt, hand_wirksam, vorzustand):
-    if hand_wirksam or a and a.modus != "HALTEN":
-        return a
+def _wallbox_auftrag(verbraucher, intent, jetzt, hand_wirksam, vorzustand):
+    if hand_wirksam:
+        return None
     if not any(v.netzladen_gewollt and v.laeuft and not v.gesperrt for v in verbraucher):
-        return a
+        return None
     ts = safe_float(intent.get("ts"), float("nan"))
-    quelle = WALLBOX_QUELLENPRAEFIX + " gewolltes Netzladen" + ("; " + a.quelle if a else "")
+    quelle = WALLBOX_QUELLENPRAEFIX + " gewolltes Netzladen"
     vorher = vorzustand.optimierung.vorgabe[1] if vorzustand and vorzustand.optimierung else None
     beginn = (vorher.beginn_s if isinstance(vorher, k.Auftrag) and vorher.modus == "HALTEN"
         and vorher.quelle == quelle and vorher.ende_s >= jetzt else ts)
@@ -513,8 +704,10 @@ def eingang_und_quellen_bauen(uebergabe, quellen_vorzustand=None, kern_vorzustan
     # Ausfallfilter bereinigt nur die übrige Regelungssicht; der Messleser lehnt
     # abgelaufene Erzeugerwerte weiterhin selbst ab.
     verbraucher_cfg_basis, verbraucher_intent, verbraucher_native = cfg, intent, native
-    outage = ergebnis.get("wallbox_data_outage")
-    if outage is None:
+    # C09: Datenausfall aus der eigenen Aufnahme (gemeinsamer Leser, eigenes Gedächtnis), nicht aus dem Produkt;
+    # ohne Aufnahme (Aufrufer außerhalb des Dienstes) derselbe Leser ohne Vorzustand.
+    outage = auftauen(e.ausfall) or None
+    if outage is None or outage.get("aufnahmefehler") is True:
         outage = wallbox_data_outage_context(cfg, intent, native, jetzt)
     cfg, intent, native = storage_inputs_without_failed_wallboxes(cfg, intent, native, outage)
     model = LiveDataSnapshot.from_dict(live, now_s=jetzt)
@@ -536,27 +729,29 @@ def eingang_und_quellen_bauen(uebergabe, quellen_vorzustand=None, kern_vorzustan
     vorhalt, context = _vorhalt(quelle, cfg, live, plan, hand_wirksam, jetzt, monoton, zeitbasis,
         e.regelung_an, entladen.wert, kern_vorzustand)
     marker = None
-    state = str(ergebnis.get("state") or "")
     sonder = [marker] if marker else []
-    if (state.startswith("storm_guard") or (auftauen(e.funktionsstatus).get("Unwetter") or {}).get("angefordert")) and not (
-            (plan.get("storm_grid_charge") or {}).get("active") is True
-            or (plan.get("storm_guard") or {}).get("control_active") is True):
-        sonder.append("Unwetter: Plan fehlt")
     if quelle.get("fehler"):
         sonder.append("Vorhaltung: Schattenaufnahme fehlgeschlagen")
     if quelle["contract"]["mode"] == 2 and vorhalt.kapazitaet_wh is None:
         sonder.append("Vorhaltung: Kapazität unbekannt")
+    # Direktvermarktung bewertet der Kern selbst aus der gebundenen Lage (kein Produktzustand als Eingang).
     for name, status in auftauen(e.funktionsstatus).items():
-        if name not in ("Unwetter", "Wärme-Tarif", "Pre-Dump", "Vorhaltung", "Preis-Boost") and (status.get("angefordert") is True or status.get("wirksam") is True):
+        if name not in ("Unwetter", "Wärme-Tarif", "Pre-Dump", "Vorhaltung", "Preis-Boost", "Direktvermarktung",
+                        "Lastspitzen") and (
+                status.get("angefordert") is True or status.get("wirksam") is True):
             sonder.append(name)
-    # Konfiguriert allein erzeugt keinen Marker. Die Dienstentscheidung hat
-    # die vorhandenen Pre-Dump-, Unwetter- und Wärme-Leser bereits ausgewertet.
-    for name, aktiv in (
-        ("Lastspitzen", state.startswith("peak_shaving") or (ergebnis.get("peak_shaving") or {}).get("applied") is True),
-        ("Direktvermarktung", state.startswith("direct_marketing") or (ergebnis.get("storage_dispatch_phase5") or {}).get("applied") is True),
-    ):
-        if aktiv:
-            sonder.append(name)
+    # Konfiguriert allein erzeugt keinen Marker. Lastspitzen rechnet der Kern aus der eigenen Aufnahme.
+    spitze, spitzen_auftrag, spitzen_hinweis = _spitze(auftauen(e.spitze), jetzt)
+    if spitzen_hinweis:
+        sonder.append(spitzen_hinweis)
+    lastkappe, last_hinweis = _lastkappe(auftauen(e.last))
+    if last_hinweis:
+        sonder.append(last_hinweis)
+    if (cfg_bool(cfg, "storage_curve_sliding_horizon_enable", False)
+            and ergebnis.get("sliding_horizon_active") is not False):
+        # N03: Der gleitende Prognosehorizont (Option) ist im Kern nicht nachgebaut; sichtbar statt vorgetäuscht,
+        # sobald er im Zyklus wirkt. Eine unbekannte Wirkung zählt als Wirkung.
+        sonder.append("Kurve: gleitender Prognosehorizont")
     haus_quelle ="Bilanz" if model.plausibility.get("home_independent") is False or "balance" in model.plausibility.get("home_source", "").lower() else model.plausibility.get("home_source", "live")
     hauswert = model.home_w
     if live.get("Home_Includes_WP") is True:
@@ -583,15 +778,20 @@ def eingang_und_quellen_bauen(uebergabe, quellen_vorzustand=None, kern_vorzustan
             if v.art.startswith("wallbox_") else v for v in verbraucher)
     auftrag, marker = _auftrag(manual, ergebnis, cfg, model.soc, maximum.wert, jetzt, plan, lade_ok,
         vorhalt=vorhalt, context=context, quelle=quelle, hand_wirksam=hand_wirksam, plan_revision=e.plan_revision,
-        live=live, verbraucher=verbraucher, intent=verbraucher_intent, kern_vorzustand=kern_vorzustand)
+        live=live, verbraucher=verbraucher, intent=verbraucher_intent, kern_vorzustand=kern_vorzustand,
+        dv=auftauen(e.dv), platz=auftauen(e.platz), platz_messung=bool(model.pv_valid and model.grid_valid))
     if marker:
         sonder.append(marker)
-    window = predump_time_window(cfg, plan)
-    if (cfg_bool(cfg, "predump_enable", True) and (cfg_bool(cfg, "hard_predump_grid_enable")
-            or ergebnis.get("predump_grid_fallback") is True)
-            and window["valid"] and window["start_ts"] <= jetzt < window["deadline_ts"]
-            and (plan.get("predump_curve_active") or (plan.get("target_curve_meta") or {}).get("predump_curve_active"))):
-        sonder.append("Pre-Dump-Netzfallback")
+    # V03: Der Netzrückfall kommt aus der vor der Entscheidung gebundenen Aufnahme (dieselben Leser wie der
+    # Produktpfad, kein Produktergebnis); Warteuhr und laufenden Rückfall führt der Kern selbst.
+    if auftrag and auftrag.modus == "VORAB" and cfg_bool(cfg, "predump_enable", True):
+        rueckfall, hinweis = _netzrueckfall(auftauen(e.vorab_netz))
+        if hinweis:
+            sonder.append(hinweis)
+        if rueckfall is not None:
+            auftrag = replace(auftrag, netzrueckfall=rueckfall)
+    if auftrag is None and spitzen_auftrag is not None:
+        auftrag = spitzen_auftrag          # L03: Nachladen des Puffers nur ohne anderen Auftrag (nachrangig).
     if auftrag and auftrag.modus == "VORAB":
         verbraucher = tuple(replace(v, vorab_angemeldet=bool(not v.gesperrt and cfg_bool(cfg,
             "predump_" + ("wallbox" if v.art.startswith("wallbox_") else
@@ -607,7 +807,8 @@ def eingang_und_quellen_bauen(uebergabe, quellen_vorzustand=None, kern_vorzustan
         and not any(zone_intent.get(key) for key in ("manual_pause", "bev_full_blocked", "battery_departure_active",
             "wbminsoc_runtime_raise_active", "price_opt_active", "scheduled_slot_active",
             "price_boost_active"))
-        and not ergebnis.get("force_wallbox_stop")),
+        # C03: Am eigenen Pre-Dump-Ziel (Bodenhalt) keine Haltezone, wie der Wallbox-Stopp des Produkts.
+        and not (kern_vorzustand is not None and kern_vorzustand.vorab_latch is not None)),
         mode=zone_intent.get("wb_mode_active"),
         hysterese_pct=zone_intent.get("wb_soc_hysterese_pct", verbraucher_cfg.get("wb_soc_hysterese_pct",
             verbraucher_cfg.get("wb_hysterese_pct"))),
@@ -627,15 +828,10 @@ def eingang_und_quellen_bauen(uebergabe, quellen_vorzustand=None, kern_vorzustan
         nativ_w=nativ_w, kurve=kurve, max_laden_w=maximum.wert,
         leistungsdaten_gueltig=leistungsdaten_gueltig,
         vorzustand=quellen_vorzustand, jetzt_s=jetzt)
-    last = quelle.get('regelbare_last_w')
-    wb = [p.leistung.zahl(jetzt, 0, k.LEISTUNG_MAX_W) for p in verbraucher if p.art.startswith("wallbox_")]
-    netz = netz_messwert.zahl(jetzt, -k.LEISTUNG_MAX_W, k.LEISTUNG_MAX_W)
-    akku = akku_messwert.zahl(jetzt, -k.LEISTUNG_MAX_W, k.LEISTUNG_MAX_W)
-    maximum_a = _konfigzahl(house_fuse.get('effective'))
-    harte_restlast = (max(0.0, netz-akku-sum(wb)-last
-        - max(0.0, maximum_a-max(0.0, safe_float(cfg.get('grid_max_reserve_amp'), 2.0)))*690)
-        if netz is not None and akku is not None and last is not None
-        and None not in wb and _zahl(maximum_a) and maximum_a > 0 else None)
+    fahrzeug = live.get("managed_vehicle_phases")
+    fahrzeug = fahrzeug if isinstance(fahrzeug, dict) else {}
+    fahrzeugwerte = fahrzeug.get("phase_w")
+    fahrzeugwerte = fahrzeugwerte if isinstance(fahrzeugwerte, (tuple, list)) else ()
     return k.Eingang(jetzt_s=jetzt, monoton_s=probe["monotonic_ts"] if zeit_ok else float("nan"),
         zeitbasis=(str(probe["boot_id"]) + ":" + str(probe["process_epoch"])) if zeit_ok else "",
         messzeit_s=ts, soc=_messwert(model.soc, "live:SOC", ts, model.soc_valid),
@@ -649,15 +845,71 @@ def eingang_und_quellen_bauen(uebergabe, quellen_vorzustand=None, kern_vorzustan
         geraetereserve=_messwert(reserve["effective_pct"], reserve["source"] or "Gerätereserve unbekannt", reserve_ts),
         anschluss_a=_messwert(_konfigzahl(house_fuse.get("effective")),
             "config:" + str(house_fuse.get("source", "unbekannt")), jetzt,
-            house_fuse.get("source") not in (None, "invalid", "none")
-            and live.get("Grid_PM_Delta_Rule_Effective") is not True),
+            house_fuse.get("source") not in (None, "invalid", "none")),
+        anschluss_phasen=tuple(_messwert(live.get(key), "live:PM:" + key, ts,
+            live.get("grid_pm_available") is not False and live.get("Grid_PM_Available") is not False)
+            for key in ("grid_p1", "grid_p2", "grid_p3")),
+        akku_phasen=(1 if live.get("pvi_ac_max_phase_count_valid") is True
+            and type(live.get("pvi_ac_max_phase_count")) in (int, float)
+            and live.get("pvi_ac_max_phase_count") == 1 else 3),
+        fahrzeug_phasen=tuple(_messwert(w, "Wallbox-Manager:PM-Anteil", fahrzeug.get("ts"))
+            for w in fahrzeugwerte),
         anschluss_abstand_a=max(0.0, safe_float(cfg.get("grid_max_reserve_amp"), 2.0)),
         regelung_an=e.regelung_an, rscp_fehler=e.rscp_fehler,
         verbraucher=verbraucher, haltezone=zone, kurve=kurve,
-        vorhalt=vorhalt, harte_restlast_w=harte_restlast,
+        vorhalt=vorhalt,
         auftrag=auftrag, sonderfunktion="; ".join(sonder) or None,
         einspeise_ladebedarf=k.Messwert(quellen.bedarf_w, quellen.bedarf_w is not None,
             'gemeinsame Druckrechnung:' + quellen.revision, quellen.zeit_s, quellen.grund),
         quellen_ladekappe=(_messwert(quellen.ladekappe_w, 'DC-only, gebundener Quellensplit',
             quellen.zeit_s, quellen.quellen['gueltig'])
-            if quellen.ladekappe_angefordert else None)), quellen
+            if quellen.ladekappe_angefordert else None),
+        kurvenformung=_kurvenformung(auftauen(e.dv), cfg), spitze=spitze, last=lastkappe), quellen
+
+
+def _spitze(s, jetzt):
+    """L01–L03: Lastspitzen aus der gebundenen Aufnahme (gemeinsamer Intervallplaner, eigenes Gedächtnis).
+
+    Rückgabe (Kappe/Puffer oder None, Netzladeauftrag oder None, Hinweis oder None). Ohne Aufnahme (Aufrufer
+    außerhalb des Dienstes) keine Wirkung; ein Aufnahmefehler oder ein unbekannter Kandidat bleibt Fehlstelle."""
+    if not s:
+        return None, None, None
+    if s.get("aufnahmefehler") is True or s.get("aktiv") not in (True, False):
+        return None, None, "Lastspitzen: Aufnahme fehlt"
+    klasse = s.get("klasse")
+    if s["aktiv"] is False or klasse in (None, "release", "observe", "idle"):
+        return None, None, None
+    if klasse == "active_cap" and _zahl(s.get("ziel_w")):
+        return k.Spitze("active_cap", float(s["ziel_w"])), None, None
+    if klasse == "reserve_hold":
+        return k.Spitze("reserve_hold"), None, None
+    if klasse == "grid_recharge" and all(_zahl(s.get(key)) for key in ("lade_w", "puffer_pct", "ende_s")):
+        # Nachladen des Puffers aus dem Netz innerhalb der Viertelstunde: derselbe Netzladeweg wie Markt und Unwetter.
+        return None, k.Auftrag("NETZLADEN", jetzt, float(s["ende_s"]), k.SPITZE_NACHLADEN_QUELLE, float(s["lade_w"]),
+            float(s["puffer_pct"])), None
+    return None, None, "Lastspitzen: " + str(klasse)[:30]
+
+
+def _lastkappe(l):
+    """T06: geplante externe Last aus der gebundenen Aufnahme; (Kappe oder None, Hinweis oder None)."""
+    if not l:
+        return None, None
+    if l.get("aufnahmefehler") is True or l.get("aktiv") not in (True, False):
+        return None, "Geplante Last: Aufnahme fehlt"
+    if l["aktiv"] is False:
+        return None, None
+    if l.get("klasse") == "halten":
+        return k.Lastkappe("halten"), None
+    if l.get("klasse") == "stuetzen" and _zahl(l.get("kappe_w")):
+        return k.Lastkappe("stuetzen", float(l["kappe_w"])), None
+    return None, "Geplante Last: " + str(l.get("klasse"))[:30]
+
+
+def _kurvenformung(dv, cfg):
+    """D09: Preiskurve und Ladereservierung der Direktvermarktung aus der gebundenen Lage, sonst keine Formung."""
+    f = dv.get("kurvenformung") if dv.get("aktiv") is True and cfg_bool(cfg, "direct_marketing_enable", False) else None
+    if not isinstance(f, dict) or not (_zahl(f.get("preis_w")) or _zahl(f.get("reservierung_w"))):
+        return None
+    return k.Kurvenformung(float(f["preis_w"]) if _zahl(f.get("preis_w")) else None,
+        float(f["reservierung_w"]) if _zahl(f.get("reservierung_w")) else None,
+        float(f["importwaechter_w"]) if _zahl(f.get("importwaechter_w")) else 80.0)

@@ -9,6 +9,7 @@ from .quellenrahmen import DRUCK_CONFIG_FELDER
 
 
 CONFIG_FELDER = (
+    "storage_curve_sliding_horizon_enable",
     "maximumladeleistung", "maximaleentladeleistung", "storage_live_stale_guard_s",
     "ep_reserve_pct", "speichergroesse", "grid_max_amps", "grid_max_reserve_amp",
     "storage_manual_override_max_age_h", "storage_regulation_changed_ts",
@@ -25,6 +26,7 @@ CONFIG_FELDER = (
     "strompreis_cheap", "strompreis_basis", "strompreis_uht", "heat_tariff_shift_windows",
     "heat_tariff_shift_mode", "peak_shaving_enable", "direct_marketing_enable",
     "storage_backup_hold_enable", "cheap_grid_battery_enable", "awattar_mode",
+    "market_battery_max_w", "cheap_grid_battery_max_w",
     "storage_backup_energy_kwh", "storage_backup_reference_time", "storage_backup_until_time",
     "storage_backup_grid_charge_enable", "storage_backup_grid_price_limit_ct",
 ) + DRUCK_CONFIG_FELDER  # Druck- und Quellenschlüssel, gleicher Eingang.
@@ -48,7 +50,7 @@ INTENT_FELDER = (
     "start_request_contract_version", "connected", "plugged", "active", "charging_active",
     "external_wallbox_manager", "wallbox_storage_points", "car_energy_needs",
     "openwb_primary_pv_mode_ids", "openwb_primary_pv_mode_active", "openwb_primary_observe_only",
-    "observe_storage_policy", "start_hold_requests", "phase_transition_reservations",
+    "observe_storage_policy", "phase_transition_reservations",
 )
 
 
@@ -76,7 +78,7 @@ def waerme_aufnahme(record):
 # Positivlisten der reinen Leser. Signierte Beobachtungen bleiben als Vertrag vollständig.
 LIVE_FELDER = (
     'Battery', 'Battery_SoC', 'Ext_PV_Power', 'Ext_PV_Power_Age_S', 'Ext_PV_Power_Source', 'Ext_PV_Power_Valid',
-    'Grid', 'Grid_PM_Delta', 'Grid_PM_Delta_Rule_Effective', 'Heatpump_Compressor_Observation_Valid', 'Heatpump_Compressor_Running', 'Heatpump_Evidence_TS',
+    'Grid', 'Grid_PM_Delta', 'Heatpump_Compressor_Observation_Valid', 'Heatpump_Compressor_Running', 'Heatpump_Evidence_TS',
     'Heatpump_PV_Contract', 'Heatpump_Pause_Active', 'Home', 'Home_Includes_WP', 'Home_Power_Balance', 'Home_Power_Delta',
     'Home_Power_Independent', 'Home_Power_Raw', 'Home_Power_Source', 'Notstrom_Status', 'PV', 'Power_Decision_Usable',
     'Power_Plausibility', 'RSCP_Glitch_Reasons', 'RSCP_Sample_Valid', 'WB', 'WP_Power', 'Wallbox_Live_Power',
@@ -93,8 +95,11 @@ LIVE_FELDER = (
     + tuple(prefix+suffix for prefix in ("bat", "bat1", "bat2", "bat3") for suffix in ("_usable_kwh", "_full_cap_kwh", "_specified_kwh", "_v"))\
     + tuple("device_max_"+d+s for d in ("charge", "discharge") for s in ("_power_w", "_power_w_valid", "_power_w_source", "_power_w_observed_at_s"))
 LIVE_FELDER += tuple("dc"+str(index)+"_max_w" for index in range(8))
+LIVE_FELDER += ("ems_charge_locked", "ems_weather_charging", "weather_regulated_charge")
+LIVE_FELDER += ("grid_p1", "grid_p2", "grid_p3", "grid_pm_available", "Grid_PM_Available",
+    "pvi_ac_max_phase_count", "pvi_ac_max_phase_count_valid", "managed_vehicle_phases")
 PLAN_FELDER = (
-    '_vorab_revision', 'adaptive_headroom_available_wh', 'adaptive_headroom_required_wh', 'adaptive_headroom_target_soc', 'backup_hold_observation', 'battery_capacity',
+    '_vorab_revision', 'awattar_mode', 'adaptive_headroom_available_wh', 'adaptive_headroom_required_wh', 'adaptive_headroom_target_soc', 'backup_hold_observation', 'battery_capacity',
     'cheap_grid_charge', 'curtailment_pressure_wh', 'curtailment_unavoidable_wh', 'direct_marketing', 'evening_shortfall_wh', 'hard_predump_enabled',
     'headroom_reserve_active', 'headroom_reserve_pressure_wh', 'headroom_reserve_source', 'ladeende_ts', 'ladestart_ts', 'latest_charge_start_ts',
     'plan_id', 'predump_bev_start_buffer_s', 'predump_curve_active', 'predump_curve_soc', 'predump_dump_wh', 'predump_enabled',
@@ -161,6 +166,13 @@ class ZyklusEingaenge:
     vorhalt: Felder
     verbraucher: Felder
     energy_decision: Felder = Felder(())
+    dv: Felder = Felder(())
+    vorab_netz: Felder = Felder(())
+    platz: Felder = Felder(())
+    phasen: Felder = Felder(())
+    ausfall: Felder = Felder(())
+    spitze: Felder = Felder(())
+    last: Felder = Felder(())
 
 
 @dataclass(frozen=True)
@@ -171,8 +183,24 @@ class Uebergabe:
     power_settings: Felder
 
 
+DV_FELDER = ("aktiv", "aufnahmefehler", "ziel", "befehle", "fehler", "gate", "beginn_ms", "ende_ms",
+    "aktion_id", "slot_id", "export_w", "lade_w", "headroom_halten", "phase5_feld", "kurvenformung",
+    "reserve_boden_pct", "export_grenze_w", "netzpunkt", "wallbox_laedt", "pv_laden")
+VORAB_NETZ_FELDER = ("aktiv", "aufnahmefehler", "erlaubt", "faellig", "frist_nah", "rate_w", "verfuegbar", "last_w",
+    "schwelle_w", "warte_s", "export_grenze_w", "hard_grenze_w", "schritt_w", "bev_fenster", "bev_faellig", "waechter",
+    "rampe_w")
+LAST_FELDER = ("aktiv", "aufnahmefehler", "klasse", "kappe_w", "erwartet_w", "erkannt_w")
+SPITZE_FELDER = ("aktiv", "aufnahmefehler", "klasse", "ziel_w", "lade_w", "puffer_pct", "ende_s",
+    "kontext")
+AUSFALL_FELDER = ("active", "points", "vehicle_present", "aufnahmefehler")
+PHASEN_FELDER = ("aktiv", "aufnahmefehler", "reserviert_w", "ziel_phasen", "frist_s")
+PLATZ_FELDER = ("aktiv", "aufnahmefehler", "konto", "beginn_s", "frist_s", "boden_pct", "rest_wh", "min_w", "max_w",
+    "min_pv_w", "luecke_s", "export_marge_w", "importwaechter_w", "export_ziel_w", "tagesgrenze_wh", "regel")
+
+
 def eingaenge_binden(*, live, plan, wb_native, wb_intent, manual, cycle_cfg,
-                     start, zeitprobe, regelung_an, rscp_fehler, funktionsstatus, house_fuse=None, energy_decision=None):
+                     start, zeitprobe, regelung_an, rscp_fehler, funktionsstatus, house_fuse=None, energy_decision=None,
+                     dv=None, vorab_netz=None, platz=None, phasen=None, spitze=None, ausfall=None, last=None):
     # Ein Plan, vor der Entscheidung eingefroren; der Kernmodus ergänzt
     # den Wirksamkeitsstatus erst in der hypothetischen Projektion.
     storm = plan.get("storm_grid_charge") or {}
@@ -200,15 +228,10 @@ def eingaenge_binden(*, live, plan, wb_native, wb_intent, manual, cycle_cfg,
     # Nur die vom Ladepunktleser benötigten Betriebsfelder, keine Fahrzeugkennungen.
     for key, felder in (("car_energy_needs", ("wb_id", "connected", "car_power_w",
             "car_power_valid", "car_charging_last_valid_ts")),
-            ("phase_transition_reservations", ("wb_id", "active", "requested_w")),
-            ("start_hold_requests", ("wb_id", "group_minimum_w", "group_members"))):
+            ("phase_transition_reservations", ("wb_id", "active", "requested_w"))):
         if key in intent:
             intent[key] = [{feld: row[feld] for feld in felder if feld in row}
                 for row in (intent[key] or []) if isinstance(row, dict)]
-    for row in intent.get("start_hold_requests", []):
-        if "group_members" in row:
-            row["group_members"] = [{"wb_id": member["wb_id"]} for member in (row["group_members"] or [])
-                if isinstance(member, dict) and "wb_id" in member]
     return ZyklusEingaenge(start, einfrieren(lese_aufnahme(live, LIVE_FELDER)),
         einfrieren(plan_aufnahme(plan)), einfrieren(lese_aufnahme(wb_native, (
             "ts", "total_power_w", "total_power_valid", "wb_details", "charging_active", "observation", "wb_possible_power_w",
@@ -225,13 +248,21 @@ def eingaenge_binden(*, live, plan, wb_native, wb_intent, manual, cycle_cfg,
         einfrieren({key: (house_fuse or {}).get(key) for key in ("effective", "source")}),
         einfrieren(cycle_cfg.get("_kern_vorhalt") or vorhalte_aufnahme_sicher(cycle_cfg, plan, start, live=live)),
         einfrieren(cycle_cfg.get("_kern_verbraucher") or verbraucher_aufnahme(cycle_cfg)),
-        einfrieren(waerme_aufnahme(energy_decision if energy_decision is not None
-            else cycle_cfg.get("_kern_energy_decision"))))
+        energy_decision=einfrieren(waerme_aufnahme(energy_decision if energy_decision is not None
+            else cycle_cfg.get("_kern_energy_decision"))),
+        # Direktvermarktung vor der Entscheidung; ohne Aufnahme unbekannt, nie „aus“.
+        dv=einfrieren(lese_aufnahme(dv, DV_FELDER) if isinstance(dv, dict) else {}),
+        vorab_netz=einfrieren(lese_aufnahme(vorab_netz, VORAB_NETZ_FELDER) if isinstance(vorab_netz, dict) else {}),
+        platz=einfrieren(lese_aufnahme(platz, PLATZ_FELDER) if isinstance(platz, dict) else {}),
+        phasen=einfrieren(lese_aufnahme(phasen, PHASEN_FELDER) if isinstance(phasen, dict) else {}),
+        spitze=einfrieren(lese_aufnahme(spitze, SPITZE_FELDER) if isinstance(spitze, dict) else {}),
+        ausfall=einfrieren(lese_aufnahme(ausfall, AUSFALL_FELDER) if isinstance(ausfall, dict) else {}),
+        last=einfrieren(lese_aufnahme(last, LAST_FELDER) if isinstance(last, dict) else {}))
 
 
 # Nur benötigte fachliche Ergebnisse, kein Rohdump der Controllerdiagnose.
 ERGEBNIS_FELDER = (
-    "state", "mode", "val", "auto_limit", "wallbox_data_outage", "abregel_charge_req_w",
+    "state", "mode", "val", "auto_limit", "wallbox_data_outage", "abregel_charge_req_w", "smartcharge_external_veto",
     "market_economics_action", "market_economics_contract", "market_economics_forecast",
     "market_economics_target_soc_pct", "market_economics_planned_charge_w",
     "market_grid_charge_control", "market_grid_job_done", "market_late_fill_window_end_ts", "market_plan_grace",
@@ -243,8 +274,8 @@ ERGEBNIS_FELDER = (
     "force_wallbox_stop", "heatpump_pv_contract", "heatpump_start_funding",
     "authorized_heatpump_budget_w", "heatpump_pause_request", "consumer_budget_contract",
     "wallbox_phase_transition", "wallbox_phase_transition_grants",
-    "wallbox_phase_transition_reserved_w", "wallbox_start_hold_active", "wallbox_start_hold_w",
-    "wallbox_start_hold_until_ts", "predump_consumer_plan", "predump_discharge_add_contract",
+    "wallbox_phase_transition_reserved_w",
+    "predump_consumer_plan", "predump_discharge_add_contract", "sliding_horizon_active",
 )
 
 

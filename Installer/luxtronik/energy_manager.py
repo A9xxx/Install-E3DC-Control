@@ -4191,8 +4191,10 @@ def heatpump_compressor_running(wp_data=None, wp_status=None):
     if bitmask is not None:
         return bool(_safe_int(bitmask, 0) & 0x03)
     if (str(data.get("Quelle") or "").casefold() == "stiebel_live"
-            or str(status.get("source") or "").casefold() == "stiebel_live"):
+            or str(status.get("source") or "").casefold() == "stiebel_live"
+            or data.get("dimplex_compressor_source") == "modbus_coil"):
         # Schätzleistung und COP dürfen fehlenden Status nicht in Lauf verwandeln.
+        # Dimplex: Mit gelesenem Ausgang „Verdichter 1“ zählt nur dieses Signal.
         return any(_safe_int(data.get(key), 0) > 0 for key in ("Verdichter_Ein", "Verdichter"))
     for key in ("Verdichter_Ein", "Verdichter", "Verdichter 1"):
         if key in data or key in status:

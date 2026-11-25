@@ -2421,9 +2421,12 @@ function applyMarketFlowSeries(datasets, flows, battery, grid, mapFlip, dashFor)
 
 function marketSocRequestData(data, requestEpoch) {
     if (requestEpoch === (window._storageMarketEpoch || 0)) return data;
-    const liveView = marketSocDisplay(window._storageLiveData || {});
+    const live = window._storageLiveData || {};
+    const liveView = marketSocDisplay(live);
+    // Eine überholte Antwort übernimmt Grund und Kennzeichnung der Entwertung aus dem Zwischenspeicher.
     return {...data, market_soc_trajectory: {complete: false,
-        reason_code: liveView.reasonCode || 'market_plan_binding_invalid'}};
+        reason_code: liveView.reasonCode || 'market_plan_binding_invalid',
+        plan_refresh_pending: live.market_soc_trajectory?.plan_refresh_pending === true}};
 }
 
 function marketSocHint(data = {}) {
@@ -2432,7 +2435,12 @@ function marketSocHint(data = {}) {
     if (reason === 'dv_active') return '';
     let hint = '';
     if (!view.complete) {
-        if (/expired|stale/.test(reason)) hint = 'Marktplan veraltet';
+        if (/expired|stale/.test(reason)) {
+            hint = /expired/.test(reason) && (data.storage_projection_status?.plan_refresh_pending === true
+                    || data.market_soc_trajectory?.plan_refresh_pending === true)
+                ? 'Plan wird aktualisiert'
+                : 'Marktplan veraltet';
+        }
         else if (reason === 'live_soc_mismatch') hint = 'Ist-Ladestand weicht vom Plan ab';
         else if (reason.startsWith('live_soc_')) hint = 'Aktueller Ladestand für den Marktplan nicht verfügbar';
         else if (reason === 'storage_override_active') hint = 'Sturm- bzw. Preisschutz übersteuert den Marktplan';
@@ -2818,6 +2826,11 @@ function cacheStorageCurveData(data) {
         window._storageControlSoc = null;
     }
     const marketView = marketSocDisplay(mergedData);
+    const marketRecovered = Boolean(previousPlanId && marketView.complete
+        && !marketSocDisplay(previousData).complete);
+    const marketChartOpen = activeJsChartMode === 'forecast' || activeJsChartMode === 'hybrid'
+        || (activeJsChartMode === 'live'
+            && liveLineChart?.data.datasets.some(dataset => dataset.marketSoc));
     if (!marketView.complete || planChanged
         || (liveLineChart?.data.datasets.some(dataset => dataset.marketSoc)
             && liveLineChart.$marketPlanId !== marketView.planId)) {
@@ -2830,6 +2843,13 @@ function cacheStorageCurveData(data) {
             ? {...mergedData, market_soc_trajectory: {complete: false, reason_code: 'market_plan_binding_invalid'}}
             : mergedData;
         renderMarketSocHint(hintData, document.getElementById('liveChartContainer'));
+    }
+    // Derselbe Planwechsel löst auch bei mehreren Telegrammen nur einen Abruf aus.
+    // Nach fehlender Serverbestätigung lädt die wieder vollständige Bindung erneut.
+    const chartContainer = document.getElementById('liveChartContainer');
+    if ((planChanged || marketRecovered) && marketChartOpen
+        && chartContainer?.style.display === 'block' && reloadJsChart) {
+        reloadJsChart();
     }
     renderStorageCurveSparkline(mergedData);
     const modal = document.getElementById('storageCurveModal');
@@ -9713,8 +9733,10 @@ function expireMarketSocChart(chart, view, baseline, xScale, data, container) {
 function expireConfirmedMarketSoc(data) {
     const view = marketSocDisplay(data);
     if (view.complete) return;
-    // Der erste Fristablauf entwertet die Bestätigung in allen Ansichten.
-    cacheStorageCurveData({market_soc_trajectory: {complete: false, reason_code: view.reasonCode}});
+    // Der erste Fristablauf entwertet die Bestätigung in allen Ansichten. Läuft der Marktplan an der Viertelstunde
+    // aus, gilt bis zum nächsten Serverabruf die Planaktualisierung; dessen Antwort ersetzt diese Kennzeichnung.
+    cacheStorageCurveData({market_soc_trajectory: {complete: false, reason_code: view.reasonCode,
+        plan_refresh_pending: view.reasonCode === 'market_plan_expired'}});
 }
 
 function clearConfirmedMarketChart(chart) {
@@ -9785,6 +9807,14 @@ function updateForecastProjectionStatus(data, directMarketingView = null) {
     if (contract.status === 'coherent' && contract.plan_fresh !== false) {
         status.hidden = true;
         status.textContent = '';
+        return;
+    }
+    if (contract.plan_refresh_pending === true) {
+        // Planwechsel an der Viertelstunde: höchstens eine Minute neutral, danach gilt wieder der Status.
+        status.textContent = 'Plan wird aktualisiert.';
+        status.style.background = 'rgba(108,117,125,.18)';
+        status.style.color = '#6c757d';
+        status.hidden = false;
         return;
     }
     const reasons = {
@@ -10460,6 +10490,7 @@ let currentLiveHours = 6;
 let autoRefreshJsChart = null;
 let activeJsChartMode = '';
 let jsChartRequestGeneration = 0;
+let reloadJsChart = null;
 
 function chartTimestampMs(value) {
     let timestamp = (typeof value === 'number' || (typeof value === 'string' && value.trim() !== ''))
@@ -10926,14 +10957,16 @@ function activateJsChartMode(mode) {
     const normalizedMode = String(mode || '');
     if (activeJsChartMode !== normalizedMode) {
         activeJsChartMode = normalizedMode;
+        reloadJsChart = null;
         jsChartRequestGeneration += 1;
         stopAutoRefreshJsChart();
     }
     return jsChartRequestGeneration;
 }
 
-function beginJsChartRequest(mode) {
+function beginJsChartRequest(mode, reload = null) {
     activateJsChartMode(mode);
+    reloadJsChart = reload;
     stopAutoRefreshJsChart();
     jsChartRequestGeneration += 1;
     return jsChartRequestGeneration;
@@ -10953,7 +10986,7 @@ function scheduleJsChartAutoRefresh(mode, requestGeneration, callback) {
 
 function loadJsLiveChart(hours, file = null) {
     renderDirectMarketingForecastChart({direct_marketing_enabled: false});
-    const requestGeneration = beginJsChartRequest('live');
+    const requestGeneration = beginJsChartRequest('live', () => loadJsLiveChart(hours, file));
     currentLiveHours = hours;
 
     let url = 'get_chart_data.php?hours=' + hours;
@@ -11236,7 +11269,14 @@ function loadJsLiveChart(hours, file = null) {
                 const canvas = document.getElementById('liveChartCanvas');
                 if (canvas) canvas.ondblclick = () => { if (liveLineChart) liveLineChart.resetZoom(); };
             }
-
+        })
+        .catch(err => {
+            if (isCurrentJsChartRequest('live', requestGeneration)) {
+                console.error("Fehler beim Laden des Live-Diagramms:", err);
+            }
+        })
+        .finally(() => {
+            // Der Minutentakt läuft auch nach einem gescheiterten Abruf und nach einer Fehlermeldung weiter.
             scheduleJsChartAutoRefresh('live', requestGeneration, () => {
                 const container = document.getElementById('liveChartContainer');
                 if (container && container.style.display === 'block') loadJsLiveChart(currentLiveHours);
@@ -11396,11 +11436,11 @@ function renderForecastKwhSummary(data = {}) {
 }
 
 function loadJsForecastChart(file = '') {
-    const requestGeneration = beginJsChartRequest('forecast');
+    const requestGeneration = beginJsChartRequest('forecast', () => loadJsForecastChart(file));
     const marketEpoch = window._storageMarketEpoch || 0;
     const url = file ? 'get_forecast_data.php?file=' + encodeURIComponent(file) : 'get_forecast_data.php';
-    renderForecastKwhSummary({});
 
+    // Die Tagessummen-Leiste bleibt bis zur Antwort stehen; die Antwort ersetzt sie, ein gescheiterter Abruf leert sie.
     fetch(url)
         .then(r => r.json())
         .then(data => {
@@ -11616,17 +11656,21 @@ function loadJsForecastChart(file = '') {
             }
             expireMarketSocChart(liveLineChart, marketView, marketBaseline, forecastTimeContext.xScale,
                 marketData, document.getElementById('liveChartContainer'));
+        })
+        .catch(err => {
+            if (isCurrentJsChartRequest('forecast', requestGeneration)) {
+                renderForecastKwhSummary({});
+                console.error("Fehler beim Laden des Prognose-Diagramms:", err);
+            }
+        })
+        .finally(() => {
             // Wie Live, Hybrid und Preis jede Minute neu laden; sonst läuft die Bestätigung des Marktplans nach fünf
-            // Minuten ab, obwohl der Plan weiter gilt.
+            // Minuten ab, obwohl der Plan weiter gilt. Der Takt läuft auch nach einem gescheiterten Abruf und nach
+            // einer Antwort ohne Kurvenpunkte weiter.
             scheduleJsChartAutoRefresh('forecast', requestGeneration, () => {
                 const container = document.getElementById('liveChartContainer');
                 if (container && container.style.display === 'block') loadJsForecastChart(file);
             });
-        })
-        .catch(err => {
-            if (isCurrentJsChartRequest('forecast', requestGeneration)) {
-                console.error("Fehler beim Laden des Prognose-Diagramms:", err);
-            }
         });
 }
 
@@ -11694,7 +11738,7 @@ function chartTooltipLines(context, text) {
 }
 
 function loadJsHybridChart(hours, file = null) {
-    const requestGeneration = beginJsChartRequest('hybrid');
+    const requestGeneration = beginJsChartRequest('hybrid', () => loadJsHybridChart(hours, file));
     const marketEpoch = window._storageMarketEpoch || 0;
     currentLiveHours = hours;
 
@@ -12146,15 +12190,18 @@ function loadJsHybridChart(hours, file = null) {
 
         expireMarketSocChart(liveLineChart, marketView, marketBaseline, hybridTimeContext.xScale,
             marketData, document.getElementById('liveChartContainer'));
-        scheduleJsChartAutoRefresh('hybrid', requestGeneration, () => {
-            const container = document.getElementById('liveChartContainer');
-            if (container && container.style.display === 'block') loadJsHybridChart(currentLiveHours, file);
-        });
     })
     .catch(err => {
         if (isCurrentJsChartRequest('hybrid', requestGeneration)) {
             console.error("Fehler beim Laden des Hybrid-Diagramms:", err);
         }
+    })
+    .finally(() => {
+        // Der Minutentakt läuft auch nach einem gescheiterten Abruf und nach einer Fehlermeldung weiter.
+        scheduleJsChartAutoRefresh('hybrid', requestGeneration, () => {
+            const container = document.getElementById('liveChartContainer');
+            if (container && container.style.display === 'block') loadJsHybridChart(currentLiveHours, file);
+        });
     });
 }
 
@@ -12279,15 +12326,16 @@ function loadJsPriceChart(hours, file = null) {
                 detailsEl.style.display = 'none';
             }
         }
-
-        scheduleJsChartAutoRefresh('price', requestGeneration, () => {
-            const container = document.getElementById('liveChartContainer');
-            if (container && container.style.display === 'block') loadJsPriceChart(currentLiveHours, file);
-        });
     }).catch(e => {
         if (isCurrentJsChartRequest('price', requestGeneration)) {
             console.error("Fehler beim Laden des Preis-Diagramms:", e);
         }
+    }).finally(() => {
+        // Der Minutentakt läuft auch nach einem gescheiterten Abruf und nach einer Fehlermeldung weiter.
+        scheduleJsChartAutoRefresh('price', requestGeneration, () => {
+            const container = document.getElementById('liveChartContainer');
+            if (container && container.style.display === 'block') loadJsPriceChart(currentLiveHours, file);
+        });
     });
 }
 

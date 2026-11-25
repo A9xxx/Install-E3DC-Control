@@ -2501,7 +2501,7 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                                 <i class="fab fa-docker me-2"></i>Docker Versionen
                             </button>
                             <?php endif; ?>
-                            <button id="btn-repair-permissions" class="btn btn-outline-warning btn-sm me-2" onclick="fixPermissions('btn-repair-permissions')" title="Startet eine vollständige Systemreparatur mit Backup, Stable-Abgleich, Rechteprojektion und Dienstneustart"><i class="fas fa-tools me-2"></i>System reparieren</button>
+                            <button id="btn-repair-permissions" class="btn btn-outline-warning btn-sm me-2" onclick="fixPermissions('btn-repair-permissions')" title="Startet eine vollständige Systemreparatur: Sicherung, neueste veröffentlichte Version, Rechte und Neustart der Dienste"><i class="fas fa-tools me-2"></i>System reparieren</button>
                             <button class="btn btn-danger btn-sm" onclick="restartService()" title="Setzt alle Dienste sanft zurück und entfernt temporäre Boosts"><i class="fas fa-power-off me-2"></i>Notfall-Neustart (Reset)</button>
                         </div>
                     </div>

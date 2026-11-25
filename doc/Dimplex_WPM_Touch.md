@@ -38,10 +38,22 @@ Die Standardwerte nutzen die offiziellen Dimplex-WPM-Touch-Dokumentationsadresse
 | Elektrische Leistung | `5170` | `5169` | W/10, ab WPM-Software M 3.5 |
 | Heartbeat Out | `5064` | `5063` | Heartbeat-Ausgabe, ab WPM-Software M 3.14 |
 | Softwarestand | `65`/`66`/`67` | `64`/`65`/`66` | Version, Nummer und Index, z.B. `M3.21` |
+| Verdichter 1 (Ausgang) | `41` bei WPM J/L/M, `80` bei WPM H | `40` bzw. `79` | Coil, nur lesend; Ein/Aus |
+| Betriebsstunden Verdichter 1 | `72` bei WPM J/L/M, `64` bei WPM H | `71` bzw. `63` | Stunden, nur Anzeige |
 
 Wenn deine Modbus-Doku oder dein Testtool bereits 0-basierte Adressen erwartet, setze `dimplex_modbus_zero_based=1`.
 
 Wenn das elektrische Leistungsregister eine laufende Wärmepumpe zeigt, das Wärmeleistungsregister aber nur einen unplausibel kleinen Wert liefert, nutzt der Live-Dienst `dimplex_cop_estimate` als gekennzeichnete Wärmeleistungs-Schätzung. Der Rohwert bleibt im Frontend und in der Diagnose sichtbar.
+
+## Verdichterstatus und Betriebsstunden
+
+E3DC-Control liest den Ausgang „Verdichter 1“ des Wärmepumpenmanagers als Coil, nur lesend. Die Adresse richtet sich nach dem Softwarestand: `41` bei WPM-Software J, L und M, `80` bei H. Liefert der Wärmepumpenmanager den Ausgang, gilt allein dieser Zustand als Verdichterlauf, auch für Mindestlaufzeit und Wiedereinschaltsperre; Leistungswerte ändern daran nichts. Damit erkennt E3DC-Control den Verdichter auch bei WPM-Ständen vor M 3.5, die keine Leistungsregister liefern.
+
+Rückfall: Ist der Softwarestand unbekannt oder beantwortet der Wärmepumpenmanager die Abfrage nicht, leitet E3DC-Control den Verdichterlauf wie bisher aus der elektrischen Leistung ab (ab 150 W). Fehlt bei bekanntem Softwarestand neben dem Ausgang auch die Leistung, etwa bei WPM-Ständen vor M 3.5, gilt der Verdichterstatus in diesem Zyklus als unbekannt und nicht als Stillstand. Die Wärmepumpen-Seite zeigt beim Verdichter die verwendete Quelle.
+
+Die Betriebsstunden des Verdichters liest E3DC-Control aus Register `72` (WPM H: `64`) und zeigt sie auf der Wärmepumpen-Seite an. Der Wert hat keine Regelwirkung; liefert der Wärmepumpenmanager ihn nicht, bleibt die Anzeige leer.
+
+Die Adressen für Verdichter und Betriebsstunden sind fest hinterlegt. `dimplex_modbus_zero_based` gilt nur für die überschreibbaren Register; die beiden festen Adressen verschiebt der Schalter nicht.
 
 ## SG-Ready-Zustände
 

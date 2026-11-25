@@ -129,10 +129,8 @@ RUN find -P /app/pi/Install -xdev -type d -exec chmod 0755 -- {} + && \
     test -f /app/pi/Install/Installer/apache/e3dc-control-access-log.conf && \
     test -f /app/pi/Install/Installer/Storage/process_singleton.py && \
     test -f /app/pi/Install/Installer/Wallbox/process_singleton.py && \
-    test -f /app/pi/Install/Installer/Wallbox/start_hold.py && \
     test -f /app/pi/Install/Installer/Wallbox/fixed_phase_session.py && \
     test -f /app/pi/Install/Installer/Wallbox/fixed_phase_runtime.py && \
-    test -f /app/pi/Install/Installer/Wallbox/fixed_start_energy.py && \
     test -f /app/pi/Install/Installer/Wallbox/openwb_transport.py && \
     test -f /app/pi/Install/Installer/Wallbox/simple_core.py && \
     test -f /app/pi/Install/Installer/control_time.py && \
@@ -157,6 +155,7 @@ RUN find -P /app/pi/Install -xdev -type d -exec chmod 0755 -- {} + && \
     test -f /app/pi/Install/html/cost_history.js && \
     test -f /app/pi/Install/html/cost_history_view.php && \
     test -f /app/pi/Install/html/daily_stats_cli.php && \
+    test -f /app/pi/Install/html/doku_suche.json && \
     test -f /app/pi/Install/html/get_cost_history.php && \
     test -f /app/pi/Install/html/heatpump_season.php && \
     test -f /app/pi/Install/html/pv_entity_projection.php && \

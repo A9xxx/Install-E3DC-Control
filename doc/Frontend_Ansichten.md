@@ -58,7 +58,7 @@ Die einfache Config-Ansicht ist als Raster aufgebaut:
 Der Config-Editor kennzeichnet abhängige Einstellungen grau, wenn eine benötigte
 Freigabe oder ein passendes Profil fehlt. Direkt am Feld steht, welche
 Voraussetzung fehlt. Beispielsweise benötigt **Speicher-Netzladen** auch den
-**netzdienlichen Eco-Modus** und einen unterstützten zeitvariablen Tarif.
+geöffneten **Marktpfad** und einen unterstützten zeitvariablen Tarif.
 Aktivierte, dadurch unwirksame Markteinstellungen erscheinen zusätzlich in
 einem Hinweis oberhalb der Konfiguration, auch in der einfachen Ansicht.
 

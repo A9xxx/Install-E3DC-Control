@@ -1,6 +1,6 @@
 <?php
 require_once __DIR__ . '/helpers.php';
-requireWebAuth(true);
+requireDashboardReadAuth(true);
 header('Content-Type: application/json');
 date_default_timezone_set('Europe/Berlin');
 

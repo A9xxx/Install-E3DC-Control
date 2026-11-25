@@ -597,7 +597,6 @@ def druck_rechnen(*, cfg, live, messsatz, parameter, vorzustand, jetzt_s):
         live_derate_limit_w,
         parameter['curve_cap_feed_buffer_w'],
     )
-    derate_hard_limit_w = int(pcc_limit_contract.get("hard_limit_w") or 0)
     derate_limit_w = int(pcc_limit_contract.get("limit_w") or 0)
     derate_limit_source = str(pcc_limit_contract.get("source") or "none")
     derating_active = bool(
@@ -627,14 +626,15 @@ def druck_rechnen(*, cfg, live, messsatz, parameter, vorzustand, jetzt_s):
         if feed_export_threshold_w > 0
         else 0
     )
-    if feed_export_threshold_w > 0:
-        grid_export_error_w = int(grid_export_w) - int(feed_export_threshold_w)
-        grid_export_over_limit_w = max(0, grid_export_error_w)
-        curve_cap_below_threshold_w = max(0, -grid_export_error_w)
-    else:
-        grid_export_error_w = int(grid_export_w) if curve_above_enter else 0
-        grid_export_over_limit_w = max(0, grid_export_error_w)
-        curve_cap_below_threshold_w = 0
+    # Nur ein aktiver PCC-Vertrag macht Export zu Abregeldruck.
+    # Eine gepufferte aktive Nullgrenze bleibt ein wirksamer Vertrag.
+    grid_export_error_w = (
+        int(grid_export_w) - int(feed_export_threshold_w)
+        if pcc_limit_contract["active"] and (feed_export_threshold_w > 0 or curve_above_enter)
+        else 0
+    )
+    grid_export_over_limit_w = max(0, grid_export_error_w)
+    curve_cap_below_threshold_w = max(0, -grid_export_error_w) if feed_export_threshold_w > 0 else 0
     curve_cap_feedback_active = bool(
         curve_cap_tracking_active
         and curve_cap_grid_contract_valid
@@ -671,30 +671,32 @@ def druck_rechnen(*, cfg, live, messsatz, parameter, vorzustand, jetzt_s):
             >= max(0, int(release_export_threshold_w) - int(parameter['curve_cap_feedback_band_w']))
         )
     )
-    # DC-/WR-Druck darf den harten Abregelschutz nur begleiten, wenn der
-    # AC-Netzpunkt schon an der Abregelgrenze arbeitet oder der Pfad durch
-    # die Hysterese gehalten wird. Ist der Abregelschutz bereits aktiv,
-    # bleibt echter WR-Druck auch bei kurzen Haus-/Grid-Spruengen erhalten.
-    # PV knapp oberhalb der WR-Leistung ist sonst nur Diagnose; der E3DC
-    # kann diesen Anteil oft autonom aufnehmen.
+    # Ohne PCC-Grenze bleibt ausschließlich der bereits berechnete WR-/DC-Anteil
+    # wirksam. Er hängt von PV und WR-Grenze ab, nicht von der Akkuladung.
+    # Bei aktiver PCC-Grenze gilt unverändert die bestehende Druckhysterese.
     curve_cap_dc_pressure_active = bool(
         inverter_pressure_w > 0
         and curve_cap_grid_contract_valid
-        and feed_export_threshold_w > 0
         and not curve_cap_real_grid_import_active
         and (
-            grid_export_over_limit_w > 0
-            or curve_cap_feedback_active
-            or curve_cap_dc_hold_active
+            not pcc_limit_contract["active"]
             or (
-                release_export_threshold_w > 0
-                and grid_export_w >= release_export_threshold_w
+                feed_export_threshold_w > 0
                 and (
-                    curve_above_soft
-                    or curve_above_keep
-                    or curve_above_enter
-                    or previous_curve_cap_w >= parameter['curve_charge_enter_w']
-                    or derating_active
+                    grid_export_over_limit_w > 0
+                    or curve_cap_feedback_active
+                    or curve_cap_dc_hold_active
+                    or (
+                        release_export_threshold_w > 0
+                        and grid_export_w >= release_export_threshold_w
+                        and (
+                            curve_above_soft
+                            or curve_above_keep
+                            or curve_above_enter
+                            or previous_curve_cap_w >= parameter['curve_charge_enter_w']
+                            or derating_active
+                        )
+                    )
                 )
             )
         )
@@ -749,27 +751,27 @@ def druck_rechnen(*, cfg, live, messsatz, parameter, vorzustand, jetzt_s):
         'curve_cap_relevant': curve_cap_relevant,
         'curve_cap_target_w': curve_cap_target_w,
         'curve_cap_tracking_active': curve_cap_tracking_active,
-        'derate_hard_limit_w': derate_hard_limit_w,
+        'derate_hard_limit_w': pcc_limit_contract["hard_limit_w"],
         'derate_limit_source': derate_limit_source,
-        'derate_limit_w': derate_limit_w,
+        'derate_limit_w': pcc_limit_contract["limit_w"],
         'derating_active': derating_active,
         'derating_pressure_w': derating_pressure_w,
         'ems_budget': ems_budget,
         'ems_mandatory_charge_w': ems_mandatory_charge_w,
-        'feed_export_threshold_w': feed_export_threshold_w,
+        'feed_export_threshold_w': pcc_limit_contract["limit_w"],
         'grid_export_error_w': grid_export_error_w,
         'grid_export_over_limit_w': grid_export_over_limit_w,
         'grid_export_w': grid_export_w,
         'grid_import_w': grid_import_w,
         'inverter_limit_w': inverter_limit_w,
         'inverter_pressure_w': inverter_pressure_w,
-        'live_derate_limit_w': live_derate_limit_w,
+        'live_derate_limit_w': live_derate_limit_w or None,
         'meter_balance': meter_balance,
         'meter_balance_plausible': meter_balance_plausible,
         'meter_home_w': meter_home_w,
         'pcc_limit_contract': pcc_limit_contract,
         'previous_curve_cap_w': previous_curve_cap_w,
-        'release_export_threshold_w': release_export_threshold_w,
+        'release_export_threshold_w': release_export_threshold_w if pcc_limit_contract["active"] else None,
         'settings_bounded_zero_confirmed': settings_bounded_zero_confirmed,
         'settings_previous_curve_cap_confirmed': settings_previous_curve_cap_confirmed,
         'settings_readback_valid': settings_readback_valid,
@@ -848,8 +850,8 @@ def schatten_quellen(cfg, live, *, haus_w, nativ_w, kurve, max_laden_w,
     parameter = druck_parameter(cfg, max_laden_w if _zahl(max_laden_w) else 0)
     pcc = resolve_buffered_pcc_limit(_configured_kw_or_w(cfg.get('einspeiselimit')),
         _safe_int(live.get('derate_at_power_w')), parameter['curve_cap_feed_buffer_w'])
-    if not pcc['active']:
-        fehler.append('PCC-Grenze fehlt')
+    # Ohne PCC-Grenze rechnet die Druckrechnung wie der Regler nur den WR-/DC-Anteil; der PCC-Anteil bleibt mit
+    # Grund leer. Eine gültige Nullgrenze ist aktiv und keine fehlende Grenze.
     herkunft.append('PCC:' + pcc['source'])
     if fehler:
         return SchattenQuellen(None, zeit, '; '.join(fehler), None, quellen,
@@ -870,7 +872,8 @@ def schatten_quellen(cfg, live, *, haus_w, nativ_w, kurve, max_laden_w,
         curve_above_soft=gap is not None and -gap >= parameter['curve_auto_hold_exit_pct'])
     rechnung = druck_rechnen(cfg=cfg, live=live, messsatz=messsatz,
         parameter=parameter, vorzustand=previous, jetzt_s=jetzt_s)
-    return SchattenQuellen(rechnung.werte['curve_cap_pressure_w'], zeit, 'belegt',
+    return SchattenQuellen(rechnung.werte['curve_cap_pressure_w'], zeit,
+        'belegt' if pcc['active'] else 'belegt; PCC-Grenze fehlt, nur WR-/DC-Anteil',
         rechnung, quellen, angefordert, kappe, tuple(herkunft))
 
 

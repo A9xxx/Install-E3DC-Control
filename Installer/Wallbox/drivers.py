@@ -8695,7 +8695,11 @@ class OpenWBProCharger(WallboxDriver):
         phases_actual = int(self._float(data.get("phases_actual"), 0.0))
         phases_target = int(self._float(data.get("phases_target"), 0.0))
         phases_in_use = int(self._float(data.get("phases_in_use"), 0.0))
-        measured_phases = sum(1 for cur in currents if self._float(cur, 0.0) > 0.2)
+        # Eine Phase ist belegt, wenn Strom oder Wirkleistung derselben Probe es zeigen. Ein einzelner Messwert 0 je
+        # Phase verkleinert die elektrische Belegung nicht; ein Stromaussetzer einer Phase bei weiter gemessener
+        # Leistung gab sonst für einen Zyklus eine Netzphase frei.
+        measured_phases = sum(1 for idx, phase_power in enumerate((p1, p2, p3))
+            if (idx < len(currents) and self._float(currents[idx], 0.0) > 0.2) or phase_power > 50.0)
         if measured_phases > 0:
             phases_in_use = measured_phases
         elif not charge_state and not phase_power_verified and apparent_power_va <= 50.0:

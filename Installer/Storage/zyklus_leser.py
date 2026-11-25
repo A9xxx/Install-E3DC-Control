@@ -72,17 +72,22 @@ def vorhalte_aufnahme(cfg, plan, start, previous_state=None, owner_binding=None,
                 and (flags.get('pv_store_dc_only_enable') is True
                     or _an(cfg, 'direct_marketing_pv_store_dc_only_enable')))),
         grid_charge_enable=flags.get('grid_charge_enable') is True)
-    if contract["mode"] != 2:
-        return aufnahme
     live = live or {}
     previous_state = previous_state or {}
+    # Der Marktvertrag ist ein vor der Entscheidung gebundener Erzeugervertrag, auch ohne Vorhaltung; ein
+    # Fehler betrifft nur ihn (der Kern weist ihn aus), nicht die Vorhaltung.
+    try:
+        aufnahme["markt"] = markt_leser(cfg, live, plan, start, previous_state) if markt_leser else None
+    except Exception:
+        aufnahme["markt"] = dict(fehler=True)
+    if contract["mode"] != 2:
+        return aufnahme
     execution = backup_hold.read_execution(plan, cfg, start * 1000, contract=contract)
     deadline = execution['deadline_ts_ms'] if execution else start * 1000
     control = previous_state.get('backup_hold_control') or {}
     account = control.get('closed_account') or previous_state.get('backup_hold_closed_account') or {}
     regelbare_last, lasten = regelbare_lasten(cfg, live)
-    aufnahme.update(markt=markt_leser(cfg, live, plan, start, previous_state) if markt_leser else None,
-        regelbare_last_w=regelbare_last, regelbare_lasten=lasten,
+    aufnahme.update(regelbare_last_w=regelbare_last, regelbare_lasten=lasten,
         preise=(backup_hold.tarif_preise(cfg, plan, start * 1000, deadline)
             if contract["values"][backup_hold.KEYS[4]] else dict(reason="grid_charge_disabled", prices=[])),
         startkonto=dict(account))

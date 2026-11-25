@@ -6,7 +6,11 @@ Diese Dokumentation beschreibt die verfügbaren API-Endpunkte deiner E3DC-Contro
 
 ## 1. Authentifizierung & Sicherheit
 
-Alle Anfragen an die API-Endpunkte müssen authentifiziert werden, wenn eine `web_pin` in deiner Konfiguration hinterlegt ist. Ist keine `web_pin` gesetzt, ist die API ohne Anmeldung offen.
+E3DC-Control verlangt bei gesetzter `web_pin` eine Anmeldung für die API-Endpunkte. Ausgenommen sind die Dashboard-Daten aus `get_live_json.php` (GET-Lesepfade und Live-Sampler-POST), `get_chart_data.php`, `get_forecast_data.php` und `?action=get_daily_stats` in `index.php` und `mobile.php` (aktueller Tag und Archivtage), wenn der aufgerufene Name lokal ist und der Verbindungsabsender zum Heimnetz gehört. E3DC-Control verlangt bei Absendern aus `127.0.0.0/8` oder `::1`, auch IPv4-gemappt, weiterhin die Anmeldung; Weiterleitungsköpfe ändern die Freigabe nicht. E3DC-Control liefert im Heimnetz dieselben vollständigen Dashboard-Antworten wie ohne PIN. Der Live-Sampler-POST benötigt weiterhin das CSRF-Merkmal der Dashboardseite und die zugehörige Sitzung. Die Kostenhistorie (`get_cost_history.php`), andere Aktionen, Konfiguration und Schaltfunktionen benötigen weiterhin die Anmeldung. Ist keine `web_pin` gesetzt, bleibt die API ohne Anmeldung offen; die Domainsperre gilt weiterhin.
+
+E3DC-Control schützt bei gesetzter Web-PIN Einstellungen und Schaltfunktionen auch bei Zugriffen aus dem Internet. Für eine Internetfreigabe eine Web-PIN setzen. Über den dokumentierten Cloudflare-Tunnel schützt die PIN auch das Dashboard, weil der Tunnel den öffentlichen Namen durchreicht. Ersetzt ein Reverse-Proxy oder eine Docker-Portweiterleitung den Absender durch eine interne Adresse und den aufgerufenen Namen durch einen lokalen Namen, kann E3DC-Control den Zugriff von außen nicht erkennen; die Dashboard-Daten bleiben dann trotz PIN ohne Anmeldung sichtbar. In diesem Fall den öffentlichen Namen durchreichen lassen oder ein VPN nutzen.
+
+E3DC-Control verlangt auch für einen Proxy oder Tunnel auf demselben Gerät die Anmeldung, wenn dieser die Anlage über `127.0.0.1`/`localhost` anspricht und der Zugriff mit einer solchen Absenderadresse ankommt. Ein Ziel über die Heimnetz-Adresse fällt bei lokalem Namen und Heimnetz-Absender unter die Ausnahme. Für eine Anzeige direkt am Gerät das Dashboard über dessen Heimnetz-Adresse öffnen; über `localhost` verlangt E3DC-Control die Anmeldung.
 
 ### API-Schlüssel per Header
 Sende den API-Schlüssel in einem der beiden gleichwertigen Header-Felder:
@@ -22,7 +26,7 @@ Beide Wege werden gleich geprüft. Schickt ein Client beide Header, wird der Wer
 
 ### Sperre nach Fehlversuchen
 *   Für beide Header-Wege gilt dieselbe Sperre wie für die Anmeldung im Browser: Nach 5 falschen PIN-Versuchen wird die Client-Adresse für 10 Minuten gesperrt. Fehlversuche über `X-API-PIN` und `Authorization: Bearer` zählen gemeinsam.
-*   Während der Sperre antwortet die API auch mit der richtigen PIN mit HTTP `403`. Eine erfolgreiche Anmeldung setzt den Zähler zurück.
+*   Während der Sperre antworten anmeldepflichtige API-Endpunkte auch mit der richtigen PIN mit HTTP `403`. Die frei lesbaren Dashboard-Endpunkte im Heimnetz benötigen keine PIN und bleiben davon unberührt. Eine erfolgreiche Anmeldung setzt den Zähler zurück.
 *   Die Sperre gilt je Client-Adresse, bei IPv6 je /64-Netz. Ein Widget mit veralteter PIN sperrt deshalb auch die Browser-Anmeldung vom selben Gerät bzw. Netz. Nach einer PIN-Änderung zuerst alle Widgets und Skripte anpassen.
 *   Bereits angemeldete Browser-Sitzungen bleiben von der Sperre unberührt.
 *   Hinter einem Tunnel oder Reverse-Proxy: Die vom Cloudflare-Tunnel übermittelte Client-Adresse (`CF-Connecting-IP`) wird nur ausgewertet, wenn der Tunnel lokal auf demselben System angebunden ist (Verbindung von `127.0.0.1` bzw. `::1`). Andere Weiterleitungs-Header wie `X-Forwarded-For` werden nicht ausgewertet. Kommen alle Anfragen über eine gemeinsame Adresse an, teilen sich diese Clients eine Sperre; Fehlversuche Dritter können dann auch die eigenen Widgets für 10 Minuten aussperren.
@@ -120,6 +124,6 @@ Moderne Web-App-Frameworks (React, Vue, Angular) senden vor einer HTTP-Anfrage m
 
 Deine API beantwortet solche `OPTIONS`-Anfragen mit HTTP `403` und gibt keine CORS-Freigabe zurück. Browser-Apps, die von einer anderen Adresse (fremdem Origin) aus auf die API zugreifen, werden damit bewusst abgewiesen. Die Web-PIN ist keine Freigabeliste für fremde Webseiten.
 
-Ohne Web-PIN sind IP-Adressen, einteilige Namen, der eigene Hostname und Namen unter `.local`, `.lan`, `.home`, `.internal`, `.home.arpa`, `.localdomain`, `.fritz.box` und `.ts.net` erreichbar. Andere Hostnamen erhalten HTTP `421` mit einem Hinweis: Über die IP-Adresse oder einen lokalen Namen den Config-Editor öffnen und eine Web-PIN setzen. Mit gesetzter Web-PIN bleibt der bisherige Zugriff einschließlich `X-API-PIN` unverändert.
+Ohne Web-PIN sind IP-Adressen, einteilige Namen, der eigene Hostname und Namen unter `.local`, `.lan`, `.home`, `.internal`, `.home.arpa`, `.localdomain`, `.fritz.box` und `.ts.net` erreichbar. Andere Hostnamen erhalten HTTP `421` mit einem Hinweis: Über die IP-Adresse oder einen lokalen Namen den Config-Editor öffnen und eine Web-PIN setzen. Mit gesetzter Web-PIN gelten die Anmeldepflicht und die Heimnetzausnahme aus Abschnitt 1; `X-API-PIN` bleibt für anmeldepflichtige Zugriffe verfügbar.
 
 Widgets, Apps, Home-Assistant-REST-Sensoren und Skripte, die ihre Anfrage selbst senden, sind davon nicht betroffen: Sie senden keinen Preflight und authentifizieren sich wie in Abschnitt 1 beschrieben.

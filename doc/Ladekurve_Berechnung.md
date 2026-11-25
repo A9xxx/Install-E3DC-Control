@@ -310,7 +310,14 @@ wenn echte Einspeise- oder Wechselrichtergrenzen erreicht werden könnten:
 - live gemeldetes E3DC-Derating,
 - DC-Leistung oberhalb der Wechselrichterleistung, die sonst abgeregelt würde.
 
-Oberhalb der Ladekurve lädt der Speicher nur den echten Abregelbedarf. Unter der
+Oberhalb der Ladekurve lädt der Speicher nur den echten Abregelbedarf. Ohne
+aktive Einspeisegrenze, also ohne eingetragene Einspeisebegrenzung und ohne
+gemeldetes Derating, ist Export am Netzpunkt kein Abregelbedarf: Oberhalb der
+Kurve hält der Speicher dann im Automatikmodus mit Ladegrenze 0 W, und der
+PV-Überschuss steht Verbrauchern und Einspeisung zur Verfügung. Den Ladeanteil
+aus DC-Leistung oberhalb der Wechselrichterleistung lädt er weiterhin. Eine
+aktive Grenze, die der Puffer auf 0 W absenkt, bleibt ein gültiger Regelauftrag.
+Fehlende Grenzwerte stehen in der Diagnose als leer mit Quelle `none`. Unter der
 Kurve darf zusätzlich `iFc` beziehungsweise der sanfte Aufholbedarf wirken,
 solange Exportdruck und PV-Reserve vorhanden sind. Dadurch bleibt der
 Abregelschutz stabil, ohne große Aufholjagden durch die Hintertür zu erzwingen.

@@ -16,8 +16,8 @@ Die Anzeige ist kein messtechnischer Nachweis der Herkunft jedes geladenen Watts
 
 ## Automatisches Netzladen bei zeitvariablem Tarif
 
-Für normales preisabhängiges Speichernachladen müssen der **netzdienliche
-Eco-Modus** und **Speicher-Netzladen** eingeschaltet sein. Der separate
+Für normales preisabhängiges Speichernachladen müssen **Marktpfad öffnen**
+und **Speicher-Netzladen** eingeschaltet sein. Der separate
 Negativpreis-Boost und die früheren aWATTar-Optionen ersetzen diese Freigaben
 nicht. Ein günstiges Zeitfenster allein startet noch keine Ladung: Prognose,
 nutzbarer Speicherinhalt, Preisvorteil, Verluste und Mindestlademenge bestimmen
@@ -54,7 +54,10 @@ Speicher ohne Entladung und PV lädt frei. Den Rest lädt der Speicher zum
 berechneten spätesten Start als Hauptblock mit voller zulässiger Leistung;
 bei bereits erreichtem spätestem Start beginnt er direkt damit. Ein
 begonnener Hauptblock bleibt bis zum Ziel bestehen. E3DC-Control plant die Restladezeit
-je Ladezustand und zehn Minuten Hochlaufreserve vor der Zielzeit ein.
+je Ladezustand und zehn Minuten Hochlaufreserve vor der Zielzeit ein. Während
+des Wartens auf den Hauptblock rechnet die Planung mit der eingestellten
+Ladeleistung; den tatsächlichen Start begrenzt der Regler weiterhin mit
+frischen Phasenwerten.
 Die Zielzeit liegt 30 Minuten vor Fensterende, bei Fenstern unter einer
 Stunde gilt stattdessen die halbe Fensterdauer als Zeitpuffer.
 Der Speicher nutzt PV vorrangig und nimmt sie oberhalb der Netzladerate ungedrosselt auf.
@@ -90,7 +93,7 @@ konfigurierten Kundentarif wird kein Börsenpreis abgeleitet.
 
 Mit **Speicher halten** kann der Haushalt in günstigeren Stunden Strom aus dem
 Netz beziehen, während vorhandene Batterieenergie für spätere teure Stunden
-verbleibt. Dafür müssen Eco-Modus und Halten freigegeben sein. Die Planung
+verbleibt. Dafür muss der Marktpfad offen und Halten freigegeben sein. Die Planung
 berücksichtigt auch den Verbrauch bis zur Preisspitze und rechtzeitige PV.
 Füllt PV den Speicher vorher ohnehin wieder auf, entfällt dieser Haltevorteil.
 
@@ -271,7 +274,7 @@ Sperre besteht. Rückweg: Ursache beheben und die Sperre als Root zurücksetzen
 neu starten. Ein Neustart des E3DC setzt die Akkugrenzen auf die
 Grundeinstellung.
 
-> **Stand:** v5.5.8
+> **Stand:** v5.5.9
 >
 > **Dateien:** `Installer/storage_simulator.py`,
 > `Installer/storage_manager.py`, `Installer/storage_parallel_regulator.py`
@@ -784,9 +787,10 @@ niedrigerer Nutzerwert gilt unmittelbar; ein höherer Wert überschreibt den
 E3DC-Wert erst nach ausdrücklicher Bestätigung. Fehlen beide Werte, ist
 Netzladen nicht möglich. Für PV-Laden der Wallbox bleiben 35 A je Phase als
 Ersatzrahmen; dieser gibt einphasiges Laden über 20 A nicht frei. Auch ohne
-Nachladen bleibt die Notstromreserve gegen Entladung geschützt. Ein fehlender
-oder ungültiger Netzwert verhindert Netzladen; eine Abweichung zwischen
-Netzwert und Zählersumme bleibt ein Hinweis ohne Regelwirkung.
+Nachladen bleibt die Notstromreserve gegen Entladung geschützt. Netzladen des
+Speichers richtet sich allein nach den Phasenwerten des E3DC-Leistungsmessers;
+ein fehlender oder ungültiger Netzwert verhindert es nicht, und eine Abweichung
+zwischen Netzwert und Zählersumme bleibt ein Hinweis ohne Regelwirkung.
 Mehrere Ladepunkte teilen diesen Phasenrahmen ohne pauschale Gleichteilung. Ein
 gebundenes einphasiges Fahrzeugprofil bestimmt die reale Lastphase; ohne
 Fahrzeugbeleg bleibt die feste Wallboxtopologie maßgeblich.
@@ -794,9 +798,9 @@ Fahrzeugbeleg bleibt die feste Wallboxtopologie maßgeblich.
 Wird `wbminsoc` während der Ladung über den aktuellen Speicher-SoC angehoben,
 endet die Akku-Unterstützung im selben Zyklus. Nur das batterieneutrale
 PV-Budget darf die Ladung weiterführen; unterhalb der phasenabhängigen
-Mindestleistung wird gestoppt. Start-Holds dürfen einen Fehlbetrag nur dann
-ergänzen, wenn er vollständig durch verringerte Speicherladung oder eine
-ausdrückliche Batterie-Freigabe finanziert ist.
+Mindestleistung wird gestoppt. E3DC-Control ergänzt das Wallboxbudget nicht
+durch einen allgemeinen Start-Hold; für den Start gelten der vorhandene
+Quellenrahmen und die bestehende Verbraucherzuteilung.
 
 ### Pre-Dump, Direktvermarktung und Zusatzwechselrichter
 
@@ -904,11 +908,33 @@ Storage Manager.
 - Beim Begrenzen und Halten bleibt E3/DC in AUTO; die Regelung setzt einen
   Lade- oder Entladerahmen und fordert keine Netzeinspeisung an. Für dessen
   Schreibweise über `POWER_SETTINGS` gilt Abschnitt 3.1.
-- Sicherheitsabstand, Leistungshysterese, SoC-Hysterese und
-  Freigabe-Entprellung verhindern Flattern.
+- Unterhalb der Speicherschwelle rechnet E3DC-Control alle 30 Sekunden genau
+  eine Zahl aus dem Netzbezug der laufenden Viertelstunde: bisherige Grenze plus
+  mittlerer Netzbezug des Takts minus zulässiger Restbezug, beim Nachladen
+  zusätzlich minus wirksame Ladeleistung. Ab 300 W ist sie die Entladegrenze,
+  darunter hält 0 W den Puffer, negativ ist sie der Spielraum für die
+  freigegebene Netz-Nachladung. Die gemessene Akkuleistung geht in die
+  Entladegrenze nicht ein.
+- Maßgeblich ist der Mittelwert der Viertelstunde. Der momentane Netzbezug darf
+  deshalb zeitweise über der Grenze liegen, solange die Viertelstunde reicht;
+  der Speicherstatus nennt den Stand. Ein Lastsprung wirkt bis zum nächsten
+  Takt ungekappt und wird, außer im letzten Takt, in derselben Viertelstunde
+  ausgeglichen. Nach der Spitze sinkt die Entladegrenze je Takt um höchstens
+  den zulässigen Restbezug.
+- Die Leistungshysterese ist die kleinste Änderung der Entladegrenze, die
+  SoC-Hysterese hält die Pufferzone ruhig. Der Sicherheitsabstand deckt
+  Messabweichungen und einen Lastsprung im letzten Takt der Viertelstunde.
+- Halten und Begrenzen haben denselben Vorrang: Sie gelten vor jeder anderen
+  Entladung. Laden, Netzladen, Notstrom- und Reserveschutz, die
+  Speicheruntergrenze der Wallbox, das Warten auf Unwetter-Netzladen sowie
+  Handaufträge gehen vor, eine strengere bestehende Entladegrenze bleibt
+  erhalten.
 - Der Lastspitzenpuffer liegt oberhalb der physischen Notstromreserve.
-- Bei einer zu großen Messlücke bleibt der Pfad passiv und beginnt erst an einer
-  neuen festen Viertelstundengrenze.
+- Oberhalb der Speicherschwelle entlädt E3/DC in AUTO frei. Für lange Spitzen
+  mit mehr Akkureserve die Speicherschwelle höher setzen.
+- Bei einer zu großen Messlücke begrenzt der Pfad nicht; unterhalb der
+  Speicherschwelle bleibt der Puffer stehen. Er beginnt erst an einer neuen
+  festen Viertelstundengrenze.
 - Netz-Nachladung des Puffers benötigt
   `peak_shaving_grid_recharge_enable = 1`, verwendet vorübergehend den
   angeforderten Netzlademodus und bleibt zusätzlich an lückenlose Historie,
@@ -964,12 +990,23 @@ fehlt ein gelernter Wochentag in diesen Messungen oder ist die Temperatur ohne
 Variation, lernt das gesamte Modell ohne Temperaturmerkmal. Fehlende Werte
 werden nicht durch eine konstante Temperatur ersetzt. Künftige Wetterwerte
 werden ausschließlich für die Vorhersage verwendet. Das wöchentliche Training
-bleibt sonntags um 03:00 Uhr. Ein vorhandenes älteres Modell ohne diese
+ist sonntags um 03:00 Uhr Ortszeit fällig. E3DC-Control prüft die Fälligkeit zu
+jeder vollen Stunde am Trainingszeitpunkt des geprüften Modells und holt ein
+verpasstes Training an jedem Wochentag nach; ein Dienstneustart wiederholt ein
+erledigtes Training nicht. Fehlt ein prüfbares Modell, ist sein
+Trainingszeitpunkt unlesbar oder liegt er mehr als einen Tag in der Zukunft, ist
+das Training sofort fällig. Im HA-Standby startet das wöchentliche Training
+nicht. Ein vorhandenes älteres Modell ohne diese
 Trainingsdiagnose wird bei der nächsten Prognose neu trainiert; bei noch
 unvollständigen Wochentagen wird nach erfolgreichem Training frühestens am
 nächsten Kalendertag erneut trainiert. Ein fehlgeschlagenes Neutraining wird als
 ausstehend diagnostiziert. Nach einem fehlgeschlagenen oder abgebrochenen Versuch
-aus der Prognose ist ein neuer Versuch frühestens nach sechs Stunden möglich.
+aus der Prognose oder dem wöchentlichen Training ist ein neuer Versuch frühestens
+nach sechs Stunden möglich; beide teilen diese Sperre. Scheitert ein Training,
+bleibt die Verbrauchsprognose erhalten, solange das bisherige Modell nutzbar ist.
+Ohne nutzbares Modell entfernt E3DC-Control sie; nach einem Versuch des
+wöchentlichen Trainings veröffentlicht es das Historienprofil sofort wieder,
+wenn genügend Verlauf vorliegt.
 Gleichzeitige Prognoseprozesse prüfen die Identität des veröffentlichten Modells
 und reservieren den Versuch unter derselben Dateisperre. Der Versuchszustand liegt
 flüchtig unter `/var/www/html/ramdisk/ml_training_attempt.json` und gehört nicht zum
@@ -992,8 +1029,13 @@ bis dahin ist nur ein vorhandenes gemessenes Gesamtmittel oder der ausgewiesene
 Historienrückfall zulässig.
 
 Die Plausibilitätsprüfung begrenzt grobe Ausreißer der Haus-Modellausgabe vor
-der Bias-Korrektur. Der Bias bewertet weiterhin die tatsächlich ausgegebene
-Prognose anhand des Bewertungslogs. Die Wärmepumpen-Plausibilitätsprüfung bleibt
+der Bias-Korrektur. E3DC-Control berechnet den Bias aus Ist-Verbrauch und
+Tagessumme unmittelbar vor dem Bias: beim Haus im Standardpfad nach der
+Plausibilitätsprüfung, im bisherigen Pfad davor, bei der Wärmepumpe vor der
+Korrektur. Das Bewertungslog enthält diese Bezugsgrößen zusätzlich zur
+weiterhin bewerteten ausgegebenen Prognose. Bis drei gültige neue Tage je
+Verbrauchsart vorliegen, verwendet das System das bisherige Verhältnis.
+Die Wärmepumpen-Plausibilitätsprüfung bleibt
 unverändert. Die Grenze `ml_home_daily_cap_kwh` (Standard 24 kWh) beschreibt
 die Obergrenze der Referenzbasis, keine Grenze der ausgegebenen Prognose und
 keine Leistungs- oder Schutzgrenze des Speichers. Der Validator berät bei Werten

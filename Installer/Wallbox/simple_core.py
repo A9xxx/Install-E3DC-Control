@@ -347,15 +347,6 @@ def decide(snapshot, state, now, previous_snapshot=None):
         return stop("window_end" if s.get("window_ended") else "target_reached")
     if s.get("budget_timeout") is True and s.get("source") != "grid":
         return stop("budget_timeout")
-    if (s.get("unplug_offer_active") is True and s.get("connected") is False
-            and s.get("charging") is not True):
-        # Der Kern führt im Leerlauf schon das stehende Angebot mit genau
-        # diesen Uhren. Die spätere Einzelbox-Beobachtung qualifiziert es
-        # nicht nochmals und löscht es auch nicht als Phasenfehler.
-        state["session_active"] = False
-        for key in ("reserve_phases", "phase_target", "phase_since"):
-            state.pop(key, None)
-        return result(reason="no_vehicle", sentence="Kein Fahrzeug verbunden")
     limits_unknown = (minimum is None or maximum is None or step is None or step <= 0
         or minimum <= 0 or maximum < 0 or phases is None or cap is None or house is None)
     invalid = s.get("live_valid") is not True or s.get("status_valid") is not True
@@ -374,6 +365,15 @@ def decide(snapshot, state, now, previous_snapshot=None):
     invalid_age = _since(state, "invalid_since", now, data_invalid)
     soc_invalid_age = _since(state, "soc_invalid_since", now,
                              s.get("mode") == 4 and s.get("soc_valid") is not True)
+    if (s.get("unplug_offer_active") is True and s.get("connected") is False
+            and s.get("charging") is not True):
+        # Der Kern führt im Leerlauf schon das stehende Angebot mit genau
+        # diesen Uhren. Die spätere Einzelbox-Beobachtung qualifiziert es
+        # nicht nochmals und löscht es auch nicht als Phasenfehler.
+        state["session_active"] = False
+        for key in ("reserve_phases", "phase_target", "phase_since"):
+            state.pop(key, None)
+        return result(reason="no_vehicle", sentence="Kein Fahrzeug verbunden")
     # Bekannte elektrische Grenzen haben Vorrang vor der Datenfrist.
     # Slot 0 ist Unterdeckung, kein elektrischer Schutzstopp.
     if not limits_unknown:
@@ -381,7 +381,10 @@ def decide(snapshot, state, now, previous_snapshot=None):
         ceiling = min(hard_ceiling, _floor(max(minimum, cap) if active else cap, step))
         if hard_ceiling < minimum:
             return stop("electrical_limit")
-    if data_invalid and invalid_age >= 300:
+    # Gültige Eingänge erholen sich im vorhandenen Datenhalt. Bei einem
+    # erneuten Fehler gilt sofort wieder die unveränderte alte Frist.
+    if (data_invalid and invalid_age >= 300
+            and number(state.get("data_valid_since")) is None):
         return stop("data_timeout")
     if limits_unknown:
         state.pop("start_since", None)

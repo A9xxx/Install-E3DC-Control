@@ -5,12 +5,26 @@ Updates werden ausschließlich über den Installer ausgeführt. Ein manuelles
 Nutzerinstallation ist für den regulären Ziel-Updater weder Voraussetzung noch
 Updateautorität.
 
-Der aktuelle Stable-Stand ist `v5.5.8`. Das Dashboard startet ausschließlich
+Der aktuelle Stable-Stand ist `v5.5.9`. Das Dashboard startet ausschließlich
 den root-eigenen Systemjob ohne freie Argumente. Die einzige Ausnahme ist
 die tokengebundene Driftfreigabe. Dieser installiert den neuesten
 veröffentlichten Stable-Stand oder repariert dieselbe Version. Der
 Stable-Versionscheck ist nur eine Anzeige und keine Startfreigabe. Freie Pfade,
 Release-Tags, Neuinstallationen und Rückfälle bleiben im Web gesperrt.
+
+5.5.9 ist ein Funktions- und Korrekturupdate zu 5.5.8 (Zugriff von außen nur mit
+Web-PIN, Dashboard im Heimnetz ohne Anmeldung, einfacherer Wallbox-Start, Suche
+in Einstellungen und Dokumentation, Einrichtungsstand). Bestehende
+Installationen aktualisieren wie gewohnt über **System Update** bzw. das
+[Docker-Update](#docker-update). Während des Updates kein Fahrzeug anstecken.
+Wer die Oberfläche ohne Web-PIN über einen Domainnamen oder eine öffentliche
+IP-Adresse öffnet, hat ab dem ersten solchen Zugriff 14 Tage Zeit, im
+Config-Editor unter „Sicherheit, Webansicht & Updates“ die Web-PIN zu setzen
+oder „Domainzugriff ohne Web-PIN“ bewusst einzustellen; danach ist der Zugriff
+gesperrt, im Heimnetz bleibt er frei. Für einphasige Fahrzeuge an festen
+E3DC-Wallboxen ohne eigene Phasenumschaltung ein einphasiges Fahrzeugprofil
+wählen. Ein fester Docker-Pin wird bewusst auf `E3DC_IMAGE_TAG=v5.5.9` geändert.
+Einzelheiten stehen in den [Release Notes](../RELEASE_NOTES.md).
 
 5.5.8 ist ein Funktions- und Korrekturupdate zu 5.5.7 (gemeinsamer
 Anschlussrahmen für Akku-Netzladen und Wallbox, Markt-Netzladen mit Puffer und

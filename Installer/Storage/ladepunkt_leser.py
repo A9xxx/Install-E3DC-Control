@@ -204,13 +204,6 @@ def storage_inputs_without_failed_wallboxes(cfg, intent, native, outage):
     # Start- oder Phasenrahmen reservieren. Gebundene Gruppen mit einem
     # ausgefallenen Mitglied müssen neu qualifiziert werden.
     allowed = {safe_int(p.get("id"), 0) for p in points} | {safe_int(r.get("wb_id"), 0) for r in rows}
-    starts = [item for item in intent.get("start_hold_requests", [])
-              if isinstance(item, dict) and safe_int(item.get("wb_id"), 0) in allowed
-              and not any(safe_int(member.get("wb_id"), 0) in failed
-                          for member in item.get("group_members", []) if isinstance(member, dict))]
-    filtered["start_hold_requests"] = starts
-    filtered["start_hold_requested_group_minimum_w"] = max(
-        (max(0, safe_int(item.get("group_minimum_w"), 0)) for item in starts), default=0)
     phases = [item for item in intent.get("phase_transition_reservations", [])
               if isinstance(item, dict) and safe_int(item.get("wb_id"), 0) in allowed]
     filtered["phase_transition_reservations"] = phases

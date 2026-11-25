@@ -138,32 +138,39 @@ def market_charge_deliverable_wh(capacity_wh, soc, target, seconds, limit_w, dev
 
 
 def market_grid_charge_room_w(cfg, live, now_s=None):
-    """Gemeinsamer Netzladerahmen nach der höchsten Grundlastphase.
+    """Liefert den gemeinsamen Netzladerahmen nach der höchsten Grundlastphase."""
+    return market_grid_charge_room_result(cfg, live, now_s=now_s)[0]
+
+
+def market_grid_charge_room_result(cfg, live, now_s=None):
+    """Gemeinsamer Netzladerahmen mit dem Grund einer ungültigen Eingangsprobe.
 
     Der E3DC-Leistungsmesser enthält die Verbraucher bereits. Die gemessenen
     geregelten Fahrzeuge werden einmal gelöst, ebenso die eigene Akkuleistung: nur bei gültiger PVI-Phasenzahl 1 einphasig,
     andernfalls wie bisher gleichmäßig auf drei Phasen.
     """
     amps = safe_float(cfg.get("grid_max_amps"), 0.0)
+    if not math.isfinite(amps) or amps <= 0:
+        return 0, "Netzladen wartet: Hausabsicherung nicht hinterlegt"
+    invalid_reason = "Netzladen wartet: Keine Phasenwerte vom E3DC-Leistungsmesser"
     stamp = safe_float(live.get("_ts"), float("nan"))
-    if (not math.isfinite(amps) or amps <= 0
-            or not math.isfinite(stamp) or stamp <= 0
+    if (not math.isfinite(stamp) or stamp <= 0
             or not 0 <= (time.time() if now_s is None else now_s) - stamp <= LIVE_SAMPLE_MAX_AGE_S
             or live.get("live_stale") or live.get("RSCP_Sample_Valid") is False
             or live.get("grid_pm_available") is False
             or live.get("Grid_PM_Available") is False):
-        return 0
+        return 0, invalid_reason
     phases = []
     for key in ("grid_p1", "grid_p2", "grid_p3", "Battery_Power"):
         raw = live.get(key)
         if raw is None or isinstance(raw, bool) or not str(raw).strip():
-            return 0
+            return 0, invalid_reason
         value = safe_float(raw, float("nan"))
         if not math.isfinite(value):
-            return 0
+            return 0, invalid_reason
         phases.append(value)
     if live.get("Battery_Power_Valid") is False:
-        return 0
+        return 0, invalid_reason
     battery_w = phases.pop()
     reserve_amp = max(0.0, safe_float(cfg.get("grid_max_reserve_amp"), 2.0))
     phase_count = (1.0 if live.get("pvi_ac_max_phase_count_valid") is True
@@ -176,7 +183,7 @@ def market_grid_charge_room_w(cfg, live, now_s=None):
     base = [watts - battery_w / phase_count - own
             for watts, own in zip(phases, vehicles)]
     highest_phase_w = max(0.0, max(base))
-    return int(max(0.0, phase_count * (230.0 * (amps - reserve_amp) - highest_phase_w)))
+    return int(max(0.0, phase_count * (230.0 * (amps - reserve_amp) - highest_phase_w))), None
 
 
 def managed_vehicle_phase_w(snapshot, now_s):
@@ -904,8 +911,14 @@ def _grid_charge_job_state(
     planned_charge_w = int(max(0, min(configured_power_w, device_w))) if end_soc > start_soc else 0
     charge_duration_ms = int(market_charge_duration_s(capacity_wh, start_soc, end_soc,
         planned_charge_w, device_w, profile_state) * 1000.0)
+    # In der gebundenen Wartezeit plant der Rest mit der eingestellten Leistung.
+    # Den tatsächlichen Ladebeginn begrenzt der Regler mit frischen Phasenwerten.
+    planning_power_w = configured_power_w if (
+        isinstance(control_source, dict) and control_source.get("window_end_ts") == window["end_ts"]
+        and control_source.get("phase") == "wait") else min(
+            configured_power_w, safe_float(config.get("_market_grid_charge_room_w"), configured_power_w))
     control = market_charge_schedule(capacity_wh, start_soc, end_soc,
-        min(configured_power_w, safe_float(config.get("_market_grid_charge_room_w"), configured_power_w)), device_w, profile_state, now_ms, bound_start,
+        planning_power_w, device_w, profile_state, now_ms, bound_start,
         int(window["end_ts"]), target_ts, config.get("_market_grid_charge_control"),
         job_storage_wh=job_grid_wh * efficiency)
     result = dict(base)
@@ -1707,7 +1720,11 @@ def _executable_future_window(annotated, idx, reserve, efficiency, horizon_end,
                                econ_cut_ct=cost, need_buffer_wh=buffer_wh,
                                future_cheap_credit=dict(credit_cfg, reference_billing_ct=ref,
                                                         capacity_only=True))
-    job = _grid_charge_job_state(config, annotated, idx, start, independent,
+    # Ein späteres Fenster plant ohne den momentanen Anschlussrahmen.
+    future_config = dict(config)
+    future_config.pop("_market_grid_charge_room_w", None)
+    job = _grid_charge_job_state(future_config,
+                                annotated, idx, start, independent,
                                 credit_cfg.get("capacity_wh"), efficiency,
                                 slot_allowed=allowed, reserve=projected,
                                 observed_charge_w=None, profile=profile)

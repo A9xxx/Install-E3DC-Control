@@ -103,7 +103,6 @@ V4_BLOCK_TARIFF = {
     'peak_shaving_grid_recharge_enable', 'peak_shaving_recharge_max_w',
     'peak_shaving_control_margin_w', 'peak_shaving_hysteresis_w',
     'peak_shaving_soc_hysteresis_pct', 'peak_shaving_max_sample_gap_s',
-    'peak_shaving_release_debounce_s',
     # Negativpreis-Boost/Kompatibilität: bisherige Preisfenster erkennen, Verbraucher optional freigeben.
     'cheap_grid_boost_enable', 'cheap_grid_price_limit_ct',
     'cheap_grid_min_duration_min',

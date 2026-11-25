@@ -38,7 +38,7 @@ def apply(config, live, payload, request, *, now, reserve_pct, previous_state=No
                 and power is not None and power > 0
                 and live.get('Notstrom_Status', live.get('ems_emergency_power_status')) in (0, 2, 3)
                 and not result.get('safety_veto') and not result.get('suppress_rscp_output')
-                and not result.get('heatpump_pv_set_power_only') and not result.get('wallbox_fixed_start_set_power_only')
+                and not result.get('heatpump_pv_set_power_only')
                 and result.get('mode') == 0 and (not result.get('protected') or peak_owner)
                 and not result.get('hard_mode_guard_errors')
                 and enabled(config.get('auto_mode')) and (boost_active or str(config.get('wp_type')) == '0')
@@ -105,8 +105,8 @@ def apply(config, live, payload, request, *, now, reserve_pct, previous_state=No
             contract['reason'] = 'peak_shaving_context_missing'
             return result
         peak_priority = min(required, peak_cap, max(0., cap))
-        # Dieselben Energie- und Bezugsgrenzen wie evaluate_peak_shaving:
-        # verfügbare Wh oberhalb der physischen Reserve über die Restzeit.
+        # Energie- und Bezugsgrenze der Anhebung: verfügbare Wh oberhalb der
+        # physischen Reserve über die Restzeit, höchstens der bilanzierte Bezug.
         reserve_energy_cap_w = max(0, math.floor(
             storage_kwh * 1000. * max(0., soc - reserve) / 100. * 3600. / remaining_s))
         peak_priority = min(peak_priority, reserve_energy_cap_w, math.ceil(base_import))

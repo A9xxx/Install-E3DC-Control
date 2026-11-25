@@ -174,7 +174,13 @@ def _configured_billing_price_now(config, now_ts=None):
 
 def _load_config_uncached():
     """Liest e3dc.config.txt + e3dc_v4.json und gibt ein flaches Dict zurueck."""
+    return _load_config_checked()[0]
+
+
+def _load_config_checked():
+    """Wie ``_load_config_uncached``; zusätzlich ``False``, wenn eine vorhandene e3dc_v4.json nicht lesbar war."""
     conf = {}
+    v4_readable = True
 
     # 1. Basis-Konfiguration (txt)
     if os.path.exists(CONFIG_FILE):
@@ -235,11 +241,15 @@ def _load_config_uncached():
                         if k == "config" or not _is_scalar(v) or _blank_car_value(str(k).lower(), v):
                             continue
                         conf[str(k).lower()] = str(v)
+                else:
+                    v4_readable = False
+                    logger.warning(f"v4 JSON ohne Konfigurationsobjekt ({cand})")
             except Exception as e:
-                logger.error(f"Fehler beim Lesen der v4 JSON ({cand}): {e}")
+                v4_readable = False
+                logger.warning(f"Fehler beim Lesen der v4 JSON ({cand}): {e}")
             break
 
-    return conf
+    return conf, v4_readable
 
 
 def get_config():
@@ -254,9 +264,21 @@ def get_config():
     signature = tuple((path, file_signature(path)) for path in candidates)
     if _CONFIG_CACHE.get("signature") == signature:
         return dict(_CONFIG_CACHE.get("data") or {})
-    data = _load_config_uncached()
+    if _CONFIG_CACHE.get("failed_signature") == signature and _CONFIG_CACHE.get("valid"):
+        return dict(_CONFIG_CACHE["data"])
+    data, v4_readable = _load_config_checked()
+    if not v4_readable and _CONFIG_CACHE.get("valid"):
+        # Eine unlesbare e3dc_v4.json gibt nichts frei: Pause, Sperre und Modus bleiben
+        # auf dem letzten gültigen Stand, bis die Datei wieder lesbar geändert ist.
+        logger.warning("Konfiguration nicht lesbar; es gilt der letzte gültige Stand.")
+        _CONFIG_CACHE["failed_signature"] = signature
+        return dict(_CONFIG_CACHE["data"])
+    if not v4_readable:
+        logger.error("Konfiguration nicht lesbar und kein früherer gültiger Stand vorhanden.")
     _CONFIG_CACHE["signature"] = signature
     _CONFIG_CACHE["data"] = dict(data)
+    _CONFIG_CACHE["valid"] = v4_readable
+    _CONFIG_CACHE.pop("failed_signature", None)
     return dict(data)
 
 

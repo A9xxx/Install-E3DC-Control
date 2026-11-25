@@ -102,12 +102,6 @@ def projizieren(stellgroesse, vorherige_projektion, jetzt):
         raise ValueError("Projektionszeit fehlt")
     # Restmenge, Frist und Ausgabedauer eines endlichen Netzauftrags werden nur
     # transportiert; die Kappe rechnet allein der Kern (eine Stelle, kein zweites Mal).
-    if (stellgroesse.modus == "NETZLADEN" and stellgroesse.grid_soll_w is not None
-            and 0 <= stellgroesse.grid_soll_w < EMS_POWER_SETTINGS_NONZERO_MIN_W):
-        # Nicht aufrunden: derselbe Haltevertrag unter der technischen
-        # GRID-Mindestleistung, ohne einen eigenen Wartezustand.
-        stellgroesse = replace(stellgroesse, modus="HALTEN", grid_soll_w=None,
-                              entladegrenze_w=0.0, grenzen_frei=False)
     if stellgroesse.modus == "NETZLADEN" and stellgroesse.grid_soll_w is not None:
         wert = _watt(stellgroesse.grid_soll_w)
         if wert is None:
@@ -119,6 +113,22 @@ def projizieren(stellgroesse, vorherige_projektion, jetzt):
             (Teilvorgabe("set_power", (MODE_GRID, wert), True),), "GRID, Auffrischung je aktivem Zyklus",
             rest_wh=stellgroesse.grid_rest_wh, gueltig_bis_s=stellgroesse.grid_gueltig_bis_s,
             ausgabe_dauer_s=stellgroesse.grid_dauer_s), neu
+    # Endliche Entladung: derselbe SET_POWER-Vertrag mit DISCH, aufgefrischt je aktivem Zyklus wie GRID.
+    if stellgroesse.modus == "ENTLADEN" and getattr(stellgroesse, "entlade_soll_w", None) is not None:
+        wert = _watt(stellgroesse.entlade_soll_w)
+        if wert is None:
+            return Projektion(3, "unbekannt", MODE_AUTO, 0, None, (), "DISCH-Soll ungültig"), z
+        neu = replace(z, modus=MODE_DISCH, letzte_grid_zeit_s=None, letzter_grid_wert_w=None)
+        return Projektion(3, "mode:DISCH", MODE_DISCH, wert, None,
+            (Teilvorgabe("set_power", (MODE_DISCH, wert), True),), "DISCH, Auffrischung je aktivem Zyklus"), neu
+    # Quellengebundenes PV-Laden: derselbe SET_POWER-Vertrag mit CHRG, aufgefrischt je aktivem Zyklus.
+    if stellgroesse.modus == "LADEN" and getattr(stellgroesse, "lade_soll_w", None) is not None:
+        wert = _watt(stellgroesse.lade_soll_w)
+        if wert is None:
+            return Projektion(3, "unbekannt", MODE_AUTO, 0, None, (), "CHRG-Soll ungültig"), z
+        neu = replace(z, modus=MODE_CHRG, letzte_grid_zeit_s=None, letzter_grid_wert_w=None)
+        return Projektion(3, "mode:CHRG", MODE_CHRG, wert, None,
+            (Teilvorgabe("set_power", (MODE_CHRG, wert), True),), "CHRG, Auffrischung je aktivem Zyklus"), neu
     charge, discharge = _watt(stellgroesse.ladegrenze_w), _watt(stellgroesse.entladegrenze_w)
     frei = stellgroesse.grenzen_frei
     if frei:

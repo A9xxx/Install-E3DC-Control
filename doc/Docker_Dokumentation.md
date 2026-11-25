@@ -2,8 +2,8 @@
 
 Veröffentlichte Images entstehen ausschließlich aus einem versionierten stabilen Release-Tag. `latest` verweist damit auf die zuletzt veröffentlichte stabile Version.
 
-Der aktuelle Stable-Stand ist `v5.5.8`. Die Tags `latest`, `v5.5.8` und
-`5.5.8` bezeichnen denselben Stable-Stand.
+Der aktuelle Stable-Stand ist `v5.5.9`. Die Tags `latest`, `v5.5.9` und
+`5.5.9` bezeichnen denselben Stable-Stand.
 
 **Updates im Überblick:** Der Knopf **System Update** in der Weboberfläche und
 das **Auto-Update** im Config-Editor geben dem optionalen Watchtower-Dienst das
@@ -18,7 +18,7 @@ Der Knopf **System Update** steht ab 5.5.0 zur Verfügung. Das Update von 5.4.x 
 noch über den Host-Weg; ab dem nächsten Release genügt der Knopf. Die Schritte
 stehen im Abschnitt 3 unter „Übergang von 5.4.x auf 5.5.0“.
 
-Weiterhin enthalten sind die begrenzte Phasenerkennung fester E3DC-Wallboxen,
+Weiterhin enthalten sind die gemessene Phasenzahl fester E3DC-Wallboxen,
 die korrigierte Zuteilung zwischen mehreren Ladepunkten und geschützte
 Luxtronik-PV-Aufträge. Vor optionalem Wärmepumpen-PV-Boost das elektrische
 Leistungsprofil und erlaubte Überbrückungskontingente im Config Editor prüfen.
@@ -131,14 +131,14 @@ installieren, anschließend das Ziel ausdrücklich wählen:
 
 ```bash
 curl -q -fsS --proto '=https' --tlsv1.2 \
-  -o ./docker_compose_update-5.5.8.py \
-  https://raw.githubusercontent.com/A9xxx/Install-E3DC-Control/v5.5.8/Installer/docker_compose_update.py
+  -o ./docker_compose_update-5.5.9.py \
+  https://raw.githubusercontent.com/A9xxx/Install-E3DC-Control/v5.5.9/Installer/docker_compose_update.py
 if [ ! -d ./Installer ]; then
   sudo install -d -m 0755 ./Installer
 fi
-sudo install -m 0644 ./docker_compose_update-5.5.8.py ./Installer/docker_compose_update.py
+sudo install -m 0644 ./docker_compose_update-5.5.9.py ./Installer/docker_compose_update.py
 sudo python3 ./Installer/docker_compose_update.py \
-  --compose-dir . --sudo --image-tag v5.5.8
+  --compose-dir . --sudo --image-tag v5.5.9
 ```
 
 Der aktuelle Helfer akzeptiert die gebundene gestoppte Altinstanz, ergänzt bei
@@ -693,7 +693,7 @@ Ohne ausdrücklichen Tag verwendet der Helfer das Image des ausgewählten Dienst
 Die mitgelieferte variable Zeile folgt ohne `E3DC_IMAGE_TAG` dem geprüften Stable-Tag
 `latest`. Ein vorhandener fester Tag bleibt absichtlich bestehen.
 
-`--image-tag v5.5.8` funktioniert auch bei einer fest eingetragenen OMV-Imagezeile.
+`--image-tag v5.5.9` funktioniert auch bei einer fest eingetragenen OMV-Imagezeile.
 Der Helfer schreibt diese Auswahl dauerhaft nur in das `image:`-Feld des
 Zieldienstes. Die `.env` und das Image anderer E3DC-Dienste bleiben unverändert.
 Bei einem gescheiterten Update wird die vorherige Zeile im Rahmen des verifizierten
@@ -715,7 +715,7 @@ sudo docker compose config --images e3dc-control
 
 Gezielte Rückfallversion:
 
-Den Stable-Container `v5.5.8` auf den veröffentlichten Rollback-Root
+Den Stable-Container `v5.5.9` auf den veröffentlichten Rollback-Root
 `v5.3.2b` zurücksetzen:
 
 ```bash
@@ -1000,7 +1000,7 @@ Port, etwa `E3DC_PUBLISH_BIND=192.0.2.20` und `E3DC_PUBLISH_PORT=8085`.
 Verwende denselben Compose-Ordner und Projektnamen. Sichere vorher die
 funktionierende `docker-compose.yml` als `docker-compose.host.bak`, die
 vorhandene `.env` und die persistenten Daten. Halte den aktuell eingesetzten
-versionierten Runtime-Image-Tag für den Rückweg fest, beispielsweise `v5.5.8`.
+versionierten Runtime-Image-Tag für den Rückweg fest, beispielsweise `v5.5.9`.
 Ein älterer Root-Tag eignet sich nicht für diesen ersten Netzwerk-Rückweg.
 Prüfe eine administrativ zugängliche Kopie der aktuellen
 Konfiguration, ohne ihren Inhalt auszugeben:
@@ -1346,7 +1346,7 @@ ihre Weboberfläche nennt höchstens die Host-Befehle.
    beschrieben: die unveränderte mitgelieferte Datei ersetzen; eine vom
    Installer erzeugte Datei mit `./data`- und `./logs`-Ordnern sowie OMV- und
    eigene Dateien nicht ersetzen, sondern die Änderungen übertragen.
-2. Einen festen Pin in `.env` gegebenenfalls bewusst auf `v5.5.8` ändern.
+2. Einen festen Pin in `.env` gegebenenfalls bewusst auf `v5.5.9` ändern.
    Wer noch kein Watchtower-Token hat (`grep -c '^E3DC_WATCHTOWER_API_TOKEN=.' .env`
    zählt nicht leere Einträge, ohne das Token auszugeben; `0` bedeutet kein Eintrag), trägt es jetzt mit dem zweiten Befehl aus
    „Watchtower einmalig freischalten“ in `.env` ein. Dann erstellt der

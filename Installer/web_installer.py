@@ -220,6 +220,7 @@ ALLOWED_JOB_TYPES = set(READ_ACTIONS) | set(SERVICE_ACTIONS) | {
     "permissions_check",
     "repair_permissions_dry_run",
     "update_check",
+    "setup_overview",
     "start_service",
     "stop_service",
     "restart_service",
@@ -264,6 +265,7 @@ READ_ONLY_ACTIONS = {
     "permissions_check",
     "repair_permissions_dry_run",
     "update_check",
+    "setup_overview",
 }
 
 
@@ -2824,7 +2826,7 @@ def installer_status() -> dict[str, Any]:
         "write_actions": WRITE_ACTION_NAMES,
         "message": (
             "Optionale Module verwenden den geprüften Modul-Launcher."
-            if module_ready else "Moduländerungen benötigen einen geprüften Modul-Launcher; Freigabeprüfung öffnen."
+            if module_ready else "Moduländerungen benötigen einen geprüften Modul-Launcher; „Modulfreigabe prüfen“ öffnen."
         ),
     }
 
@@ -2833,6 +2835,29 @@ def update_check() -> dict[str, Any]:
     """Vergleicht die installierte VERSION mit dem neuesten Stable-Release."""
 
     return stable_update_check(INSTALL_ROOT.resolve())
+
+
+def setup_overview() -> dict[str, Any]:
+    """Schalterzustände für die Karte „Einrichtungsstand“; liest nur, gibt keine Konfigurationswerte aus."""
+
+    try:
+        from .optional_service_contract import configured_optional_services
+        from .tariff_schedule import supports_spot_market_prices
+    except ImportError:
+        from optional_service_contract import configured_optional_services
+        from tariff_schedule import supports_spot_market_prices
+    cfg = load_config()
+    if not isinstance(cfg, dict) or not cfg:
+        return {"success": True, "docker": is_docker(), "config_readable": False}
+    return {
+        "success": True,
+        "docker": is_docker(),
+        "config_readable": True,
+        "configured_services": list(configured_optional_services(cfg)),
+        "spot_tariff": supports_spot_market_prices(cfg),
+        "direct_marketing": cfg_enabled(cfg, "direct_marketing_enable"),
+    }
+
 
 def job_status() -> dict[str, Any]:
     return {
@@ -3374,7 +3399,7 @@ def write_readiness(
             "Veröffentlichten Ziel-Bootstrap root-privat laden und im Systemjob starten",
             "Globale Rechte-Reparatur und Rückfall weiterhin administrativ ausführen",
         ],
-        "next_step": "Optionale Module können über den geprüften Modul-Launcher installiert und entfernt werden." if module_web_ready else module_launcher.get("message", "Freigabeprüfung in der Installationszentrale prüfen."),
+        "next_step": "Optionale Module können über den geprüften Modul-Launcher installiert und entfernt werden." if module_web_ready else module_launcher.get("message", "„Modulfreigabe prüfen“ in der Installationszentrale öffnen."),
     }
 
 
@@ -3433,7 +3458,7 @@ def write_permission_plan() -> dict[str, Any]:
             "Nur E3DC-eigene direkte systemctl-/WebUI-Freigaben entfernen; fremde Fragmente bleiben byte- und metadatengleich.",
             "Nur die engen Service- und argumentlosen Update-Launcher für www-data setzen; installer_wrapper.sh bleibt administrativ.",
             "sudoers-Syntax mit visudo -cf prüfen.",
-            "Freigabe-Check erneut ausführen; privilegierte Installer-Webjobs bleiben gesperrt.",
+            "„Modulfreigabe prüfen“ erneut ausführen; privilegierte Installer-Webjobs bleiben gesperrt.",
         ],
         "rollback_plan": [
             "Backup der sudoers-Datei wiederherstellen.",
@@ -3549,7 +3574,7 @@ def backup_plan(module_key: str | None = None) -> dict[str, Any]:
         "success": True,
         "read_only": True,
         "write_actions_enabled": WRITE_ACTIONS_ENABLED,
-        "summary": "Backup-Plan: keine Änderung am System. Der Plan zeigt, was vor späteren Schreibjobs gesichert würde.",
+        "summary": "Sicherungsplan: keine Änderung am System. Der Plan zeigt, was vor späteren Schreibjobs gesichert würde.",
         "scope": "module" if module_key else "system",
         "module": module_key,
         "modules": module_names,
@@ -3604,7 +3629,7 @@ def create_backup_snapshot(action: str, module_key: str | None = None) -> dict[s
         return {
             "success": False,
             "root": str(backup_root),
-            "message": plan.get("error") or "Backup-Plan konnte nicht berechnet werden.",
+            "message": plan.get("error") or "Sicherungsplan konnte nicht berechnet werden.",
             "copied": copied,
             "skipped": skipped,
             "plan": plan,
@@ -4597,10 +4622,10 @@ def control_service(module_key: str | None, action: str) -> dict[str, Any]:
             "module": module.public_dict(),
             "readiness": readiness,
             "blocked_reasons": [
-                item.get("issue") or item.get("label") or "Freigabe-Check blockiert"
+                item.get("issue") or item.get("label") or "Modulfreigabe blockiert"
                 for item in readiness.get("hard_blockers", [])
             ],
-            "message": "Service-Aktion abgebrochen: Freigabe-Check meldet noch harte Blocker.",
+            "message": "Service-Aktion abgebrochen: Die Modulfreigabe meldet noch harte Blocker.",
         }
 
     status_before = service_status(module.service_unit)
@@ -4683,10 +4708,10 @@ def install_module(module_key: str | None = None) -> dict[str, Any]:
             "module": module.public_dict(),
             "readiness": readiness,
             "blocked_reasons": [
-                item.get("issue") or item.get("label") or "Freigabe-Check blockiert"
+                item.get("issue") or item.get("label") or "Modulfreigabe blockiert"
                 for item in readiness.get("hard_blockers", [])
             ],
-            "message": "Installation abgebrochen: Freigabe-Check meldet noch harte Blocker.",
+            "message": "Installation abgebrochen: Die Modulfreigabe meldet noch harte Blocker.",
         }
 
     dry = module_install_dry_run(module.key).get(module.key, {})
@@ -4813,7 +4838,7 @@ def remove_module(module_key: str | None = None) -> dict[str, Any]:
             "success": False,
             "module": module.public_dict(),
             "readiness": readiness,
-            "message": "Rückbau abgebrochen: Freigabe-Check meldet noch harte Blocker.",
+            "message": "Rückbau abgebrochen: Die Modulfreigabe meldet noch harte Blocker.",
         }
 
     unit_path = Path("/etc/systemd/system") / module.service_unit
@@ -5945,7 +5970,7 @@ def repair_permissions(
             "rollback_plan": [
                 "Gebundene Transaktions-Preimages atomar zurückspielen",
                 "visudo -cf /etc/sudoers ausführen",
-                "Freigabe-Check erneut starten",
+                "„Modulfreigabe prüfen“ erneut ausführen",
             ],
         }
     except Exception as exc:
@@ -6094,6 +6119,8 @@ def execute_job(job: dict[str, Any]) -> dict[str, Any]:
         return permissions_check()
     if normalized_action == "update_check":
         return update_check()
+    if normalized_action == "setup_overview":
+        return setup_overview()
     if normalized_action == "repair_permissions_dry_run":
         plan = write_permission_plan()
         return {

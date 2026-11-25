@@ -57,7 +57,8 @@ function e3dc_config_editor_test_value(array $posted, array $current, $key) {
 }
 
 function e3dc_config_editor_wallbox_toggle_checked(array $config, $key) {
-    $missingDefaults = ['wb1_e3dc_wbchar6_compat_enable' => '1', 'wb2_e3dc_wbchar6_compat_enable' => '1'];
+    $missingDefaults = ['wb1_e3dc_wbchar6_compat_enable' => '1', 'wb2_e3dc_wbchar6_compat_enable' => '1',
+        'wb_openwb_auto_discovery' => '1', 'wb_openwb_auto_role_enable' => '1'];
     $value = array_key_exists($key, $config) ? ($config[$key]['value'] ?? '0') : ($missingDefaults[$key] ?? '0');
     return in_array(strtolower(trim((string)$value)), ['1', 'true', 'yes', 'on'], true);
 }
@@ -382,7 +383,6 @@ $defaults = [
     "peak_shaving_grid_recharge_enable" => "0", "peak_shaving_recharge_max_w" => "0",
     "peak_shaving_control_margin_w" => "300", "peak_shaving_hysteresis_w" => "600",
     "peak_shaving_soc_hysteresis_pct" => "1.0", "peak_shaving_max_sample_gap_s" => "10",
-    "peak_shaving_release_debounce_s" => "20",
     "awattar" => "0", "awmwst" => "19.0", "awnebenkosten" => "16.18", "awreserve" => "10.0", "awsimulation" => "0",
     "cheap_grid_boost_enable" => "0", "cheap_grid_price_limit_ct" => "0.0", "cheap_grid_min_duration_min" => "15",
     "cheap_grid_battery_enable" => "1", "cheap_grid_wallbox_enable" => "0", "cheap_grid_heatpump_enable" => "0", "cheap_grid_heater_enable" => "0",
@@ -664,8 +664,8 @@ $tooltips = [
     "frontend_variant"       => "Wählt das Dashboard-Layout. Klassisch bleibt der stabile Rückfallpfad; Modern aktiviert das neue Grid-/Badge-Frontend.",
     "frontend_detail_mode"   => "Steuert die Informationsdichte der neuen Oberfläche: kompakt, normal oder detailreich.",
     "darkmode"               => "Dashboard-Darstellung: 1=Dunkel (Standard), 0=Hell.",
-    "web_pin" => "Optional. Mindestens 6 Zeichen empfohlen, Buchstaben und Ziffern erlaubt. Leer lassen = unverändert. Zum Entfernen „Wert löschen“ wählen. Mit Web-PIN fragt die Oberfläche nach einer Pause ohne Aufruf (meist 24 Minuten) oder nach dem Schließen von Browser bzw. App erneut nach der PIN. Ab der nächsten Version ist der Zugriff über Domainnamen (eigene Domain, DynDNS, MyFRITZ, Reverse-Proxy) nur mit Web-PIN möglich.",
-    "web_remote_pin_optout" => "Nur ohne Web-PIN wirksam. Nein: Beim Zugriff über einen Domainnamen erscheint ein Hinweis; ab der nächsten Version ist dieser Zugriff nur mit Web-PIN möglich. Ja: bewusst ohne Web-PIN weiter wie bisher, kein Hinweis und keine spätere Sperre. Dann kann jede im Browser geöffnete Webseite, die einen Domainnamen auf die Anlage umleitet, die Oberfläche bedienen. IP-Adressen und lokale Namen sind nie betroffen.",
+    "web_pin" => "Optional. Mindestens 6 Zeichen empfohlen, Buchstaben und Ziffern erlaubt. Leer lassen = unverändert. Zum Entfernen „Wert löschen“ wählen. Mit Web-PIN fragt die Oberfläche nach einer Pause ohne Aufruf (meist 24 Minuten) oder nach dem Schließen von Browser bzw. App erneut nach der PIN. Ohne Web-PIN ist der Zugriff über Domainnamen (eigene Domain, DynDNS, MyFRITZ, Reverse-Proxy) und öffentliche IP-Adressen (Portfreigabe) gesperrt, nach einem Update erst nach 14 Tagen Hinweis; ausgenommen ist die bewusste Abwahl unter „Domainzugriff ohne Web-PIN“.",
+    "web_remote_pin_optout" => "Nur ohne Web-PIN wirksam. Nein: Der Zugriff über Domainnamen und öffentliche IP-Adressen ist gesperrt, nach einem Update erst nach 14 Tagen Hinweis; die Oberfläche bleibt über private IP-Adressen und lokale Namen erreichbar. Ja: bewusst ohne Web-PIN weiter wie bisher, auch über Domainnamen und öffentliche IP-Adressen. Dann kann jede im Browser geöffnete Webseite, die einen Domainnamen auf die Anlage umleitet, die Oberfläche bedienen, und eine per Portfreigabe erreichbare Anlage steht jedem im Internet offen. Private IP-Adressen und lokale Namen sind nie betroffen.",
     "wbcostpowers"           => "Typische Wallbox-Ladeleistungen in kW (komma-getrennt), z.B. '7.2, 11.0, 22.0'. Wird für Kostenberechnung genutzt.",
     "matter_bridge"          => "Aktiviert die Matter Bridge für Apple Home / Google Home / Alexa (Node.js Dienst erforderlich).",
     "config_secret_protection_mode" => "Standard schützt e3dc_v4.json und Config-Backups mit 660 für Install-User:www-data. Kompatibilität erlaubt 664 für eigene externe Leser.",
@@ -675,7 +675,7 @@ $tooltips = [
     "maximumladeleistung"    => "Maximale Ladeleistung in Watt. Liegt die Eingabe über der gültigen Gerätegrenze oder ist sie leer, 0 oder kleiner als 300 W, wird die Gerätegrenze mit Hinweis verwendet. Eine bewusste Drosselung ab 300 W bleibt erhalten; eine E3DC-Mindestempfehlung ist nur ein Hinweis.",
     "maximaleentladeleistung" => "Maximale Entladeleistung in Watt. Liegt die Eingabe über der gültigen Gerätegrenze oder ist sie leer, 0 oder kleiner als 300 W, wird die Gerätegrenze mit Hinweis verwendet. Eine bewusste Drosselung ab 300 W bleibt erhalten. Notstromsperre und dynamische Grenzen gelten weiterhin.",
     "ep_reserve_pct"         => "Leer oder 0: Der E3DC hält seine eigene Reserve; E3DC-Control sperrt dann nur eigene Entladebefehle. Leer bedeutet Rückfall 8 %, falls die Gerätereserve fehlt oder niedriger liegt. Für den Freilauf das Feld leeren oder 0 eintragen. Eine eingetragene Reserve bleibt als zusätzlicher Boden wirksam; der höhere Wert gilt. Wh werden auf die Gesamtspeicherkapazität umgerechnet.",
-    "einspeiselimit"         => "Einspeisebegrenzung in kW (z.B. 7.0). Der Abregelschutz nutzt diesen Wert als Ziel-Netzpunkt, sofern er unter dem per RSCP gemeldeten E3DC-Derating liegt.",
+    "einspeiselimit"         => "Einspeisebegrenzung in kW (z.B. 7.0). Der Abregelschutz nutzt diesen Wert als Ziel-Netzpunkt, sofern er unter dem per RSCP gemeldeten E3DC-Derating liegt. Mit 0 ist die eingetragene Grenze aus; ohne eingetragene und ohne gemeldete Grenze gilt Export als zulässige Einspeisung, und der Speicher lädt oberhalb der Ladekurve nur den Anteil oberhalb der Wechselrichterleistung.",
     "storage_curve_target_mode" => "Zielkurven-Modus. Ankerkurve nutzt Morgen-Puffer, Zwischenziele und Tagesziel wie bisher. Prognose auf 100% berechnet die Speicher-Zielkurve allein aus PV- und Verbrauchsprognose bis zum Tagesziel am Freilauf. Normal sind 100%; bei aktivem PV + Akku und unzureichender gemeinsamer PV-Deckung kann die heutige PV-Kurve bei wbminSoC enden. Bedarf 0 senkt nichts, unbekannter Bedarf zählt nach bestätigter Ladung weiter, nur am selben Kurventag und in derselben Steck-Episode; nach 60 Minuten unter 300 W bei ausreichendem PV- und Stromangebot endet dieser Beleg. Für alle Wallboxen gelten mögliche bzw. konfigurierte Phasen und mindestens der konfigurierte Mindeststrom (mindestens 6 A), bei gemeldetem Gerätewert der höhere. Der Ladebeleg schaltet ab 500 W ein, nach 45 s unter 300 W aus. Folgetage und Netzladeziele bleiben normal; Schutzpfade, Pre-Dump und Abregelreserve bleiben aktiv.",
     "storage_curve_sliding_horizon_enable" => "Optionaler erweiterter Modus: erlaubt dem 100%-Prognosepfad, die Ladung über einen gleitenden Prognosehorizont zu entspannen, wenn Vertrauen, Zielerreichbarkeit und Abregeldruck sicher sind. Nur bei Zielkurven-Modus 'Prognose auf 100%' aktivierbar.",
     "storage_forecast100_late_full_guard_enable" => "Nur im Zielkurven-Modus 'Prognose auf 100%'. An (Standard): 100 % werden erst kurz vor dem PV-Ende geplant, aber nur mit Grund – Einspeiselimit unter der erwarteten PV-Spitze, Abregeldruck in der Prognose, Direktvermarktung aktiv oder Pre-Dump geplant. So bleibt Platz für Spitzen, die sonst abgeregelt würden. Ein einmal eingetretener Grund gilt bis zum Ende des Tages. Ohne Grund endet die Kurve am letzten nutzbaren Überschuss minus Kurvenende-Puffer: Überschuss geht mittags in den Speicher statt ins Netz, und Wolken am Nachmittag gefährden das Ziel weniger. Aus: nie spätes Kurvenende.",
@@ -794,7 +794,7 @@ $tooltips = [
     "strompreis_cheap" => "Günstiger Octopus-Heat-Zeitpreis in ct/kWh, täglich von 02–06 und 12–16 Uhr. Außerhalb dieser und der Hochpreiszeiten gilt der Arbeitspreis.",
     "strompreis_uht" => "Hoher Octopus-Heat-Zeitpreis in ct/kWh, täglich von 18–21 Uhr. Von 02–06 und 12–16 Uhr gilt der günstige Zeitpreis, sonst der Arbeitspreis.",
     "strompreis_spezial"     => "Spezialtarif als Tagesprofil: Startzeit und Preis in ct/kWh, z.B. '00:00 20' und '04:00 40'. Der Preis gilt bis zum nächsten Eintrag.",
-    "grid_friendly_mode"     => "Aktiviert EcoScore und den normalen Marktpfad. Günstige Fenster werden prognose- und margenbasiert genutzt; Aus bleibt aus.",
+    "grid_friendly_mode"     => "Öffnet den normalen Marktpfad für zeitvariable Tarife: bei niedrigen Preisen laden oder den Speicher halten (netzdienlich). Ohne freigegebenen Verbraucher startet nichts; Bedarf, Prognose und Preisvorteil werden zusätzlich geprüft. Aus bleibt aus. Der Preis-Boost bei negativem Gesamtpreis ist ein eigener Weg; nur Wärmepumpe und Heizstab brauchen auch dort den geöffneten Marktpfad.",
     "tariff_provider"        => "Anbieter für dynamische Preise. Tibber nutzt den echten Tarifpreis aus der API; SMARD bleibt Standard, ENTSO-E kann als 15-Minuten-Fallback dienen, aWATTar bleibt der grobe Stunden-Fallback.",
     "tibber_api_token"       => "Tibber API-Token für direkte Tarifpreise. Wird nur lokal in der Konfiguration gespeichert und nicht in Diagnose/Statusdateien ausgegeben.",
     "tibber_home_id"         => "Optionale Tibber Home-ID. Leer lassen, wenn das erste Tibber-Zuhause mit Preisinfo verwendet werden soll.",
@@ -805,23 +805,22 @@ $tooltips = [
     "peak_shaving_max_discharge_w" => "Optionales Leistungsmaximum nur für die Lastspitzenbegrenzung. 0 verwendet das wirksame Batterie-/Wechselrichterlimit.",
     "peak_shaving_grid_recharge_enable" => "Explizite Freigabe, den Lastspitzenpuffer aus dem Netz nachzuladen. Standard aus; Netzladen bleibt innerhalb der aktuellen Viertelstunden- und Hausanschlussgrenze.",
     "peak_shaving_recharge_max_w" => "Maximale Netzladeleistung zum Wiederauffüllen des Lastspitzenpuffers. 0 verwendet das wirksame Hardwarelimit.",
-    "peak_shaving_control_margin_w" => "Sicherheitsabstand unter der eingestellten Viertelstunden-Grenze, damit Mess- und Reaktionsverzögerungen nicht zur Überschreitung führen.",
-    "peak_shaving_hysteresis_w" => "Eintrittshysterese für den Lastspitzeneingriff. Sie muss strikt größer als 300 W sein; empfohlen sind mindestens 600 W.",
+    "peak_shaving_control_margin_w" => "Sicherheitsabstand unter der eingestellten Viertelstunden-Grenze. Er deckt Messabweichungen und einen Lastsprung in den letzten 30 Sekunden einer Viertelstunde.",
+    "peak_shaving_hysteresis_w" => "Kleinste Änderung der Entladegrenze. E3DC-Control rechnet die Grenze alle 30 Sekunden aus dem Netzbezug der laufenden Viertelstunde und schreibt nur Änderungen ab diesem Wert. Bei weniger als 300 W Bedarf hält der Akku ganz (0 W). Der Wert muss größer als 300 W sein; empfohlen sind mindestens 600 W.",
     "peak_shaving_soc_hysteresis_pct" => "SoC-Abstand zum stabilen Freigeben beziehungsweise Nachladen der reservierten Speicherzone.",
-    "peak_shaving_max_sample_gap_s" => "Größte zulässige Lücke zwischen zwei Netzpunktmessungen. Bei größeren Lücken bleibt die Regelung passiv; erst ab der nächsten festen Viertelstundengrenze kann wieder eine lückenlose Messfolge aufgebaut werden.",
-    "peak_shaving_release_debounce_s" => "Mindestdauer, für die die Freigabebedingung stabil sein muss, bevor die flüchtige Entladeobergrenze aufgehoben wird.",
+    "peak_shaving_max_sample_gap_s" => "Größte zulässige Lücke zwischen zwei Netzpunktmessungen. Bei größeren Lücken begrenzt die Regelung nicht, und der Puffer unterhalb der Speicherschwelle bleibt stehen; erst ab der nächsten festen Viertelstundengrenze kann wieder eine lückenlose Messfolge aufgebaut werden.",
     "awattar"                => "Legacy aWATTar Flag (1=an, 0=aus). Nutze stattdessen Tariff Provider.",
     "awmwst"                 => "Mehrwertsteuer-Satz für aWATTar/Börsenpreise (z.B. 19.0).",
     "awnebenkosten"          => "Zusätzliche Nebenkosten in ct/kWh (Netzentgelte, Umlagen etc.).",
     "awreserve"              => "Aufschlag in % für Preis-Toleranz.",
     "awsimulation" => "Historischer Schalter für die Preissimulation, Editorstandard: 0. Der aktuelle Preisleser wertet ihn nicht aus; auch leer oder 0 verändert dort keine Preise.",
-    "cheap_grid_boost_enable" => "Aktiviert den Negativpreis-Boost als Sonderpfad. Normale günstige Fenster laufen über den Marktpfad; dieser Bereich bleibt zusätzlich für Legacy-/LT-Kompatibilität.",
-    "cheap_grid_price_limit_ct" => "Optionale Preisgrenze in ct/kWh nur für Negativpreis-/Legacy-Boost. Der normale Marktpfad nutzt Prognose, Marge und Halteband statt fester Preisgrenze.",
+    "cheap_grid_boost_enable" => "Preis-Boost: eigener Weg für negative Gesamtpreise (Arbeitspreis einschließlich Netzentgelt, Umlagen und Steuern unter 0 ct/kWh). Freigegebene Verbraucher nehmen dann zusätzlich Netzstrom auf. Speicher und Wallbox brauchen dafür keinen geöffneten Marktpfad, Wärmepumpe und Heizstab schon. Normale günstige Fenster gehören zum Marktpfad.",
+    "cheap_grid_price_limit_ct" => "Optionale Preisgrenze des Preis-Boosts in ct/kWh: 0 = jeder negative Gesamtpreis, ein negativer Wert verlangt mindestens diesen Preis. Sie gilt für Speicher und Wallbox im Preis-Boost. Bei geöffnetem Marktpfad gilt für den Speicher und für Ladepunkte in „Sofort bis Preislimit“ jeder negative Gesamtpreis.",
     "cheap_grid_min_duration_min" => "Mindestdauer eines günstigen Fensters in Minuten. Kurze Einzelspitzen werden ignoriert, damit keine Taktung entsteht.",
-    "cheap_grid_battery_enable" => "Erlaubt Speicher-Netzladen im Negativpreis-/Legacy-Boost. Der normale Prognose-Marktpfad nutzt dafür getrennte, standardmäßig ausgeschaltete Speicherfreigaben.",
-    "cheap_grid_wallbox_enable" => "Erlaubt Wallbox-Laden im Negativpreis-/Legacy-Boost. Standard aus, damit kein Auto ungeplant Netzstrom zieht.",
+    "cheap_grid_battery_enable" => "Gibt den Speicher für den Preis-Boost frei: Netzladen bei negativem Gesamtpreis. Der normale Marktpfad hat eigene, standardmäßig ausgeschaltete Speicherfreigaben.",
+    "cheap_grid_wallbox_enable" => "Gibt die Wallbox für den Preis-Boost frei: Laden bei negativem Gesamtpreis. Standard aus, damit kein Auto ungeplant Netzstrom zieht.",
     "cheap_grid_heatpump_enable" => "Separate Wärmepumpen-Freigabe ausschließlich für echte Negativpreise. Standard aus; die allgemeine Preisverschiebung bleibt davon getrennt.",
-    "cheap_grid_heater_enable" => "Erlaubt Heizstab/Heizer im Negativpreis-/Legacy-Boost. Standard aus.",
+    "cheap_grid_heater_enable" => "Gibt den Heizstab bei negativem Gesamtpreis frei. Braucht zusätzlich den geöffneten Marktpfad. Standard aus.",
     "heat_policy_runtime_enable" => "Aus: Wärmepumpe und Heizstab verwenden weiterhin die bisherige Regelung. Ein: Die gemeinsame Planung darf Wärmefreigaben begrenzen; bei fehlenden oder veralteten Daten bleibt die sichere bisherige Regelung zuständig. Dieser Schalter allein aktiviert keinen Wärmepumpen-Preis-Boost.",
     "ems_budget_runtime_enable" => "Aus: Speicher, Wallbox und Wärme verwenden weiterhin ihre bisherigen Regeln. Ein: Nur eine gültige und bestätigte Gesamtplanung darf zusätzliche Leistung verteilen; fehlen aktuelle Daten, wird nichts zusätzlich freigegeben.",
     "heat_heater_grid_boost_enable" => "Erlaubt der zentralen Wärme-Policy, Heizstab-Netzboost überhaupt zu prüfen. Ohne Runtime-Schalter bleibt das nur Diagnose.",
@@ -832,7 +831,7 @@ $tooltips = [
     "heat_heater_min_temp_c" => "Unterhalb dieser Temperatur darf ein Heizstab-Boost Bedarf haben.",
     "heat_heater_max_temp_c" => "Ab dieser Temperatur sperrt die Policy den Heizstab-Boost.",
     "heat_wp_daily_kwh" => "Fallback-Wärmebedarf pro 24h, wenn keine empirischen Messdaten vorhanden sind. Leer bedeutet: erst ML/Historie, dann konservativer wissenschaftlicher Fallback.",
-    "cheap_grid_battery_max_soc" => "Obergrenze für Netzladen des Speichers in %. Zusätzlich begrenzt die PV-Prognose, damit PV-Freiraum erhalten bleibt.",
+    "cheap_grid_battery_max_soc" => "Obergrenze für Netzladen des Speichers im Preis-Boost in %. Zusätzlich begrenzt die PV-Prognose, damit PV-Freiraum erhalten bleibt. Derselbe Wert ist im Marktpfad das Ladeziel des Profils „Komfort“.",
     "cheap_grid_battery_max_w" => "Maximale Netzladeleistung in Watt. 0 = Systemlimit aus der Speicher-Konfiguration nutzen.",
     "market_charge_profile" => "Ladeprofil für preisbasiertes Speicher-Netzladen. Wirtschaftlich: nur bei Prognosedefizit und 10 % Marge. Ausgeglichen: nur bei Prognosedefizit, ohne Marge. Komfort: im Preisfenster bis zum Zielstand am Fensterende, PV wird zuerst angerechnet, kein Defizit nötig. Eigene Einstellungen: alle Felder frei. Notstromreserve, Hausanschluss und Reserven gelten in jedem Profil.",
     "market_price_limit_ct" => "Komfort-Preislimit in ct/kWh: bis zu diesem Abrechnungspreis wird im Preisfenster geladen. Leer = Mittelpreis des Tarifs (Octopus Heat aus den festen Fenstern) bzw. des gebundenen Preishorizonts, je Plan bestimmt. Nur im Profil Komfort wirksam; der Negativpreis-Boost nutzt weiterhin seine eigene Preisgrenze.",
@@ -1023,7 +1022,7 @@ $tooltips = [
     "idm_cooling_boost_min_at" => "Ab dieser gemittelten Außentemperatur darf E3DC-Control bei iDM zusätzlich Kühlung anfordern. Darunter bleibt der Sommer-Boost bei Warmwasser und Register-74-Überschuss.",
     "auto_mode"              => "Automatik-Regelung: 1=Aktiv, 0=Automatik aus. Eigene Aufträge enden sofort; ein laufender Verdichter behält seine Mindestlaufzeit. Danach nimmt E3DC-Control eigene Freigaben einmal zurück. Die Messung läuft weiter.",
     "grid_start_limit"       => "Der Betrag legt das benötigte freie Verbraucherbudget nach Akkuladung fest, nicht die Einspeisung am Netzpunkt. Negativ eintragen: -4500 steht für 4500 W benötigtes Budget. Das Vorzeichen bleibt für die PV-Pause wichtig: Deren laufender Ende-Timer wird bei Netzleistung über Start-Grenze plus 500 W zurückgesetzt. Bei +4500 geschieht das erst über 5000 W Netzbezug, bei -4500 sobald die Einspeisung unter 4000 W fällt. Die Zuteilung benötigt mindestens 1500 W; mit kleinerem Betrag startet die WP nicht. Verbraucherprioritäten gelten weiterhin.",
-    "pv_boost_delay"         => "Durchgehende Freigabe vor dem PV-Boost in Sekunden; schützt vor kurzen Wolkenlücken. Standard: 30 s. SG Ready reserviert mindestens 150 s, bei langen Verzögerungen mindestens Verzögerung plus 120 s. Ab dem normalen Reservierungsfenster weist die Konfigurationsprüfung auf die lange Budgetbindung hin.",
+    "pv_boost_delay"         => "Durchgehende Freigabe vor dem PV-Boost in Sekunden; schützt vor kurzen Wolkenlücken. Standard: 30 s. SG Ready reserviert mindestens 150 s, bei langen Verzögerungen mindestens Verzögerung plus 120 s. Bei SG Ready weist die Konfigurationsprüfung ab 150 s auf die lange Budgetbindung hin.",
     "stop_delay_minutes"     => "Minuten nach denen der Boost gestoppt wird wenn das Limit unterschritten bleibt. Standard: 10 Min.",
     "wp_min_runtime_min"     => "Mindestlaufzeiten schützen vor kurzen Verdichtertakten; nur benannte Schutzfälle verkürzen sie. Bei Luxtronik im Messwertbetrieb gilt der Schutz auch beim Wh-Kontingentende und bei Unterstützung auf 0. Nutzer-Aus und Notstromreserve nehmen den PV-Auftrag zurück, die Mindestlaufzeit läuft für Heizung und Warmwasser zu Ende. Inselbetrieb, Hausanschlussgrenze, Gerätefehler und SoC-Sicherheitsabschaltung wirken sofort. Der Netzstopp verlangt 30 Sekunden zusammenhängend frischen WP-Netzanteil über 2.500 W, höchstens Netzbezug minus 200 W. Ohne frische WP-Einzelmessung (fehlend, ungültig oder älter als 45 Sekunden) zählt der gesamte Netzbezug abzüglich 200 W. Die Frist beträgt auch dann 30 Sekunden zusammenhängend mit frischen Netzwerten; ein Wechsel der Messgrundlage beginnt sie neu. Die Wärmepumpe darf selbst stoppen.",
     "wp_restart_block_min"   => "Wiedereinschaltsperre nach einem PV-Boost-Stopp in Minuten. Glättet Wolkenwechsel und verhindert Start/Stop-Pendeln.",
@@ -1667,7 +1666,7 @@ function e3dc_config_auto_install_rules() {
 function e3dc_config_setting_requirements() {
     // Anzeigevoraussetzungen aus Markt-/Tarifvertrag und vorhandenen Geräteprofilen.
     // Dieser Katalog erteilt keine Laufzeitfreigabe und verändert keine Werte.
-    $eco = ['when' => ['type' => 'enabled', 'key' => 'grid_friendly_mode'], 'reason' => 'Netzdienlichen Eco-Modus aktivieren.'];
+    $eco = ['when' => ['type' => 'enabled', 'key' => 'grid_friendly_mode'], 'reason' => 'Marktpfad öffnen.'];
     $marketTariff = ['when' => ['type' => 'in', 'key' => 'stromtarif_typ', 'values' => ['tibber', 'awattar', 'dynamic', 'epex', 'octopus_heat', 'special', 'spezial', 'special_tariff']], 'reason' => 'Einen zeitvariablen Tarif wählen: EPEX/Tibber, Octopus Heat oder Spezialtarif.'];
     $spotTariff = ['when' => ['type' => 'in', 'key' => 'stromtarif_typ', 'values' => ['tibber', 'awattar', 'dynamic', 'epex']], 'reason' => 'Ein Börsenpreistarif mit echten Negativpreis-Slots ist erforderlich; Octopus Heat und Spezialtarif zählen nicht dazu.'];
     $negativeBoost = ['when' => ['type' => 'enabled', 'key' => 'cheap_grid_boost_enable'], 'reason' => 'Negativpreis-Boost aktivieren.'];
@@ -1707,7 +1706,9 @@ function e3dc_config_setting_requirements() {
             'note' => 'Getrennte Freigabe nur für den Negativpreis-Boost. Sie aktiviert kein normales günstiges Netzladen.'];
     }
     $rules['cheap_grid_wallbox_enable']['requirements'][] = $wallbox;
-    $rules['cheap_grid_heatpump_enable']['requirements'] = array_merge($rules['cheap_grid_heatpump_enable']['requirements'], [$heat, $heatAuto]);
+    // Wärmepumpe und Heizstab folgen dem Vertrag für negative Gesamtpreise; den gibt es nur bei geöffnetem Marktpfad.
+    $rules['cheap_grid_heater_enable']['requirements'][] = $eco;
+    $rules['cheap_grid_heatpump_enable']['requirements'] = array_merge($rules['cheap_grid_heatpump_enable']['requirements'], [$eco, $heat, $heatAuto]);
     $rules['cheap_grid_boost_enable'] = ['label' => 'Negativpreis-Boost', 'requirements' => [$spotTariff], 'summary' => true,
         'note' => 'Verbraucher unten getrennt freigeben. Ein günstiges Zeitfenster allein ist kein Negativpreis-Slot.'];
     $rules['auto_mode'] = ['label' => 'WP-Automatik', 'requirements' => [$heat],
@@ -1743,6 +1744,7 @@ function e3dc_config_setting_requirements() {
         ['when' => ['type' => 'enabled', 'key' => 'heat_policy_runtime_enable'], 'reason' => 'Wärme in die Gesamtplanung einbeziehen aktivieren.'],
         ['when' => ['type' => 'enabled', 'key' => 'cheap_grid_boost_enable'], 'reason' => 'Den gemeinsamen Negativpreis-Boost im Tarifbereich aktivieren.'],
         ['when' => ['type' => 'enabled', 'key' => 'cheap_grid_heatpump_enable'], 'reason' => 'Die Wärmepumpe für den Negativpreis-Boost freigeben.'],
+        $eco,
     ], 'summary' => true, 'note' => 'Standardmäßig aus. Benötigt ein freigegebenes Negativpreisfenster, Wärmebedarf und eine aktuelle Speicherzusage. Dieser Schalter aktiviert nicht das separate Tariffenster-Heizen; dafür gilt der eigene Block.'];
     // Verborgene Wärmeblöcke erzeugen auch in der Übersicht keine Wirkungshinweise.
     $wpSpotVisible = ['all' => [$spotTariff['when'], ['type' => 'equals', 'key' => 'wp_type', 'value' => '0']]];
@@ -4866,7 +4868,6 @@ $groups = [
         "peak_shaving_enable", "peak_shaving_grid_import_limit_w", "peak_shaving_reserve_soc_pct", "peak_shaving_max_discharge_w",
         "peak_shaving_grid_recharge_enable", "peak_shaving_recharge_max_w", "peak_shaving_control_margin_w",
         "peak_shaving_hysteresis_w", "peak_shaving_soc_hysteresis_pct", "peak_shaving_max_sample_gap_s",
-        "peak_shaving_release_debounce_s",
         "cheap_grid_boost_enable", "cheap_grid_price_limit_ct", "cheap_grid_min_duration_min",
         "cheap_grid_battery_enable", "cheap_grid_wallbox_enable", "cheap_grid_heater_enable",
         "cheap_grid_battery_max_soc", "cheap_grid_battery_max_w", "cheap_grid_pv_buffer_pct", "cheap_grid_soc_hysteresis_pct",
@@ -4959,6 +4960,7 @@ $frontendHiddenKeys = [
     'storage_curve_control_soc_band_pct', 'storage_curve_control_soc_reset_pct',
     'wallbox_live_stale_guard_s',
     // Altlast ohne Wirkung; nach zwei Releases entfernbar.
+    'peak_shaving_release_debounce_s',
     'tl_enable', 'storage_pv_floor_ratio', 'storage_pv_floor_threshold_w', 'storage_pv_floor_max_w',
     'wb_phase_down_delay_s', 'wb1_phase_down_delay_s', 'wb2_phase_down_delay_s',
     'wb_phase_up_forecast_hold_s', 'wb1_phase_up_forecast_hold_s', 'wb2_phase_up_forecast_hold_s',
@@ -5868,6 +5870,9 @@ async function readConfirmedConfigJson(response) {
     #configSearch:focus {
         background-color: var(--bs-body-bg); border-color: var(--bs-info); box-shadow: 0 0 0 0.2rem rgba(13, 202, 240, 0.25); outline: none;
     }
+    .config-search-hit {
+        outline: 2px solid var(--bs-info); outline-offset: 2px; border-radius: 6px;
+    }
     .config-wizard-shell {
         background: rgba(14,165,233,0.07);
         border: 1px solid rgba(14,165,233,0.28);
@@ -6347,7 +6352,7 @@ async function readConfirmedConfigJson(response) {
     <script src="storage_regulation.js?v=2" defer></script>
 
     <div class="px-1" id="configAdvancedSearch">
-        <input type="text" id="configSearch" class="form-control" placeholder="🔍 Variable suchen..." onkeyup="filterConfig()">
+        <input type="text" id="configSearch" class="form-control" placeholder="🔍 Einstellung suchen: Name, Beschriftung oder Hilfetext" aria-label="Einstellung suchen" onkeyup="filterConfig()">
     </div>
 
     <form method="POST" id="configEditorForm">
@@ -6919,7 +6924,7 @@ async function readConfirmedConfigJson(response) {
 
                 $groupTitle = ($isLuxEnabled || $isClimateEnabled) ? "Smart Home & Verbrauchsprognose" : "Smart Home Monitoring (aus)";
         ?>
-        <details class="card config-card config-group-el mb-2" id="group-luxtronik" data-search-text="<?= $groupSearchText ?>">
+        <details class="card config-card config-group-el mb-2" id="group-luxtronik" data-search-text="<?= $groupSearchText ?> morning_boost_enable super_intelligence_enable">
             <summary class="config-header position-relative" style="justify-content: center;">
                 <span class="fs-6 fw-bold"><i class="fas <?= $isLuxEnabled ? 'fa-robot' : 'fa-brain' ?> me-2 text-info"></i><?= $groupTitle ?></span>
                 <button type="button" class="btn btn-sm btn-info rounded-pill fw-bold text-dark shadow position-absolute save-dynamic-btn" onclick="event.stopPropagation(); event.preventDefault(); document.getElementById('configEditorForm').submit();">💾 Speichern</button>
@@ -9491,8 +9496,10 @@ async function readConfirmedConfigJson(response) {
             endif;
 
             if ($title === "Tarif & Strompreise"):
-                $isTrue = function($k) use ($config) {
-                    $v = $config[$k]['value'] ?? '0';
+                // Ohne gespeicherten Wert gilt der übergebene Standard; ein gespeicherter Wert bleibt, auch 0.
+                $isTrue = function($k, $default = '0') use ($config) {
+                    $v = $config[$k]['value'] ?? '';
+                    if ($v === '') $v = $default;
                     return ($v === '1' || strtolower($v) === 'true');
                 };
                 $val = function($k) use ($config, $defaults) {
@@ -9630,13 +9637,14 @@ async function readConfirmedConfigJson(response) {
                 </div>
 
                 <div class="row g-3">
-                    <div class="col-md-7">
+                    <div class="col-md-7" id="opt_market_path" style="display: <?= $showMarketSettings ? 'block' : 'none' ?>;">
                         <div class="form-check form-switch p-0 ps-5">
                             <input type="hidden" name="values[grid_friendly_mode]" value="0">
                             <input class="form-check-input" type="checkbox" name="values[grid_friendly_mode]" value="1" id="conf_eco" <?= $isTrue('grid_friendly_mode') ? 'checked' : '' ?> style="transform: scale(1.3); margin-left: -2.8em;">
-                            <label class="form-check-label ms-2 fw-bold text-success" for="conf_eco" data-tooltip="<?= htmlspecialchars($tooltipMap['grid_friendly_mode'] ?? '') ?>">Netzdienlichen Eco-Modus aktivieren</label>
+                            <label class="form-check-label ms-2 fw-bold text-success" for="conf_eco" data-tooltip="<?= htmlspecialchars($tooltipMap['grid_friendly_mode'] ?? '') ?>">Marktpfad öffnen: bei niedrigen Preisen laden (netzdienlich)</label>
                         </div>
-                        <div class="text-muted small ms-1 mt-1">Aktiviert EcoScore und den normalen Marktpfad; Verbraucher werden unten getrennt freigegeben.</div>
+                        <div class="text-muted small ms-1 mt-1">Ohne freigegebenen Verbraucher passiert nichts; die Freigaben stehen unten bei „Preisbewusste Verbraucher“.</div>
+                        <div class="small ms-1 mt-1" id="market_path_state" aria-live="polite"></div>
                     </div>
                     <div class="col-md-5" id="opt_tariff_provider" style="display: <?= $showDynamicPriceSettings ? 'block' : 'none' ?>;">
                         <label class="config-label text-secondary" data-tooltip="<?= htmlspecialchars($tooltipMap['tariff_provider'] ?? '') ?>">Börsen-Datenquelle (für Eco-Score)</label>
@@ -9804,14 +9812,6 @@ async function readConfirmedConfigJson(response) {
                                                 <span class="input-group-text bg-body-tertiary">s</span>
                                             </div>
                                             <?= $configValidationMarker('peak_shaving_max_sample_gap_s') ?>
-                                        </div>
-                                        <div class="col-md">
-                                            <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['peak_shaving_release_debounce_s'] ?? '') ?>">Freigabe-Entprellung</label>
-                                            <div class="input-group">
-                                                <input type="number" min="5" max="120" step="5" name="values[peak_shaving_release_debounce_s]" class="form-control config-input" value="<?= $val('peak_shaving_release_debounce_s') ?>">
-                                                <span class="input-group-text bg-body-tertiary">s</span>
-                                            </div>
-                                            <?= $configValidationMarker('peak_shaving_release_debounce_s') ?>
                                         </div>
                                     </div>
                                 </details>
@@ -10015,7 +10015,7 @@ async function readConfirmedConfigJson(response) {
                                         'market_wallbox_enable' => ['Wallbox', 'fa-charging-station'],
                                         'market_heater_enable' => ['Heizstab', 'fa-temperature-high'],
                                     ] as $mk => $meta): ?>
-                                    <div class="form-check form-switch">
+                                    <div class="form-check form-switch" data-market-release>
                                         <input type="hidden" name="values[<?= $mk ?>]" value="0">
                                         <input class="form-check-input" type="checkbox" name="values[<?= $mk ?>]" value="1" id="conf_<?= $mk ?>" <?= ($isTrue($mk) || ($mk === 'market_battery_hold_enable' && $isTrue('market_battery_grid_charge_enable'))) ? 'checked' : '' ?>>
                                         <label class="form-check-label config-label" for="conf_<?= $mk ?>" data-tooltip="<?= htmlspecialchars($tooltipMap[$mk] ?? '') ?>"><i class="fas <?= $meta[1] ?> me-1"></i><?= $meta[0] ?></label>
@@ -10059,7 +10059,7 @@ async function readConfirmedConfigJson(response) {
                 <div class="mt-3 p-3 rounded-3 border border-success-subtle" id="opt_cheap_grid_boost" style="display: <?= $showCheapGridBoost ? 'block' : 'none' ?>; background: rgba(16,185,129,0.08);">
                     <div class="d-flex flex-wrap align-items-center justify-content-between gap-2">
                         <div>
-                            <div class="fw-bold text-success"><i class="fas fa-plug-circle-bolt me-2"></i>Netzladen bei negativen Preisen</div>
+                            <div class="fw-bold text-success"><i class="fas fa-plug-circle-bolt me-2"></i>Preis-Boost: Netzladen bei negativen Preisen</div>
                         </div>
                         <div class="form-check form-switch m-0">
                             <input type="hidden" name="values[cheap_grid_boost_enable]" value="0">
@@ -10067,7 +10067,7 @@ async function readConfirmedConfigJson(response) {
                             <label class="form-check-label ms-2 config-label" for="conf_cheap_grid_boost" data-tooltip="<?= htmlspecialchars($tooltipMap['cheap_grid_boost_enable'] ?? '') ?>">Gezielt freigeben</label>
                         </div>
                     </div>
-                    <div class="small text-muted mt-1 mb-3 pe-md-5">Ist die Funktion aus, wird kein zusätzlicher Netzlade-Boost ausgelöst. Normale Markt- und PV-Planung laufen unabhängig davon weiter.</div>
+                    <div class="small text-muted mt-1 mb-3 pe-md-5">Eigener Weg für negative Gesamtpreise (einschließlich Netzentgelt, Umlagen und Steuern): Freigegebene Verbraucher nehmen dann zusätzlich Netzstrom auf. Speicher und Wallbox brauchen dafür keinen geöffneten Marktpfad, Wärmepumpe und Heizstab schon. Markt- und PV-Planung laufen unabhängig davon weiter.</div>
                     <div id="cheap_grid_boost_details" style="<?= $isTrue('cheap_grid_boost_enable') ? '' : 'display:none;' ?>">
 
                     <div class="row g-3 border-top border-success-subtle pt-3">
@@ -10155,6 +10155,10 @@ async function readConfirmedConfigJson(response) {
                             </div>
                         </div>
 
+                        <?php // Nur mit Heizstab-Modul oder Heizstab als Wärmepumpentyp; ein noch eingeschalteter Netzboost bleibt sichtbar und abschaltbar. ?>
+                        <?php $heaterModuleStored = $isTrue('heizstab'); ?>
+                        <div class="col-12" data-heater-grid-boost="<?= $heaterModuleStored ? '1' : '0' ?>" <?= ($heaterModuleStored || $priceBoostWpType === '2' || $isTrue('heat_heater_grid_boost_enable')) ? '' : 'hidden' ?>>
+                        <div class="row g-3">
                         <div class="col-12">
                             <div class="alert alert-warning border-warning-subtle mb-0">
                                 <div class="fw-bold"><i class="fas fa-triangle-exclamation me-2"></i>Heizstab-Netzboost nur bewusst freigeben</div>
@@ -10179,7 +10183,7 @@ async function readConfirmedConfigJson(response) {
                         <div class="col-md-4">
                             <div class="form-check form-switch">
                                 <input type="hidden" name="values[heat_heater_grid_boost_requires_deficit]" value="0">
-                                <input class="form-check-input" type="checkbox" name="values[heat_heater_grid_boost_requires_deficit]" value="1" id="conf_heat_heater_grid_boost_requires_deficit" <?= $isTrue('heat_heater_grid_boost_requires_deficit') ? 'checked' : '' ?>>
+                                <input class="form-check-input" type="checkbox" name="values[heat_heater_grid_boost_requires_deficit]" value="1" id="conf_heat_heater_grid_boost_requires_deficit" <?= $isTrue('heat_heater_grid_boost_requires_deficit', $defaults['heat_heater_grid_boost_requires_deficit']) ? 'checked' : '' ?>>
                                 <label class="form-check-label config-label" for="conf_heat_heater_grid_boost_requires_deficit" data-tooltip="<?= htmlspecialchars($tooltipMap['heat_heater_grid_boost_requires_deficit'] ?? '') ?>">nur Prognose-Defizit</label>
                             </div>
                         </div>
@@ -10211,6 +10215,8 @@ async function readConfirmedConfigJson(response) {
                                 <input type="number" step="0.1" name="values[heat_heater_max_temp_c]" class="form-control config-input" value="<?= $val('heat_heater_max_temp_c') ?>">
                                 <span class="input-group-text bg-body-tertiary">°C</span>
                             </div>
+                        </div>
+                        </div>
                         </div>
                         <div class="col-md-4">
                             <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['heat_wp_daily_kwh'] ?? '') ?>">Fallback Wärmebedarf</label>
@@ -10310,7 +10316,7 @@ async function readConfirmedConfigJson(response) {
                         </div>
                         <div class="form-check form-switch m-0">
                             <input type="hidden" name="values[direct_marketing_enable]" value="0">
-                            <input class="form-check-input" type="checkbox" name="values[direct_marketing_enable]" value="1" id="conf_direct_marketing_enable" <?= $isTrue('direct_marketing_enable') ? 'checked' : '' ?> style="transform: scale(1.25);" onchange="toggleDirectMarketingDetails(this.checked);">
+                            <input class="form-check-input" type="checkbox" name="values[direct_marketing_enable]" value="1" id="conf_direct_marketing_enable" <?= $isTrue('direct_marketing_enable') ? 'checked' : '' ?> style="transform: scale(1.25);" onchange="toggleDirectMarketingDetails(this.checked); updateDirectMarketingOffHint(this);">
                             <label class="form-check-label ms-2 config-label fw-bold" for="conf_direct_marketing_enable" data-tooltip="<?= htmlspecialchars($tooltipMap['direct_marketing_enable'] ?? '') ?>">Direktvermarktung aktiv</label>
                         </div>
                     </div>
@@ -10319,6 +10325,12 @@ async function readConfirmedConfigJson(response) {
                         <div class="alert alert-warning border-warning-subtle small py-2 mt-3 mb-3">
                             <i class="fas fa-triangle-exclamation me-1"></i>
                             Standard bleibt Safe. PV-Speichern greift nur mit echtem PV-Überschuss und Importwächter. Batterieeinspeisung, Netzladen und Arbitrage bleiben separate Freigaben mit gültiger Wirtschaftlichkeitsprüfung. E3DC-Control rechnet und warnt; Vertrags-, Messkonzept- und Nutzerentscheidungen bleiben Betreiberverantwortung.
+                        </div>
+                        <div class="col-12" id="direct_marketing_off_hint" hidden>
+                            <div class="alert alert-info border-info-subtle small py-2 mb-3">
+                                <i class="fas fa-circle-info me-1"></i>
+                                <strong>Ausgeschaltet:</strong> <span data-dv-off-list></span>. In der Grundeinstellung sind diese Zusatzschalter an; ein früheres Speichern kann sie ausgeschaltet haben. Es wird nichts automatisch geändert, ein Klick führt zum Schalter.
+                            </div>
                         </div>
 
                         <div class="mt-3 mb-3 p-3 rounded-3 border border-info-subtle" style="background: rgba(14,165,233,0.08);">
@@ -10383,7 +10395,7 @@ async function readConfirmedConfigJson(response) {
                         <div class="row g-3 border-top border-warning-subtle pt-3">
                             <div class="col-md-3">
                                 <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['direct_marketing_mode'] ?? '') ?>">Strategie</label>
-                                <select class="form-select config-input" name="values[direct_marketing_mode]" id="conf_direct_marketing_mode" onchange="updateDirectMarketingModeFields(this.value)">
+                                <select class="form-select config-input" name="values[direct_marketing_mode]" id="conf_direct_marketing_mode" onchange="updateDirectMarketingModeFields(this.value); updateDirectMarketingOffHint(this);">
                                     <option value="safe" <?= ($val('direct_marketing_mode') === 'safe') ? 'selected' : '' ?>>Beobachten und schützen (Safe)</option>
                                     <option value="eco" <?= ($val('direct_marketing_mode') === 'eco') ? 'selected' : '' ?>>PV günstig speichern (Eco)</option>
                                     <option value="eco_plus" <?= ($val('direct_marketing_mode') === 'eco_plus') ? 'selected' : '' ?>>PV speichern und wirtschaftlich verkaufen (Eco+)</option>
@@ -11010,9 +11022,9 @@ async function readConfirmedConfigJson(response) {
                                 'direct_marketing_passive_normal_zero_charge_enable' => ['Gebundene Hausversorgung: Laden 0 W', 'fa-link', 'text-warning', 'eco_plus'],
                                 'direct_marketing_low_price_no_export' => ['Kein Verkauf bei Billigpreis', 'fa-circle-dollar-to-slot', 'text-success', 'eco eco_plus'],
                             ] as $dk => $meta): ?>
-                            <div class="form-check form-switch" data-dv-mode="<?= htmlspecialchars($meta[3]) ?>">
+                            <div class="form-check form-switch" data-dv-mode="<?= htmlspecialchars($meta[3]) ?>"<?= ($defaults[$dk] ?? '0') === '1' ? ' data-dv-default-on' : '' ?>>
                                 <input type="hidden" name="values[<?= $dk ?>]" value="0">
-                                <input class="form-check-input" type="checkbox" name="values[<?= $dk ?>]" value="1" id="conf_<?= $dk ?>" <?= $isTrue($dk) ? 'checked' : '' ?>>
+                                <input class="form-check-input" type="checkbox" name="values[<?= $dk ?>]" value="1" id="conf_<?= $dk ?>" <?= $isTrue($dk, $defaults[$dk] ?? '0') ? 'checked' : '' ?> onchange="updateDirectMarketingOffHint(null);">
                                 <label class="form-check-label config-label <?= $meta[2] ?>" for="conf_<?= $dk ?>" data-tooltip="<?= htmlspecialchars($tooltipMap[$dk] ?? '') ?>"><i class="fas <?= $meta[1] ?> me-1"></i><?= $meta[0] ?></label>
                             </div>
                             <?php endforeach; ?>
@@ -11687,10 +11699,10 @@ async function readConfirmedConfigJson(response) {
                             <div class="col-12 col-lg-6">
                                 <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['web_remote_pin_optout'] ?? '') ?>">Domainzugriff ohne Web-PIN</label>
                                 <select name="values[web_remote_pin_optout]" class="form-select config-input">
-                                    <option value="0" <?= !$webRemoteWithoutPin ? 'selected' : '' ?>>Nein: ab der nächsten Version nur mit Web-PIN (empfohlen)</option>
+                                    <option value="0" <?= !$webRemoteWithoutPin ? 'selected' : '' ?>>Nein: Domainzugriff nur mit Web-PIN (empfohlen)</option>
                                     <option value="1" <?= $webRemoteWithoutPin ? 'selected' : '' ?>>Ja, bewusst ohne Web-PIN (weiter wie bisher)</option>
                                 </select>
-                                <div class="text-muted mt-1" style="font-size:0.72rem;">Gilt nur ohne Web-PIN und nur für Domainnamen wie eigene Domain, DynDNS oder MyFRITZ. IP-Adressen und lokale Namen bleiben immer frei.</div>
+                                <div class="text-muted mt-1" style="font-size:0.72rem;">Gilt nur ohne Web-PIN und nur für Domainnamen wie eigene Domain, DynDNS oder MyFRITZ sowie öffentliche IP-Adressen. Private IP-Adressen und lokale Namen bleiben immer frei.</div>
                             </div>
                             <div class="col-12">
                                 <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['config_secret_protection_mode'] ?? '') ?>">Config-Schutz</label>
@@ -13985,28 +13997,7 @@ async function readConfirmedConfigJson(response) {
                         <i class="fas fa-circle-notch fa-spin me-1"></i>Lade Prognosedaten...
                     </div>
                 </div>
-                <div class="mt-4 rounded-3 p-3 mb-4" style="background:rgba(239,68,68,0.06); border:1px solid rgba(239,68,68,0.2);">
-                    <div class="fw-bold mb-1" style="color:#ef4444; font-size:0.9rem;">
-                        <i class="fas fa-hand-holding-usd me-2"></i>Eco-Score Drosselung
-                    </div>
-                    <div class="text-muted mb-3" style="font-size:0.78rem;">
-                        Diese Parameter drosseln einen bereits freigegebenen Pre-Dump nach Netz-/Preis-Signal. Das globale Pre-Dump-Startfenster liegt in der Ladekurven-Konfiguration.
-                    </div>
-                    <div class="row g-2">
-                        <div class="col-6 col-md-6">
-                            <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['pd_eco_min'] ?? '') ?>">Vollgas Eco-Min</label>
-                            <input type="number" step="0.5" name="values[pd_eco_min]" class="form-control config-input" value="<?= $sv('pd_eco_min') ?>" placeholder="25.0">
-                            <div class="text-muted" style="font-size:0.72rem;">Unterhalb = Vollgas entladen</div>
-                        </div>
-                        <div class="col-6 col-md-6">
-                            <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['pd_eco_max'] ?? '') ?>">Pause Eco-Max</label>
-                            <input type="number" step="0.5" name="values[pd_eco_max]" class="form-control config-input" value="<?= $sv('pd_eco_max') ?>" placeholder="60.0">
-                            <div class="text-muted" style="font-size:0.72rem;">Oberhalb = Dump pausiert</div>
-                        </div>
-                    </div>
-                </div>
-
-                <div class="rounded-3 p-3 mb-4" style="background:rgba(59,130,246,0.06); border:1px solid rgba(59,130,246,0.2);">
+                <div class="mt-4 rounded-3 p-3 mb-4" style="background:rgba(59,130,246,0.06); border:1px solid rgba(59,130,246,0.2);">
                     <div class="fw-bold mb-1" style="color:#3b82f6; font-size:0.9rem;">
                         <i class="fas fa-tachometer-alt me-2"></i>Trajectory-Clamping (Ladekurven-Tracking)
                     </div>
@@ -14830,6 +14821,7 @@ function updateTariffEditorFields(tariffType) {
     setDisplay('opt_price_cheap', isOctopus ? 'block' : 'none');
     setDisplay('opt_price_uht', isOctopus ? 'block' : 'none');
     setDisplay('opt_price_special', isSpecial ? 'block' : 'none');
+    setDisplay('opt_market_path', (isDynamicPrice || isOctopus || isSpecial) ? 'block' : 'none');
     setDisplay('opt_tariff_provider', isDynamicPrice ? 'block' : 'none');
     setDisplay('opt_tibber_api', isTibber ? 'flex' : 'none');
     setDisplay('opt_awattar_settings', isEpex ? 'flex' : 'none');
@@ -14850,6 +14842,45 @@ document.addEventListener('DOMContentLoaded', () => {
     if (tariff) updateTariffEditorFields(tariff.value);
     const wpType = document.querySelector('[name="values[wp_type]"]');
     if (wpType && tariff) wpType.addEventListener('change', () => updateTariffEditorFields(tariff.value));
+});
+
+// Zustand am Schalter: wofür der Marktpfad offen ist, oder welche Freigaben ohne ihn nicht wirken. Nur Anzeige.
+function updateMarketPathState() {
+    const line = document.getElementById('market_path_state');
+    const opener = document.getElementById('conf_eco');
+    if (!line || !opener) return;
+    const names = Array.from(document.querySelectorAll('[data-market-release]'))
+        .filter(element => element.querySelector('input[type="checkbox"]').checked)
+        .map(element => element.querySelector('label').textContent.trim()).join(', ');
+    line.textContent = opener.checked
+        ? (names ? 'Offen für: ' + names + '.' : 'Offen, aber kein Verbraucher freigegeben.')
+        : (names ? 'Geschlossen. Freigegeben, aber ohne Wirkung: ' + names + '.' : 'Geschlossen.');
+    line.className = 'small ms-1 mt-1 ' + (!names ? 'text-muted' : (opener.checked ? 'text-success' : 'text-warning-emphasis'));
+}
+
+// Der Heizstab-Netzboost hat ohne Heizstab keine Wirkung. Gespeicherte Werte bleiben beim Ausblenden erhalten.
+function updateHeaterGridBoostVisibility() {
+    const box = document.querySelector('[data-heater-grid-boost]');
+    if (!box) return;
+    const view = document.getElementById('configAdvancedView') || document;
+    const modules = Array.from(view.querySelectorAll('[name="values[heizstab]"]')).filter(field => field.type !== 'hidden');
+    const module = modules.length
+        ? modules.some(field => field.type === 'checkbox' ? field.checked : field.value === '1')
+        : box.dataset.heaterGridBoost === '1';
+    const wpType = view.querySelector('[name="values[wp_type]"]');
+    const boost = document.getElementById('conf_heat_heater_grid_boost_enable');
+    box.hidden = !(module || (wpType && wpType.value === '2') || (boost && boost.checked));
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+    const form = document.getElementById('configEditorForm');
+    if (!form) return;
+    form.addEventListener('change', () => {
+        updateMarketPathState();
+        updateHeaterGridBoostVisibility();
+    });
+    updateMarketPathState();
+    updateHeaterGridBoostVisibility();
 });
 
 function toggleCheapGridBoostDetails(checked) {
@@ -15221,24 +15252,117 @@ document.addEventListener('DOMContentLoaded', function () {
     });
 });
 
+// Suche im Config-Editor: Ein Feld passt, wenn jedes Suchwort in Schlüssel, Beschriftung, Hilfetext oder Hinweiszeile vorkommt.
+function configSearchMatches(filter, text) {
+    var words = String(filter || '').toLowerCase().split(/\s+/).filter(Boolean);
+    var haystack = String(text || '').toLowerCase();
+    if (words.length === 0) return false;
+    for (var w = 0; w < words.length; w++) {
+        if (haystack.indexOf(words[w]) === -1) return false;
+    }
+    return true;
+}
+
+// Beschriftungen, Hinweiszeilen und Felder eines Rahmens in der Reihenfolge der Seite.
+function configSearchParts(box) {
+    return Array.from(box.querySelectorAll('.config-label, .text-muted, .form-text, input[name^="values["], select[name^="values["], textarea[name^="values["]'));
+}
+
+// Anderes Feld: eigener Name und sichtbar; das versteckte Standardfeld eines Schalters trennt nicht.
+function configSearchIsOtherField(part, input) {
+    return Boolean(part.name) && part.type !== 'hidden' && part.name !== input.name;
+}
+
+// Beschriftung eines Felds, höchstens drei Ebenen nach oben: die mit passendem „for“, sonst die letzte vor dem Feld ohne anderes Feld dazwischen.
+// Eine Beschriftung mit eigenem Eingabefeld („Wert löschen“) beschriftet kein Nachbarfeld.
+function configSearchFieldLabel(input) {
+    var box = input.parentElement;
+    for (var level = 0; box && level < 3; level++) {
+        var parts = configSearchParts(box);
+        var previous = null;
+        var reached = false;
+        for (var p = 0; p < parts.length; p++) {
+            var part = parts[p];
+            if (part === input) {
+                reached = true;
+            } else if (part.classList.contains('config-label')) {
+                if (part.querySelector('input, select, textarea')) continue;
+                if (part.htmlFor && part.htmlFor === input.id) return part;
+                if (!reached && !part.htmlFor) previous = part;
+            } else if (!reached && configSearchIsOtherField(part, input)) {
+                previous = null;
+            }
+        }
+        if (previous) return previous;
+        box = box.parentElement;
+    }
+    return null;
+}
+
+// Kleinster Rahmen um Feld und Beschriftung.
+function configSearchFieldFrame(input, label) {
+    var box = input.parentElement;
+    while (label && !box.contains(label)) box = box.parentElement;
+    return box;
+}
+
+// Markiert wird der Rahmen; enthält er weitere Felder oder fehlt die Beschriftung, nur das Feld selbst.
+function configSearchFieldBox(input) {
+    if (!input.configSearchBox) {
+        var label = configSearchFieldLabel(input);
+        var box = configSearchFieldFrame(input, label);
+        var shared = configSearchParts(box).some(function (part) { return configSearchIsOtherField(part, input); });
+        input.configSearchBox = label && !shared ? box : input;
+    }
+    return input.configSearchBox;
+}
+
+// Hinweiszeile: die erste nach der Beschriftung und vor dem nächsten Feld.
+function configSearchFieldHint(input, label) {
+    var parts = configSearchParts(configSearchFieldFrame(input, label));
+    for (var p = parts.indexOf(label) + 1; label && p < parts.length; p++) {
+        if (configSearchIsOtherField(parts[p], input)) return null;
+        if (!parts[p].name && !parts[p].classList.contains('config-label') && !label.contains(parts[p])) return parts[p];
+    }
+    return null;
+}
+
+// Beschriftungen ändern sich auf der Seite nicht: Suchtext und Markierung eines Felds entstehen nur bei der ersten Suche.
+function configSearchFieldText(input) {
+    if (input.configSearchText === undefined) {
+        var name = input.getAttribute('name') || '';
+        var match = name.match(/values\[(.*?)\]/);
+        var label = configSearchFieldLabel(input);
+        var hint = configSearchFieldHint(input, label);
+        input.configSearchText = [match ? match[1] : '', label ? label.textContent : '', label ? label.getAttribute('data-tooltip') : '', hint ? hint.textContent : ''].join(' ');
+    }
+    return input.configSearchText;
+}
+
 function filterConfig() {
     var input = document.getElementById('configSearch');
     if (!input) return;
     var filter = input.value.trim().toLowerCase();
     var groups = document.getElementsByClassName('config-group-el');
+    var oldHits = document.querySelectorAll('.config-search-hit');
+    for (var oh = 0; oh < oldHits.length; oh++) {
+        oldHits[oh].classList.remove('config-search-hit');
+    }
 
     for (var j = 0; j < groups.length; j++) {
         var groupTitle = (groups[j].querySelector('.config-header')?.textContent || '').toLowerCase();
         var groupSearchText = (groups[j].getAttribute('data-search-text') || groupTitle).toLowerCase();
         var items = groups[j].querySelectorAll('.config-item');
-        var groupMatches = groupSearchText.includes(filter);
+        var groupMatches = configSearchMatches(filter, groupSearchText);
 
         for (var i = 0; i < items.length; i++) {
             var key = items[i].getAttribute('data-search-key') || '';
             var isDefaultHidden = items[i].getAttribute('data-default-hidden') === 'true';
+            var itemLabel = items[i].querySelector('.config-label');
+            var itemText = [key, itemLabel ? itemLabel.textContent : '', itemLabel ? itemLabel.getAttribute('data-tooltip') : ''].join(' ');
 
             if (filter.length > 0) {
-                if (key.includes(filter)) { items[i].style.display = ""; }
+                if (configSearchMatches(filter, itemText)) { items[i].style.display = ""; items[i].classList.add('config-search-hit'); }
                 else if (groupMatches && !isDefaultHidden) { items[i].style.display = ""; }
                 else { items[i].style.display = "none"; }
             } else {
@@ -15261,12 +15385,10 @@ function filterConfig() {
         if (filter.length > 0) {
             var customInputs = groups[j].querySelectorAll('input[name^="values["], select[name^="values["], textarea[name^="values["]');
             for (var ci = 0; ci < customInputs.length; ci++) {
-                var cName = customInputs[ci].getAttribute('name') || '';
-                var match = cName.match(/values\[(.*?)\]/);
-                var cKey = match ? match[1].toLowerCase() : '';
-                var cLabel = (customInputs[ci].closest('.col-12, .col-6, .col-md-6, .col-lg-4, .col-lg-3, .col-lg-2, div')?.querySelector('.config-label')?.textContent || '').toLowerCase();
-                if (cKey.includes(filter) || cLabel.includes(filter)) {
+                if (customInputs[ci].type === 'hidden') continue;
+                if (configSearchMatches(filter, configSearchFieldText(customInputs[ci]))) {
                     hasVisibleItems = true;
+                    configSearchFieldBox(customInputs[ci]).classList.add('config-search-hit');
                     var parentDet = customInputs[ci].closest('details');
                     while (parentDet) {
                         parentDet.open = true;
@@ -16351,46 +16473,45 @@ function marketDayNeed(c, rows, stock, cut, cost, credit = null) {
         horizon = Math.min(usable, Math.max(0, horizon - r.deficit) + r.surplus * c.efficiency);
         if (!inWindow && stockEnd === null) stockEnd = energy;
         if (credit && !inWindow && i >= checked) {
-            const w = marketDayWindow(rows, i, credit.cap);
+            const cap = Math.min(credit.cap, credit.ref * (1 + c.margin / 100));
+            const w = marketDayWindow(rows, i, cap);
             checked = w ? w.end : i + 1;
-            if (w && w.ref <= credit.ref * (1 + c.margin / 100) + .001 && c.grid && c.enabled && c.charge * .73 >= 300) {
-                const project = initial => {
+            if (w && c.grid && c.enabled && c.charge * .73 >= 300) {
+                // Sollbestand: physikalische Ladefähigkeit; Bestand: ausführbarer Auftrag.
+                // Der innere Nachweis verwendet nur Ladefähigkeiten, keine weiteren Aufträge.
+                let proof = {active: false, gridWh: 0};
+                if (!credit.capacityOnly) {
                     const sub = rows.slice(i);
-                    const need = marketDayNeed(c, sub, initial, w.end - i, marketDayThresholds(c, w.ref).cost);
-                    return marketDayJob(c, sub, initial, {...w, start: 0, end: w.end - i}, need, w.ref);
-                };
-                const proof = project(energy);
-                if (proof.active && (c.profile === 'comfort' || proof.benefit !== null && proof.benefit >= marketDayThresholds(c, w.ref).grid)) {
-                    const projection = project(required);
-                    let left = proof.gridWh * c.efficiency;
-                    let projected = projection.active ? projection.gridWh * c.efficiency : 0;
-                    const entry = {...proof, ...w, deliveryEnd: w.endTs - 900000};
-                    proofs.push(entry);
-                    for (let j = i; j < w.end; j++) {
-                        const hours = Math.max(0, Math.min(rows[j].end, entry.deliveryEnd) - rows[j].ts) / 3600000;
-                        const amount = Math.min(left, c.charge * .73 * hours * c.efficiency);
-                        const amountRequired = Math.min(projected, c.charge * .73 * hours * c.efficiency);
-                        credits.set(j, [amount, amountRequired]); left -= amount; projected -= amountRequired;
-                    }
+                    const need = marketDayNeed(c, sub, energy, w.end - i, marketDayThresholds(c, w.ref).cost,
+                        {...credit, ref: w.ref, capacityOnly: true});
+                    proof = marketDayJob(c, sub, energy, {...w, start: 0, end: w.end - i}, need, w.ref);
+                    if (c.profile !== 'comfort' && !(proof.benefit !== null && proof.benefit >= marketDayThresholds(c, w.ref).grid)) proof = {active: false, gridWh: 0};
+                }
+                const entry = {...proof, ...w, deliveryEnd: w.endTs - 900000};
+                if (proof.active) proofs.push(entry);
+                let left = proof.active ? proof.gridWh * c.efficiency : 0;
+                for (let j = i; j < w.end; j++) {
+                    const hours = Math.max(0, Math.min(rows[j].end, entry.deliveryEnd) - rows[j].ts) / 3600000;
+                    const capacity = c.charge * .73 * hours * c.efficiency;
+                    const amount = credit.capacityOnly ? capacity : Math.min(left, capacity);
+                    credits.set(j, [amount, capacity, credit.capacityOnly || proof.active]); left -= amount;
                 }
             }
         }
-        const cheap = credits.has(i);
+        const requiredCheap = credits.has(i), cheap = requiredCheap && credits.get(i)[2];
         const uncovered = cheap || inWindow ? 0 : Math.max(0, r.deficit - Math.max(0, energy));
         if (!cheap && !inWindow) energy -= Math.min(Math.max(0, energy), r.deficit);
         energy = Math.min(usable, energy + r.surplus * c.efficiency);
         if (uncovered > .001 && r.price + .001 >= cost) served.push({wh: Math.round(uncovered * 1000) / 1000, price: r.price});
         if (!inWindow) {
-            const missing = cheap ? 0 : Math.max(0, r.deficit - required);
-            if (!cheap) required = Math.max(0, required - r.deficit);
+            const missing = requiredCheap ? 0 : Math.max(0, r.deficit - required);
+            if (!requiredCheap) required = Math.max(0, required - r.deficit);
             required = Math.min(usable, required + r.surplus * c.efficiency);
             requiredTotal += missing;
             if (r.price + .001 >= cost) requiredEcon += missing;
         }
-        if (cheap) {
-            energy = Math.min(usable, energy + credits.get(i)[0]);
-            if (!inWindow) required = Math.min(usable, required + credits.get(i)[1]);
-        }
+        if (cheap) energy = Math.min(usable, energy + credits.get(i)[0]);
+        if (requiredCheap && !inWindow) required = Math.min(usable, required + credits.get(i)[1]);
     }
     if (stockEnd === null) stockEnd = energy;
     const requiredStock = Math.min(usable, requiredEcon + buffer);
@@ -16683,7 +16804,7 @@ function updateMarketPathPreview() {
     put('[data-market-preview-tariff]', !input.rows.length ? (input.dynamic ? '—' : input.note) : (fixed ? 'Fixpreis: Marktpfad aus' : octopus ? 'Octopus Heat' : special ? 'Spezialtarif' : 'EPEX / dynamisch') + ' · Profil ' + MARKET_CHARGE_PROFILE_PRESETS[c.profile].label);
     const note = c.profile === 'comfort'
         ? `Komfort: Preislimit ${c.limit > 0 ? marketPathPreviewFormat(c.limit, 1) + ' ct/kWh' : 'Tarif-Mittelpreis'}, Ziel ${marketPathPreviewFormat(c.target, 0)} %. PV zuerst, Netz für den Rest bis zum Fensterende. Halten bis zum nächsten Komfortfenster, ohne Pufferabzug.`
-        : `Halten mit Mindestabstand und 5 % Haltemarge. Der Pufferanteil jedes Netzladeauftrags zählt nicht als Nachladen. Netzladen: ×${marketPathPreviewFormat(1 / c.efficiency, 2)} Wirkungsgrad, ${marketPathPreviewFormat(c.degradation, 1)} ct Akku, ${marketPathPreviewFormat(c.safety, 2)} ct Sicherheit, ${marketPathPreviewFormat(c.margin, 1)} % Marge. PV-autark zuerst blockiert bei ausreichender Deckung.`;
+        : `Halten mit Mindestabstand und 5 % Haltemarge. Der Pufferanteil jedes Netzladeauftrags zählt nicht als Nachladen. Netzladen: ×${marketPathPreviewFormat(1 / c.efficiency, 2)} Wirkungsgrad, ${marketPathPreviewFormat(c.degradation, 1)} ct Akku, ${marketPathPreviewFormat(c.safety, 2)} ct Sicherheit, ${marketPathPreviewFormat(c.margin, 1)} % Marge. PV-autark zuerst blockiert bei ausreichender Deckung. E3DC-Control rechnet die Ladefähigkeit späterer günstiger Fenster in den Bedarf ein.`;
     put('[data-market-formula-note]', !input.rows.length ? (input.dynamic ? '—' : input.note) : fixed ? 'Fixer Arbeitspreis: kein normaler Marktpfad.' : note);
     const info = document.querySelector('[data-market-preview-info]');
     if (info) info.setAttribute('data-tooltip', 'Halten nach zeitlicher Verteilung von Bestand, PV und nachweisbar günstigerem Nachladen. Der Pufferanteil zählt nicht als Nachladen; Komfort ohne Pufferabzug. Netzladen gegen den mengengewichteten Nutzen der versorgten Defizit-Slots prüfen. Freigaben, Reserve und Prognosedeckung berücksichtigen. Beispiel: Bei 85 % Wirkungsgrad, 4 ct/kWh Akkukosten und 24,91 ct/kWh im günstigen Fenster kostet nachgeladene Energie rund 33,3 ct/kWh. Liegt der aktuelle Bezugspreis darunter, zählt sie nicht als Ersatz. Eine negative Sicherheitskorrektur senkt diese Ersatzkosten rechnerisch und kann tatsächlich teureres Umladen auslösen. Bei negativen Börsenpreisen kann die Vorschau von der Regelung abweichen; der gesonderte Negativpreis-Boost ist nicht enthalten.');
@@ -18491,6 +18612,33 @@ function toggleDirectMarketingDetails(checked) {
     scheduleStorageCurveConfigPreview();
 }
 
+// Beim Einschalten der Direktvermarktung und beim Wechsel der Strategie nennt ein Hinweis die Zusatzschalter, die in der
+// Grundeinstellung an, hier aber aus sind. Kein Wert wird geändert; ohne Auslöser wird nur ein sichtbarer Hinweis nachgeführt.
+function updateDirectMarketingOffHint(trigger) {
+    const hint = document.getElementById('direct_marketing_off_hint');
+    const toggle = document.getElementById('conf_direct_marketing_enable');
+    if (!hint || !toggle || (!trigger && hint.hidden)) return;
+    const off = Array.from(document.querySelectorAll('#direct_marketing_details [data-dv-default-on]'))
+        .filter(element => !element.hidden && !element.querySelector('input[type="checkbox"]').checked);
+    hint.hidden = !toggle.checked || off.length === 0;
+    if (trigger) {
+        const anchor = trigger === toggle ? document.querySelector('#direct_marketing_details > .alert') : trigger.closest('[class*="col-"]');
+        if (anchor) anchor.after(hint);
+    }
+    hint.querySelector('[data-dv-off-list]').replaceChildren(...off.flatMap((element, index) => {
+        const input = element.querySelector('input[type="checkbox"]');
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'btn btn-link btn-sm p-0 align-baseline';
+        button.textContent = element.querySelector('label').textContent.trim();
+        button.addEventListener('click', () => {
+            input.scrollIntoView({block: 'center', behavior: 'smooth'});
+            input.focus({preventScroll: true});
+        });
+        return index ? [', ', button] : [button];
+    }));
+}
+
 function refreshDirectMarketingPowerValidationMarkers() {
     const directMarketingEnabled = storageCurvePreviewBool('direct_marketing_enable', false);
     [
@@ -18633,14 +18781,20 @@ document.addEventListener('DOMContentLoaded', function () {
     });
 });
 
+// Gleichnamige Felder: das der erweiterten Ansicht, bei Schaltern die Checkbox statt des versteckten Standardfelds.
+function configFocusTarget(focusKey) {
+    const selector = `[name="values[${focusKey.replace(/"/g, '\\"')}]"]`;
+    const fields = Array.from(document.querySelectorAll(`#configAdvancedView ${selector}`));
+    return fields.find(field => field.type !== 'hidden') || fields[0] || document.querySelector(selector);
+}
+
 // Gruppe anhand der URL automatisch öffnen
 document.addEventListener('DOMContentLoaded', function() {
     const urlParams = new URLSearchParams(window.location.search);
     const focusKey = urlParams.get('focus');
     if (focusKey) {
         setConfigEditorView('advanced');
-        const selectorKey = focusKey.replace(/"/g, '\\"');
-        const target = document.querySelector(`[name="values[${selectorKey}]"]`);
+        const target = configFocusTarget(focusKey);
         if (target) {
             let parentDetails = target.closest('details');
             while (parentDetails) {
@@ -18656,7 +18810,8 @@ document.addEventListener('DOMContentLoaded', function() {
             }
             const item = target.closest('.config-item') || target.closest('.row') || target.parentElement;
             setTimeout(() => {
-                target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                // Ein Feld ohne sichtbare Eingabe (PV-Fläche) hat kein Layout; dann zählt sein Rahmen.
+                (target.type === 'hidden' && item ? item : target).scrollIntoView({ behavior: 'smooth', block: 'center' });
                 if (typeof target.focus === 'function') target.focus({ preventScroll: true });
                 if (item) {
                     item.classList.add('config-focus-pulse');

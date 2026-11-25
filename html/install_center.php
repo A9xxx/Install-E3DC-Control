@@ -1636,6 +1636,113 @@ function installCenterReadJsonAssoc($path) {
     return is_array($decoded) ? $decoded : [];
 }
 
+/** Beschriftung einer eingetragenen Auswahl aus den Modulfeldern; unbekannte Werte bleiben ohne Beschriftung. */
+function installCenterSetupChoice($moduleKey, $fieldKey, $value) {
+    foreach (installCenterModuleConfigFields($moduleKey) as $field) {
+        if (($field['key'] ?? '') !== $fieldKey) continue;
+        foreach ($field['options'] as $option) {
+            if ((string)$option['value'] === (string)$value) return (string)$option['label'];
+        }
+    }
+    return null;
+}
+
+/**
+ * Lesende Angaben für die Karte „Einrichtungsstand“: Zustände, Alter und Schalter aus vorhandenen Dateien.
+ * Zugangsdaten und übrige Konfigurationswerte bleiben draußen; fehlende oder unlesbare Quellen sind null.
+ */
+function installCenterSetupOverview($contract, $loaded, $version, $ramdisk = '/var/www/html/ramdisk') {
+    $age = static function ($name) use ($ramdisk) {
+        $mtime = is_file($ramdisk . '/' . $name) ? @filemtime($ramdisk . '/' . $name) : false;
+        $seconds = $mtime === false ? -1 : time() - $mtime;
+        return $seconds >= 0 ? $seconds : null;
+    };
+    $json = static function ($name) use ($ramdisk) {
+        return installCenterReadJsonAssoc($ramdisk . '/' . $name);
+    };
+    $release = static function ($value) {
+        return is_string($value) && preg_match('/^[0-9]+\.[0-9]+\.[0-9]+[A-Za-z0-9._-]*$/D', $value) ? $value : '';
+    };
+    $contract = is_array($contract) ? $contract : [];
+    $config = is_array($loaded) && empty($loaded['error']) && is_array($loaded['config'] ?? null) ? $loaded['config'] : [];
+    $readable = $config !== [] && ($contract['success'] ?? null) === true && ($contract['config_readable'] ?? null) === true;
+    $wallbox = static function ($fieldKey) use ($config) {
+        $type = normalizeWallboxTypeConfig($config[$fieldKey] ?? '');
+        return isConfiguredWallboxTypeConfig($type) ? installCenterSetupChoice('wallbox', $fieldKey, $type) : null;
+    };
+    $wpType = trim((string)($config['wp_type'] ?? ''));
+    $haMode = strtolower(trim((string)($config['ha_mode'] ?? '')));
+
+    $live = $json('live_data_py.json');
+    $errors = $live['_errors'] ?? [];
+    $fetchedAt = $json('pv_forecast_meta.json')['fetched_at'] ?? null;
+    $fetched = is_string($fetchedAt) && preg_match('/^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2}):\d{2}/', $fetchedAt, $parts) ? $parts : null;
+    $connected = $json('mqtt_hub_status.json')['connections']['main']['connected'] ?? null;
+
+    $validation = $json('config_validation.json');
+    $warnings = 0;
+    $fields = [];
+    foreach (['storage', 'wallbox', 'consumer', 'price', 'forecast'] as $group) {
+        foreach ((is_array($validation[$group] ?? null) ? $validation[$group] : []) as $entry) {
+            if (!is_array($entry) || ($entry['severity'] ?? '') !== 'warning') continue;
+            $warnings++;
+            $key = is_string($entry['key'] ?? null) ? strtolower($entry['key']) : '';
+            // Nur Schlüssel und Beschriftung; die Meldung selbst enthält eingetragene Werte.
+            if (preg_match('/^[a-z0-9_]+$/D', $key) && !e3dcIsSensitiveConfigKey($key)) {
+                $fields[] = ['key' => $key, 'label' => is_string($entry['label'] ?? null) ? $entry['label'] : $key];
+            }
+        }
+    }
+    $checkedAt = is_numeric($validation['ts'] ?? null) ? (int)$validation['ts'] : 0;
+    $checkedAge = $checkedAt > 0 ? time() - $checkedAt : -1;
+
+    $update = null;
+    foreach (['e3dc_update_status.json', 'e3dc_self_update_status.json'] as $name) {
+        $updateAge = $age($name);
+        if ($updateAge === null || ($update !== null && $update['age_s'] <= $updateAge)) continue;
+        $status = $json($name);
+        $update = [
+            'age_s' => $updateAge,
+            'success' => ($status['success'] ?? null) === true && empty($status['updating']) && empty($status['skipped']),
+            'missing' => in_array($status['missing'] ?? null, [0, 1], true) ? $status['missing'] : null,
+            'current' => $release($status['current_version'] ?? null),
+            'target' => $release($status['target_version'] ?? null),
+        ];
+    }
+
+    return [
+        'success' => true,
+        'docker' => e3dcIsDockerEnvironment() || ($contract['docker'] ?? null) === true,
+        'version' => $release($version),
+        'web_access' => $config === [] ? 'unknown' : ((string)($config['web_pin'] ?? '') === '' ? 'unset' : 'set'),
+        'config' => !$readable ? ['readable' => false] : [
+            'readable' => true,
+            'configured_services' => array_values(array_filter((array)($contract['configured_services'] ?? []), 'is_string')),
+            'spot_tariff' => ($contract['spot_tariff'] ?? null) === true,
+            'direct_marketing' => ($contract['direct_marketing'] ?? null) === true,
+            'update_check' => ($config['check_updates'] ?? '1') !== '0',
+            'role' => in_array($haMode, ['', 'off'], true) ? 'single' : ($haMode === 'master' ? 'master' : 'standby'),
+            'wallboxes' => [$wallbox('wb_native_type'), $wallbox('wb_native_type2')],
+            // Nur direkt angebundene Typen; SG-Ready und reine Messung tragen keinen Gerätetyp.
+            'heatpump' => in_array($wpType, ['0', '1', '4', '5'], true) ? installCenterSetupChoice('heatpump', 'wp_type', $wpType) : null,
+        ],
+        'live' => [
+            'age_s' => $age('live_data_py.json'),
+            'readable' => isset($live['_ts']),
+            'errors' => is_array($errors) ? count($errors) : null,
+        ],
+        'forecast' => $fetched === null ? null : ['date' => $fetched[1], 'time' => $fetched[2], 'today' => $fetched[1] === date('Y-m-d')],
+        'prices' => ['age_s' => $age('epex_daten.json'), 'filled' => $json('epex_daten.json') !== []],
+        'mqtt' => ['age_s' => $age('mqtt_hub_status.json'), 'connected' => is_bool($connected) ? $connected : null],
+        'validation' => [
+            'age_s' => $checkedAge >= 0 ? $checkedAge : null,
+            'warnings' => ($validation['summary']['warnings'] ?? null) === $warnings ? $warnings : null,
+            'fields' => $fields,
+        ],
+        'update' => $update,
+    ];
+}
+
 function installCenterPowerRound($value) {
     if (!is_numeric($value)) return null;
     return round((float)$value, 3);
@@ -2374,7 +2481,7 @@ function installCenterStorageComparisonCard() {
     $status = !empty($state['gesperrt']) ? 'Stillgelegt: Schreibweg erkannt' : ($fresh ? 'Vergleich aktiv' : 'Keine aktuellen Daten');
     $last = is_array($state['vergleich_letzter_zyklus'] ?? null) ? $state['vergleich_letzter_zyklus'] : [];
     $class = in_array($last['klasse'] ?? '', ['gleich', 'U', 'A0', 'A1', 'A2', 'A3', 'A4'], true) ? $last['klasse'] : 'unbekannt';
-    $pair = preg_match('/^(FREI|KURVE|HALTEN|NETZLADEN|SONDER)×(FREI|KURVE|HALTEN|NETZLADEN|SONDER)$/u', (string)($last['moduspaar'] ?? '')) ? $last['moduspaar'] : 'unbekannt';
+    $pair = preg_match('/^(FREI|KURVE|HALTEN|NETZLADEN|SONDER|ENTLADEN|LADEN)×(FREI|KURVE|HALTEN|NETZLADEN|SONDER|ENTLADEN|LADEN)$/u', (string)($last['moduspaar'] ?? '')) ? $last['moduspaar'] : 'unbekannt';
     $today = is_array($state['heute'] ?? null) && ($state['heute']['tag'] ?? 0) == (int)date('Ymd') ? $state['heute'] : [];
     $counts = $today['klassen'] ?? array_fill(0, 7, 0);
     $comparable = (int)($today['vergleichbar'] ?? 0);
@@ -2388,6 +2495,31 @@ function installCenterStorageComparisonCard() {
         $a3 += (int)($hour[4][4] ?? 0); $a4 += (int)($hour[4][5] ?? 0);
     }
     $a3 += (int)($counts[4] ?? 0); $a4 += (int)($counts[5] ?? 0);
+    // Schrankenbefunde, die eine vorrangige Klasse (nicht vergleichbar, Schreibweg) verdeckt hat.
+    $hidden = array_sum(array_map('intval', is_array($today['verdeckt'] ?? null) ? $today['verdeckt'] : []));
+    foreach (($aggregate['stunden'] ?? []) as $hour) {
+        if (($hour[1] ?? 0) == ($today['tag'] ?? -1) || !is_array($hour[11] ?? null)) continue;
+        $hidden += array_sum(array_map('intval', $hour[11]));
+    }
+    // Häufigste Ursachen nicht vergleichbarer Zyklen heute, als feste Codes hinter den älteren 19; die Namen
+    // stehen im Aggregat des Schreibers (eine Quelle).
+    $codeNames = is_array($aggregate['codes_spalten'] ?? null) ? array_values(array_filter($aggregate['codes_spalten'], 'is_string')) : [];
+    $places = ['beobachtung' => 'Beobachten', 'live_fehlt' => 'Livedaten fehlen', 'handover' => 'Übergabe', 'fallback' => 'Rückfall',
+        'ausgang' => 'Ausgang', 'konfiguration' => 'Konfiguration', 'besitzer' => 'anderer Besitzer'];
+    $causeLabel = static function ($code) use ($places) {
+        if (str_starts_with($code, 'nicht_abgedeckt:')) return substr($code, 16) . ' nicht abgedeckt';
+        if (str_starts_with($code, 'produktpfad_ohne_vergleich:')) return 'Produktpfad ohne Vergleich (' . ($places[substr($code, 27)] ?? 'unbekannt') . ')';
+        return ['eingang_ungebunden' => 'Eingang nicht gebunden', 'neustart' => 'Neustart', 'produkt_sonder' => 'Sonderzustand des Produkts',
+            'zeitbudget' => 'Zeitbudget überschritten', 'schattenfehler' => 'Diagnosefehler', 'gesperrt' => 'Vergleich stillgelegt'][$code] ?? $code;
+    };
+    $causes = [];
+    foreach (array_slice($codeNames, 19, null, true) as $i => $code) {
+        $n = (int)(($today['codes'] ?? [])[$i] ?? 0);
+        if ($n > 0) $causes[$code] = $n;
+    }
+    arsort($causes);
+    $causeText = [];
+    foreach (array_slice($causes, 0, 3, true) as $code => $n) $causeText[] = $causeLabel($code) . ' ' . $n;
     $coverage = [];
     $coverageKnown = true;
     $names = ['Pre-Dump', 'Unwetter', 'Wärme-Tarif', 'Lastspitzen', 'Direktvermarktung', 'Preis-Boost', 'Vorhaltung'];
@@ -2402,14 +2534,14 @@ function installCenterStorageComparisonCard() {
     $values = [
         'Stand' => $status,
         'Letzter Vergleich' => $class . ' · ' . $pair,
-        'Heute' => $shares,
-        'Schrankenkonflikte / Schreibweg' => $totalsKnown ? 'A3 ' . $a3 . ' / A4 ' . $a4 : 'unbekannt',
+        'Heute' => $shares . ($causeText ? '; nicht vergleichbar: ' . implode('; ', $causeText) : ''),
+        'Schrankenkonflikte / Schreibweg' => $totalsKnown ? 'A3 ' . $a3 . ' / A4 ' . $a4 . ($hidden > 0 ? ' · verdeckt ' . $hidden : '') : 'unbekannt',
         'Abdeckung / angefordert' => $coverage ? implode('; ', $coverage) : ($coverageKnown ? 'Keine Sonderfunktion konfiguriert' : 'unbekannt'),
         'Laufzeit p95' => is_numeric($p95) ? number_format($p95, 1, ',', '.') . ' ms' : 'unbekannt',
     ];
     $html = '<section id="storageComparisonCard" class="installer-status mb-3"><strong>Neue Speicherregelung im Vergleichsbetrieb</strong><div class="small text-secondary">E3DC-Control vergleicht Vorschläge. Die neue Regelung steuert keine Geräte.</div><dl class="row small mt-2 mb-0">';
     foreach ($values as $label => $value) {
-        $red = $label === 'Schrankenkonflikte / Schreibweg' && ($a3 + $a4) > 0 ? ' text-danger' : '';
+        $red = $label === 'Schrankenkonflikte / Schreibweg' && ($a3 + $a4 + $hidden) > 0 ? ' text-danger' : '';
         $html .= '<dt class="col-sm-4">' . htmlspecialchars($label, ENT_QUOTES, 'UTF-8') . '</dt><dd class="col-sm-8' . $red . '">' . htmlspecialchars($value, ENT_QUOTES, 'UTF-8') . '</dd>';
     }
     return $html . '</dl></section>';
@@ -3532,22 +3664,45 @@ function installCenterDiagnosticJsonExcerpt($value, $startTs, $endTs) {
     return $value;
 }
 
+function installCenterStorageComparisonColumns() {
+    // Feste Spalten des Vergleichsbetriebs. Ursachen nicht vergleichbarer Zyklen stehen hinter den älteren Codes.
+    $absent = ['zeitbudget','schattenfehler','gesperrt','produktpfad_ohne_vergleich:beobachtung','produktpfad_ohne_vergleich:live_fehlt',
+        'produktpfad_ohne_vergleich:handover','produktpfad_ohne_vergleich:fallback','produktpfad_ohne_vergleich:ausgang',
+        'produktpfad_ohne_vergleich:konfiguration','produktpfad_ohne_vergleich:besitzer'];
+    return ['codes' => array_merge(['GLEICH','MODUS','DAUER','LEISTUNG','FLATTERN','BUDGETFREIGABE','SCHUTZ_FEHLT','STRENGER','RESERVE','ANSCHLUSS','AUS','INSEL','LADESP','RESERVE_BUDGET','DATEN','NETZRAHMEN_UNBEKANNT','SCHREIBWEG','A0','U',
+        'eingang_ungebunden','neustart','nicht_abgedeckt:Pre-Dump','nicht_abgedeckt:Unwetter','nicht_abgedeckt:Wärme-Tarif','nicht_abgedeckt:Lastspitzen',
+        'nicht_abgedeckt:Direktvermarktung','nicht_abgedeckt:Preis-Boost','nicht_abgedeckt:Vorhaltung','nicht_abgedeckt:Sonderfunktion','produkt_sonder'], $absent),
+        'extra' => ['verdeckt'=>['RESERVE','NETZRAHMEN_UNBEKANNT','ANSCHLUSS','AUS','INSEL','LADESP','RESERVE_BUDGET','DATEN'],
+        'fehlstellen'=>['DIREKTVERMARKTUNG','LASTSPITZEN','VORAB_NETZFALLBACK','VORAB_PFLICHTFELD','UNWETTER_PLAN','UNWETTER_AUFTRAG',
+            'VORHALT_AUFNAHME','VORHALT_KAPAZITAET','HAND_ENTLADEN','HAND_OHNE_ZIEL','HAND_UNBEKANNT','MARKT_HALTEN','MARKT_LADEN','PREIS_BOOST','SONSTIGE',
+            'DV_EXPORT','DV_PV_SPEICHER','DV_KURVENFORMUNG','DV_PHASE5','DV_AUFNAHME','DV_LADEBLOCK_FENSTER','MARKT_AUFNAHME',
+            'PLATZSCHAFFEN','KURVE_HORIZONT','GEPLANTE_LAST'],
+        'diagnose'=>['BUDGET_WALLBOX','BUDGET_WAERMEPUMPE','BUDGET_HEIZSTAB','WAERME_FREIGABE','WAERME_AKTIV','UNWETTER_WIRKSAM','NEBENPROJEKTION_FEHLER','SMARTCHARGE']]];
+}
+
 function installCenterStorageComparisonExport($data) {
     // Ausschließlich fachliche Zahlen und feste Produktcodes passieren den Export.
-    $out = ['stunden_spalten'=>['beginn','tag','zyklen','vergleichbar','klassen','codes','abweichung_laengste_s','a3_a4','abdeckung','laufzeit_ms','betriebsfaelle'],
+    $columns = installCenterStorageComparisonColumns();
+    $codeNames = $columns['codes'];
+    $extra = $columns['extra'];
+    $out = ['stunden_spalten'=>['beginn','tag','zyklen','vergleichbar','klassen','codes','abweichung_laengste_s','a3_a4','abdeckung','laufzeit_ms','betriebsfaelle','verdeckt','fehlstellen','diagnose'],
         'klassen_spalten'=>['gleich','A0','A1','A2','A3','A4','U'],
-        'codes_spalten'=>['GLEICH','MODUS','DAUER','LEISTUNG','FLATTERN','BUDGETFREIGABE','SCHUTZ_FEHLT','STRENGER','RESERVE','ANSCHLUSS','AUS','INSEL','LADESP','RESERVE_BUDGET','DATEN','NETZRAHMEN_UNBEKANNT','SCHREIBWEG','A0','U'],
-        'abdeckung_spalten'=>['Pre-Dump','Unwetter','Wärme-Tarif','Lastspitzen','Direktvermarktung','Preis-Boost','Vorhaltung']];
+        'codes_spalten'=>$codeNames,
+        'abdeckung_spalten'=>['Pre-Dump','Unwetter','Wärme-Tarif','Lastspitzen','Direktvermarktung','Preis-Boost','Vorhaltung'],
+        'verdeckt_spalten'=>$extra['verdeckt'], 'fehlstellen_spalten'=>$extra['fehlstellen'], 'diagnose_spalten'=>$extra['diagnose']];
     $number = static fn($v) => is_int($v) || is_float($v) ? (is_finite((float)$v) ? $v : null) : null;
     foreach (['ts', 'version'] as $key) $out[$key] = $number($data[$key] ?? null);
     $out['gesperrt'] = ($data['gesperrt'] ?? null) === 'SCHREIBWEG';
     $last = $data['vergleich_letzter_zyklus'] ?? [];
     $out['vergleich_letzter_zyklus'] = [
         'klasse' => in_array($last['klasse'] ?? null, ['gleich','A0','A1','A2','A3','A4','U'], true) ? $last['klasse'] : null,
-        'code' => in_array($last['code'] ?? null, ['GLEICH','MODUS','DAUER','LEISTUNG','FLATTERN','BUDGETFREIGABE','SCHUTZ_FEHLT','STRENGER','RESERVE','ANSCHLUSS','AUS','INSEL','LADESP','RESERVE_BUDGET','DATEN','NETZRAHMEN_UNBEKANNT','SCHREIBWEG'], true) ? $last['code'] : null,
+        'code' => in_array($last['code'] ?? null, array_diff($codeNames, ['A0','U']), true) ? $last['code'] : null,
+        'verdeckt' => in_array($last['verdeckt'] ?? null, $extra['verdeckt'], true) ? $last['verdeckt'] : null,
+        'fehlstellen' => array_values(array_intersect($extra['fehlstellen'], is_array($last['fehlstellen'] ?? null) ? $last['fehlstellen'] : [])),
+        'diagnose' => array_values(array_intersect($extra['diagnose'], is_array($last['diagnose'] ?? null) ? $last['diagnose'] : [])),
         'dauer_s' => $number($last['dauer_s'] ?? null),
         'laufzeit_ms' => $number($last['laufzeit_ms'] ?? null)];
-    $pair = static fn($v) => is_string($v) && preg_match('/^(FREI|KURVE|HALTEN|NETZLADEN|SONDER)×(FREI|KURVE|HALTEN|NETZLADEN|SONDER)$/u', $v) ? $v : null;
+    $pair = static fn($v) => is_string($v) && preg_match('/^(FREI|KURVE|HALTEN|NETZLADEN|SONDER|ENTLADEN|LADEN)×(FREI|KURVE|HALTEN|NETZLADEN|SONDER|ENTLADEN|LADEN)$/u', $v) ? $v : null;
     $out['vergleich_letzter_zyklus']['moduspaar'] = $pair($last['moduspaar'] ?? null);
     $vector = static function($v, $n) use ($number) {
         $v = is_array($v) && array_is_list($v) ? $v : [];
@@ -3558,19 +3713,25 @@ function installCenterStorageComparisonExport($data) {
     foreach (['klassen'=>7, 'laufzeit_ms'=>4] as $key=>$n) $out['heute'][$key] = $vector($data['heute'][$key] ?? [], $n);
     $out['heute']['abdeckung'] = [];
     for ($i=0; $i<7; $i++) $out['heute']['abdeckung'][] = $vector($data['heute']['abdeckung'][$i] ?? [], 2);
+    foreach ($extra as $key => $names) $out['heute'][$key] = $vector($data['heute'][$key] ?? [], count($names));
+    $sparse = static function($v, $n) use ($number) {
+        $result = []; for ($i=0; $i<$n; $i++) if (isset($v[(string)$i])) $result[(string)$i] = $number($v[(string)$i]);
+        return $result;
+    };
     $out['stunden'] = [];
-    // Format 1 wird nicht weitergegeben; Format 2 hat feste Spalten.
+    // Format 1 wird nicht weitergegeben; Format 2 hat feste Spalten, ältere Zeilen ohne die drei hinteren.
     if (($data['version'] ?? null) === 2) foreach (array_slice($data['stunden'] ?? [], -336) as $row) {
-        if (!is_array($row) || !array_is_list($row) || count($row) !== 11) continue;
+        if (!is_array($row) || !array_is_list($row) || !in_array(count($row), [11, 14], true)) continue;
         $r = []; foreach ([0,1,2,3] as $i) $r[] = $number($row[$i]);
         $r[] = $vector($row[4], 7);
-        $codes = []; for ($i=0; $i<19; $i++) if (isset($row[5][(string)$i])) $codes[(string)$i] = $number($row[5][(string)$i]);
-        $r[] = $codes;
+        $r[] = $sparse($row[5], count($codeNames));
         $r[] = $number($row[6]); $r[] = $number($row[7]);
         $coverage = []; for ($i=0; $i<7; $i++) $coverage[] = $vector($row[8][(string)$i] ?? [], 2);
         $r[] = $coverage; $r[] = $vector($row[9], 2);
         $cases = []; foreach (($row[10] ?? []) as $key => $value) if ($pair($key)) $cases[$key] = $vector($value, 4);
-        $r[] = $cases; $out['stunden'][] = $r;
+        $r[] = $cases;
+        $i = 11; foreach ($extra as $names) { $r[] = $sparse($row[$i] ?? [], count($names)); $i++; }
+        $out['stunden'][] = $r;
     }
     $out['zeitraum'] = $vector($data['zeitraum'] ?? [], 2);
     return $out;
@@ -4448,6 +4609,21 @@ if (isset($_GET['action']) && $_GET['action'] === 'job_status') {
     exit;
 }
 
+if (isset($_GET['action']) && $_GET['action'] === 'setup_overview') {
+    requireWebAuth(true);
+    header('Content-Type: application/json; charset=utf-8');
+    if (($_SERVER['REQUEST_METHOD'] ?? '') !== 'GET') {
+        http_response_code(405);
+        echo json_encode(['success' => false, 'error' => 'Einrichtungsstand nur per GET lesbar'], JSON_UNESCAPED_UNICODE);
+        exit;
+    }
+    echo json_encode(
+        installCenterSetupOverview(runInstallerAction('setup_overview'), loadE3dcConfig(), readInstalledVersion()),
+        JSON_UNESCAPED_UNICODE | JSON_INVALID_UTF8_SUBSTITUTE
+    );
+    exit;
+}
+
 if (isset($_GET['action']) && $_GET['action'] === 'run_job') {
     requireWebAuth(true);
     header('Content-Type: application/json; charset=utf-8');
@@ -4643,7 +4819,37 @@ if (isset($_GET['action']) && $_GET['action'] === 'check_runtime_permissions_rep
         .return-nav { position: sticky; top: 0; z-index: 100; padding: 12px 0; margin-bottom: 8px; background: var(--bg); border-bottom: 1px solid var(--line); }
         .back-btn { display: inline-flex; align-items: center; border: 1px solid #3a4148; color: #ced4da; text-decoration: none; padding: 7px 12px; border-radius: 6px; }
         .back-btn:hover { border-color: var(--cyan); color: #fff; }
-        .security-note { border: 1px solid rgba(0,217,255,.35); background: rgba(0,217,255,.08); border-radius: 8px; padding: 12px 14px; }
+        .setup-card { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 16px 18px; margin-bottom: 16px; }
+        .setup-card h2 { font-size: 1.1rem; margin: 0 0 4px; }
+        .setup-lead, .setup-explain { color: #a0a0a0; font-size: .88rem; line-height: 1.45; }
+        .setup-lead { margin-bottom: 12px; }
+        .setup-explain + .setup-explain { margin-top: 6px; }
+        .setup-summary { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 12px; }
+        .setup-pill { border-radius: 999px; padding: 4px 12px; font-size: .85rem; border: 1px solid var(--line); color: #a0a0a0; }
+        .setup-pill.is-ok { color: #2ecc71; border-color: rgba(46,204,113,.5); }
+        .setup-pill.is-warn { color: #f1c40f; border-color: rgba(241,196,15,.5); }
+        .setup-pill.is-bad { color: #ff5f78; border-color: rgba(231,76,60,.5); }
+        .setup-group { font-size: .8rem; text-transform: uppercase; letter-spacing: .05em; color: #a0a0a0; margin: 12px 0 6px; }
+        .setup-row { display: grid; grid-template-columns: 28px minmax(0, 1fr) auto; gap: 10px; align-items: center; padding: 8px 10px; border-radius: 10px; }
+        .setup-row + .setup-row { border-top: 1px solid #2a2a2a; }
+        .setup-icon { font-size: 1.05rem; text-align: center; color: #8f98a3; }
+        .setup-row.is-ok .setup-icon { color: #2ecc71; }
+        .setup-row.is-warn .setup-icon { color: #f1c40f; }
+        .setup-row.is-bad .setup-icon { color: #ff5f78; }
+        .setup-what { color: #e9ecef; font-weight: 600; }
+        .setup-why { color: #a0a0a0; font-size: .85rem; margin-top: 2px; overflow-wrap: anywhere; }
+        .setup-why a { color: #0dcaf0; }
+        .setup-actions { display: flex; flex-wrap: wrap; gap: 6px; justify-content: flex-end; }
+        .setup-action { color: #0dcaf0; background: none; border: 1px solid rgba(13,202,240,.5); border-radius: 999px; padding: 4px 12px; font-size: .82rem; text-decoration: none; cursor: pointer; }
+        .setup-action:hover { color: #fff; border-color: #0dcaf0; }
+        .setup-focus { outline: 2px solid #0dcaf0; outline-offset: 2px; }
+        .setup-tools summary { cursor: pointer; color: #0dcaf0; font-weight: 600; }
+        .setup-tool { display: grid; grid-template-columns: 250px minmax(0, 1fr); gap: 12px; align-items: center; margin-top: 10px; }
+        @media (max-width: 760px) {
+            .setup-row { grid-template-columns: 24px minmax(0, 1fr); }
+            .setup-actions { grid-column: 2; justify-content: flex-start; }
+            .setup-tool { grid-template-columns: 1fr; gap: 4px; }
+        }
         .module-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(330px, 1fr)); gap: 14px; }
         .module-card { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 15px; min-height: 228px; }
         .module-card.core { border-left: 4px solid #0d6efd; }
@@ -4674,7 +4880,8 @@ if (isset($_GET['action']) && $_GET['action'] === 'check_runtime_permissions_rep
         .advanced-actions .module-actions { margin-top: 8px; }
         .btn-locked { opacity: .58; cursor: not-allowed; }
         .action-hint { color: #8f98a3; font-size: .78rem; margin-top: 8px; line-height: 1.35; }
-        .utility-bar { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin: 16px 0 18px; }
+        .utility-bar { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin: 12px 0 14px; }
+        .utility-bar .btn small { display: block; font-size: .72rem; opacity: .8; }
         .installer-status { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; margin: 0 0 16px; }
         .installer-status-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
         .installer-status-badges { display: flex; gap: 8px; flex-wrap: wrap; }
@@ -4781,7 +4988,7 @@ if (isset($_GET['action']) && $_GET['action'] === 'check_runtime_permissions_rep
     <div class="topbar">
         <div>
             <h1 class="mt-3 mb-1 fw-bold"><i class="fas fa-screwdriver-wrench text-info me-2"></i>Installationszentrale</h1>
-            <div class="text-secondary">Module installieren, Dienste prüfen und optionale Verbraucher sauber aktivieren oder deaktivieren.</div>
+            <div class="text-secondary">Dienste einrichten, prüfen und reparieren.</div>
         </div>
         <button class="btn btn-outline-info rounded-pill" onclick="loadInstallCenter()"><i class="fas fa-rotate me-1"></i> Aktualisieren</button>
     </div>
@@ -4796,65 +5003,82 @@ if (isset($_GET['action']) && $_GET['action'] === 'check_runtime_permissions_rep
     </section>
     <?php endif; ?>
 
-    <div class="security-note mb-3">
-        <div class="fw-bold"><i class="fas fa-shield-halved me-2"></i>Sicherheitsmodell</div>
-        <div class="small mt-1">
-            Diese Seite nutzt nur den zentralen Modul-Katalog und die erlaubte Service-Steuerung.
-            Freie Shell-Befehle, beliebige Dienstnamen und der alte C++-Dienst <code>e3dc.service</code> sind hier nicht vorgesehen.
-        </div>
-    </div>
+    <section class="setup-card" aria-labelledby="setupOverviewTitle">
+        <h2 id="setupOverviewTitle">Einrichtungsstand</h2>
+        <div class="setup-lead">Was eingerichtet ist, was noch fehlt und was auffällt. Ein Klick auf „Zum Feld“ öffnet die passende Einstellung im Config-Editor. <span id="setupOverviewTime"></span></div>
+        <div id="setupOverview" class="text-secondary">Lade Einrichtungsstand...</div>
+    </section>
 
-    <div class="alert alert-warning border-warning bg-warning bg-opacity-10 text-warning small">
-        <i class="fas fa-triangle-exclamation me-1"></i>
-        Sicherer Installationsmodus: Dienst-Start/Stop läuft nur für erlaubte Dienste.
-        „Nur Rechte prüfen“ ist read-only. „Rechte reparieren“ korrigiert nur die Metadaten bekannter Pfade – ohne Backup,
-        Update oder Dienstneustart. „System reparieren“ bleibt getrennt und startet den vollständigen Stable-Abgleich.
-        Nutzerbeschreibbarer Installer-Code erhält keine sudo-Freigabe.
-        Core-Dienste bleiben gegen Start, Stop und Deinstallation geschützt; erlaubt sind Neustart und Diagnose.
-    </div>
+    <section class="setup-card" aria-labelledby="maintenanceTitle">
+        <h2 id="maintenanceTitle">Wartung</h2>
+        <div class="setup-explain">Diese Seite startet, stoppt und installiert nur die bekannten Dienste von E3DC-Control. Eigene Befehle oder fremde Dienste sind hier nicht möglich. Die Grunddienste (Live-Daten, Prognose, Preise, Speicherplan, Speicherregelung, Benachrichtigungen) lassen sich neu starten, aber nicht anhalten oder entfernen.</div>
+        <div class="setup-explain">„Nur Rechte prüfen“ liest nur. „Rechte reparieren“ korrigiert nur Besitzer, Gruppe und Zugriffsrechte bekannter Dateien, ohne Sicherung, Update oder Neustart. „System reparieren“ legt eine Sicherung an, spielt die neueste veröffentlichte Version ein (auch dieselbe erneut), setzt die Rechte und startet die Dienste neu.</div>
 
     <div class="utility-bar">
         <button class="btn btn-outline-info rounded-pill" onclick="runGlobalAction('permissions_check')">
-            <i class="fas fa-shield-halved me-1"></i> Nur Rechte prüfen (keine Änderung)
+            <i class="fas fa-shield-halved me-1"></i> Nur Rechte prüfen<small>liest nur, ändert nichts</small>
         </button>
         <button id="systemRepairButton" class="btn btn-outline-warning rounded-pill" onclick="runPermissionRepairUpdate()" <?php if (e3dcIsDockerEnvironment()) echo 'disabled'; ?>>
-            <i class="fas fa-tools me-1"></i> System reparieren (Backup + Stable-Abgleich)
-        </button>
-        <button class="btn btn-outline-secondary rounded-pill" onclick="runGlobalAction('write_readiness')">
-            <i class="fas fa-user-shield me-1"></i> Freigabe prüfen
-        </button>
-        <button class="btn btn-outline-secondary rounded-pill" onclick="runGlobalAction('write_permission_plan')">
-            <i class="fas fa-file-shield me-1"></i> Freigabe-Plan
-        </button>
-        <button class="btn btn-outline-secondary rounded-pill" onclick="runGlobalJob('write_permission_plan')">
-            <i class="fas fa-clipboard-list me-1"></i> Freigabe-Job
-        </button>
-        <button class="btn btn-outline-info rounded-pill" onclick="runGlobalAction('backup_plan')">
-            <i class="fas fa-box-archive me-1"></i> Backup-Plan
-        </button>
-        <button class="btn btn-outline-info rounded-pill" onclick="runGlobalJob('backup_plan')">
-            <i class="fas fa-clipboard-check me-1"></i> Backup-Job
+            <i class="fas fa-tools me-1"></i> System reparieren<small>spielt die neueste veröffentlichte Version ein (auch dieselbe erneut)</small>
         </button>
         <button class="btn btn-outline-success rounded-pill" onclick="runGlobalAction('install_module_dry_run')">
-            <i class="fas fa-traffic-light me-1"></i> Module prüfen
+            <i class="fas fa-traffic-light me-1"></i> Module prüfen<small>zeigt, was installiert werden kann</small>
         </button>
         <button class="btn btn-outline-warning rounded-pill" onclick="showDiagnosticBundleModal()">
-            <i class="fas fa-file-zipper me-1"></i> Diagnosepaket
+            <i class="fas fa-file-zipper me-1"></i> Diagnosepaket<small>für Rückfragen im Forum</small>
         </button>
         <button class="btn btn-outline-info rounded-pill" onclick="openRuleCalmAnalysis()">
-            <i class="fas fa-wave-square me-1"></i> Regelruhe prüfen
+            <i class="fas fa-wave-square me-1"></i> Regelruhe prüfen<small>zeigt, wie oft geschaltet wurde</small>
         </button>
-        <button class="btn btn-outline-primary rounded-pill" onclick="runGlobalAction('job_status')">
-            <i class="fas fa-clipboard-list me-1"></i> Job-Status
-        </button>
-        <span class="text-secondary small">Prüfaktionen lesen nur. Die enge Rechtereparatur ändert ausschließlich Besitzer, Gruppe und Modus bekannter Pfade. Privilegierte Installer-Webjobs sind dauerhaft deaktiviert; Module laufen über den Modul-Launcher.</span>
     </div>
 
+    <details class="setup-tools">
+        <summary>Werkzeuge für die Fehlersuche</summary>
+        <div class="setup-explain mt-2">Für die Fehlersuche mit Unterstützung. Diese Schaltflächen lesen und rechnen nur; Aufträge legen ihr Ergebnis unter „Letzter Auftrag“ ab. Privilegierte Installer-Webjobs sind dauerhaft deaktiviert; Module laufen über den Modul-Launcher.</div>
+        <div class="setup-tool">
+            <button class="btn btn-outline-secondary rounded-pill" onclick="runGlobalAction('write_readiness')">
+                <i class="fas fa-user-shield me-1"></i> Modulfreigabe prüfen
+            </button>
+            <span class="setup-explain">Prüft, ob diese Seite Dienste und Module sicher installieren und entfernen darf (Hilfsprogramme und sudo-Freigaben); es wird nichts verändert.</span>
+        </div>
+        <div class="setup-tool">
+            <button class="btn btn-outline-secondary rounded-pill" onclick="runGlobalAction('write_permission_plan')">
+                <i class="fas fa-file-shield me-1"></i> Freigabe-Plan anzeigen
+            </button>
+            <span class="setup-explain">Zeigt, welche sudo-Freigaben für die Weboberfläche angepasst würden und wie das rückgängig geht; es wird nichts geändert.</span>
+        </div>
+        <div class="setup-tool">
+            <button class="btn btn-outline-secondary rounded-pill" onclick="runGlobalJob('write_permission_plan')">
+                <i class="fas fa-clipboard-list me-1"></i> Freigabe-Plan als Auftrag
+            </button>
+            <span class="setup-explain">Wie der Freigabe-Plan, läuft aber als Auftrag mit Fortschritt und Ergebnis unter „Letzter Auftrag“; es wird nichts geändert.</span>
+        </div>
+        <div class="setup-tool">
+            <button class="btn btn-outline-info rounded-pill" onclick="runGlobalAction('backup_plan')">
+                <i class="fas fa-box-archive me-1"></i> Sicherungsplan anzeigen
+            </button>
+            <span class="setup-explain">Zeigt, welche Dateien vor einer Moduländerung gesichert würden; es wird keine Sicherung angelegt.</span>
+        </div>
+        <div class="setup-tool">
+            <button class="btn btn-outline-info rounded-pill" onclick="runGlobalJob('backup_plan')">
+                <i class="fas fa-clipboard-check me-1"></i> Sicherungsplan als Auftrag
+            </button>
+            <span class="setup-explain">Wie der Sicherungsplan, läuft aber als Auftrag mit Ergebnis unter „Letzter Auftrag“; es wird nichts gesichert.</span>
+        </div>
+        <div class="setup-tool">
+            <button class="btn btn-outline-primary rounded-pill" onclick="runGlobalAction('job_status')">
+                <i class="fas fa-clipboard-list me-1"></i> Letzter Auftrag
+            </button>
+            <span class="setup-explain">Zeigt den zuletzt gestarteten Auftrag der Installationszentrale mit Ergebnis und ob gerade einer läuft.</span>
+        </div>
+    </details>
+
     <?php if (e3dcIsDockerEnvironment()): ?>
-    <div id="systemRepairHint" class="text-secondary small mb-3" style="white-space: pre-wrap"><?php echo htmlspecialchars(e3dcDockerSystemRepairHint(), ENT_QUOTES, 'UTF-8'); ?></div>
+    <div id="systemRepairHint" class="text-secondary small mt-3" style="white-space: pre-wrap"><?php echo htmlspecialchars(e3dcDockerSystemRepairHint(), ENT_QUOTES, 'UTF-8'); ?></div>
     <?php else: ?>
-    <div id="systemRepairHint" class="text-secondary small mb-3" style="white-space: pre-wrap" hidden></div>
+    <div id="systemRepairHint" class="text-secondary small mt-3" style="white-space: pre-wrap" hidden></div>
     <?php endif; ?>
+    </section>
 
     <div id="installerStatus" class="installer-status skeleton">
         <div class="text-secondary">Lade Installer-Status...</div>
@@ -5040,6 +5264,7 @@ if (isset($_GET['action']) && $_GET['action'] === 'check_runtime_permissions_rep
 <script>
 const installCenterCsrfToken = <?= json_encode(installCenterCsrfToken(), JSON_UNESCAPED_UNICODE) ?>;
 const serviceControlCsrfToken = <?= json_encode(e3dcCsrfToken(), JSON_UNESCAPED_UNICODE) ?>;
+const setupConfigUrl = <?= json_encode(installCenterDashboardReturnUrl(), JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT) ?>;
 const groupLabels = {
     core: ['Kernsystem', 'fa-microchip'],
     consumers: ['Verbraucher', 'fa-plug-circle-bolt'],
@@ -5687,7 +5912,7 @@ function renderModule(module, serviceInfo, diagnosis, installBlock = null) {
         ? `<span class="badge text-bg-warning" title="${esc(module.install_warning)}">Hinweis</span>`
         : '';
     return `
-        <article class="module-card ${esc(module.group)}">
+        <article class="module-card ${esc(module.group)}" data-module="${esc(module.key)}">
             <div class="module-title">
                 <h2>${esc(module.display_name)}</h2>
                 <span class="badge ${module.optional ? 'text-bg-secondary' : 'text-bg-primary'}">${module.optional ? 'Optional' : 'Kern'}</span>
@@ -5725,7 +5950,7 @@ function renderModule(module, serviceInfo, diagnosis, installBlock = null) {
                 <summary><i class="fas fa-screwdriver-wrench me-1"></i>Expertenaktionen</summary>
                 <div class="module-actions">
                     <button class="btn btn-sm btn-outline-warning" title="Direkter Dry-Run: prüft nur und aktualisiert den letzten Job nicht" onclick="runModuleAction('${esc(module.key)}','dry_run')"><i class="fas fa-list-check me-1"></i> Direkt-Dry-Run</button>
-                    <button class="btn btn-sm btn-outline-secondary" title="Direkter Installations-Dry-Run: zeigt Bedarf, schreibt aber keinen Jobstatus" onclick="runModuleAction('${esc(module.key)}','install_module_dry_run')"><i class="fas fa-box-open me-1"></i> Install-Details</button>
+                    <button class="btn btn-sm btn-outline-secondary" title="Direkter Installations-Dry-Run: zeigt Bedarf, legt aber keinen Auftrag ab" onclick="runModuleAction('${esc(module.key)}','install_module_dry_run')"><i class="fas fa-box-open me-1"></i> Install-Details</button>
                     <button class="btn btn-sm btn-success" ${startDisabled} onclick="controlService('${esc(unit)}','start')"><i class="fas fa-play me-1"></i> Start</button>
                     <button class="btn btn-sm btn-outline-info" ${restartDisabled} onclick="controlService('${esc(unit)}','restart')"><i class="fas fa-rotate me-1"></i> Neustart</button>
                     <button class="btn btn-sm btn-outline-danger" ${stopDisabled} onclick="controlService('${esc(unit)}','stop')"><i class="fas fa-stop me-1"></i> Stop</button>
@@ -6281,14 +6506,14 @@ async function updateJobModalFromStatus() {
         document.getElementById('jobModalBody').innerHTML = renderJobModalStatus(data);
         return data;
     } catch (err) {
-        document.getElementById('jobModalBody').innerHTML = `<div class="bad">Job-Status konnte nicht gelesen werden: ${esc(err.message || err)}</div>`;
+        document.getElementById('jobModalBody').innerHTML = `<div class="bad">Letzter Auftrag konnte nicht gelesen werden: ${esc(err.message || err)}</div>`;
         return null;
     }
 }
 
 function renderWriteGatePreview(data) {
     if (!data || data.success === false) {
-        return `<div class="bad">Freigabe-Check konnte nicht gelesen werden: ${esc(data && (data.error || data.message) || 'keine Antwort')}</div>`;
+        return `<div class="bad">Modulfreigabe konnte nicht gelesen werden: ${esc(data && (data.error || data.message) || 'keine Antwort')}</div>`;
     }
     const checks = data.checks || [];
     const hardBlockers = data.hard_blocker_count || 0;
@@ -6302,7 +6527,7 @@ function renderWriteGatePreview(data) {
     }).join('');
     return `
         <div class="job-progress-box mt-3">
-            <strong><i class="fas fa-user-shield text-info me-1"></i>Aktueller Freigabe-Check</strong>
+            <strong><i class="fas fa-user-shield text-info me-1"></i>Aktuelle Modulfreigabe</strong>
             <div class="result-grid mt-2">
                 <div class="result-tile"><strong>Schreibmodus</strong>${boolBadge(Boolean(data.write_actions_enabled), 'frei', 'gesperrt', true)}</div>
                 <div class="result-tile"><strong>System bereit</strong>${boolBadge(ready, 'vorbereitet', 'nicht bereit', true)}</div>
@@ -6335,7 +6560,7 @@ async function showBlockedInstall(moduleKey, displayName) {
                 <button class="btn btn-sm btn-outline-primary" onclick="runModuleJob('${esc(moduleKey)}','install_module_dry_run')"><i class="fas fa-clipboard-check me-1"></i>Stattdessen Job-Test starten</button>
             </div>
             <div id="writeGatePreview" class="mt-3 text-secondary small">
-                <i class="fas fa-spinner fa-spin me-1"></i>Freigabe-Check wird gelesen...
+                <i class="fas fa-spinner fa-spin me-1"></i>Modulfreigabe wird gelesen...
             </div>
         `
     );
@@ -6345,7 +6570,7 @@ async function showBlockedInstall(moduleKey, displayName) {
         if (box) box.innerHTML = renderWriteGatePreview(data);
     } catch (err) {
         const box = document.getElementById('writeGatePreview');
-        if (box) box.innerHTML = `<div class="bad">Freigabe-Check konnte nicht geladen werden: ${esc(err.message || err)}</div>`;
+        if (box) box.innerHTML = `<div class="bad">Modulfreigabe konnte nicht geladen werden: ${esc(err.message || err)}</div>`;
     }
 }
 
@@ -6371,10 +6596,10 @@ function actionLabel(action) {
         repair_permissions: 'Systemreparatur',
         install_module: 'Modulinstallation',
         remove_module: 'Modul-Rückbau',
-        write_readiness: 'Freigabe-Check',
+        write_readiness: 'Modulfreigabe',
         write_permission_plan: 'Freigabe-Plan',
-        backup_plan: 'Backup-Plan',
-        job_status: 'Job-Status'
+        backup_plan: 'Sicherungsplan',
+        job_status: 'Letzter Auftrag'
     };
     return labels[action] || action || 'kein Job';
 }
@@ -6401,7 +6626,7 @@ function renderInstallerStatus(data) {
     const jobState = lastJob.state || (hasLastJob ? 'known' : 'kein Job');
     const running = jobState === 'running' || Boolean(data.lock_active);
     const jobText = actionLabel(job.action);
-    const resultText = result.message || result.summary || result.error || lastJob.updated_at || 'noch kein Jobstatus';
+    const resultText = result.message || result.summary || result.error || lastJob.updated_at || 'noch kein Auftrag';
     return `
         <div class="installer-status-head">
             <div>
@@ -6459,7 +6684,7 @@ function renderReadiness(readiness) {
     const reasons = (readiness.reasons || []).map(reason => `<li>${esc(reason)}</li>`).join('');
     return `
         <div class="mt-3 result-tile">
-            <div class="result-title mb-1"><i class="fas ${icon}"></i>${esc(readiness.label || 'Freigabeprüfung')}</div>
+            <div class="result-title mb-1"><i class="fas ${icon}"></i>${esc(readiness.label || 'Modulfreigabe')}</div>
             <div>${esc(readiness.message || '')}</div>
             ${(readiness.warnings || []).map(message => `<div class="warn mt-2">${esc(message)}</div>`).join('')}
             <div class="mt-2">${boolBadge(Boolean(readiness.can_install_when_writes_enabled), 'installierbar', 'nicht installierbar', true)}</div>
@@ -6727,7 +6952,7 @@ function renderReadinessResult(data) {
     const actions = (data.allowed_write_actions || []).map(action => `<span class="badge text-bg-secondary me-1 mb-1">${esc(action)}</span>`).join('');
     const releaseSteps = (data.release_steps || []).map(step => `<li>${esc(step)}</li>`).join('');
     return `
-        <div class="result-title"><i class="fas ${ready ? 'fa-circle-check ok' : 'fa-triangle-exclamation warn'}"></i>Freigabe-Check</div>
+        <div class="result-title"><i class="fas ${ready ? 'fa-circle-check ok' : 'fa-triangle-exclamation warn'}"></i>Modulfreigabe</div>
         <div class="text-secondary small">${esc(data.summary || 'Freigabe geprüft.')}</div>
         <div class="result-grid">
             <div class="result-tile"><strong>Modul-Launcher</strong>${boolBadge(Boolean(data.write_actions_enabled), 'Launcher bereit', 'Launcher gesperrt', true)}</div>
@@ -6822,8 +7047,8 @@ function renderBackupPlanResult(data) {
     `).join('');
     const normalList = (rows) => rows.length ? `<ul class="result-list">${rows.map(row => `<li>${esc(row)}</li>`).join('')}</ul>` : '';
     return `
-        <div class="result-title"><i class="fas fa-box-archive text-info me-1"></i>Backup-Plan</div>
-        <div class="text-secondary small">${esc(data.summary || 'Read-only Backup-Plan berechnet.')}</div>
+        <div class="result-title"><i class="fas fa-box-archive text-info me-1"></i>Sicherungsplan</div>
+        <div class="text-secondary small">${esc(data.summary || 'Sicherungsplan berechnet; es wurde nichts gesichert.')}</div>
         <div class="result-grid">
             <div class="result-tile"><strong>Modus</strong>${boolBadge(Boolean(data.read_only), 'read-only', 'Schreibpfad', true)}</div>
             <div class="result-tile"><strong>Würde sichern</strong>${esc(data.would_backup_count ?? 0)} Datei(en)<div class="text-secondary mt-1">${esc(data.missing_count ?? 0)} fehlen aktuell</div></div>
@@ -6892,7 +7117,7 @@ function renderJobStatusResult(data) {
     const resultMessage = result.message || result.summary || result.error || '';
     const progressHtml = renderProgressSteps(last.progress_steps || []);
     return `
-        <div class="result-title"><i class="fas ${running ? 'fa-spinner fa-spin warn' : (ok ? 'fa-circle-check ok' : 'fa-triangle-exclamation warn')}"></i>Job-Status</div>
+        <div class="result-title"><i class="fas ${running ? 'fa-spinner fa-spin warn' : (ok ? 'fa-circle-check ok' : 'fa-triangle-exclamation warn')}"></i>Letzter Auftrag</div>
         <div class="text-secondary small">Letzter Web-Installer-Job aus der Ramdisk. Diagnose, Direkt-Dry-Run und Statusabfragen sind passiv und überschreiben diesen Stand nicht.</div>
         <div class="result-grid">
             <div class="result-tile"><strong>Status</strong>${boolBadge(ok && !running, jobStateLabel(state), jobStateLabel(state), true)}<div class="text-secondary mt-1">${esc(updated || 'noch kein Zeitstempel')}</div></div>
@@ -7454,7 +7679,7 @@ async function startPermissionRepairUpdate() {
     const log = document.getElementById('actionLog');
     showJobModal(
         '<i class="fas fa-tools text-warning me-2"></i>System reparieren',
-        'Backup + vollständiger Stable-Abgleich + Rechteprojektion + Dienstneustart',
+        'Sicherung, neueste veröffentlichte Version, Rechte und Neustart der Dienste',
         '<div class="job-progress-box"><i class="fas fa-spinner fa-spin warn me-1"></i>Lokale Inhalte werden vor dem Start rein lesend geprüft...</div>',
         true
     );
@@ -7702,9 +7927,312 @@ async function loadJson(url) {
     return await res.json();
 }
 
+// Einrichtungsstand: wertet nur die schon geladenen Abrufe aus, schaltet und schreibt nichts.
+// Unbekannt bleibt unbekannt; „fehlt“ braucht einen gewollten Dienst und zwei übereinstimmende Quellen.
+function setupAgeText(seconds) {
+    const age = Math.max(0, Math.round(Number(seconds) || 0));
+    if (age < 120) return `vor ${age} s`;
+    if (age < 7200) return `vor ${Math.round(age / 60)} min`;
+    if (age < 172800) return `vor ${Math.round(age / 3600)} h`;
+    return `vor ${Math.round(age / 86400)} Tagen`;
+}
+
+function setupServiceState(key, data) {
+    const module = (data.modules || {})[key];
+    const diag = (data.diagnosis || {})[key];
+    const service = module ? (data.services || {})[serviceKey(module.service_unit)] : null;
+    if (!module || !diag || !diag.systemd || !diag.alive || !service) return {known: false, module};
+    const bareMetal = diag.docker === false && service.is_docker === false && Boolean(data.overview) && data.overview.docker === false;
+    // Nur eine ausdrückliche systemd-Antwort belegt „läuft nicht“; andere Antworten bleiben offen.
+    const running = (active, raw) => active === true ? true
+        : (bareMetal && ['inactive', 'failed'].includes(String(raw || '').trim()) ? false : null);
+    const answers = [running(diag.systemd.active, diag.systemd.raw), running(service.active, service.raw_status)];
+    const seen = answers.includes(true);
+    const stopped = answers.includes(false);
+    return {
+        known: true, module, diag, bareMetal, seen,
+        alive: diag.alive,
+        config: diag.config || {},
+        active: seen && !stopped ? true : (answers.every(answer => answer === false) ? false : null),
+        installed: bareMetal && typeof service.exists === 'boolean' && diag.systemd.exists === service.exists ? service.exists : null
+    };
+}
+
+function setupServiceResult(key, data) {
+    const state = setupServiceState(key, data);
+    const module = state.module || {};
+    const name = module.display_name || key;
+    const optional = module.optional === true;
+    const config = (data.overview || {}).config || {};
+    const result = (status, kind, text) => ({status, kind, text, key, name, optional, state});
+    if (!state.known) return result('unknown', 'unread', 'Der Dienststand ist nicht lesbar.');
+    if (config.readable !== true) return result('unknown', 'unread', 'Die Konfiguration ist nicht lesbar.');
+    const missing = state.installed === false && !state.seen;
+    if (missing || (state.installed === true && state.active === false)) {
+        const what = missing ? 'ist nicht installiert' : 'läuft nicht';
+        // Slave und Shadow halten Dienste planmäßig an.
+        if (config.role === 'standby') return result('unknown', 'role', `Der Dienst „${name}“ ${what}; ob er in dieser Cluster-Rolle laufen soll, ist hier unbekannt.`);
+        const block = (data.readiness || {})[key] || {};
+        const hint = !missing ? '' : (!optional ? ' Einrichtung über Konsole 1) Installation / Update.'
+            : (block.system_update_only === true ? ' Einrichtung über das Systemupdate.'
+                : (data.launcherReady === false ? ' Der Modul-Launcher ist gesperrt; „Modulfreigabe prüfen“ nennt den Grund.' : '')));
+        return result('bad', missing ? 'missing' : 'inactive', `${optional ? 'In der Konfiguration eingeschaltet, aber der' : 'Der'} Dienst „${name}“ ${what}.${hint}`);
+    }
+    if (!state.bareMetal && state.active !== true) {
+        return result('unknown', 'silent', `Vom Dienst „${name}“ liegt kein aktuelles Lebenszeichen vor.${optional ? ' Im Docker-Betrieb die Konfiguration speichern und den Container neu starten.' : ''}`);
+    }
+    if (state.active !== true || (state.bareMetal && state.installed !== true)) {
+        return result('unknown', 'unclear', `Ob der Dienst „${name}“ läuft, ist nicht eindeutig.`);
+    }
+    if (state.diag.journal_unhealthy) return result('warn', 'journal', `Der Dienst „${name}“ meldet im Protokoll: „${state.diag.journal_unhealthy}“.`);
+    if (state.config.ok === false) {
+        return result('warn', 'config', `Angaben fehlen: ${configDisplayList(state.config, 'missing_labels', 'missing_keys').join(', ')}.`);
+    }
+    if ((state.config.warnings || []).length) return result('warn', 'warning', state.config.warnings.join(' '));
+    if (!module.alive_file) return result('ok', 'ok', state.bareMetal ? 'Eingerichtet, Dienst läuft.' : 'Eingerichtet, Prozess läuft.');
+    // Die Alive-Datei belegt nur, dass der Dienst schreibt, nicht, was er gemessen hat.
+    if (state.alive.exists !== true) return result('unknown', 'silent', `Der Dienst „${name}“ läuft, hat aber noch kein Lebenszeichen geschrieben.`);
+    const age = setupAgeText(state.alive.age_s);
+    if (state.alive.fresh !== true) return result('unknown', 'stale', `Der Dienst „${name}“ läuft, sein letztes Lebenszeichen ist aber alt (${age}).`);
+    return result('ok', 'ok', `Eingerichtet, ${state.bareMetal ? 'Dienst läuft, ' : ''}Lebenszeichen ${age}.`);
+}
+
+function setupWorstResult(results) {
+    const order = ['bad', 'warn', 'unknown', 'ok'];
+    return results.slice().sort((a, b) => order.indexOf(a.status) - order.indexOf(b.status))[0];
+}
+
+function setupOverviewRows(data) {
+    data = data || {};
+    const overview = data.overview || {};
+    const config = overview.config || {};
+    const readable = config.readable === true;
+    const modules = data.modules || {};
+    const rows = [];
+    const isAge = (value, limit) => typeof value === 'number' && value >= 0 && value <= limit;
+    const field = key => ({type: 'field', key});
+    const moduleField = (module, moduleConfig) => [firstConfigFocusKey(module, moduleConfig)].filter(Boolean).map(field);
+    const diagnosis = key => ({type: 'diagnosis', key});
+    const add = (group, title, status, text, actions = [], fields = []) => rows.push({group, title, status, text, actions, fields});
+    // Dienstzeilen: „Einrichten“ führt zur Modulkarte, nie direkt in einen Auftrag.
+    const serviceActions = result => {
+        const block = (data.readiness || {})[result.key] || {};
+        const module = modules[result.key];
+        const actions = result.kind === 'config' && module ? moduleField(module, result.state.config) : [];
+        if (result.optional && block.system_update_only === false
+            && (result.kind === 'inactive' || (result.kind === 'missing' && data.launcherReady === true))) {
+            actions.push({type: 'setup', key: result.key});
+        }
+        if (module && (!actions.length || result.kind === 'inactive')) actions.push(diagnosis(result.key));
+        return actions;
+    };
+    const addResult = (group, title, result, actions) => add(group, title, result.status, result.text, actions || serviceActions(result));
+
+    // Grundsystem
+    const base = 'Grundsystem';
+    const live = setupServiceResult('live', data);
+    const frame = overview.live || {};
+    if (live.status === 'ok') {
+        if (frame.readable !== true || typeof frame.errors !== 'number' || !isAge(frame.age_s, Number(live.state.module.alive_max_age_s))) {
+            live.status = 'unknown';
+            live.text = 'Die Live-Daten sind nicht lesbar oder veraltet.';
+        } else if (frame.errors > 0) {
+            live.status = 'warn';
+            live.text = `Live-Daten ${setupAgeText(frame.age_s)} geschrieben, der letzte Abruf meldet aber ${frame.errors === 1 ? 'einen Fehler' : `${frame.errors} Fehler`}.`;
+        } else {
+            live.text = `Live-Daten ${setupAgeText(frame.age_s)} empfangen.`;
+        }
+    }
+    addResult(base, 'Verbindung zum E3DC', live);
+
+    const storage = setupWorstResult([setupServiceResult('storage_manager', data), setupServiceResult('storage_simulator', data)]);
+    if (storage.status === 'ok') storage.text = `${storage.state.bareMetal ? 'Dienst läuft, ' : ''}Lebenszeichen ${setupAgeText(storage.state.alive.age_s)}.`;
+    addResult(base, 'Speicherregelung', storage);
+
+    const weather = setupServiceResult('weather', data);
+    if (weather.status === 'ok') {
+        const stand = overview.forecast;
+        if (stand && stand.date && stand.time) {
+            const day = String(stand.date).split('-');
+            weather.text = `${weather.state.bareMetal ? 'Dienst läuft, Stand' : 'Stand'} ${stand.today === true ? 'heute' : `${day[2]}.${day[1]}.`} ${stand.time}.`;
+        } else {
+            weather.status = 'unknown';
+            weather.text = 'Der Stand der PV-Prognose ist nicht lesbar.';
+        }
+    }
+    addResult(base, 'PV-Prognose', weather, weather.status === 'ok' ? [] : undefined);
+
+    // Strompreise zählen nur beim dynamischen Tarif; eine leere Preisdatei belegt keine Preise.
+    if (!readable) {
+        add(base, 'Strompreise', 'unknown', 'Die Konfiguration ist nicht lesbar.');
+    } else if (config.spot_tariff === true) {
+        const prices = setupServiceResult('epex', data);
+        const file = overview.prices || {};
+        if (prices.status === 'ok') {
+            if (file.filled !== true || !isAge(file.age_s, Number(prices.state.module.alive_max_age_s))) {
+                prices.status = 'unknown';
+                prices.text = 'Die Preisdatei ist leer, nicht lesbar oder veraltet.';
+            } else {
+                prices.text = `Preisdatei ${setupAgeText(file.age_s)} aktualisiert.`;
+            }
+        }
+        addResult(base, 'Strompreise', prices, prices.status === 'ok' ? [field('stromtarif_typ')] : undefined);
+    }
+
+    // Eingeschaltete Funktionen: gewollt ist, was der Dienstvertrag aus der Konfiguration ableitet.
+    const functions = 'Eingeschaltete Funktionen';
+    const optional = Object.values(modules).filter(module => module && module.optional === true);
+    if (!readable || !optional.length) {
+        add(functions, 'Eingeschaltete Funktionen', 'unknown', readable ? 'Der Dienstkatalog ist nicht lesbar.' : 'Die Konfiguration ist nicht lesbar.');
+    } else {
+        const groupOrder = ['consumers', 'integrations', 'core', 'system'];
+        const heatKeys = ['heatpump', 'lux_live', 'idm_live', 'stiebel_live', 'dimplex_live'];
+        const outsideContract = ['ha', 'shadow'];
+        const wanted = module => (config.configured_services || []).includes(String(module.service || '').replace(/\.service$/, ''));
+        const heat = optional.filter(module => heatKeys.includes(module.key) && wanted(module));
+        const wallboxes = config.wallboxes || [];
+        const typed = (label, type) => type ? (type.includes('(') ? `${label}: ${type}` : `${label} (${type})`) : label;
+        const titles = {
+            wallbox: wallboxes[1] ? `${typed('Wallbox 1', wallboxes[0])}, ${typed('Wallbox 2', wallboxes[1])}`
+                : (wallboxes[0] ? typed('Wallbox 1', wallboxes[0]) : 'Wallbox'),
+            heatpump: typed('Wärmepumpe', config.heatpump),
+            mqtt: 'MQTT / Home Assistant'
+        };
+        optional.sort((a, b) => groupOrder.indexOf(a.group) - groupOrder.indexOf(b.group));
+        for (const module of optional) {
+            const title = titles[module.key] || module.display_name || module.key;
+            if (heat.includes(module)) {
+                // Manager und Live-Dienst der Wärmepumpe stehen in einer Zeile; der schlechtere Stand zählt.
+                if (module !== heat[0]) continue;
+                const result = setupWorstResult(heat.map(item => setupServiceResult(item.key, data)));
+                addResult(functions, titles.heatpump, result);
+                continue;
+            }
+            const result = setupServiceResult(module.key, data);
+            if (!wanted(module)) {
+                if (!result.state.known || result.state.installed !== true) continue;
+                if (!outsideContract.includes(module.key)) {
+                    add(functions, title, 'off', 'In der Konfiguration nicht oder nicht vollständig eingeschaltet; der Dienst ist installiert.',
+                        moduleField(module, result.state.config));
+                } else if (config.role === 'single') {
+                    add(functions, title, 'off', 'Keine Cluster-Rolle eingetragen; der Dienst ist installiert.', [diagnosis(module.key)]);
+                } else if (result.status === 'bad') {
+                    add(functions, title, 'unknown', 'Der Dienst ist installiert und läuft nicht; ob er in dieser Cluster-Rolle laufen soll, ist hier unbekannt.', [diagnosis(module.key)]);
+                } else {
+                    addResult(functions, title, result);
+                }
+                continue;
+            }
+            if (module.key === 'mqtt' && result.status === 'ok') {
+                const hub = overview.mqtt || {};
+                const fresh = isAge(hub.age_s, Number(module.alive_max_age_s));
+                if (!fresh || typeof hub.connected !== 'boolean') {
+                    result.status = 'unknown';
+                    result.text = 'Der Dienst läuft; er ist nicht verbunden, hat noch keine Verbindung versucht oder sein Zustand ist nicht lesbar.';
+                } else if (hub.connected) {
+                    result.text = 'Verbunden.';
+                } else {
+                    result.status = 'warn';
+                    result.text = 'Der Dienst läuft, ist aber nicht mit dem Broker verbunden.';
+                }
+            }
+            addResult(functions, title, result);
+        }
+        add(functions, 'Direktvermarktung', 'off', config.direct_marketing === true
+            ? 'Eingeschaltet. Die Speicherregelung führt sie aus; einen eigenen Dienst gibt es nicht.'
+            : 'Ausgeschaltet.', [field('direct_marketing_enable')]);
+    }
+
+    // Sicherheit und Wartung
+    const care = 'Sicherheit und Wartung';
+    if (overview.web_access === 'set') add(care, 'Web-PIN', 'ok', 'Gesetzt.');
+    else if (overview.web_access === 'unset') add(care, 'Web-PIN', 'warn', 'Nicht gesetzt: Jeder Rechner im Heimnetz kann Einstellungen ändern und Module steuern.', [field('web_pin')]);
+    else add(care, 'Web-PIN', 'unknown', 'Die Konfiguration ist nicht lesbar.');
+
+    const version = String(overview.version || '');
+    const update = overview.update || {};
+    if (!version) add(care, 'Version', 'unknown', 'Die installierte Version ist nicht lesbar.');
+    else if (overview.docker !== false) add(care, 'Version', 'unknown', `${version}. Ob eine neuere Version vorliegt, ist im Docker-Betrieb hier unbekannt.`);
+    else if (readable && config.update_check === false) add(care, 'Version', 'off', `${version}. Die Updateprüfung ist ausgeschaltet.`, [field('check_updates')]);
+    else if (update.success !== true || !isAge(update.age_s, 1800) || update.current !== version || ![0, 1].includes(update.missing)) {
+        add(care, 'Version', 'unknown', `${version}. Ob eine neuere Version vorliegt, ist hier unbekannt; das Dashboard prüft es.`);
+    } else if (update.missing === 1) {
+        add(care, 'Version', 'warn', update.target ? `${version}. Version ${update.target} ist verfügbar.` : `${version}. Eine neuere Version ist verfügbar.`);
+    } else add(care, 'Version', 'ok', `${version}, aktuell.`);
+
+    const checks = overview.validation || {};
+    if (!isAge(checks.age_s, 300) || typeof checks.warnings !== 'number') {
+        add(care, 'Hinweise aus der Konfiguration', 'unknown', 'Der letzte Prüfstand fehlt oder ist älter als 5 Minuten.');
+    } else if (checks.warnings === 0) {
+        add(care, 'Hinweise aus der Konfiguration', 'ok', 'Keine Warnungen.');
+    } else {
+        const links = (checks.fields || []).slice(0, 8);
+        const count = checks.warnings === 1 ? 'Eine Warnung am Feld im Config-Editor' : `${checks.warnings} Warnungen an den Feldern im Config-Editor`;
+        add(care, 'Hinweise aus der Konfiguration', 'warn', count + (!links.length ? '.' : (links.length < checks.warnings ? ', darunter:' : ':')), [], links);
+    }
+    return rows;
+}
+
+function setupFieldUrl(key) {
+    return `${setupConfigUrl}&focus=${encodeURIComponent(key)}`;
+}
+
+function renderSetupAction(action) {
+    if (action.type === 'field') return `<a class="setup-action" href="${esc(setupFieldUrl(action.key))}">Zum Feld</a>`;
+    if (action.type === 'setup') return `<button type="button" class="setup-action" onclick="openModuleCard('${esc(action.key)}')">Einrichten</button>`;
+    return `<button type="button" class="setup-action" onclick="showModuleDiagnosis('${esc(action.key)}')">Diagnose</button>`;
+}
+
+function renderSetupOverview(rows) {
+    const labels = {ok: ['✓', 'in Ordnung'], warn: ['⚠', 'auffällig'], bad: ['✗', 'fehlt'], unknown: ['?', 'unbekannt'], off: ['–', 'ohne Wertung']};
+    const count = status => rows.filter(row => row.status === status).length;
+    const pills = ['ok', 'warn', 'bad', 'unknown'].filter(status => status === 'ok' || count(status))
+        .map(status => `<span class="setup-pill is-${status}">${labels[status][0]} ${count(status)} ${labels[status][1]}</span>`).join('');
+    let group = '';
+    const list = rows.map(row => {
+        const heading = row.group === group ? '' : `<div class="setup-group">${esc(row.group)}</div>`;
+        group = row.group;
+        const links = (row.fields || []).map(item => `<a href="${esc(setupFieldUrl(item.key))}">${esc(item.label || item.key)}</a>`).join(', ');
+        const unknown = row.status === 'unknown' && !/unbekannt/i.test(row.text) ? 'Unbekannt. ' : '';
+        return `${heading}<div class="setup-row is-${row.status}">
+            <div class="setup-icon" role="img" aria-label="${labels[row.status][1]}">${labels[row.status][0]}</div>
+            <div><div class="setup-what">${esc(row.title)}</div><div class="setup-why">${unknown}${esc(row.text)}${links ? ` ${links}` : ''}</div></div>
+            <div class="setup-actions">${(row.actions || []).map(renderSetupAction).join('')}</div>
+        </div>`;
+    }).join('');
+    return `<div class="setup-summary">${pills}</div>${list}`;
+}
+
+function showSetupOverview(data) {
+    const box = document.getElementById('setupOverview');
+    const time = document.getElementById('setupOverviewTime');
+    if (!box) return;
+    try {
+        box.innerHTML = renderSetupOverview(setupOverviewRows(data));
+        box.classList.remove('text-secondary');
+        if (time) time.textContent = `Stand ${new Date().toLocaleTimeString('de-DE')}.`;
+    } catch (err) {
+        box.textContent = 'Der Einrichtungsstand ist nicht verfügbar.';
+        if (time) time.textContent = '';
+    }
+}
+
+// „Einrichten“: nur zur Modulkarte mit ihrem bestehenden Ablauf springen.
+function openModuleCard(moduleKey) {
+    const card = Array.from(document.querySelectorAll('.module-card')).find(item => item.dataset.module === moduleKey);
+    if (!card) return;
+    card.scrollIntoView({behavior: 'smooth', block: 'center'});
+    card.classList.add('setup-focus');
+    window.setTimeout(() => card.classList.remove('setup-focus'), 2600);
+}
+
 async function loadInstallCenter() {
     const root = document.getElementById('moduleRoot');
     const installerBox = document.getElementById('installerStatus');
+    const setupBox = document.getElementById('setupOverview');
+    const setupOverview = loadJson('install_center.php?action=setup_overview')
+        .then(result => result && result.success === true ? result : null).catch(() => null);
+    if (setupBox) setupBox.textContent = 'Lade Einrichtungsstand...';
     root.classList.add('skeleton');
     installerBox.classList.add('skeleton');
     installerBox.innerHTML = '<div class="text-secondary">Lade Installer-Status...</div>';
@@ -7743,9 +8271,11 @@ async function loadInstallCenter() {
             html += '</div>';
         }
         root.innerHTML = html || '<div class="module-card">Keine Module gefunden.</div>';
+        setupOverview.then(overview => showSetupOverview({overview, modules, diagnosis: diag, services: serviceMap, readiness: readinessMap, launcherReady: status.write_actions_enabled === true}));
     } catch (err) {
         root.innerHTML = `<div class="alert alert-danger">Installationszentrale konnte nicht geladen werden: ${esc(err.message)}</div>`;
         installerBox.innerHTML = `<div class="bad"><i class="fas fa-triangle-exclamation me-1"></i>Installer-Status konnte nicht geladen werden: ${esc(err.message)}</div>`;
+        setupOverview.then(overview => showSetupOverview({overview}));
     } finally {
         root.classList.remove('skeleton');
         installerBox.classList.remove('skeleton');

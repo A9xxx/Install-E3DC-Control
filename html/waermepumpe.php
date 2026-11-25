@@ -289,14 +289,17 @@ $configMtime = file_exists($configFile) ? date("d.m. H:i:s", filemtime($configFi
 $pyMtime = file_exists($luxInstallDir . 'energy_manager.py') ? date("d.m. H:i:s", filemtime($luxInstallDir . 'energy_manager.py')) : '--';
 
 // WP-Verbrauchslogik: präziser Messwert oder Live-Ersatzwert
-$wp_power_w = ($wpType === 4) ? null : 0;
+// Dimplex mit gelesenem Ausgang „Verdichter 1“: Die gemessene Leistung bleibt auch bei stehendem
+// Verdichter stehen; fehlt sie, bleibt der Wert unbekannt.
+$dimplexCoilRead = ($wpType === 5 && ($data['dimplex_compressor_source'] ?? '') === 'modbus_coil');
+$wp_power_w = ($wpType === 4 || $dimplexCoilRead) ? null : 0;
 $wp_source = 'live';
 
 if (isset($data['Leistung_Verdichter_W']) || isset($data['Leistungsaufnahme'])) {
     $wp_power_w = $data['Leistung_Verdichter_W'] ?? (($data['Leistungsaufnahme'] ?? 0) * 1000);
 
     // Bei Stiebel darf Neben-/Pumpenleistung sichtbar bleiben; sie ist nur kein aktiver Verdichterbetrieb.
-    if ($wpType != 4 && empty($data['Verdichter_Ein']) && empty($data['Verdichter'])) {
+    if ($wpType != 4 && !$dimplexCoilRead && empty($data['Verdichter_Ein']) && empty($data['Verdichter'])) {
         $wp_power_w = ($wpType === 4) ? null : 0;
     }
     $wp_source = 'modbus';
@@ -1532,6 +1535,11 @@ if ($isChargingOnly) {
                     $dimplexHeatPowerEstimated = !empty($data['dimplex_heat_power_estimated']);
                     $dimplexWpmSoftware = $data['dimplex_wpm_software'] ?? ($json['dimplex']['wpm_software'] ?? '--');
                     $dimplexPowerNote = $data['dimplex_power_note'] ?? null;
+                    $dimplexCompressorText = isset($data['Verdichter_Ein']) ? (!empty($data['Verdichter_Ein']) ? 'Ein' : 'Aus') : 'unbekannt';
+                    $dimplexCompressorSource = (($data['dimplex_compressor_source'] ?? '') === 'modbus_coil')
+                        ? 'Ausgang Verdichter 1, Adresse ' . (string)($data['dimplex_compressor_coil_register'] ?? '--')
+                        : (isset($data['Verdichter_Ein']) ? 'aus elektrischer Leistung' : '--');
+                    $dimplexCompressorHours = $data['dimplex_compressor_hours'] ?? null;
                     $dimplexSgNote = $data['dimplex_sg_note'] ?? null;
                     $dimplexDiagNotes = array_filter([$dimplexSgNote, $dimplexPowerNote], fn($v) => is_string($v) && trim($v) !== '');
                 ?>
@@ -1578,6 +1586,20 @@ if ($isChargingOnly) {
                         <div class="p-2 bg-body-tertiary rounded border text-center h-100">
                             <div class="small text-muted">Register</div>
                             <div class="fw-bold small"><?= htmlspecialchars((string)($json['dimplex_sg_register'] ?? ($data['dimplex_sg_register'] ?? '5167'))) ?> / PDU <?= htmlspecialchars((string)($json['dimplex_sg_address'] ?? ($data['dimplex_sg_address'] ?? '5166'))) ?></div>
+                        </div>
+                    </div>
+                    <div class="col-6 col-md-3">
+                        <div class="p-2 bg-body-tertiary rounded border text-center h-100">
+                            <div class="small text-muted">Verdichter</div>
+                            <div class="fw-bold"><?= htmlspecialchars($dimplexCompressorText) ?></div>
+                            <div class="text-muted small"><?= htmlspecialchars($dimplexCompressorSource) ?></div>
+                        </div>
+                    </div>
+                    <div class="col-6 col-md-3">
+                        <div class="p-2 bg-body-tertiary rounded border text-center h-100">
+                            <div class="small text-muted">Betriebsstunden Verdichter</div>
+                            <div class="fw-bold"><?= is_numeric($dimplexCompressorHours) ? number_format((float)$dimplexCompressorHours, 0, ',', '.') . ' h' : '--' ?></div>
+                            <div class="text-muted small">Register <?= htmlspecialchars((string)($data['dimplex_compressor_hours_register'] ?? '--')) ?></div>
                         </div>
                     </div>
                     <div class="col-6 col-md-3">

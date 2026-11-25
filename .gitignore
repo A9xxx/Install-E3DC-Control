@@ -94,7 +94,6 @@
 !/Installer/Wallbox/e3dc_session.py
 !/Installer/Wallbox/fixed_phase_session.py
 !/Installer/Wallbox/fixed_phase_runtime.py
-!/Installer/Wallbox/fixed_start_energy.py
 !/Installer/Wallbox/goe_session.py
 !/Installer/Wallbox/modes.py
 !/Installer/Wallbox/openwb_pro_session.py
@@ -106,7 +105,6 @@
 !/Installer/Wallbox/phase_sequencer.py
 !/Installer/Wallbox/phase_transition.py
 !/Installer/Wallbox/process_singleton.py
-!/Installer/Wallbox/start_hold.py
 !/Installer/Wallbox/policy.py
 !/Installer/Wallbox/ramps.py
 !/Installer/Wallbox/runtime_state.py
@@ -395,6 +393,7 @@
 !/html/get_live_json.php
 !/html/get_shadow_snapshot.php
 !/html/help.php
+!/html/doku_suche.json
 !/html/helpers.php
 !/html/heatpump_season.php
 !/html/retention.php

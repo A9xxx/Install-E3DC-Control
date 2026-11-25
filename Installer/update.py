@@ -6573,6 +6573,12 @@ FIRST_INSTALL_METADATA_KEYS = frozenset({
     "venv_name",
     "venv_path",
 })
+# Gleich WEB_CONFIG_FIRST_INSTALL_DEFAULTS in installer_config, hier ohne Import: Ein laufender
+# älterer Updater kann dieses Modul sonst nicht mit seinem installer_config laden.
+FIRST_INSTALL_CONFIG_DEFAULTS = {
+    "grid_friendly_mode": "0",
+    "cheap_grid_battery_enable": "0",
+}
 
 
 def classify_installation_state(config_path: str = HA_CONFIG_PATH) -> tuple[str, str]:
@@ -6614,10 +6620,11 @@ def classify_installation_state(config_path: str = HA_CONFIG_PATH) -> tuple[str,
     except Exception as exc:
         return "blocked", f"V4-Konfiguration ist nicht sicher lesbar: {exc}"
 
-    allowed_keys = set(FIRST_INSTALL_METADATA_KEYS) | set(WEB_CONFIG_START_DEFAULTS) | {"ha_mode"}
+    start_defaults = {**WEB_CONFIG_START_DEFAULTS, **FIRST_INSTALL_CONFIG_DEFAULTS}
+    allowed_keys = set(FIRST_INSTALL_METADATA_KEYS) | set(start_defaults) | {"ha_mode"}
     is_default_config = set(config).issubset(allowed_keys)
     if is_default_config:
-        for key, default in WEB_CONFIG_START_DEFAULTS.items():
+        for key, default in start_defaults.items():
             if config.get(key, default) != default:
                 is_default_config = False
                 break

@@ -37,6 +37,10 @@ nicht, wird keine alte Modelldatei geladen. E3DC-Control verwendet bis zu einem
 Neutraining den konservativen, lokal berechneten Fallback. Das hebt weder
 Reserve-, Netz-, Speicher- noch Verbraucher-Schutzgrenzen auf.
 
+Scheitert ein Training, während das bisherige Modell nutzbar ist, bleiben Modell
+und Verbrauchsprognose bestehen. Ein fehlendes oder verpasstes Training holt
+E3DC-Control selbst nach, höchstens einmal je sechs Stunden.
+
 ## Prüfung und Reparatur
 
 Das Installationscenter zeigt, ob eine aktuelle Prognose und genügend lokale

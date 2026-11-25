@@ -976,8 +976,11 @@ def validate_heatpump_start_config(cfg: Dict[str, Any]) -> Dict[str, Dict[str, A
     for key, label, unit, value, warning, message in (
         ("grid_start_limit", 'Start-Grenze (Betrag in Watt)', "W", start, start < minimum,
          (f'Die Startgrenze von {start:g} W liegt unter der benötigten Mindestleistung von {minimum} W; ein kleinerer Wert ermöglicht keinen Start. Im Config-Editor unter „Smart Home & Verbrauchsprognose“ das Feld „Start-Grenze (Betrag in Watt)“ prüfen.') if start < minimum else (f"Die Startgrenze von {start:g} W bezieht sich auf die verfügbare Verbraucherleistung nach der Speicherladung, nicht auf die Netzeinspeisung. Zum Start sind mindestens {minimum} W nötig.")),
-        ("pv_boost_delay", 'Start-Verzögerung (Sek)', "s", delay, delay >= duration,
-         (f'Die Startverzögerung von {delay:g} s hält bei SG Ready die Leistung zum Start mindestens {delay + 120:g} s bereit; andere Verbraucher können sie so lange nicht nutzen. Im Config-Editor unter „Smart Home & Verbrauchsprognose“ das Feld „Start-Verzögerung (Sek)“ nur für bewusst längeres Warten so belassen.' if sg_ready else f'Die Startverzögerung von {delay:g} s ist mindestens so lang wie die {duration:g} s, für die Leistung zum Start bereitgehalten wird; diese Zeit wird bei direkter Sollwertvorgabe nicht verlängert. Im Config-Editor unter „Smart Home & Verbrauchsprognose“ das Feld „Start-Verzögerung (Sek)“ prüfen.') if delay >= duration else (f"Die Startverzögerung von {delay:g} s liegt unter den {duration:g} s, für die diese Startart Leistung bereithält. " + ('Bei SG Ready bleibt die Leistung mindestens für die Verzögerung plus 120 s bereit; andere Verbraucher können sie währenddessen nicht nutzen.' if sg_ready else 'Bei direkter Sollwertvorgabe bleibt die Leistung nur für die kurze Startzeit bereit.'))),
+        # Bei direkter Sollwertvorgabe läuft die Verzögerung vor der Startreservierung und bindet keine Leistung.
+        ("pv_boost_delay", 'Start-Verzögerung (Sek)', "s", delay, sg_ready and delay >= duration,
+         f'Die Startverzögerung von {delay:g} s läuft bei direkter Sollwertvorgabe vor der Reservierung der Startleistung; andere Verbraucher bindet sie nicht.' if not sg_ready else
+         f'Die Startverzögerung von {delay:g} s hält bei SG Ready die Leistung zum Start mindestens {delay + 120:g} s bereit; andere Verbraucher können sie so lange nicht nutzen. Im Config-Editor unter „Smart Home & Verbrauchsprognose“ das Feld „Start-Verzögerung (Sek)“ nur für bewusst längeres Warten so belassen.' if delay >= duration else
+         f'Die Startverzögerung von {delay:g} s liegt unter den {duration:g} s, für die diese Startart Leistung bereithält. Bei SG Ready bleibt die Leistung mindestens für die Verzögerung plus 120 s bereit; andere Verbraucher können sie währenddessen nicht nutzen.'),
     ):
         entries[key] = _entry(key=key, label=label, unit=unit, configured=cfg.get(key),
             live_value=None, live_key=None, effective=value, source="user",
@@ -2680,11 +2683,6 @@ def validate_storage_config(
             "peak_shaving_max_sample_gap_s",
             10.0,
         ),
-        "peak_shaving_release_debounce_s": _configured_finite_number(
-            cfg,
-            "peak_shaving_release_debounce_s",
-            20.0,
-        ),
     }
     peak_limit_w = peak_values["peak_shaving_grid_import_limit_w"][0]
     peak_reserve_soc = peak_values["peak_shaving_reserve_soc_pct"][0]
@@ -2725,12 +2723,6 @@ def validate_storage_config(
             peak_values["peak_shaving_max_sample_gap_s"][1]
             and 2.0 <= peak_values["peak_shaving_max_sample_gap_s"][0] <= 60.0
         ),
-        "peak_shaving_release_debounce_s": (
-            peak_values["peak_shaving_release_debounce_s"][1]
-            and 5.0
-            <= peak_values["peak_shaving_release_debounce_s"][0]
-            <= 120.0
-        ),
     }
     peak_messages = {
         "peak_shaving_grid_import_limit_w": (
@@ -2757,9 +2749,6 @@ def validate_storage_config(
         "peak_shaving_max_sample_gap_s": (
             'Die größte Messlücke muss zwischen 2 und 60 Sekunden liegen.' + ' Im Config-Editor unter „Tarif & Strompreise“ das Feld „Maximale Messlücke“ prüfen.'
         ),
-        "peak_shaving_release_debounce_s": (
-            'Die Freigabe-Entprellung muss zwischen 5 und 120 Sekunden liegen.' + ' Im Config-Editor unter „Tarif & Strompreise“ das Feld „Freigabe-Entprellung“ prüfen.'
-        ),
     }
     peak_labels = {
         "peak_shaving_grid_import_limit_w": ("15-Minuten-Netzbezugsgrenze", "W"),
@@ -2770,7 +2759,6 @@ def validate_storage_config(
         "peak_shaving_hysteresis_w": ("Lastspitzen-Leistungshysterese", "W"),
         "peak_shaving_soc_hysteresis_pct": ("Lastspitzen-SoC-Hysterese", "%"),
         "peak_shaving_max_sample_gap_s": ("Lastspitzen max. Messlücke", "s"),
-        "peak_shaving_release_debounce_s": ("Lastspitzen Freigabe-Entprellung", "s"),
     }
     peak_contract_valid = all(
         valid
@@ -3376,9 +3364,9 @@ def validate_storage_config(
         live_key=None,
         effective=heater_requires_deficit,
         source="user" if _has_user_value(cfg, "heat_heater_grid_boost_requires_deficit") else "default",
-        severity="ok" if heater_requires_deficit else "warning",
+        severity="warning" if heater_grid_boost and not heater_requires_deficit else "ok",
         message=(
-            'Zusätzliches Heizstabheizen mit Netzstrom ist auf den vorhergesagten fehlenden Wärmebedarf begrenzt.' if heater_requires_deficit else 'Die Begrenzung auf den vorhergesagten fehlenden Wärmebedarf ist ausgeschaltet; der Heizstab kann dadurch mehr Netzstrom verbrauchen. Im Config-Editor unter „Tarif & Strompreise“ das Feld „nur Prognose-Defizit“ einschalten oder nur für bewusst gewünschte Sonderfälle ausgeschaltet lassen.'
+            'Zusätzliches Heizstabheizen mit Netzstrom ist auf den vorhergesagten fehlenden Wärmebedarf begrenzt.' if heater_requires_deficit else 'Zusätzliches Heizstabheizen mit Netzstrom ist aus; die ausgeschaltete Begrenzung auf den vorhergesagten fehlenden Wärmebedarf hat deshalb keine Wirkung.' if not heater_grid_boost else 'Die Begrenzung auf den vorhergesagten fehlenden Wärmebedarf ist ausgeschaltet; der Heizstab kann dadurch mehr Netzstrom verbrauchen. Im Config-Editor unter „Tarif & Strompreise“ das Feld „nur Prognose-Defizit“ einschalten oder nur für bewusst gewünschte Sonderfälle ausgeschaltet lassen.'
         ),
     )
     for key, label, value, unit, low, high in (

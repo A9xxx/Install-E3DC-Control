@@ -962,14 +962,31 @@ function handleCORSAndExternalAuth() {
 // CORS & Preflight-Handling sofort beim Laden ausführen
 handleCORSAndExternalAuth();
 
-/** IP-Adressen, einteilige Namen, der eigene Hostname und lokale Endungen gelten als lokal. */
+/** Private, Loopback-, Link-Local- und Tailscale-Adressen (100.64.0.0/10); IPv6 ::1, fc00::/7 und fe80::/10. */
+function e3dcHostIsPrivateAddress($address) {
+    $packed = e3dcWebAuthPackAddress($address);
+    if ($packed === false) return false;
+    $bytes = array_values(unpack('C*', $packed));
+    if (count($bytes) === 4) {
+        [$a, $b] = $bytes;
+        return $a === 10 || $a === 127 || ($a === 172 && $b >= 16 && $b <= 31) || ($a === 192 && $b === 168)
+            || ($a === 169 && $b === 254) || ($a === 100 && $b >= 64 && $b <= 127);
+    }
+    return $packed === str_repeat("\0", 15) . "\x01" || ($bytes[0] & 0xFE) === 0xFC
+        || ($bytes[0] === 0xFE && ($bytes[1] & 0xC0) === 0x80);
+}
+
+/**
+ * Private IP-Adressen, einteilige Namen, der eigene Hostname und lokale Endungen gelten als lokal.
+ * Öffentliche IP-Adressen (etwa eine Portfreigabe) gelten wie Domainnamen.
+ */
 function e3dcHostIsLocalName($rawHost) {
     $rawHost = (string)$rawHost;
     $host = strtolower(rtrim(preg_replace('/:\d+$/', '', $rawHost), '.'));
     if (preg_match('/^\[([^\]]+)\](?::\d+)?$/D', $rawHost, $parts)) {
-        if (filter_var($parts[1], FILTER_VALIDATE_IP, FILTER_FLAG_IPV6)) return true;
+        return filter_var($parts[1], FILTER_VALIDATE_IP, FILTER_FLAG_IPV6) !== false && e3dcHostIsPrivateAddress($parts[1]);
     }
-    if (filter_var($host, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) return true;
+    if (filter_var($host, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) return e3dcHostIsPrivateAddress($host);
     $ownHost = strtolower(rtrim((string)gethostname(), '.'));
     if (preg_match('/^[a-z0-9_-]+$/D', $host)
         || ($ownHost !== '' && ($host === $ownHost || $host === explode('.', $ownHost)[0]))) return true;
@@ -980,29 +997,103 @@ function e3dcHostIsLocalName($rawHost) {
 }
 
 /**
- * Übergang Domainzugriff ohne Web-PIN: liefert den aufgerufenen Namen, wenn die Seite über
- * einen Domainnamen ohne Web-PIN geöffnet ist und keine bewusste Abwahl gesetzt ist, sonst null.
- * Diese Version sperrt nicht; die Oberfläche zeigt nur den Hinweis.
+ * Beginn der Übergangsfrist für die Sperre: der erste Zugriff ohne Web-PIN über einen Domainnamen, eine öffentliche
+ * Adresse oder von außerhalb des Heimnetzes, also der erste angezeigte Hinweis. So sieht jeder, der selbst von außen
+ * zugreift, den Hinweis 14 Tage vor der Sperre. Gespeichert in data/, damit die Frist Neustarts übersteht. Ein
+ * fehlender, unlesbarer oder unplausibler Beginn wird neu gesetzt; ist er nicht speicherbar, läuft die Frist weiter
+ * (Hinweis statt Sperre). Rückbau, sobald Updates aus 5.5.8 und älter nicht mehr vorkommen.
  */
-function e3dcHostPinNoticeHost() {
-    if (!isset($_SERVER['HTTP_HOST'])) return null;
+function e3dcHostLockGraceSince() {
+    static $since = null;
+    if ($since !== null) return $since;
+    $file = '/var/www/html/data/web_host_lock_since.txt';
+    $now = time();
+    $raw = is_file($file) ? @file_get_contents($file, false, null, 0, 64) : false;
+    if (is_string($raw) && preg_match('/^\s*(\d{10})\s*$/D', $raw, $match)
+        && (int)$match[1] >= 1700000000 && (int)$match[1] <= $now + 86400) {
+        return $since = (int)$match[1];
+    }
+    $handle = @fopen($file, is_file($file) ? 'c' : 'x');
+    if ($handle === false || !@ftruncate($handle, 0) || @fwrite($handle, $now . "\n") === false) {
+        error_log('E3DC-Control Domainzugriff ohne Web-PIN: Beginn der Übergangsfrist nicht speicherbar (' . $file . '), bis dahin nur Hinweis.');
+    }
+    if ($handle !== false) @fclose($handle);
+    return $since = $now;
+}
+
+/**
+ * Absender im Heimnetz: private Adresse oder IPv6 aus demselben /64-Netz wie die Adresse, auf der die Anfrage
+ * ankam. Anders als der Host-Kopf lässt sich der Absender einer Verbindung über eine Portfreigabe nicht fälschen.
+ */
+function e3dcHostClientIsLocal() {
+    $remote = trim((string)($_SERVER['REMOTE_ADDR'] ?? ''));
+    if ($remote === '' || e3dcHostIsPrivateAddress($remote)) return true;
+    $client = e3dcWebAuthPackAddress($remote);
+    $server = e3dcWebAuthPackAddress((string)($_SERVER['SERVER_ADDR'] ?? ''));
+    return is_string($client) && is_string($server) && strlen($client) === 16 && strlen($server) === 16
+        && substr($client, 0, 8) === substr($server, 0, 8);
+}
+
+/**
+ * Aufruf über einen Domainnamen, eine öffentliche IP-Adresse, ohne Host-Kopf oder von einem Absender außerhalb des
+ * Heimnetzes, jeweils ohne Web-PIN und ohne bewusste Abwahl: aufgerufener Name, Herkunft und Zeitpunkt der Sperre
+ * (14 Tage nach Fristbeginn), sonst null. Interne Aufrufe per PHP-CLI haben weder Anfragemethode noch Namen.
+ */
+function e3dcHostLockState() {
+    if (!isset($_SERVER['HTTP_HOST']) && !isset($_SERVER['REQUEST_METHOD'])) return null;
     $conf = loadE3dcConfig();
     $cfg = is_array($conf['config'] ?? null) ? $conf['config'] : [];
     if ((string)($cfg['web_pin'] ?? '') !== '') return null;
     if ((string)($cfg['web_remote_pin_optout'] ?? '0') === '1') return null;
-    $rawHost = (string)$_SERVER['HTTP_HOST'];
-    return e3dcHostIsLocalName($rawHost) ? null : $rawHost;
+    $rawHost = (string)($_SERVER['HTTP_HOST'] ?? '');
+    $extern = !e3dcHostClientIsLocal();
+    if (!$extern && e3dcHostIsLocalName($rawHost)) return null;
+    $lockAt = e3dcHostLockGraceSince() + 14 * 86400;
+    return ['host' => $rawHost === '' ? '(ohne Namen)' : $rawHost, 'extern' => $extern, 'lock_at' => $lockAt];
 }
 
-/** Hinweisbanner für den Übergang; leer, wenn kein Hinweis nötig ist. */
+/**
+ * Ohne Web-PIN Domainnamen und öffentliche IP-Adressen nach Ablauf der Frist vor jeder Seitenausgabe abweisen
+ * (Schutz gegen DNS-Rebinding und offenen Zugang aus dem Internet).
+ */
+function e3dcEnforceLocalHost() {
+    $state = e3dcHostLockState();
+    if ($state === null || time() < $state['lock_at']) return;
+    $rawHost = $state['host'];
+    http_response_code(421);
+    $message = 'Zugriff über Domainnamen, öffentliche IP-Adressen und von außerhalb des Heimnetzes ist ohne Web-PIN gesperrt. Zum Freischalten die Oberfläche im Heimnetz über die IP-Adresse der Anlage '
+        . 'oder einen lokalen Namen öffnen und im Config-Editor unter „Sicherheit, Webansicht & Updates“ im Bereich „Sicherheit“ eine Web-PIN setzen. '
+        . 'Wer bewusst ohne Web-PIN weiterarbeiten will, stellt dort „Domainzugriff ohne Web-PIN“ auf „Ja, bewusst ohne Web-PIN“.';
+    $json = strtolower((string)($_SERVER['HTTP_X_REQUESTED_WITH'] ?? '')) === 'xmlhttprequest'
+        || str_contains(strtolower((string)($_SERVER['HTTP_ACCEPT'] ?? '')), 'application/json')
+        || preg_match('~(?:/api/|(?:^|/)(?:get_|set_|save_|webpush_api|api_))~', (string)($_SERVER['SCRIPT_NAME'] ?? ''));
+    foreach (headers_list() as $header) {
+        if (stripos($header, 'Content-Type: application/json') === 0) $json = true;
+    }
+    if ($json) {
+        header('Content-Type: application/json; charset=utf-8');
+        echo json_encode(['success' => false, 'error' => $message], JSON_UNESCAPED_UNICODE);
+    } else {
+        header('Content-Type: text/html; charset=utf-8');
+        echo '<!doctype html><html lang="de"><meta charset="utf-8"><title>Web-PIN erforderlich</title><h1>Web-PIN erforderlich</h1><p>'
+            . htmlspecialchars($message, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '</p><p>Aufgerufen über: '
+            . htmlspecialchars($rawHost, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8')
+            . ($state['extern'] ? ' (von außerhalb des Heimnetzes)' : '') . '</p></html>';
+    }
+    exit;
+}
+e3dcEnforceLocalHost();
+
+/** Hinweis während der Frist; leer mit Web-PIN, mit bewusster Abwahl und bei privaten Adressen oder lokalen Namen. */
 function e3dcHostPinNoticeHtml() {
-    $host = e3dcHostPinNoticeHost();
-    if ($host === null) return '';
+    $state = e3dcHostLockState();
+    if ($state === null) return '';
     $esc = static fn($text) => htmlspecialchars((string)$text, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
     return '<div class="alert alert-warning m-2 e3dc-host-pin-notice" role="alert">'
-        . '<strong>Web-PIN fehlt:</strong> Diese Oberfläche ist über „' . $esc($host) . '“ ohne Web-PIN geöffnet. '
-        . 'Ab der nächsten Version ist der Zugriff über Domainnamen (eigene Domain, DynDNS, MyFRITZ, Reverse-Proxy) nur noch mit Web-PIN möglich; '
-        . 'IP-Adressen und lokale Namen bleiben frei. '
+        . '<strong>Web-PIN fehlt:</strong> Diese Oberfläche ist über „' . $esc($state['host']) . '“'
+        . ($state['extern'] ? ' von außerhalb des Heimnetzes' : '') . ' ohne Web-PIN geöffnet. '
+        . 'Ab dem ' . date('d.m.Y', $state['lock_at']) . ' ist der Zugriff über Domainnamen (eigene Domain, DynDNS, MyFRITZ, Reverse-Proxy) '
+        . 'und öffentliche IP-Adressen (Portfreigabe) nur noch mit Web-PIN möglich; private IP-Adressen und lokale Namen bleiben frei. '
         . 'Web-PIN setzen: <a href="index.php?seite=config">Config-Editor</a> → „Sicherheit, Webansicht &amp; Updates“ → „Sicherheit“ → „Web-PIN“. '
         . 'Wer bewusst ohne Web-PIN weiterarbeiten will, stellt dort „Domainzugriff ohne Web-PIN“ auf „Ja, bewusst ohne Web-PIN“; '
         . 'dann entfällt dieser Hinweis, und der Zugriff bleibt wie bisher.</div>';
@@ -1106,6 +1197,14 @@ function isWebAuthenticated() {
     return $tokenResults[$resultKey] = ($decision['authenticated'] === true);
 }
 
+/** Dashboard-Daten bleiben im Heimnetz lesbar; lokale Proxys benötigen die Anmeldung. */
+function requireDashboardReadAuth($isAjax = true) {
+    $remote = trim((string)($_SERVER['REMOTE_ADDR'] ?? ''));
+    if ($remote !== '' && !e3dcWebAuthIsLoopbackAddress($remote)
+        && e3dcHostClientIsLocal() && e3dcHostIsLocalName((string)($_SERVER['HTTP_HOST'] ?? ''))) return;
+    requireWebAuth($isAjax);
+}
+
 function requireWebAuth($isAjax = true) {
     if (!isWebAuthenticated()) {
         if ($isAjax || (isset($_SERVER['HTTP_X_REQUESTED_WITH']) && strtolower($_SERVER['HTTP_X_REQUESTED_WITH']) == 'xmlhttprequest')) {
@@ -1148,7 +1247,8 @@ function e3dcRequireCsrfToken($isAjax = true) {
     }
 }
 
-function e3dcRequirePostMutation($isAjax = true) {
+// Die Dashboard-Ausnahme gilt ausschließlich für den Live-Sampler; Methode und CSRF bleiben verbindlich.
+function e3dcRequirePostMutation($isAjax = true, $dashboardRead = false) {
     if (strtoupper((string)($_SERVER['REQUEST_METHOD'] ?? 'GET')) !== 'POST') {
         http_response_code(405);
         header('Allow: POST');
@@ -1165,7 +1265,8 @@ function e3dcRequirePostMutation($isAjax = true) {
         }
         exit;
     }
-    requireWebAuth($isAjax);
+    if ($dashboardRead) requireDashboardReadAuth($isAjax);
+    else requireWebAuth($isAjax);
     e3dcRequireCsrfToken($isAjax);
 }
 
@@ -7976,7 +8077,7 @@ function e3dcStartCanonicalWebUpdateJob(
     $exitCode = (int)($process['exit_code'] ?? 1);
     $runId = e3dcReadSelfUpdateRunId();
     $startedMessage = $purpose === 'permissions_repair'
-        ? 'Die vollständige Systemreparatur mit Backup, Stable-Abgleich, Rechteprojektion und Dienstneustart wurde gestartet.'
+        ? 'Die vollständige Systemreparatur (Sicherung, neueste veröffentlichte Version, Rechte und Neustart der Dienste) wurde gestartet.'
         : 'Update als root-kontrollierter Systemjob gestartet.';
     return [
         'success' => !empty($process['success']) && $exitCode === 0,
@@ -8174,12 +8275,12 @@ function e3dcFindServiceWrapper(&$status = null) {
 
 function e3dcServiceWrapperFailureMessage($status) {
     if (in_array($status, ['content_drift', 'contract_content_drift', 'head_unbound'], true)) {
-        return 'Service-Wrapper passt nicht zum installierten Release. „System reparieren (Backup + Stable-Abgleich)“ ausführen.';
+        return 'Service-Wrapper passt nicht zum installierten Release. „System reparieren“ ausführen.';
     }
     if (str_starts_with((string)$status, 'contract_')) {
-        return 'Root-eigener Modul-Vertrag fehlt oder ist ungültig. „System reparieren (Backup + Stable-Abgleich)“ ausführen.';
+        return 'Root-eigener Modul-Vertrag fehlt oder ist ungültig. „System reparieren“ ausführen.';
     }
-    return 'Service-Wrapper fehlt oder ist nicht sicher prüfbar. „System reparieren (Backup + Stable-Abgleich)“ ausführen.';
+    return 'Service-Wrapper fehlt oder ist nicht sicher prüfbar. „System reparieren“ ausführen.';
 }
 
 function e3dcDockerMatterResetGuardReady() {
@@ -10134,7 +10235,7 @@ function handleRunUpdate() {
  */
 function handleDailyStats() {
     if (isset($_GET['action']) && $_GET['action'] === 'get_daily_stats') {
-        requireWebAuth(true);
+        requireDashboardReadAuth(true);
         header('Content-Type: application/json');
         $file = $_GET['file'] ?? '';
         if ($file === 'today' || empty($file)) {
@@ -12786,6 +12887,20 @@ function renderFooterVersion() {
          . ' title="Zum Quellcode (main branch)">' . $label . '</a>';
 }
 
+// Planwechsel an der Viertelstunde: Bis eine Minute nach dem Bezugszeitpunkt gilt die Planaktualisierung.
+function e3dcPlanRefreshWindowOpen($sinceMs, $nowMs, $windowMs = 60000.0) {
+    $sinceMs = (float)$sinceMs;
+    return $sinceMs > 0 && $nowMs >= $sinceMs && ($nowMs - $sinceMs) < $windowMs;
+}
+
+// Live-Ansichten: Der gebundene Marktplan ist abgelaufen und die Planaktualisierung läuft noch.
+function e3dcMarketPlanRefreshPending($plan, $trajectory, $nowMs = null) {
+    $nowMs = $nowMs ?? microtime(true) * 1000.0;
+    return is_array($plan) && is_array($trajectory)
+        && ($trajectory['reason_code'] ?? '') === 'market_plan_expired'
+        && e3dcPlanRefreshWindowOpen($plan['valid_until_ts_ms'] ?? 0, $nowMs);
+}
+
 // Anzeigevertrag: nur prüfen und durchreichen; keine Marktentscheidung und
 // keine Energieintegration. Der Ist-Abgleich interpoliert vorhandene Punkte.
 function e3dcMarketSocTrajectoryForDisplay($plan, $live, $nowMs = null) {
@@ -12865,7 +12980,12 @@ function e3dcMarketSocTrajectoryForDisplay($plan, $live, $nowMs = null) {
     if ($binding['created_ts'] != ($market['created_ts'] ?? null)
         || $binding['start_ts'] > $t['integration_start_ts_ms'] || $binding['end_ts'] <= $t['integration_start_ts_ms']) return $fail('market_contract_inactive');
     $contract = $market['active_contract'] ?? null;
-    if ($binding['action'] === 'hold_horizon') {
+    if ($binding['action'] === 'future_grid_charge') {
+        // Lokale Anzeigebindung für spätere Aufträge, kein aktiver Vertrag.
+        if ($contract !== null || $binding['start_ts'] != $t['integration_start_ts_ms']
+            || $binding['end_ts'] != $t['horizon_end_ts_ms']
+            || ($market['consumer_policy']['storage_grid_charge'] ?? null) !== true) return $fail('market_contract_invalid');
+    } elseif ($binding['action'] === 'hold_horizon') {
         $horizon = $market['forecast']['hold_horizon'] ?? null;
         if (!is_array($horizon) || ($horizon['valid'] ?? null) !== true
             || !is_array($horizon['schedule'] ?? null) || $binding['start_ts'] != $t['integration_start_ts_ms']) return $fail('market_contract_invalid');
@@ -12951,7 +13071,7 @@ function e3dcMarketSocTrajectoryForDisplay($plan, $live, $nowMs = null) {
         if (!$base || $s['start_ts_ms'] < $base['start_ts_ms'] || $s['end_ts_ms'] > $base['end_ts_ms']
             || $s['start_ts_ms'] !== $expected || $s['end_ts_ms'] <= $s['start_ts_ms']
             || abs($s['soc_start_pct'] - $previousSoc) > 0.001) return $fail('market_projection_continuity_invalid');
-        if ($s['reserve_soc_pct'] != $reserve || min($s['soc_start_pct'], $s['soc_end_pct']) < $reserve - 0.001
+        if ($s['reserve_soc_pct'] != $reserve || $s['soc_end_pct'] < min($reserve, $s['soc_start_pct']) - 0.001
             || max($s['soc_start_pct'], $s['soc_end_pct']) > 100.001) return $fail('market_projection_reserve_invalid');
         if (!is_string($s['phase'] ?? null) || !isset($catalog[$s['phase']]) || ($s['action'] ?? null) !== $catalog[$s['phase']]['action']) return $fail('market_projection_action_invalid');
         $chosen = null;

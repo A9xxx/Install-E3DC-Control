@@ -51,6 +51,9 @@ DEFAULT_HEARTBEAT_OUT_REGISTER = 5064
 DEFAULT_SW_VERSION_REGISTER = 65
 DEFAULT_SW_NUMBER_REGISTER = 66
 DEFAULT_SW_INDEX_REGISTER = 67
+# Ausgang „Verdichter 1“ (Coil, nur lesen) und Betriebsstunden „Verdichter 1“
+# (Register, Stunden) je WPM-Softwarefamilie laut Dimplex-Datenpunktliste.
+COMPRESSOR_POINTS_BY_FAMILY = {"H": (80, 64), "J": (41, 72), "L": (41, 72), "M": (41, 72)}
 DEFAULT_COP_ESTIMATE = 3.0
 
 SG_STATES = {
@@ -283,6 +286,24 @@ def read_optional_register(client: Any, address: int, unit_id: int) -> int | Non
         return None
 
 
+def read_optional_coil(client: Any, address: int, unit_id: int) -> bool | None:
+    """Liest eine Coil (Read Coils); nicht lesbar ergibt None, nie False."""
+    try:
+        result = modbus_call(client, "read_coils", unit_id, address=address, count=1)
+    except Exception:
+        return None
+    if result is None or (hasattr(result, "isError") and result.isError()):
+        return None
+    bits = getattr(result, "bits", None) or []
+    return bool(bits[0]) if bits else None
+
+
+def dimplex_compressor_points(software_text: Any) -> tuple[int, int] | None:
+    """Dokumentationsadressen (Coil, Betriebsstunden); unbekannter Softwarestand ergibt None."""
+    parsed = parse_wpm_software(software_text)
+    return COMPRESSOR_POINTS_BY_FAMILY.get(parsed[0]) if parsed else None
+
+
 def read_wpm_software(client: Any, unit_id: int) -> tuple[str | None, dict[str, Any]]:
     version_raw = read_optional_register(client, pdu_address(DEFAULT_SW_VERSION_REGISTER, False), unit_id)
     number_raw = read_optional_register(client, pdu_address(DEFAULT_SW_NUMBER_REGISTER, False), unit_id)
@@ -388,6 +409,15 @@ def read_dimplex(client: Any, cfg: dict[str, Any], unit_id: int) -> dict[str, An
     configured_software = str(cfg.get("dimplex_wpm_software") or "").strip()
     software_text = configured_software or detected_software
     power_supported = dimplex_power_registers_supported(software_text)
+    compressor_points = dimplex_compressor_points(software_text)
+    compressor_coil = None
+    compressor_hours = None
+    if compressor_points:
+        # Feste Adressen der Datenpunktliste, umgerechnet wie beim Softwarestand.
+        # Beide Abfragen stehen hinter den Bestandsregistern; die Coil (Verdichterstatus) kommt vor
+        # den Betriebsstunden (reine Anzeige).
+        compressor_coil = read_optional_coil(client, pdu_address(compressor_points[0], False), unit_id)
+        compressor_hours = read_optional_register(client, pdu_address(compressor_points[1], False), unit_id)
     heat_power_w = scale_power_w(heat_power_raw)
     electric_power_w = scale_power_w(electric_power_raw)
     raw_heat_power_w = heat_power_w
@@ -423,7 +453,16 @@ def read_dimplex(client: Any, cfg: dict[str, Any], unit_id: int) -> dict[str, An
     sg_boost_active = sg_value in (11, 13)
     operating_mode = safe_int(operating_mode_raw, -1)
     operating_mode_text = OPERATING_MODES.get(operating_mode, f"Unbekannt {operating_mode}" if operating_mode >= 0 else "--")
-    compressor_on = 1 if float(electric_power_w or 0) >= 150.0 else 0
+    if compressor_coil is not None:
+        compressor_on = 1 if compressor_coil else 0
+        compressor_source = "modbus_coil"
+    elif compressor_points and electric_power_w is None:
+        # Coil erwartet, aber nicht gelesen, und keine Leistung: unbekannt, kein Stillstand.
+        compressor_on = None
+        compressor_source = "unknown"
+    else:
+        compressor_on = 1 if float(electric_power_w or 0) >= 150.0 else 0
+        compressor_source = "electric_power_threshold"
 
     data: dict[str, Any] = {
         "Hersteller": "Dimplex",
@@ -458,6 +497,10 @@ def read_dimplex(client: Any, cfg: dict[str, Any], unit_id: int) -> dict[str, An
         "Leistung_Verdichter_W": max(0, electric_power_w) if electric_power_w is not None else None,
         "Leistungsaufnahme": round(max(0, electric_power_w) / 1000.0, 3) if electric_power_w is not None else None,
         "Verdichter_Ein": compressor_on,
+        "dimplex_compressor_source": compressor_source,
+        "dimplex_compressor_coil_register": compressor_points[0] if compressor_points else None,
+        "dimplex_compressor_hours": compressor_hours,
+        "dimplex_compressor_hours_register": compressor_points[1] if compressor_points else None,
         "Modus Heizen": "Aus",
         "Modus Warmw.": "Aus",
         "dimplex_sg_register": safe_int(sg_register, DEFAULT_SG_REGISTER),

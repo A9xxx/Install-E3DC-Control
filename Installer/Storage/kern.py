@@ -5,7 +5,11 @@ Bezug. Der Aufrufer normalisiert Quellen und liefert beide Uhren als Werte.
 """
 
 from dataclasses import dataclass, replace
-from math import isfinite
+from math import isfinite, ceil
+try:
+    from Installer.market_economics import market_grid_charge_room_w
+except ModuleNotFoundError:
+    from market_economics import market_grid_charge_room_w
 try:
     from Installer.Wallbox.decision import wbminsoc_hold_zone_contract
 except ModuleNotFoundError:
@@ -31,8 +35,12 @@ LADEBELEG_W = 500.0
 WALLBOX_QUELLENPRAEFIX = "wallbox,"
 HAUS_MIN_W = -100.0
 LEISTUNG_MAX_W = 1000000.0
-DREIPHASEN_W_PRO_A = 690.0
 SEKUNDEN_PRO_STUNDE = 3600.0
+# Auftragsarten, die der Kern selbst rechnet; jede andere gültige Art ist nicht abgedeckt.
+AUFTRAGSMODI = ("HALTEN", "LADESP", "LADEBLOCK", "NETZLADEN", "VORAB", "ENTLADEN", "PVLADEN")
+# Endliche Entladung: Abstand zum Ziel wie beim Handentladen (Ziel + 0,2) und technische Mindestleistung.
+ENTLADE_ABSTAND_PP = 0.2
+ENTLADE_MINDEST_W = 300.0
 
 
 @dataclass(frozen=True)
@@ -100,17 +108,127 @@ class Kurve:
 
 
 @dataclass(frozen=True)
+class Netzpunkt:
+    """Mindesteinspeisung eines Exportauftrags am Netzpunkt (gleiche Werte wie der Produktvertrag)."""
+    mindest_w: float = 100.0
+    totband_w: float = 30.0
+    importwaechter_w: float = 30.0
+    lastmarge_w: float = 0.0
+    auf_w: float = 1000.0             # Rampe aufwärts je Takt
+    ab_w: float = 100.0               # Rampe abwärts je Takt
+    marge_w: float = 80.0             # Halteband: erst über Mindesteinspeisung + Marge wird zurückgenommen
+    schritt_w: float = 100.0          # Budgetschritt, aufgerundet
+
+
+@dataclass(frozen=True)
+class PvLaderecht:
+    """Quellengebundenes PV-Laden (DV-PV-Speichern): Werte desselben Vertrags wie der Produktpfad."""
+    importwaechter_w: float = 80.0      # Netzbezug darüber: kein PV-Speichern (kein Netzstrom als PV)
+    mindest_ueberschuss_w: float = 300.0
+    hysterese_pct: float = 0.7          # Ziel erreicht ab Ziel minus Hysterese
+    nur_dc: bool = False                 # nur der E3DC-DC-Überschuss (DC-only)
+    export_grenze_w: float | None = None  # harte Exportgrenze (Fenster bzw. externe Abregelung), sonst None
+    export_waechter_w: float = 100.0
+    dc_angebot_w: float | None = None    # DC-Überschuss aus dem gebundenen Quellensplit (nur für nur_dc)
+    rampe_w: float = 300.0             # D12: Anhebeschritt je Takt (direct_marketing_pv_store_ramp_step_w)
+    halte_s: float = 600.0             # D12: Mindesthaltezeit über kleine Einbrüche (direct_marketing_pv_store_min_hold_s)
+    schritt_w: float = 100.0           # Budgetschritt (aufgerundet)
+
+
+@dataclass(frozen=True)
+class Kurvenformung:
+    """DV-Formung der normalen Kurvenladung (D09): Preiskurve hebt auf die angefragte DC-Ladeleistung, eine gültige
+    Reservierung für ein künftiges PV-Speicherfenster begrenzt; Netzbezug über dem Wächter schließt die Reservierung."""
+    preis_w: float | None = None
+    reservierung_w: float | None = None
+    importwaechter_w: float = 80.0
+
+
+@dataclass(frozen=True)
+class Platzregel:
+    """Platzschaffen (N04) wie der Produktregler: Werte derselben Leser, vor der Entscheidung gebunden."""
+    kurven_boden_pct: float | None    # adaptiver Kurvenboden, sonst Kurvenwert; None ohne aktive Kurve
+    ausfuehrungsziel_pct: float | None
+    zielkurve_pct: float | None       # Kurvenwert jetzt (Plateauprüfung)
+    endziel_pct: float
+    plateau_pct: float
+    ein_pct: float
+    halte_pct: float
+    kuehl_s: float
+    horizont_h: float
+    schritt_w: float
+    druck_wh: float
+    min_druck_wh: float
+    kapazitaet_wh: float
+    min_w: float
+    slot: str | None = None
+    slot_rest_wh: float | None = None
+    tag: int | None = None            # Ortstag des Tageskontos
+
+
+@dataclass(frozen=True)
+class Lastkappe:
+    """Geplante externe Last (T06), bestätigt: Halten (0 W Entladung) oder preisgeführte Stütze bis kappe_w."""
+    klasse: str                       # "halten" oder "stuetzen"
+    kappe_w: float = 0.0
+
+
+@dataclass(frozen=True)
+class Spitze:
+    """Lastspitzen-Kandidat des gemeinsamen Intervallplaners (L02/L03), vor der Entscheidung gebunden: aktive Kappe
+    der Entladung auf den Viertelstundenbedarf (ohne Einspeisung) oder Pufferhalten (kein Entladen, Laden offen).
+    Das Nachladen aus dem Netz kommt als gewöhnlicher Netzladeauftrag."""
+    klasse: str                       # "active_cap" oder "reserve_hold"
+    ziel_w: float = 0.0
+
+
+@dataclass(frozen=True)
+class Netzrueckfall:
+    """Pre-Dump-Netzrückfall (V03): Werte derselben Leser wie der Produktpfad, vor der Entscheidung gebunden."""
+    erlaubt: bool                     # Komfort-Pre-Dump immer, harter Pre-Dump nur mit Freigabe
+    faellig: bool                     # späteste Entladezeit für die Restenergie erreicht
+    frist_nah: bool                   # Frist vor dem Ladestart nah
+    rate_w: float
+    verfuegbar: bool                  # freigegebener Verbraucherpfad vorhanden
+    last_w: float                     # tatsächliche Aufnahme der freigegebenen Verbraucher
+    schwelle_w: float = 250.0
+    warte_s: float = 180.0
+    export_grenze_w: float | None = None
+    hard_grenze_w: float | None = None
+    schritt_w: float = 100.0
+    bev_fenster: bool = False         # Fahrzeug-Zeitfenster gilt: keine Warteuhr, Fälligkeit aus dem Fenster
+    bev_faellig: bool = False         # späteste Startzeit des Fahrzeugblocks erreicht
+    waechter: bool = False            # Netzwächter des Pre-Dump aktiv (keine Rampe)
+    rampe_w: float = 300.0            # Anhebeschritt ohne Dringlichkeit, wie im Produktpfad
+
+
+# Quelle des Puffer-Nachladens der Lastspitzen: Beginn und Kandidatenleistung kommen jeden Zyklus neu aus dem
+# Intervallplaner; neu bewertet wird der Auftrag wie jedes Netzladen ohne feste Energiemenge nur im Kerntakt.
+SPITZE_NACHLADEN_QUELLE = "Lastspitzen; Puffer"
+
+
+@dataclass(frozen=True)
 class Auftrag:
-    modus: str                        # HALTEN, NETZLADEN, LADESP, VORAB (Verbraucherangebot)
+    # HALTEN, NETZLADEN, LADESP (Nutzer), LADEBLOCK (Plan: Laden 0 W, Entladen normal), VORAB (Verbraucherangebot),
+    # ENTLADEN (endliche Entladung bis zum Ziel; Rate ist Akkuleistung)
+    modus: str
     beginn_s: float
     ende_s: float
     quelle: str
     rate_w: float | None = None
     ziel_pct: float | None = None
-    rest_wh: float | None = None       # Netzenergie; bei VORAB Restenergie bis zum Ziel
+    rest_wh: float | None = None       # Energie nach energiebezug; NETZLADEN Netz, VORAB und ENTLADEN Akku
     konto: str | None = None
     unabhaengig: "Auftrag | None" = None
     energieziel_wh: float | None = None  # eigenes absolutes Ziel, auf Netzenergie bezogen
+    # Ausdrücklicher Bezug von rest_wh: "netz" (Netzladen) oder "akku" (Entladen, Verbraucherangebot).
+    energiebezug: str | None = None
+    netzpunkt: Netzpunkt | None = None   # nur Exportaufträge
+    netzrueckfall: Netzrueckfall | None = None  # nur VORAB
+    druckveto: bool = False                      # Abregeldruck sperrt die Entladung (Platzschaffen)
+    pv_laderecht: PvLaderecht | None = None       # nur PVLADEN
+    tagesgrenze_wh: float | None = None          # Tageskonto der Entladung je Kalendertag (Platzschaffen)
+    platz: Platzregel | None = None              # nur Platzschaffen
 
 
 @dataclass(frozen=True)
@@ -166,7 +284,12 @@ class Eingang:
     vorhalt: Vorhalt | None = None
     # Hypothetischer Wirk-/Refreshvertrag; G6 bindet ihn am realen Gerät.
     ausgabe_dauer_s: float = 3.0
-    harte_restlast_w: float | None = None
+    anschluss_phasen: tuple[Messwert, Messwert, Messwert] = (Messwert(), Messwert(), Messwert())
+    akku_phasen: int = 3
+    fahrzeug_phasen: tuple[Messwert, ...] = ()
+    kurvenformung: Kurvenformung | None = None
+    spitze: Spitze | None = None
+    last: Lastkappe | None = None
 
 
 @dataclass(frozen=True)
@@ -181,6 +304,10 @@ class Stellgroesse:
     grid_rest_wh: float | None = None
     grid_gueltig_bis_s: float | None = None
     grid_dauer_s: float | None = None
+    # Endliche Entladung: Akkuleistung als SET_POWER DISCH (nur Modus ENTLADEN).
+    entlade_soll_w: float | None = None
+    # Quellengebundenes PV-Laden: Ladeleistung als SET_POWER CHRG (nur Modus LADEN).
+    lade_soll_w: float | None = None
 
 
 @dataclass(frozen=True)
@@ -254,6 +381,25 @@ class Zustand:
     restlast_w: float | None = None
     # Zuordnung der Verbraucher (Art, herausgerechnet belegt, Rechtsgrund), zu der diese Restlast gehört.
     restlast_zuordnung: tuple = ()
+    # Pre-Dump-Netzrückfall: seit wann der Verbraucherpfad die Leistung nicht annimmt, und ob der Rückfall läuft.
+    vorab_warte_seit_s: float | None = None
+    vorab_netz_aktiv: bool = False
+    # Energiekonto endlicher Entladeaufträge mit Restenergie (Akku): Konto, erbrachte Wh, Tag und Tages-Wh.
+    entlade_konto: str | None = None
+    entlade_wh: float = 0.0
+    entlade_tag: int | None = None
+    entlade_tag_wh: float = 0.0
+    # Stillstandsabschluss des Handladeauftrags (B07): Auftrag, Fortschrittsanker (SoC, monotone Zeit), beendet.
+    hand_konto: str | None = None
+    hand_anker_soc: float | None = None
+    hand_anker_s: float | None = None
+    hand_fertig: bool = False
+    # Platzschaffen: Slotkonto (Slot, erbrachte Wh) und monotone Zeit der letzten eigenen Entladung (Kühlzeit).
+    entlade_slot: str | None = None
+    entlade_slot_wh: float = 0.0
+    platz_zuletzt_s: float | None = None
+    # DV-PV-Speichern (D12): monotone Zeit, seit der laufende Ladeauftrag begann (Mindesthaltezeit).
+    pv_laden_seit_s: float | None = None
 
 
 @dataclass(frozen=True)
@@ -289,7 +435,7 @@ def _abschluss(e: Eingang, z: Zustand, neu: Zustand, soll: Stellgroesse,
     neu = replace(neu, soll=soll, letzte_zeit_s=e.jetzt_s,
                   letzte_monoton_s=e.monoton_s, zeitbasis=e.zeitbasis)
     abgedeckt = abgedeckt and not bool(e.sonderfunktion)
-    if _auftrag_gueltig(e.auftrag, e.jetzt_s) and e.auftrag.modus not in ("HALTEN", "LADESP", "NETZLADEN", "VORAB"):
+    if _auftrag_gueltig(e.auftrag, e.jetzt_s) and e.auftrag.modus not in AUFTRAGSMODI:
         abgedeckt = False
     return Ergebnis(soll, neu, budget, soll != z.soll, abgedeckt, code, satz, rahmen)
 
@@ -359,7 +505,7 @@ def _akkuanteil(v, e, soc, reserve, gesperrt, modus, kurve_ok, entlade_max, haus
     grund = ("gesperrt" if v.gesperrt else "reserve" if gesperrt or reserve is None else
         "netzgedeckt" if v.netzgedeckt else
         "netzladen_gewollt" if v.netzladen_gewollt else
-        "auftrag" if modus in ("HALTEN", "NETZLADEN") else
+        "auftrag" if modus in ("HALTEN", "NETZLADEN", "ENTLADEN", "LADEN") else
         "wbminsoc_hold_zone" if v.art.startswith("wallbox_") and zone["active"] else
         "kein_vertrag" if v.akku_freigabe is None else
         "boden_unbekannt" if not _zahl(v.boden_pct) or not 0 <= v.boden_pct <= 100 else
@@ -453,15 +599,12 @@ def _reserve(e, z, neu, soc, fehler):
     vorhalt = (v.boden_pct if angefordert
                and _zahl(v.boden_pct) and _zahl(v.gueltig_bis_s)
                and e.jetzt_s <= v.gueltig_bis_s else None)
-    # K4: Erst die schon um regelbare Verbraucher und Akkuladung bereinigte
-    # harte Restlast erlaubt Rücknahme des Vorhalts. Die Basis bleibt bindend.
     unbekannt = angefordert and vorhalt is None
-    entlastung = vorhalt is not None and _zahl(e.harte_restlast_w) and e.harte_restlast_w > 0
-    if vorhalt is not None and not entlastung:
+    if vorhalt is not None:
         anteile['vorhalt'] = vorhalt
     reserve = max(anteile.values()) if anteile else None
     nur_geraet = eigene == 0.0 and geraet is not None and reserve == geraet and not (
-        vorhalt is not None and not entlastung and vorhalt > geraet)
+        vorhalt is not None and vorhalt > geraet)
     ausloeser = set(z.reserve_ausloeser)
     if z.reserve_aktiv and not ausloeser:
         ausloeser = {name for name, wert in alt.items() if wert == z.reserve_pct}
@@ -508,9 +651,7 @@ def _reserve(e, z, neu, soc, fehler):
         reichweite = max(35.0, LIVE_FRIST_S + e.ausgabe_dauer_s)
         safe_wh = max(0.0, v.energie_wh - reserve*v.kapazitaet_wh/100 - v.kapazitaet_wh/100)
         rahmen = min(rahmen, safe_wh*SEKUNDEN_PRO_STUNDE/reichweite)
-        if entlastung:
-            rahmen = min(rahmen, e.harte_restlast_w)
-    return neu, reserve, nur_geraet, rahmen, entlastung or unbekannt
+    return neu, reserve, nur_geraet, rahmen, unbekannt
 
 
 def _endlicher_auftrag(e, z, neu, soc):
@@ -552,10 +693,231 @@ def _endlicher_auftrag(e, z, neu, soc):
     return replace(a, rate_w=rate, rest_wh=rest), neu, rate
 
 
+def _entladeleistung(a, e, z, entlade_max, akku):
+    """Akkuleistung eines Entladeauftrags (Energiebezug Akku).
+
+    Die Rate, ohne Rate das Gerätemaximum, nie über dem reservebegrenzten Rahmen. Ein Exportauftrag folgt dem
+    Netzpunktvertrag des Produkts: Das Exportbudget (Rate) ist die Obergrenze; unter der Mindesteinspeisung hebt er
+    bis dahin an, nimmt erst über einem Halteband zurück, mit Rampen und aufgerundetem Schritt, und exportiert nicht,
+    wenn die Entladung den lokalen Bedarf nicht deckt. Vorwert ist der eigene letzte Sollsatz. Eine Rate
+    0 W heißt 0 W, nur ein Auftrag ohne Rate nutzt das Gerätemaximum. Ohne gültige Messung: None (gibt nichts frei)."""
+    if not _zahl(entlade_max) or akku is None:
+        return None
+    basis = min(max(0.0, a.rate_w), entlade_max) if _zahl(a.rate_w) else entlade_max
+    n = a.netzpunkt
+    if n is None:
+        return basis
+    netz = e.netz.zahl(e.jetzt_s, -LEISTUNG_MAX_W, LEISTUNG_MAX_W)
+    pv = e.pv.zahl(e.jetzt_s, 0, LEISTUNG_MAX_W)
+    haus = e.haus.zahl(e.jetzt_s, HAUS_MIN_W, LEISTUNG_MAX_W)
+    if None in (netz, akku, pv, haus):
+        return None
+    ist = max(0.0, -akku)
+    # Hausverbrauch einschließlich der Verbraucher im Haus, genau einmal (Prinzip 7).
+    defizit = max(0.0, haus - pv)
+    fehler = max(0.0, netz + n.mindest_w - n.totband_w)
+    netz_bedarf = ist + fehler if fehler > 0 else 0.0
+    # Wie im Produkt: Der Wunsch bleibt im Exportbudget; Mehrbedarf des Hauses hebt nicht darüber (Importwächter).
+    gewuenscht = min(basis, max(basis, netz_bedarf))
+    vorher = (z.soll.entlade_soll_w if z.soll is not None and z.soll.modus == "ENTLADEN"
+              and _zahl(z.soll.entlade_soll_w) else ist)
+    vorher = max(0.0, min(basis, vorher))
+    if gewuenscht > vorher:
+        soll = max(min(gewuenscht, vorher + n.auf_w), min(gewuenscht, max(defizit + n.mindest_w, netz_bedarf)))
+    elif gewuenscht < vorher:
+        raum = max(0.0, max(0.0, -netz) - n.mindest_w - max(n.totband_w, n.marge_w))
+        soll = vorher if raum < n.schritt_w else max(gewuenscht, vorher - min(n.ab_w, raum), basis)
+    else:
+        soll = gewuenscht
+    stufe = max(1.0, n.schritt_w)
+    soll = min(basis, ceil(soll / stufe) * stufe) if soll > 0 else 0.0
+    # Importwächter aus dem lokalen Bedarf (Haus inklusive Verbraucher minus PV), nicht aus dem Netzbezug: Der hängt
+    # von der eigenen Entladung ab. Im Exportbetrieb ist beides gleich; nach dem Ende deckt der Speicher das Haus
+    # selbst, das Netz steht bei 0, und eine Netzprüfung gäbe den Export im nächsten Takt wieder frei (Pendeln).
+    # Wie im Produkt: stationärer Lagenunterschied bis etwa η = 0,81,
+    # höchstens ((1 − η) / η)² des Solls plus 2 W Rundung.
+    # Verzögerte Übergangswerte stützen den neuen Zustand.
+    lief = (z.soll is not None and z.soll.modus == "ENTLADEN"
+            and _zahl(z.soll.entlade_soll_w) and z.soll.entlade_soll_w > 0)
+    if defizit - soll > n.lastmarge_w - (0 if lief else ceil(0.056 * soll) + 2):
+        return 0.0
+    return soll
+
+
+def _entladekonto(a, e, z, neu, akku):
+    """Energiekonto eines Entladeauftrags mit Restenergie (Akku): gemessene Entladung je Schritt, solange der
+    eigene Sollsatz dieses Kontos entlud; ein Neuplan mit demselben Konto setzt es nicht zurück. Rückgabe
+    (verbleibende Wh einschließlich Tagesgrenze, Folgezustand)."""
+    dt = _schrittzeit(e, z)
+    lief = z.entlade_konto == a.konto and z.soll is not None and z.soll.modus == "ENTLADEN"
+    zuwachs = max(0.0, -akku) * dt / SEKUNDEN_PRO_STUNDE if lief and akku is not None else 0.0
+    erbracht = (z.entlade_wh if z.entlade_konto == a.konto and _zahl(z.entlade_wh) else 0.0) + zuwachs
+    p = a.platz
+    # Tageskonto je Ortstag (Platzschaffen wie der Produktregler), sonst je UTC-Tag.
+    tag = p.tag if p is not None and isinstance(p.tag, int) else int(e.jetzt_s // 86400)
+    tag_wh = (z.entlade_tag_wh if z.entlade_tag == tag and _zahl(z.entlade_tag_wh) else 0.0) + zuwachs
+    neu = replace(neu, entlade_konto=a.konto, entlade_wh=erbracht, entlade_tag=tag, entlade_tag_wh=tag_wh)
+    rest = max(0.0, a.rest_wh - erbracht)
+    if p is not None and p.slot is not None and _zahl(p.slot_rest_wh):
+        # Zweites Konto je Planslot: der Rest späterer Slots wird nicht im aktuellen entladen.
+        slot_wh = (z.entlade_slot_wh if z.entlade_slot == p.slot and _zahl(z.entlade_slot_wh) else 0.0) + (
+            zuwachs if z.entlade_slot == p.slot else 0.0)
+        neu = replace(neu, entlade_slot=p.slot, entlade_slot_wh=slot_wh)
+        rest = min(rest, max(0.0, p.slot_rest_wh - slot_wh))
+    if _zahl(a.tagesgrenze_wh):
+        rest = min(rest, max(0.0, a.tagesgrenze_wh - tag_wh))
+    return rest, neu
+
+
+def _platz_leistung(a, e, z, soc, boden, entlade_max):
+    """Leistung des Platzschaffens wie im Produktregler: aus SoC-Abstand über dem Halteabstand oder aus dem Druck je
+    Horizont, mindestens die Mindestleistung, höchstens die Auftragsrate; Rampe je Takt ab dem eigenen letzten Satz,
+    der Start beginnt bei Mindestleistung plus einem Schritt."""
+    p = a.platz
+    rate = min(a.rate_w, entlade_max) if _zahl(a.rate_w) and _zahl(entlade_max) else None
+    if rate is None:
+        return None
+    abstand_w = max(0.0, soc - boden - p.halte_pct) / 100.0 * p.kapazitaet_wh / p.horizont_h
+    druck_w = p.druck_wh / p.horizont_h
+    ziel = max(p.min_w, min(rate, max(abstand_w, druck_w)))
+    lief = (z.soll is not None and z.soll.modus == "ENTLADEN" and z.entlade_konto == a.konto
+            and _zahl(z.soll.entlade_soll_w) and z.soll.entlade_soll_w > 0)
+    if lief:
+        vorher = z.soll.entlade_soll_w
+        soll = min(ziel, vorher + p.schritt_w) if ziel > vorher else max(ziel, vorher - p.schritt_w)
+    else:
+        soll = min(ziel, p.min_w + p.schritt_w)
+    return max(0.0, min(soll, rate))
+
+
+def _pv_ladeleistung(a, e, z, laden, akku):
+    """Ladeleistung des quellengebundenen PV-Ladens aus eigenen Messwerten (kein übernommener Produktrahmen).
+
+    Angebot ist der physische PV-Überschuss nach Haus (einschließlich der Verbraucher im Haus, genau einmal) und
+    nativer Box, bei DC-only höchstens der DC-Überschuss. Netzbezug über dem Wächter oder zu wenig Überschuss: 0 W
+    (kein Netzstrom als PV). Liegt die Einspeisung über einer harten Grenze, nimmt der Akku den Überhang bis zum
+    Angebot auf. Ohne gültige Messung: None."""
+    r = a.pv_laderecht
+    pv = e.pv.zahl(e.jetzt_s, 0, LEISTUNG_MAX_W)
+    haus = e.haus.zahl(e.jetzt_s, HAUS_MIN_W, LEISTUNG_MAX_W)
+    netz = e.netz.zahl(e.jetzt_s, -LEISTUNG_MAX_W, LEISTUNG_MAX_W)
+    nativ = [v.leistung.zahl(e.jetzt_s, 0, LEISTUNG_MAX_W) for v in e.verbraucher if v.art == "wallbox_nativ"]
+    if None in (pv, haus, netz, akku, laden) or None in nativ:
+        return None
+    angebot = max(0.0, pv - haus - sum(nativ))
+    if r.nur_dc:
+        if not _zahl(r.dc_angebot_w):
+            return None
+        angebot = min(angebot, max(0.0, r.dc_angebot_w))
+    stufe = max(1.0, r.schritt_w)
+    vorher = (z.soll.lade_soll_w if z.soll is not None and z.soll.modus == "LADEN" and _zahl(z.soll.lade_soll_w)
+              else None)
+    seit = (e.monoton_s - z.pv_laden_seit_s if vorher is not None and e.zeitbasis == z.zeitbasis
+            and _zahl(z.pv_laden_seit_s) else None)
+    boden = max(ENTLADE_MINDEST_W, r.mindest_ueberschuss_w)
+    if max(0.0, netz) > r.importwaechter_w:
+        return 0.0
+    if angebot < boden:
+        # D12: Halterahmen wie im Produkt: Ein laufendes PV-Speichern hält kleine Einbrüche bis zur Mindesthaltezeit.
+        if seit is not None and seit < r.halte_s:
+            halt = max(boden, min(vorher or boden, max(boden, angebot, max(0.0, akku))))
+            return min(laden, ceil(halt / stufe) * stufe)
+        return 0.0
+    rate = a.rate_w if _zahl(a.rate_w) and a.rate_w > 0 else laden
+    soll = min(laden, rate, angebot)
+    if _zahl(r.export_grenze_w):
+        ueber = max(0.0, -netz - r.export_grenze_w - r.export_waechter_w)
+        if ueber > 0:
+            soll = max(soll, min(laden, angebot, max(0.0, akku) + ueber))
+    # D12: Rampe wie im Produkt, ab dem eigenen letzten Satz, beim Übergang ab der gemessenen Ladung.
+    basis = vorher if vorher is not None else min(max(0.0, akku) if akku >= 250.0 else 0.0, soll)
+    if soll > basis:
+        gerampt = min(soll, basis + r.rampe_w)
+        if 0 < gerampt < ENTLADE_MINDEST_W:
+            gerampt = min(soll, ENTLADE_MINDEST_W)
+        soll = min(soll, ceil(gerampt / stufe) * stufe)
+    return soll
+
+
+HAND_STILLSTAND_PCT = 95.0
+HAND_STILLSTAND_S = 600.0
+
+
+def _hand_stillstand(a, e, z, neu, soc):
+    """B07: Ein Handladeauftrag endet wie im Produkt, wenn der Speicher ab 95 % zehn Minuten lang nicht um einen
+    Prozentpunkt steigt; danach bleibt er beendet (normale Regelung, kein Halten). Die Frist läuft auf der monotonen
+    Kernuhr; eine neue Zeitbasis beginnt sie konservativ neu, ein beendeter Auftrag bleibt beendet."""
+    if a.quelle != "manual" or not _zahl(soc):
+        return False, neu
+    konto = "manual:%s:%s" % (a.beginn_s, a.ziel_pct)
+    if z.hand_konto == konto and z.hand_fertig:
+        return True, neu
+    if soc < HAND_STILLSTAND_PCT:
+        return False, replace(neu, hand_konto=konto, hand_anker_soc=None, hand_anker_s=None, hand_fertig=False)
+    gleich = z.hand_konto == konto and e.zeitbasis == z.zeitbasis and _zahl(z.hand_anker_s)
+    if not gleich or not _zahl(z.hand_anker_soc) or soc >= z.hand_anker_soc + 1.0:
+        return False, replace(neu, hand_konto=konto, hand_anker_soc=soc, hand_anker_s=e.monoton_s, hand_fertig=False)
+    fertig = e.monoton_s - z.hand_anker_s >= HAND_STILLSTAND_S
+    return fertig, replace(neu, hand_fertig=fertig)
+
+
+def _abrunden(wert, schritt):
+    """Wie der Produktvertrag: auf den Budgetschritt abrunden, unter 300 W keine Entladung."""
+    stufe = max(1.0, schritt) if _zahl(schritt) else 100.0
+    return max(ENTLADE_MINDEST_W, (wert // stufe) * stufe) if _zahl(wert) and wert >= ENTLADE_MINDEST_W else 0.0
+
+
+def _vorab_netz(a, e, z, neu, entlade_max, akku):
+    """V03: Netzrückfall des Pre-Dump über denselben Entladeweg; sonst bleibt der Verbraucherpfad.
+
+    Der Rückfall beginnt, wenn kein Verbraucherpfad frei ist, die Frist naht, die späteste Entladezeit erreicht ist
+    oder die Verbraucher die Leistung länger als die Wartezeit nicht annehmen; ein laufender Rückfall bleibt, bis ein
+    Verbraucher annimmt. Gilt das Fahrzeug-Zeitfenster, entscheidet dessen späteste Startzeit statt der Warteuhr.
+    Ohne Entladerahmen (Reserve, Schranke 2) oder ohne gültige Netzmessung (Schranke 4) beginnt und hält kein
+    Rückfall. Ohne Dringlichkeit hebt er wie der Produktpfad in Rampenschritten an. Rückgabe (Akkuleistung oder None,
+    Folgezustand)."""
+    f = a.netzrueckfall
+    nimmt = f.last_w >= f.schwelle_w
+    gleich = e.zeitbasis == z.zeitbasis
+    seit = (e.jetzt_s if nimmt or not gleich or not _zahl(z.vorab_warte_seit_s) or z.vorab_warte_seit_s > e.jetzt_s
+            else z.vorab_warte_seit_s)
+    laeuft = gleich and z.vorab_netz_aktiv
+    neu = replace(neu, vorab_warte_seit_s=seit)
+    faellig = (laeuft and not nimmt or not f.verfuegbar
+               or not nimmt and (f.frist_nah or f.faellig or f.bev_faellig
+                                 or not f.bev_fenster and e.jetzt_s - seit >= f.warte_s)
+               or nimmt and f.last_w < max(f.schwelle_w, 0.65 * f.rate_w) and f.frist_nah)
+    netz = e.netz.zahl(e.jetzt_s, -LEISTUNG_MAX_W, LEISTUNG_MAX_W)
+    if not faellig or not f.erlaubt or not _zahl(entlade_max) or entlade_max <= 0 or netz is None:
+        return None, neu
+    rate = min(f.rate_w, entlade_max)
+    if _zahl(f.export_grenze_w):
+        rate = _abrunden(min(rate, f.export_grenze_w), f.schritt_w)
+        if rate < ENTLADE_MINDEST_W:
+            # Am Exportlimit hält ein laufender Rückfall DISCH 0 W, ein neuer wartet (Produktvertrag).
+            return (0.0, replace(neu, vorab_netz_aktiv=True)) if laeuft else (None, neu)
+    if not nimmt and _zahl(f.hard_grenze_w):
+        rate = min(rate, _abrunden(f.hard_grenze_w, f.schritt_w))
+    if not (f.waechter or f.frist_nah or f.faellig or f.bev_faellig):
+        # Rampe wie im Produktpfad: Basis ist der eigene letzte Rückfallsatz, beim Übergang die gemessene Entladung.
+        vorher = (z.soll.entlade_soll_w if laeuft and z.soll is not None and z.soll.modus == "ENTLADEN"
+                  and _zahl(z.soll.entlade_soll_w) else max(0.0, -akku) if akku is not None else 0.0)
+        vorher = 0.0 if not laeuft and vorher < 250.0 else min(max(0.0, vorher), rate)
+        if rate > vorher:
+            gerampt = min(rate, vorher + f.rampe_w)
+            if 0 < gerampt < ENTLADE_MINDEST_W:
+                gerampt = min(rate, ENTLADE_MINDEST_W)
+            stufe = max(1.0, f.schritt_w)
+            rate = min(rate, ceil(gerampt / stufe) * stufe)
+    return rate, replace(neu, vorab_netz_aktiv=True)
+
+
 def schritt(eingang: Eingang, vorzustand: Zustand) -> Ergebnis:
     """Entscheidet ohne I/O; der Vorzustand wird niemals verändert."""
     e, z = eingang, vorzustand
-    neu = replace(z, kandidat=None, kandidat_s=0.0, kandidat_wh=0.0, restlast_w=None, restlast_zuordnung=())
+    # Warteuhr und Rückfall des Pre-Dump gelten nur, solange der Verbraucherauftrag sie in diesem Zyklus fortschreibt.
+    neu = replace(z, kandidat=None, kandidat_s=0.0, kandidat_wh=0.0, restlast_w=None, restlast_zuordnung=(),
+                  vorab_warte_seit_s=None, vorab_netz_aktiv=False)
     notstrom = e.notstrom.zahl(e.jetzt_s, 0, 4)
     soc = e.soc.zahl(e.jetzt_s, 0, 100)
     # Schutzliste 2: genau die vier vereinbarten Gesamtauslöser.
@@ -564,7 +926,8 @@ def schritt(eingang: Eingang, vorzustand: Zustand) -> Ergebnis:
               or not _zahl(e.monoton_s) or not isinstance(e.zeitbasis, str) or not e.zeitbasis
               or e.regelung_an is not True or e.rscp_fehler is not False or soc is None or notstrom not in (0, 2, 3))
     neu, reserve, nur_geraet, entlade_max, reserve_vorgabe = _reserve(e, z, neu, soc, fehler)
-    if e.auftrag is not None and e.auftrag.modus == "VORAB":
+    # Akkubezogene Aufträge haben ihr eigenes Konto; das Netzladekonto gilt nur für Netzenergie (keine Umdeutung).
+    if e.auftrag is not None and e.auftrag.modus in ("VORAB", "ENTLADEN"):
         a, endliche_rate = e.auftrag, None
         neu = replace(neu, netzauftrag_rate_w=0.0)
     else:
@@ -597,10 +960,13 @@ def schritt(eingang: Eingang, vorzustand: Zustand) -> Ergebnis:
                            "GERAETEGRENZE_UNBEKANNT", "Ohne belegte Gerätegrenzen gibt es keine neue Optimierung.")
     e = _rohbilanz(e)
     kurve_ok = _kurve_gueltig(e.kurve, e.jetzt_s)
-    # Laufender Rest ist kein neuer Optimierungsauftrag.
+    # Laufender Rest ist kein neuer Optimierungsauftrag. Eine reine Ratenänderung eines Netzladeauftrags ohne feste
+    # Energiemenge (Markt, Preis-Boost, Unwetter, Hand, Lastspitzenpuffer) ist ebenfalls kein neuer Auftrag; die neue
+    # Rate wirkt im nächsten Kerntakt. Neue Anweisung bleiben Art, Quelle, Ende und Ziel (eine Regel statt des früheren
+    # Sonderfalls für das Puffer-Nachladen).
     vorgabe_auftrag = (a.modus, a.quelle, a.ende_s, a.ziel_pct) if (
-        a is not None and a.modus == "VORAB") else (a.modus, a.konto, a.ende_s, a.unabhaengig) if (
-        a is not None and a.rest_wh is not None) else a
+        a is not None and (a.modus == "VORAB" or a.modus == "NETZLADEN" and a.rest_wh is None)) else (
+        a.modus, a.konto, a.ende_s, a.unabhaengig) if a is not None and a.rest_wh is not None else a
     vorgabe = (e.kurve if kurve_ok else None,
                vorgabe_auftrag if _auftrag_gueltig(a, e.jetzt_s) else None)
     o = z.optimierung
@@ -620,25 +986,35 @@ def schritt(eingang: Eingang, vorzustand: Zustand) -> Ergebnis:
     if vorab:
         neu = replace(neu, vorab_latch=z.vorab_latch if not faellig or
             o is not None and e.zeitbasis == z.zeitbasis and o.vorgabe[1] == vorgabe_auftrag else
-            a.ziel_pct if (o is None or e.zeitbasis != z.zeitbasis)
-                and soc < a.ziel_pct + VORAB_ABSTAND_PP else None)
+            a.ziel_pct if soc < a.ziel_pct + VORAB_ABSTAND_PP else None)
         if soc <= a.ziel_pct:
             neu = replace(neu, vorab_latch=a.ziel_pct)
         elif soc >= a.ziel_pct + VORAB_ABSTAND_PP:
             neu = replace(neu, vorab_latch=None)
         faellig = faellig or neu.vorab_latch != z.vorab_latch
+    elif z.vorab_latch is not None and not (_auftrag_gueltig(a, e.jetzt_s) and a.modus == "VORAB"):
+        # C03: Ohne gültigen Pre-Dump-Auftrag gibt es kein eigenes Ziel mehr; der Bodenhalt (und mit ihm die Sperre
+        # der Haltezone) endet mit dem Auftrag, nicht erst am Abstand über dem Ziel.
+        neu = replace(neu, vorab_latch=None)
     # Anschlussrahmen nur an einer Fälligkeit; der kurze Takt prüft
     # weiter die Daten, reagiert aber nicht auf eigene Leistungssprünge.
-    netz = e.netz.zahl(e.jetzt_s, -LEISTUNG_MAX_W, LEISTUNG_MAX_W)
+    phasen = tuple(w.zahl(e.jetzt_s, -LEISTUNG_MAX_W, LEISTUNG_MAX_W)
+                   for w in e.anschluss_phasen)
     akku = e.akku.zahl(e.jetzt_s, -LEISTUNG_MAX_W, LEISTUNG_MAX_W)
     anschluss = e.anschluss_a.zahl(e.jetzt_s, 0, 1000, GERAETE_FRIST_S)
     rahmen = None
-    if (netz is not None and akku is not None and anschluss is not None
+    if (len(phasen) == 3 and None not in phasen and akku is not None and anschluss is not None
             and _zahl(e.anschluss_abstand_a) and e.anschluss_abstand_a >= 0):
-        rahmen = (max(0.0, (anschluss - e.anschluss_abstand_a) * DREIPHASEN_W_PRO_A
-                      - max(0.0, max(0.0, netz) - akku)) if faellig else o.netzrahmen_w)
+        # Derselbe Phasenvertrag wie im Speicherregler, ohne Ersatz aus der Netzsumme.
+        rahmen = (market_grid_charge_room_w(
+            dict(grid_max_amps=anschluss, grid_max_reserve_amp=e.anschluss_abstand_a),
+            dict(zip(("grid_p1", "grid_p2", "grid_p3"), phasen),
+                Battery_Power=akku, _ts=e.jetzt_s, pvi_ac_max_phase_count=e.akku_phasen,
+                pvi_ac_max_phase_count_valid=True, managed_vehicle_phases=dict(ts=e.jetzt_s,
+                    phase_w=[w.zahl(e.jetzt_s, 0, LEISTUNG_MAX_W) for w in e.fahrzeug_phasen])),
+            now_s=e.jetzt_s) if faellig else o.netzrahmen_w)
     if (e.sonderfunktion or (_auftrag_gueltig(e.auftrag, e.jetzt_s)
-                             and e.auftrag.modus not in ("HALTEN", "LADESP", "NETZLADEN", "VORAB"))):
+                             and e.auftrag.modus not in AUFTRAGSMODI)):
         soll = Stellgroesse(ladegrenze_w=laden, entladegrenze_w=entlade_max, grenzen_frei=False)
         return _abschluss(e, z, replace(neu, optimierung=None), soll, _unbekannt("NICHT_ABGEDECKT"),
                            "NICHT_ABGEDECKT", "Eine Sonderfunktion wird von diesem Kern noch nicht abgedeckt.",
@@ -674,22 +1050,33 @@ def schritt(eingang: Eingang, vorzustand: Zustand) -> Ergebnis:
     kandidat = ("FREI" if soc < e.kurve.boden_pct else "KURVE") if kurve_ok and faellig else (
         o.kandidat if not faellig else "FREI")
     ladeseite = modus
+    entlade_soll = lade_soll = None
     if _auftrag_gueltig(a, e.jetzt_s):
         if a.modus == "HALTEN":
             modus, code = "HALTEN", "PLAN_HALTEN"
         elif a.modus == "LADESP":
             modus, rate, code = "KURVE", 0.0, "NUTZER_LADESP"
+        elif a.modus == "LADEBLOCK":
+            # Planauftrag mit gleicher Wirkung wie die Ladesperre, aber Optimierung statt Nutzerwunsch.
+            modus, rate, code = "KURVE", 0.0, "PLAN_LADEBLOCK"
         elif a.modus == "VORAB" and vorab:
             if neu.vorab_latch is not None:
                 code = "ZIEL_ERREICHT"
             elif not kurve_ok or soc >= e.kurve.boden_pct:
                 rate = a.rate_w if faellig else o.rate_w
                 code = "PLAN_VORAB"
+                if a.netzrueckfall is not None:
+                    netz_soll, neu = _vorab_netz(a, e, z, neu, entlade_max, akku)
+                    if netz_soll is not None:
+                        modus, code, entlade_soll = "ENTLADEN", "PLAN_VORAB_NETZ", netz_soll
             else:
                 code = "KURVE_AUFHOLEN"
         elif (a.modus == "NETZLADEN" and _zahl(a.rate_w) and a.rate_w > 0
               and _zahl(a.ziel_pct) and 0 <= a.ziel_pct <= 100):
-            if soc < a.ziel_pct and rahmen is not None and rahmen > 0:
+            stillstand, neu = _hand_stillstand(a, e, z, neu, soc)
+            if stillstand:
+                code = "HAND_STILLSTAND"     # Abschluss wie im Produkt: normale Regelung, kein Halten.
+            elif soc < a.ziel_pct and rahmen is not None and rahmen > 0:
                 modus, code = "NETZLADEN", "PLAN_NETZLADEN"
             elif soc >= a.ziel_pct:
                 # Ziel bis zum Auftragsende erhalten: derselbe HALTEN-Modus,
@@ -697,15 +1084,76 @@ def schritt(eingang: Eingang, vorzustand: Zustand) -> Ergebnis:
                 modus, code = "HALTEN", "ZIEL_ERREICHT"
             else:
                 modus, code = "HALTEN", "NETZRAHMEN_UNBEKANNT" if rahmen is None else "NETZRAHMEN_NULL"
+        elif a.modus == "ENTLADEN" and a.energiebezug == "akku" and _zahl(a.ziel_pct) and 0 <= a.ziel_pct <= 100:
+            # Der Boden liegt nie unter der Notstromreserve; der Rahmen ist bereits reservebegrenzt (Schranke 2).
+            boden = max(a.ziel_pct, reserve if _zahl(reserve) else 0.0)
+            entlade_soll = _entladeleistung(a, e, z, entlade_max, akku)
+            rest = None
+            if _zahl(a.rest_wh):
+                rest, neu = _entladekonto(a, e, z, neu, akku)
+            druck = e.einspeise_ladebedarf.zahl(e.jetzt_s, 0, LEISTUNG_MAX_W)
+            p = a.platz
+            lief_platz = (p is not None and z.soll is not None and z.soll.modus == "ENTLADEN"
+                          and z.entlade_konto == a.konto)
+            if p is not None:
+                # Boden wie im Produktregler: Reserve, Kurvenboden, Ausführungsziel und harter Boden.
+                boden = max([boden] + [w for w in (p.kurven_boden_pct, p.ausfuehrungsziel_pct) if _zahl(w)])
+                entlade_soll = _platz_leistung(a, e, z, soc, boden, entlade_max) if akku is not None else None
+                kuehl = (not lief_platz and _zahl(z.platz_zuletzt_s) and e.zeitbasis == z.zeitbasis
+                         and 0 <= e.monoton_s - z.platz_zuletzt_s < p.kuehl_s)
+                plateau = (_zahl(p.zielkurve_pct) and p.zielkurve_pct >= p.endziel_pct - p.plateau_pct
+                           and soc >= p.zielkurve_pct - p.plateau_pct)
+            if p is not None and not _zahl(p.kurven_boden_pct):
+                code = "PLATZ_OHNE_KURVE"
+            elif p is not None and soc - boden < (p.halte_pct if lief_platz else p.ein_pct):
+                code = "ENTLADEZIEL_ERREICHT"
+            elif p is not None and kuehl:
+                code = "PLATZ_KUEHLZEIT"
+            elif p is not None and p.druck_wh < p.min_druck_wh:
+                code = "PLATZ_OHNE_DRUCK"
+            elif p is not None and plateau:
+                code = "PLATZ_PLATEAU"
+            elif soc <= boden + ENTLADE_ABSTAND_PP:
+                code = "ENTLADEZIEL_ERREICHT"
+            elif rest is not None and rest <= 0:
+                code = "ENTLADEN_REST_ERBRACHT"
+            elif a.druckveto and (druck is None or druck > 0):
+                # Abregeldruck (oder unbekannter Druck) hat Vorrang: Platz entsteht dann durch Laden, nicht Entladen.
+                code = "ENTLADEN_DRUCKVETO"
+            elif entlade_soll is None or entlade_soll < ENTLADE_MINDEST_W:
+                code = "ENTLADEN_OHNE_RAHMEN"
+            else:
+                modus, code = "ENTLADEN", "PLAN_ENTLADEN"
+                if p is not None:
+                    neu = replace(neu, platz_zuletzt_s=e.monoton_s)
+        elif (a.modus == "PVLADEN" and a.energiebezug == "akku" and a.pv_laderecht is not None and _zahl(a.ziel_pct)
+              and 0 <= a.ziel_pct <= 100):
+            # Ohne Auftragswirkung (Ziel erreicht, kein Angebot) bleibt die normale Regelung.
+            if soc >= a.ziel_pct - a.pv_laderecht.hysterese_pct:
+                code = "PV_LADEZIEL_ERREICHT"
+            else:
+                lade_soll = _pv_ladeleistung(a, e, z, laden, akku)
+                if lade_soll is None or lade_soll < ENTLADE_MINDEST_W:
+                    code = "PV_LADEN_OHNE_ANGEBOT"
+                else:
+                    modus, code = "LADEN", "PLAN_PV_LADEN"
+                    lief = z.soll is not None and z.soll.modus == "LADEN" and e.zeitbasis == z.zeitbasis
+                    neu = replace(neu, pv_laden_seit_s=z.pv_laden_seit_s if lief and _zahl(z.pv_laden_seit_s)
+                        else e.monoton_s)
 
+    # L03: Lastspitzenpuffer halten: kein Entladen bis zum nächsten echten Bedarf, Laden bleibt offen. Handaufträge
+    # und Laden gehen vor (wie im Produkt); andere Entladeaufträge ruhen über dem Puffer. Vor Budget und Haltezone
+    # gesetzt, damit wie bei jedem HALTEN kein Akkuanteil zugesagt wird.
+    # Die Ladeseite eines Auftrags (Ladesperre, Kurvenformung) bleibt dabei, wie sie ist: ein Merker vor der
+    # Übersteuerung, das Produkt behält die bestehende Ladegrenze ebenso.
+    ladesperre = code in ("NUTZER_LADESP", "PLAN_LADEBLOCK", "PLAN_VORAB", "PLAN_ENTLADEN", "PLAN_VORAB_NETZ")
+    kurvenladung = modus == "KURVE"
+    hand = a is not None and a.quelle == "manual" and _auftrag_gueltig(a, e.jetzt_s)
+    if (e.spitze is not None and e.spitze.klasse == "reserve_hold" and not hand
+            and modus not in ("NETZLADEN", "LADEN")):
+        modus, code = "HALTEN", "LASTSPITZE_PUFFER"
     bedarf = e.einspeise_ladebedarf.zahl(e.jetzt_s, 0, LEISTUNG_MAX_W)
     kurvenkappe = min(laden, max(rate, bedarf or 0.0)) if faellig else min(laden, o.kurvenkappe_w)
-    ladegrenze = (kurvenkappe
-                 if modus == "KURVE" or modus == "HALTEN" and ladeseite == "KURVE" else laden)
-    if kurve_ok and soc >= e.kurve.deckel_pct:
-        ladegrenze = min(ladegrenze, bedarf or 0.0)
-    if code in ("NUTZER_LADESP", "PLAN_VORAB"):
-        ladegrenze = 0.0
     gridrate = (min(a.rate_w, laden) if _auftrag_gueltig(a, e.jetzt_s)
                 and a.modus == "NETZLADEN" and _zahl(a.rate_w) and a.rate_w > 0 else None)
     if not faellig:
@@ -713,14 +1161,37 @@ def schritt(eingang: Eingang, vorzustand: Zustand) -> Ergebnis:
     if endliche_rate is not None:
         gridrate = min(laden, endliche_rate)
     grid = min(gridrate, rahmen) if modus == "NETZLADEN" and gridrate is not None else None
+    # Die endgültige Rate trägt die technische Mindestleistung und das
+    # vorhandene Schreibtotband; Gedächtnis ist allein der letzte Sollsatz.
+    if (grid is not None and grid < (300.0 if z.soll and z.soll.modus == "NETZLADEN"
+                                    else 300.0 + SCHREIBTOTBAND_W)):
+        modus, grid, code = "HALTEN", None, "NETZLADEN_MINDESTLEISTUNG"
+    ladegrenze = (kurvenkappe
+                 if modus == "KURVE" or modus == "HALTEN" and ladeseite == "KURVE" else laden)
+    if kurve_ok and soc >= e.kurve.deckel_pct:
+        ladegrenze = min(ladegrenze, bedarf or 0.0)
+    formung = e.kurvenformung
+    if formung is not None and kurvenladung:
+        # Nur die normale Kurvenladung wird geformt; Aufträge und Nullgrenzen danach bleiben vorrangig.
+        if _zahl(formung.preis_w):
+            ladegrenze = max(ladegrenze, min(laden, max(0.0, formung.preis_w)))
+        if _zahl(formung.reservierung_w):
+            netz_jetzt = e.netz.zahl(e.jetzt_s, -LEISTUNG_MAX_W, LEISTUNG_MAX_W)
+            ladegrenze = (0.0 if netz_jetzt is None or netz_jetzt > formung.importwaechter_w
+                          else min(ladegrenze, max(0.0, formung.reservierung_w)))
+    if ladesperre:
+        ladegrenze = 0.0
     # Einspeisedruck öffnet nur innerhalb des erlaubten Quellenrahmens; nur
     # tatsächliches Netzladen ist kein PV-Ladepfad und bleibt davon frei.
     if e.quellen_ladekappe is not None and modus != "NETZLADEN":
         quellenkappe = e.quellen_ladekappe.zahl(e.jetzt_s, 0, LEISTUNG_MAX_W)
         ladegrenze = min(ladegrenze, quellenkappe if quellenkappe is not None else 0.0)
+    if modus == "LADEN":
+        # Quellengebundenes PV-Laden: der eigene Angebotsrahmen ist die Ladeleistung (SET_POWER CHRG).
+        ladegrenze = lade_soll
     # Genau ein Anspruch; niemals Akku-Istleistung oder Wallboxlast als Rate.
-    anspruch = (grid if modus == "NETZLADEN" else rate if kurve_ok else 0.0)
-    if code in ("NUTZER_LADESP", "PLAN_VORAB"):
+    anspruch = (grid if modus == "NETZLADEN" else lade_soll if modus == "LADEN" else rate if kurve_ok else 0.0)
+    if ladesperre:
         anspruch = 0.0
     pv_anteil = (Anteil(None, False, "PV_ODER_HAUS_UNGUELTIG") if pv is None or haus is None
                  else Anteil(max(0.0, pv - haus - anspruch), True, "PV_NACH_HAUS_UND_ANSPRUCH"))
@@ -734,7 +1205,7 @@ def schritt(eingang: Eingang, vorzustand: Zustand) -> Ergebnis:
     boeden = [b for b in boeden if _zahl(b)]
     h = e.haltezone
     zone = wbminsoc_hold_zone_contract(eligible=h.eligible and not aktiv and not nur_geraet
-        and modus not in ("HALTEN", "NETZLADEN") and haus is not None and pv is not None
+        and modus not in ("HALTEN", "NETZLADEN", "ENTLADEN", "LADEN") and haus is not None and pv is not None
         and not any(v.gesperrt for v in boxen), mode=h.mode, soc=soc,
         floor_soc=(None if code == "PLAN_VORAB" and reserve is None else
             max(boeden) if boeden else None),
@@ -786,7 +1257,9 @@ def schritt(eingang: Eingang, vorzustand: Zustand) -> Ergebnis:
         if not _ladebelegt(v, e.jetzt_s) or _als_hauslast(anteil):
             continue
         w = v.watt(e.jetzt_s)
-        eingeschraenkt = eingeschraenkt or (anteil.battery_w.wert_w or 0.0) < w
+        # Dasselbe 100-W-Maß wie das Schreibtotband, damit Messrauschen um das
+        # Akkurecht den Entladedeckel nicht zwischen zwei Rahmen kippt; Schutzgrenzen wirken unverändert sofort.
+        eingeschraenkt = eingeschraenkt or (anteil.battery_w.wert_w or 0.0) < w - SCHREIBTOTBAND_W
         getragen = (w if v.art.startswith("wallbox_") and anteil.battery_w.grund in (
             "AKKU_NICHT_FREIGEGEBEN:wbminsoc_hold_zone",
             "AKKU_NICHT_FREIGEGEBEN:boden") else
@@ -809,12 +1282,30 @@ def schritt(eingang: Eingang, vorzustand: Zustand) -> Ergebnis:
     # Nach der Überbrückung gilt ohne Messung „Haus inkl. Verbraucher“.
     if not eingeschraenkt:
         entladegrenze = entlade_max
+    spitze = e.spitze
     if modus == "HALTEN":
         entladegrenze = 0.0
+    elif modus == "ENTLADEN":
+        entladegrenze = entlade_soll
+    elif modus == "LADEN":
+        entladegrenze = 0.0
+    normalbetrieb = modus in ("FREI", "KURVE") and not (a is not None and _auftrag_gueltig(a, e.jetzt_s))
+    # T06: Bestätigte geplante Last in der normalen Regelung: Halten sperrt die Entladung, die Preisstütze begrenzt
+    # sie (mindestens 300 W). Sie geht der Lastspitzen-Kappe vor (wie im Produkt).
+    last_kappe = bool(e.last is not None and normalbetrieb)
+    if last_kappe:
+        entladegrenze = 0.0 if e.last.klasse == "halten" else min(entladegrenze, max(ENTLADE_MINDEST_W, e.last.kappe_w))
+    # L02: Aktive Kappe nur im Normalbetrieb ohne gültigen Auftrag: Entladung höchstens bis zum Bedarf der
+    # Viertelstunde, nie über den bestehenden Rahmen und ohne Einspeisung (eine Kappe, kein zweiter Regler).
+    spitzen_kappe = bool(spitze is not None and spitze.klasse == "active_cap" and normalbetrieb
+        and not last_kappe and entladegrenze > 0)
+    if spitzen_kappe:
+        entladegrenze = min(entladegrenze, max(0.0, spitze.ziel_w))
 
     # Ein alleiniger belegter Geräteboden hat keine zweite eigene Nullgrenze.
     # Andere Vorgaben (HALTEN, Kurve, Ladesperre) bleiben unabhängig wirksam.
-    if (nur_geraet and modus == "FREI" and not kurve_ok and not reserve_vorgabe
+    if (nur_geraet and modus == "FREI" and not kurve_ok and not reserve_vorgabe and not spitzen_kappe
+            and not last_kappe
             and not any(v.netzgedeckt and _ladebelegt(v, e.jetzt_s)
                 for v in e.verbraucher)):
         soll = Stellgroesse()
@@ -834,13 +1325,15 @@ def schritt(eingang: Eingang, vorzustand: Zustand) -> Ergebnis:
                 and z.soll.grid_soll_w <= min(laden, rahmen, endliche_rate if endliche_rate is not None else laden)
                 and abs(grid - z.soll.grid_soll_w) < SCHREIBTOTBAND_W):
             soll = replace(soll, grid_soll_w=z.soll.grid_soll_w)
+    if soll.modus == "ENTLADEN":
+        # Derselbe Sollsatz nach dem Totband ist die DISCH-Leistung (ein Wert, keine zweite Rechnung).
+        soll = replace(soll, entlade_soll_w=soll.entladegrenze_w)
+    elif soll.modus == "LADEN":
+        soll = replace(soll, lade_soll_w=soll.ladegrenze_w)
     if a is not None and a.rest_wh is not None and grid is not None:
-        if grid < 300:
-            soll = replace(soll, modus="FREI", grid_soll_w=None)
-        else:
-            soll = replace(soll, grid_rest_wh=a.rest_wh, grid_gueltig_bis_s=a.ende_s,
-                           grid_dauer_s=e.ausgabe_dauer_s)
-            neu = replace(neu, netzauftrag_rate_w=soll.grid_soll_w)
+        soll = replace(soll, grid_rest_wh=a.rest_wh, grid_gueltig_bis_s=a.ende_s,
+                       grid_dauer_s=e.ausgabe_dauer_s)
+        neu = replace(neu, netzauftrag_rate_w=soll.grid_soll_w)
     # Unterschiedliche Namen bei identischer Hardwarewirkung sind kein Wechsel.
     if (z.soll and {soll.modus, z.soll.modus} == {"FREI", "KURVE"}
             and soll.ladegrenze_w == z.soll.ladegrenze_w
@@ -863,8 +1356,6 @@ def schritt(eingang: Eingang, vorzustand: Zustand) -> Ergebnis:
     if deckel is None:
         code = "HAUS_UNGUELTIG:" + e.haus.grund if haus_roh is None else "PV_UNGUELTIG:" + e.pv.grund
         budget = replace(budget, battery_w=Anteil(None, False, code))
-    if aktiv:
-        code = "RESERVE_ENTLADUNG_GESPERRT"
     return _abschluss(e, z, neu, soll, budget, code,
                        f"{soll.modus}: Grund {code}.",
                        rahmen=rahmen)

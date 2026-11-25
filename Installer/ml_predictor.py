@@ -508,6 +508,17 @@ def _activate_conservative_ml_fallback(reason):
     print(f"ML-Prognose nicht verfügbar; konservativer System-Fallback bleibt aktiv ({reason}).")
 
 
+def _training_failed(reason):
+    """Training ohne neues Modell: Ein nutzbares bisheriges Modell behält seine Prognose."""
+    try:
+        _load_ml_model_safely(MODEL_PATH)
+    except Exception:
+        _activate_conservative_ml_fallback(reason)
+    else:
+        print(f"Kein neues ML-Modell ({reason}); bisheriges Modell und Prognose bleiben.")
+    return False
+
+
 def _ensure_ml_training_table(conn):
     conn.execute('''
         CREATE TABLE IF NOT EXISTS ml_training_data (
@@ -1073,38 +1084,52 @@ def _accuracy_log_entry_has_full_day_forecast(entry):
         return False
 
 
+def _positive_consumption_reference(value):
+    try:
+        value = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return value if math.isfinite(value) and value > 0.0 else None
+
+
 def _compute_consumption_bias(eval_log, min_days=3):
     daily_log = eval_log.get("daily_log", []) if isinstance(eval_log, dict) else []
     daily_cap = _load_ml_home_daily_cap()
     min_home_reference_kwh = _home_reference_min_kwh(daily_cap)
     reference_caps = _load_ml_home_reference_caps()
-    usable = [
-        e for e in daily_log[-14:]
-        if e.get("forecast_home_kwh", 0) > 1.0 and e.get("actual_home_kwh", 0) > 0.5
-        and float(e.get("actual_home_kwh", 0) or 0) >= min_home_reference_kwh
-        and float(e.get("actual_home_kwh", 0) or 0) <= daily_cap * 1.35
-        and _accuracy_log_home_reference_is_quiet(e, caps=reference_caps)
-        and _accuracy_log_entry_has_full_day_forecast(e)
-    ]
-    home_ratios = [
-        max(0.55, min(1.60, float(e["actual_home_kwh"]) / float(e["forecast_home_kwh"])))
-        for e in usable
-    ]
-    wp_ratios = []
-    for e in daily_log[-14:]:
-        if not _accuracy_log_entry_has_full_day_forecast(e):
+    old_home_ratios, new_home_ratios = [], []
+    old_wp_ratios, new_wp_ratios = [], []
+    for entry in daily_log[-14:]:
+        if not _accuracy_log_entry_has_full_day_forecast(entry):
             continue
-        try:
-            forecast_wp = float(e.get("forecast_wp_kwh", 0) or 0.0)
-            actual_wp = float(e.get("actual_wp_kwh", 0) or 0.0)
-        except (TypeError, ValueError):
-            continue
-        if forecast_wp <= 0.5 or actual_wp < 0.0:
-            continue
-        # WP-aus-Tage sind echte Lerndaten. Nicht auf exakt 0 klemmen,
-        # damit die Prognose wieder hochlernen kann, wenn die WP zurückkehrt.
-        wp_ratios.append(max(0.05, min(2.0, actual_wp / forecast_wp)))
+        for channel, old_ratios, new_ratios, lower, upper in (
+            ("home", old_home_ratios, new_home_ratios, 0.55, 1.60),
+            ("wp", old_wp_ratios, new_wp_ratios, 0.05, 2.0),
+        ):
+            try:
+                actual = float(entry.get("actual_" + channel + "_kwh"))
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if not math.isfinite(actual) or actual < 0.0:
+                continue
+            if channel == "home" and (
+                actual <= 0.5 or actual < min_home_reference_kwh
+                or actual > daily_cap * 1.35
+                or not _accuracy_log_home_reference_is_quiet(entry, caps=reference_caps)
+            ):
+                continue
+            forecast = _positive_consumption_reference(entry.get("forecast_" + channel + "_kwh"))
+            if forecast is not None and forecast > (1.0 if channel == "home" else 0.5):
+                old_ratios.append(max(lower, min(upper, actual / forecast)))
+            reference = _positive_consumption_reference(entry.get("pre_bias_" + channel + "_kwh"))
+            if reference is not None:
+                # WP-aus-Tage bleiben Lerndaten; die untere Faktorgrenze bleibt bestehen.
+                new_ratios.append(max(lower, min(upper, actual / reference)))
 
+    # Übergang für Bestandslogs: Entfernen mit 5.5.11 (übernächste Version nach 5.5.9).
+    # Ab drei gültigen neuen Tagen ausschließlich gegen die Prognose vor dem Bias rechnen.
+    home_ratios = new_home_ratios if len(new_home_ratios) >= 3 else old_home_ratios
+    wp_ratios = new_wp_ratios if len(new_wp_ratios) >= 3 else old_wp_ratios
     bias_home = sum(home_ratios[-7:]) / len(home_ratios[-7:]) if len(home_ratios) >= min_days else 1.0
     bias_wp = sum(wp_ratios[-7:]) / len(wp_ratios[-7:]) if len(wp_ratios) >= min_days else 1.0
     return bias_home, bias_wp, len(home_ratios), len(wp_ratios)
@@ -1293,7 +1318,7 @@ def _apply_wp_forecast_sanity(timeline):
     return 1.0, baseline
 
 
-def _update_consumption_accuracy_log(timeline):
+def _update_consumption_accuracy_log(timeline, pre_bias_forecasts=None):
     eval_log = _load_consumption_eval_log()
     now = datetime.datetime.now()
     today = now.date().isoformat()
@@ -1321,6 +1346,15 @@ def _update_consumption_accuracy_log(timeline):
                 "first_ts": values["first_ts"],
                 "last_ts": values["last_ts"],
             }
+
+            reference = (pre_bias_forecasts or {}).get(day, {})
+            for channel in ("home", "wp"):
+                key = "pre_bias_" + channel + "_kwh"
+                value = _positive_consumption_reference(reference.get(channel + "_kwh"))
+                forecasts[day][key] = value
+                forecasts[day]["pre_bias_" + channel + "_reason"] = (
+                    None if value is not None else "missing_or_invalid_pre_bias_forecast"
+                )
 
     actual_by_day = {}
     try:
@@ -1371,6 +1405,10 @@ def _update_consumption_accuracy_log(timeline):
             "forecast_ts": forecast.get("ts"),
             "forecast_coverage_slots": forecast_coverage_slots or None,
             "forecast_coverage_fraction": forecast.get("coverage_fraction"),
+            "pre_bias_home_kwh": _positive_consumption_reference(forecast.get("pre_bias_home_kwh")),
+            "pre_bias_home_reason": forecast.get("pre_bias_home_reason") if _positive_consumption_reference(forecast.get("pre_bias_home_kwh")) is not None else "missing_or_invalid_pre_bias_forecast",
+            "pre_bias_wp_kwh": _positive_consumption_reference(forecast.get("pre_bias_wp_kwh")),
+            "pre_bias_wp_reason": forecast.get("pre_bias_wp_reason") if _positive_consumption_reference(forecast.get("pre_bias_wp_kwh")) is not None else "missing_or_invalid_pre_bias_forecast",
             "forecast_home_kwh": round(forecast_home, 3),
             "actual_home_kwh": round(actual["home_kwh"], 3),
             "actual_wb_kwh": round(actual.get("wb_kwh", 0.0), 3),
@@ -2148,8 +2186,7 @@ def _clear_training_attempt():
 def train_model():
     if not HAS_SKLEARN:
         print("FEHLER: scikit-learn ist nicht installiert. Bitte fuehre im Installer Punkt 3 aus.")
-        _activate_conservative_ml_fallback("scikit-learn fehlt")
-        return False
+        return _training_failed("scikit-learn fehlt")
 
     legacy_notice = _legacy_ml_model_notice()
     if legacy_notice:
@@ -2160,8 +2197,7 @@ def train_model():
     legacy_source = _legacy_training_enabled()
     res = _load_legacy_training_data() if legacy_source else _load_history_training_data()
     if res[0] is None:
-        _activate_conservative_ml_fallback("noch keine ausreichenden Trainingsdaten")
-        return False
+        return _training_failed("noch keine ausreichenden Trainingsdaten")
 
     X, (y_home, y_wp) = res
 
@@ -2196,13 +2232,67 @@ def train_model():
         )
     except Exception as exc:
         print(f"FEHLER: ML-Modell konnte nicht sicher gespeichert werden: {exc}")
-        _activate_conservative_ml_fallback("sicheres Modell konnte nicht veroeffentlicht werden")
-        return False
+        return _training_failed("sicheres Modell konnte nicht veroeffentlicht werden")
 
     # Erst nach sicherer Veröffentlichung, auch beim expliziten --train.
     _clear_training_attempt()
     print(f"[OK] ML-Modell erfolgreich trainiert ({MODEL_PATH}).", flush=True)
     return True
+
+
+def _weekly_training_due(now):
+    """Fälligkeit des Wochentrainings: letzter Sonntag, 03:00 Uhr Ortszeit."""
+    due = now.replace(hour=3, minute=0, second=0, microsecond=0) - datetime.timedelta(days=(now.weekday() + 1) % 7)
+    return due if due <= now else due - datetime.timedelta(days=7)
+
+
+def _weekly_training_state(now):
+    """(aktuell, Modellidentität) aus dem Manifest des geprüften Modells.
+
+    Ohne prüfbares Modell oder plausiblen Trainingszeitpunkt ist der Stand nie
+    aktuell. Der eine Tag nach vorn deckt Zeitumstellung und Uhrkorrektur ab.
+    """
+    try:
+        _payload, manifest, identity = _read_verified_ml_payload(MODEL_PATH, with_identity=True)
+    except Exception:
+        return False, None
+    try:
+        trained = datetime.datetime.fromisoformat(manifest["trained_at"])
+        return _weekly_training_due(now) <= trained <= now + datetime.timedelta(days=1), identity
+    except (KeyError, TypeError, ValueError):
+        return False, identity
+
+
+def train_model_if_due():
+    """Wochentraining, auch nachträglich; ohne prüfbares Modell ist es sofort fällig.
+
+    Erledigt ist es allein durch den Trainingszeitpunkt des geprüften Modells,
+    auch nach einem Neustart. Versuche teilen die Sperre der Nachschulung.
+    False nur nach einem fehlgeschlagenen oder nicht möglichen Versuch.
+    """
+    now = datetime.datetime.now()
+    current, identity = _weekly_training_state(now)
+    if current:
+        return True
+    try:
+        attempt = _training_attempt(now, reserve=True, model_identity=identity)
+    except Exception as exc:
+        print(f"ML-Training fällig, aber nicht möglich: {exc}")
+        return False
+    if not attempt["allowed"]:
+        return True
+    try:
+        trained = train_model() and _weekly_training_state(now)[0]
+    except Exception as exc:
+        print(f"ML-Training fehlgeschlagen: {type(exc).__name__}")
+        trained = False
+    if not trained:
+        _training_attempt(now, result="failed")
+        # Der Rückfall ohne nutzbares Modell hat die Prognose entfernt.
+        if not os.path.exists(PREDICTION_PATH):
+            predict_today()
+    return trained
+
 
 def predict_today():
     now = datetime.datetime.now()
@@ -2496,7 +2586,8 @@ def predict_today():
         total_home_today = sum(slot['home_kwh'] * 0.25 for slot in timeline[:24 * 4])
 
     # Der Hausdeckel prüft die Modellausgabe, der belegte Bias folgt danach.
-    # Das Accuracy-Log bewertet weiterhin ausschließlich die ausgegebene Prognose.
+    # Das Accuracy-Log hält Ausgabe und Bezugsgröße vor dem Bias getrennt fest.
+    pre_bias_forecasts = _daily_forecasts_from_timeline(timeline) if forecast_mode == "verified_ml_model" else None
     # Bias auf Timeline anwenden
     if bias_home != 1.0 or bias_wp != 1.0:
         for slot in timeline:
@@ -2519,7 +2610,7 @@ def predict_today():
             for slot in timeline[:24 * 4]
         )
 
-    accuracy = _update_consumption_accuracy_log(timeline)
+    accuracy = _update_consumption_accuracy_log(timeline, pre_bias_forecasts)
     corrections = {"order": "bias_then_sanity" if legacy_source else "home_sanity_then_bias",
                    "bias_home": round(bias_home, 3), "bias_wp": round(bias_wp, 3),
                    "sanity_home_factor": round(sanity_factor, 3), "sanity_home_baseline_kwh": sanity_baseline,
@@ -2664,6 +2755,8 @@ def analyze_data():
 if __name__ == "__main__":
     if "--train" in sys.argv:
         raise SystemExit(0 if train_model() else 1)
+    elif "--train-due" in sys.argv:
+        raise SystemExit(0 if train_model_if_due() else 1)
     elif "--predict" in sys.argv:
         raise SystemExit(0 if predict_today() else 1)
     elif "--model-ready" in sys.argv:

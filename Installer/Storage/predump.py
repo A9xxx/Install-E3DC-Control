@@ -1219,27 +1219,6 @@ def predump_wallbox_minimum_power_w(
         # physikalisch mögliche 3p-Wiederaufnahme unterreservieren.
         return 3
 
-    def start_hold_phases(wb_id: int = 0) -> int:
-        requests = wb_intent.get("start_hold_requests")
-        phases: List[int] = []
-        for item in requests if isinstance(requests, list) else []:
-            if not isinstance(item, dict):
-                continue
-            item_wb_id = safe_int(item.get("wb_id"), 0)
-            if wb_id > 0 and item_wb_id > 0 and item_wb_id != wb_id:
-                continue
-            if not (
-                item.get("active") is True
-                and item.get("connected") is True
-                and item.get("status_fresh") is True
-                and item.get("enabled") is True
-                and not item.get("blocked")
-            ):
-                continue
-            target = valid_phases(item.get("target_phases"))
-            if target:
-                phases.append(target)
-        return max(phases, default=0)
 
     def detail_real_power_w(detail: Dict[str, Any]) -> float:
         return max(
@@ -1274,8 +1253,7 @@ def predump_wallbox_minimum_power_w(
 
     transition_phases = active_transition_phases()
     canonical_start_phases = (
-        start_hold_phases()
-        or valid_phases(wb_intent.get("detected_phases"))
+        valid_phases(wb_intent.get("detected_phases"))
         or valid_phases(wb_native.get("detected_phases"))
     )
     if not canonical_start_phases:
@@ -1324,11 +1302,14 @@ def predump_wallbox_minimum_power_w(
                 detail_phases = transition_phases
             elif detail_is_openwb_pro(detail):
                 # Das rohe beziehungsweise alte phases_target einer stehenden
-                # Pro darf nicht in den Speicherpfad zurückwirken. Der
-                # sitzungsgebundene Startauftrag oder die Phasenerkennung des
+                # Pro darf nicht in den Speicherpfad zurückwirken. Die
+                # vorhandene Sitzungsphase oder die Phasenerkennung des
                 # Verteilers besitzt das Startminimum.
+                session_contract = detail.get("phase_contract")
+                session_contract = session_contract if isinstance(session_contract, dict) else {}
                 detail_phases = (
-                    start_hold_phases(safe_int(detail.get("id", detail.get("wb_id")), 0))
+                    valid_phases(session_contract.get("session_phase_latch_phases"))
+                    or valid_phases(session_contract.get("fixed_session_phase_count"))
                     or canonical_start_phases
                 )
             else:

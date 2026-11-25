@@ -5,7 +5,14 @@ bereits freigegebenen Rahmen zwischen Wallbox, Wärmepumpe und Heizstab auf,
 damit UI-Einstellungen keine konkurrierenden Wattbudgets erzeugen.
 """
 
+import copy
 import math
+from typing import Any, Dict
+
+try:
+    import control_time
+except ModuleNotFoundError:  # Aufruf als Paket
+    from Installer import control_time
 
 CONSUMERS = ("heatpump", "wallbox", "heater")
 DEFAULT_CONSUMER_PRIORITY_ORDER = ("heatpump", "wallbox", "heater")
@@ -834,6 +841,92 @@ def validate_heatpump_start_funding_contract(contract):
         return {"valid": False, "reason_code": "schema_invalid"}
     return {"valid": True, "reason_code": "heatpump_start_funding_valid"}
 
+
+
+CONSUMER_PRIORITY_RUNON_GUARD_SCHEMA = "consumer_priority_runon_guard_v1"
+
+
+def _float_or(value, default):
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+    return number if math.isfinite(number) else default
+
+
+def consumer_priority_runon_guard(
+    previous_contract: Any,
+    *,
+    previous_key: str,
+    configured_key: str,
+    duration_s: float,
+    current_sample: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Bindet den Wärmepumpen-Nachlauf an monotonic statt an Wallclock.
+
+    Die Wallclock bleibt Diagnosezeit. Ein Prozessneustart im selben Boot setzt
+    die monotonic Schutzfrist korrekt fort; ein Bootwechsel oder unvollständiger
+    aktiver Zustand bewaffnet sie konservativ neu und kann sie nie verkürzen.
+    """
+
+    prior = previous_contract if isinstance(previous_contract, dict) else {}
+    duration = min(7200.0, max(0.0, _float_or(duration_s, 600.0)))
+    key_changed = bool(previous_key and previous_key != configured_key)
+    prior_guard = (
+        prior.get("consumer_priority_runon_guard")
+        if isinstance(prior.get("consumer_priority_runon_guard"), dict)
+        else {}
+    )
+    prior_marked_active = bool(
+        prior.get("consumer_priority_runon_guard_active") is True
+        or prior.get("consumer_priority_wp_runon_active") is True
+    )
+
+    if key_changed:
+        guard = control_time.begin_guard(
+            duration,
+            current_sample,
+            minimum_s=0.0,
+            epoch_mode=control_time.EPOCH_MODE_SAME_BOOT_MONOTONIC,
+        )
+        reason = "priority_changed"
+    elif prior_guard.get("active") is False:
+        guard = copy.deepcopy(prior_guard)
+        reason = "priority_runon_elapsed"
+    elif prior_guard:
+        guard = control_time.evaluate_guard(
+            prior_guard,
+            current_sample,
+            minimum_s=0.0,
+        )
+        reason = str(guard.get("reason") or "priority_runon_evaluated")
+    elif prior_marked_active:
+        guard = control_time.begin_guard(
+            duration,
+            current_sample,
+            minimum_s=0.0,
+            epoch_mode=control_time.EPOCH_MODE_SAME_BOOT_MONOTONIC,
+        )
+        guard["fail_closed"] = True
+        guard["rearmed"] = True
+        guard["reason"] = "priority_runon_guard_incomplete"
+        reason = "priority_runon_guard_incomplete"
+    else:
+        guard = {}
+        reason = "priority_unchanged"
+
+    active = bool(guard.get("active") is True) if guard else False
+    return {
+        "schema_version": CONSUMER_PRIORITY_RUNON_GUARD_SCHEMA,
+        "active": active,
+        "duration_s": duration,
+        "reason": reason,
+        "fail_closed": bool(guard.get("fail_closed") is True) if guard else False,
+        "rearmed": bool(guard.get("rearmed") is True) if guard else False,
+        "previous_key": str(previous_key or ""),
+        "configured_key": str(configured_key or ""),
+        "guard": guard,
+    }
 
 
 def parse_priority_order(value):

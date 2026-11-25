@@ -16,6 +16,42 @@ export E3DC_INSTALL_PATH="/absoluter/pfad/zur/installation"
 test -f "$E3DC_INSTALL_PATH/e3dc-setup"
 ```
 
+## Rückfall von 5.5.9 auf 5.5.8
+
+**Docker:** Auf dem Host in `.env` `E3DC_IMAGE_TAG=v5.5.8` setzen und
+`sudo docker compose up -d` ausführen; die vorhandenen Daten-Volumes bleiben
+erhalten.
+
+**Bare Metal:** Der Rückweg ist das beim Update angelegte verifizierte Backup
+(siehe „Betriebsdaten wiederherstellen“). Nach dem Update geänderte
+Einstellungen und hinzugekommene Statistik- und Diagnosedaten sind darin nicht
+enthalten und vorher gesondert zu sichern.
+
+**Zugriff und Web-PIN:** 5.5.8 sperrt den Zugriff von außen ohne Web-PIN nicht,
+sondern zeigt nur einen Hinweis. Mit gesetzter Web-PIN verlangt 5.5.8 auch im
+Heimnetz für das Dashboard die Anmeldung.
+
+**Wallbox:** Die frühere 6-A-Phasenerkennung an festen E3DC-Wallboxen und der
+Start-Hold mit Akkureservierung wirken unter 5.5.8 wieder. Eine feste
+E3DC-Wallbox mit höchstens 17 A und Ruhemeldung „eine Phase“ startet unter 5.5.8
+mit Netzfreigabe nur mit einphasigem Fahrzeugprofil. Mit 5.5.9 gewählte
+Fahrzeugprofile bleiben gespeichert und gültig.
+
+**Speicher und Prognose:** Ohne aktive Einspeisegrenze wertet 5.5.8 Export
+wieder als Abregeldruck. Auf langsameren Geräten kann das Netzladen wieder ohne
+Pause beginnen. Der Korrekturfaktor der ML-Verbrauchsprognose rechnet wieder
+gegen die korrigierte Prognose; zusätzlich gespeicherte Vergleichswerte wertet
+5.5.8 nicht aus. „Freigabe-Entprellung“ der Lastspitzenkappung gilt wieder,
+soweit der Wert noch gespeichert ist.
+
+**Einstellungen:** Der Marktpfad-Schalter heißt unter 5.5.8 wieder
+„Netzdienlichen Eco-Modus aktivieren“; der gespeicherte Wert gilt unverändert.
+Ausgeblendete Werte erscheinen wieder.
+
+**Daten und Dienste:** 5.5.9 ändert keine Datenbankstruktur und führt keine
+neuen Dienste ein. Der Zeitpunkt des ersten Zugriffs von außen liegt unter
+`data/`; 5.5.8 wertet ihn nicht aus.
+
 ## Rückfall von 5.5.8 auf 5.5.7
 
 **Docker:** Auf dem Host in `.env` `E3DC_IMAGE_TAG=v5.5.7` setzen und
@@ -578,7 +614,7 @@ oder einen Prozessabbruch außerhalb des erkannten Fehlerpfads.
 
 ## Programmstand zurücksetzen
 
-Der aktuelle Stable-Stand ist `v5.5.8`.
+Der aktuelle Stable-Stand ist `v5.5.9`.
 
 Beim Rücklauf wird der tatsächliche Dateisystemzustand einer Unit weiterhin
 streng gegen reguläre Unit-Datei, kanonische `/dev/null`-Maske, unerwarteten

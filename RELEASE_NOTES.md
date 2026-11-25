@@ -1,3 +1,61 @@
+# E3DC-Control v5.5.9
+
+E3DC-Control 5.5.9 ist ein Funktions- und Korrekturupdate zu 5.5.8. Die wichtigsten Änderungen betreffen den Zugriff von außen ohne Web-PIN, das Dashboard im Heimnetz mit Web-PIN, den einfacheren Wallbox-Start, die Netzladeplanung auf langsameren Geräten, die Suche in Einstellungen und Dokumentation sowie den Einrichtungsstand in der Installationszentrale.
+
+## Vor dem Update und geändertes Verhalten
+
+- **Während des Updates kein Fahrzeug anstecken.** Solange die Dienste neu starten, regelt E3DC-Control keine Wallbox.
+- **Zugriff über Domainnamen und öffentliche IP-Adressen nur mit Web-PIN:** Ohne Web-PIN weist E3DC-Control Zugriffe über eigene Domain, DynDNS, MyFRITZ, Reverse-Proxy oder Portfreigabe ab, frühestens 14 Tage nach dem ersten solchen Zugriff; bis dahin zeigt die Oberfläche oben einen Hinweis mit dem Datum. Private IP-Adressen, lokale Namen und Tailscale bleiben frei. Zum Freischalten die Oberfläche im Heimnetz öffnen und im Config-Editor unter „Sicherheit, Webansicht & Updates“ im Bereich „Sicherheit“ eine Web-PIN setzen oder „Domainzugriff ohne Web-PIN“ bewusst auf „Ja, bewusst ohne Web-PIN“ stellen.
+- **Dashboard im Heimnetz mit Web-PIN:** Live-Daten, Diagramme, Prognose und Tagesstatistik sind im Heimnetz ohne Anmeldung sichtbar. Kostenhistorie, Einstellungen und Schaltfunktionen verlangen weiterhin die PIN. Über `localhost` verlangt E3DC-Control die Anmeldung; für eine Anzeige direkt am Gerät die Heimnetz-Adresse öffnen. Ersetzt ein Reverse-Proxy oder eine Docker-Portweiterleitung Absender und Namen durch lokale Werte, ist der Zugriff von außen nicht erkennbar; in diesem Fall den öffentlichen Namen durchreichen lassen oder ein VPN nutzen.
+- **Feste E3DC-Wallboxen ohne eigene Phasenumschaltung (Easy Connect, Multi Connect ohne efy-Automatik):** Die 6-A-Phasenerkennung entfällt. Ein einphasiges Fahrzeug ohne einphasiges Profil startet im PV-Modus erst ab 4,14 kW. Für einphasige Fahrzeuge deshalb ein Fahrzeugprofil mit einer Phase wählen.
+- **PV-Start der Wallbox:** Der Start wartet auf 60 Sekunden ausreichenden Überschuss; eine zusätzliche Akkureservierung für den Start gibt es nicht mehr.
+- **Schalter mit Standard „ein“:** Der Config-Editor zeigt bei Direktvermarktung, openWB und Heizstab-Netzboost Schalter ohne gespeicherten Wert jetzt so, wie E3DC-Control sie anwendet. Auf bestehenden Anlagen mit Direktvermarktung oder openWB lohnt ein Blick auf diese Schalter, weil sie früher beim ersten Speichern ausgeschaltet wurden.
+- **Marktpfad:** „Netzdienlichen Eco-Modus aktivieren“ heißt jetzt „Marktpfad öffnen: bei niedrigen Preisen laden (netzdienlich)“. Die gespeicherte Einstellung und die Regelung bleiben unverändert.
+- **Lastspitzenkappung (ab Werk aus):** Unterhalb der Speicherschwelle rechnet E3DC-Control die Entladegrenze alle 30 Sekunden aus dem Netzbezug der laufenden Viertelstunde. Der momentane Netzbezug darf zeitweise über der Grenze liegen, solange die Viertelstunde reicht. „Freigabe-Entprellung“ entfällt.
+
+## Änderungen
+
+- **Wallbox:** Nach einer Datenstörung läuft eine Ladung nach zehn Sekunden gültiger Daten weiter. Eine fest dreiphasige Wallbox startet im PV-Modus auch, wenn sie in Ruhe eine Phase meldet. Eine feste E3DC-Wallbox mit höchstens 17 A beginnt die Ladung mit Netzfreigabe auch ohne Phasenangabe am Fahrzeug; bisher verwarf E3DC-Control den Startbefehl. openWB Pro mit „Schneller Start (6 A)“: Ab der zweiten Stecksitzung gelten Mindestladezeit und Unterdeckung wie bei jeder Ladung. Startet ein Fahrzeug nachts ohne Freigabe selbst, endet die Ladung nach der Mindestladezeit. Pause und Ladepunktsperre gelten auch bei nicht lesbarer Konfigurationsdatei.
+- **Hausabsicherung:** Die Ladeleistung zählt nach den gemessenen Phasenleistungen der Wallbox; eine kurze Null im Phasenstrom einer openWB Pro gibt keine Phase mehr frei. Meldet eine openWB Pro beim Anlaufen kurz eine oder zwei Phasen, zählt nach einem eigenen Start weiter die bestätigte Phasenzahl, höchstens 30 Sekunden.
+- **Netzladeplanung:** Die Phasenwerte zählen mit ihrem Alter beim Lesen. Auf langsameren Geräten gelten Puffer, Pause und Hauptblock damit wie auf schnelleren; bisher konnte der Speicher zu Beginn eines Preisfensters ohne Pause bis zum Ziel laden. Spätere Fenster rechnet die Planung mit der eingestellten Ladeleistung und lernt die Leistung erst nach Anlauf und Rampe. Netzladen läuft auch ohne Netzwert weiter, solange gültige Phasenwerte vorliegen.
+- **Speicher:** Ohne aktive Einspeisegrenze gilt Export nicht mehr als Abregeldruck, die Ladegrenze pendelt dort nicht mehr.
+- **Direktvermarktung:** Der Verkauf aus dem Akku pendelt nicht mehr, wenn die Hauslast nach PV über der geplanten Entladeleistung liegt. Ist der Hauswert unbekannt, beginnt kein Verkauf.
+- **Lastspitzenkappung:** Die Entladegrenze bleibt bei gleichbleibender Last ruhig, kleine dauerhafte Überschreitungen werden in derselben Viertelstunde ausgeglichen, und die Netz-Nachladung des Puffers hält die Viertelstundengrenze auch bei verzögerter Akkumeldung ein.
+- **Prognose:** Der Korrekturfaktor der ML-Verbrauchsprognose gleicht dauerhafte Abweichungen vollständig aus. Ein verpasstes wöchentliches Training wird nachgeholt; scheitert es, bleibt die Verbrauchsprognose mit dem bisherigen Modell erhalten.
+- **Wärmepumpe:** Dimplex liest den Verdichterstatus aus dem Ausgang „Verdichter 1“ und zeigt die Betriebsstunden auf der Wärmepumpen-Seite.
+- **Suche:** Der Config-Editor findet Einstellungen auch über Hilfetexte; die Hilfeseite durchsucht die mitgelieferte Dokumentation ohne Internet.
+- **Einrichtungsstand:** Die Installationszentrale zeigt, was eingerichtet ist, was fehlt und was auffällt, mit Sprung zum Feld.
+- **Config-Editor:** Zustandszeile beim Marktpfad, Hinweis auf ausgeschaltete Zusatzschalter beim Einschalten der Direktvermarktung, Heizstab-Netzboost nur mit Heizstab, zwei wirkungslose Pre-Dump-Felder ausgeblendet. Die Konfigurationsprüfung warnt bei Wärmepumpen mit direkter Sollwertvorgabe nicht mehr vor der Start-Verzögerung; bisher erschien diese Warnung schon bei der Grundeinstellung. Gespeicherte Werte bleiben erhalten.
+- **Neuinstallationen** speichern den Marktpfad geschlossen und „Speicher“ im Preis-Boost ausgeschaltet. Bestehende Anlagen behalten ihre Einstellung.
+- **Diagramme:** Marktlinie auch ohne aktuelle Speicheraktion, knapp unter der Reserve und direkt nach einem Planwechsel; an der Viertelstunde in der ersten Minute neutral „Plan wird aktualisiert“. Die Prognose flackert beim minütlichen Abruf nicht mehr und lädt auch nach einem gescheiterten Abruf weiter. Die Tarifvorschau rechnet spätere günstige Fenster ein.
+- **Neue Speicherregelung im Vergleichsbetrieb:** berechnet jetzt auch Direktvermarktung, Pre-Dump, Lastspitzen, Preis-Boost, geplante Lasten und das Verbraucherbudget selbst; sie steuert weiterhin keine Geräte.
+- **Diagnose:** Die Regelruhe meldet den Entladungsschutz der Wallbox nicht mehr als Konflikt im Speicher-Entscheidungspfad.
+
+## Grenzen
+
+- Die Zugriffssperre ersetzt keine Web-PIN: Verdeckt ein Reverse-Proxy oder eine Docker-Portweiterleitung Absender und Namen, ist ein Zugriff von außen nicht erkennbar.
+- Läuft die Erholung nach einer Datenstörung beim Ablauf der 300-Sekunden-Frist noch, endet die Ladung bis zu rund zehn Sekunden später; der Strom bleibt bis dahin unverändert.
+- An der openWB Pro gilt bei einem Ladebeginn ohne eigenen Start, etwa durch das Fahrzeug selbst, weiterhin die Meldung der Box; der Strom einer zweiten Wallbox kann dabei für wenige Sekunden sinken.
+- Lastspitzenkappung: Ein Lastsprung wirkt bis zum nächsten Takt (höchstens 30 Sekunden) und wird in derselben Viertelstunde ausgeglichen; eine einzelne ungültige Messung setzt die Kappung bis zur nächsten Viertelstunde aus.
+- Dimplex: Der Verdichterausgang ist an den Datenpunktlisten der Softwarefamilien H, J, L und M ausgerichtet; für andere Stände gilt die Leistungsschwelle.
+- Pre-Dump: Verschiebt sich die PV-Prognose nach der ersten Tagesplanung nach vorn, kann das Vorab-Fenster über den Beginn der Ladekurve hinaus offen bleiben; so lange ist das PV-Laden gesperrt, und der Speicher entlädt nicht tiefer als geplant.
+- Eine einphasig angeschlossene efy mit höchstens 17 A braucht für den Start mit Netzfreigabe ein einphasiges Fahrzeugprofil.
+- Die neue Speicherregelung läuft nur im Vergleichsbetrieb; der Vergleich beschreibt Entscheidungen, keine gemessene Wirkung.
+- Im Feld geprüft auf einer Bare-Metal-Anlage mit E3DC-Speicher, E3DC-Wallbox und openWB Pro; weitere Wallbox- und Wärmepumpentypen sowie Docker in Tests bzw. einer Testumgebung.
+- Die in den Release Notes zu 5.5.8 genannten Grenzen gelten weiter, soweit die Änderungen oben sie nicht ausdrücklich betreffen.
+
+## Updatehinweise
+
+- **Bare Metal:** Über „System Update“ aktualisieren und anschließend die Seite neu laden.
+- **Docker:** Den bestehenden Updateweg verwenden. Einen festen Versionsstand bei Veröffentlichung bewusst auf 5.5.9 ändern; eine reine Image-Aktualisierung ohne Neuerstellen des Containers aktiviert die neue Version nicht.
+- **Von älteren Versionen:** Die Updatehinweise der übersprungenen Versionen gelten weiter. Die 14 Tage bis zur Zugriffssperre zählen auch beim Sprung über mehrere Versionen ab dem ersten Zugriff von außen.
+
+## Rückfall
+
+Auf Bare Metal das beim Update angelegte verifizierte Backup verwenden. Bei Docker den bestehenden Updateweg mit der vorherigen Version 5.5.8 nutzen und den Container neu erstellen. Anschließend Web-PIN, Fahrzeugprofile, Pause, Ladepunktsperre und Wallbox-Modus prüfen. Einzelheiten stehen in [doc/Rollback.md](doc/Rollback.md).
+
+---
+
 # E3DC-Control v5.5.8
 
 E3DC-Control 5.5.8 ist ein Funktions- und Korrekturupdate zu 5.5.7. Die wichtigsten Änderungen betreffen den gemeinsamen Anschlussrahmen für Akku-Netzladen und Fahrzeuge, die Wallbox in der Haltezone über der Akku-Untergrenze, den Ablauf des Markt-Netzladens, die Zeitbasis der PV-Prognose und den Schutz gespeicherter Zugangsdaten.

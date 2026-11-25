@@ -284,7 +284,7 @@ if ($liveJsonIsCli) {
         exit(0);
     }
 } else {
-    requireWebAuth(true);
+    requireDashboardReadAuth(true);
     header('Content-Type: application/json');
     header('Cache-Control: no-cache, no-store, must-revalidate');
     header('Pragma: no-cache');
@@ -463,7 +463,7 @@ if (
 // Wallbox-Sitzungszustände. Er ist daher kein sicherer GET-Endpunkt.
 // Ausschließlich die oben gebundenen, eng begrenzten Lesepfade bleiben read-only.
 if (!$liveJsonIsCli) {
-    e3dcRequirePostMutation(true);
+    e3dcRequirePostMutation(true, true);
     liveCloseSessionLock();
 }
 
@@ -11296,6 +11296,11 @@ if (file_exists($weatherAlertsFile)) {
 $data['market_soc_trajectory'] = liveMarketSocTrajectoryForDisplay(
     e3dcMarketSocTrajectoryForDisplay($storPlan ?? null, $marketSocLiveRaw)
 );
+// Dasselbe Serverkennzeichen wie im Prognoseabruf: In der ersten Minute nach Ablauf des Marktplans gilt die
+// Planaktualisierung; Ladekurvenvorschau und Ladekurven-Fenster zeigen dann neutral statt „Marktplan veraltet“.
+$data['storage_projection_status'] = [
+    'plan_refresh_pending' => e3dcMarketPlanRefreshPending($storPlan ?? null, $data['market_soc_trajectory']),
+];
 
 $data['vehicle_soc_contract_version'] = 1;
 if (!isset($data['vehicle_soc']) || !is_array($data['vehicle_soc'])) $data['vehicle_soc'] = [];

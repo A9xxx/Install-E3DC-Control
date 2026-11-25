@@ -8,20 +8,28 @@ werden:
 2. **Normale Speicherstrategie:** Ladekurve, Prognose, Pre-Dump und Autonomie
    ohne Raten unbekannter Großlasten.
 
-## 1. Netzdienlicher Eco-Modus
+## 1. Marktpfad öffnen
 
-Der netzdienliche Eco-Modus kann auch bei statischem Tarif aktiviert werden. Er
-nutzt Marktpreise, um günstige und teure Stunden in den Eco-Score einzusortieren
-und Verbraucher netzdienlicher zu planen.
+Der Schalter **Marktpfad öffnen** (`grid_friendly_mode`, bis 5.5.8 „Netzdienlichen
+Eco-Modus aktivieren“) gibt den normalen Marktpfad bei zeitvariablen Tarifen frei:
+bei niedrigen Preisen laden oder den Speicher halten. Ohne freigegebenen
+Verbraucher startet nichts; die Freigaben stehen im Config-Editor bei
+„Preisbewusste Verbraucher“. Eine Zeile am Schalter zeigt, wofür der Marktpfad
+offen ist und welche Freigaben ohne ihn nicht wirken. Bei Festpreis gibt es keinen
+Marktpfad, der Schalter ist dort ausgeblendet.
 
-Wichtig: Der Eco-Modus ändert nicht automatisch den angezeigten Vertragspreis.
-Er stellt nur Preis- und Score-Daten für Speicher, Wallbox und Wärmepumpe bereit.
+Der Schalter ändert den angezeigten Vertragspreis nicht. Den Eco-Score berechnet
+E3DC-Control aus den Börsenpreisen der nächsten 48 Stunden (100 = günstigster
+Preis). Er dient der Anzeige und dem Schalter **Eco** im Ladeplan der Wallbox;
+Speicher, Wärmepumpe und Heizstab folgen dem Abrechnungspreis.
 
 ## 2. Negativpreis-/Preis-Boost
 
-Der Boost-Block im Strompreisbereich ist ein eigener Regelkreis. Er ist für
-Nutzer gedacht, die bei sehr günstigen oder negativen Preisen bewusst Leistung
-ziehen wollen:
+Der Preis-Boost im Strompreisbereich ist ein eigener Weg für negative
+Gesamtpreise (Arbeitspreis einschließlich Netzentgelt, Umlagen und Steuern).
+Freigegebene Verbraucher nehmen dann zusätzlich Netzstrom auf. Speicher und
+Wallbox brauchen dafür keinen geöffneten Marktpfad, Wärmepumpe und Heizstab
+schon:
 
 - Speicher laden,
 - Wallbox starten,
@@ -32,7 +40,9 @@ Die Preisgrenze (`cheap_grid_price_limit_ct`, im Config-Editor „Preisgrenze
 (Legacy)“) kann die Freigabe nur verschärfen: Der Boost wird nur bei negativem
 Abrechnungspreis aktiv, also unter 0 ct/kWh. `0` bedeutet „jeder negative
 Preis“; ein negativer Wert verlangt mindestens diesen Preis (zum Beispiel `-2`
-erst ab −2 ct/kWh). Positive Werte öffnen den Boost nicht.
+erst ab −2 ct/kWh). Positive Werte öffnen den Boost nicht. Die Grenze gilt für
+Speicher und Wallbox im Preis-Boost; bei geöffnetem Marktpfad gilt für den
+Speicher und für Ladepunkte in `Sofort bis Preislimit` jeder negative Gesamtpreis.
 
 Dieser Block ist nicht die allgemeine Antwort auf unbekannte hohe Hauslasten.
 Er arbeitet nur mit freigegebenen Verbrauchern und klarer Preisgrenze.
@@ -164,7 +174,8 @@ zwischenzeitlich aus PV oder Netz lädt; deckt der erwartete Bestand den
 Sollbestand, wird nicht aus dem Netz geladen. Während des laufenden Fensters
 wird die Hauslast nicht vom Speicherbestand abgezogen, weil der Speicher dort
 nicht entlädt. Für die Ladedauer wird die gemessene Ladeleistung je Ladezustand verwendet.
-Eine Messung zählt erst nach einer Minute mit gleichem Netzladebefehl und
+E3DC-Control übernimmt Messungen nach Anlauf und Rampe der angeforderten Ladeleistung,
+frühestens nach vier Minuten mit gleichem Netzladebefehl und
 weniger als 200 W PV-Leistung. Sanfte Laderaten mit weniger als 300 W
 Unterlieferung senken die Prognose nicht. Mindestens 300 W weniger als
 angefordert oder eine Akkuantwort oberhalb der bisherigen Prognose liefern
@@ -174,6 +185,8 @@ Nach einem Neustart des Geräts rechnet E3DC-Control wieder mit den Startwerten 
 Für die Restladezeit berücksichtigt es die gelernte Ladeleistung je Ladezustand einschließlich der
 Drosselung kurz vor voll. Die
 Prognose stellt Drittel-Puffer, Warten und Hauptblock dar.
+Für ein noch nicht begonnenes Netzladefenster und für die Wartezeit eines laufenden Fensters vor dem Hauptblock plant E3DC-Control mit der eingestellten Ladeleistung; der Restblock bleibt so in der Marktprognose sichtbar, auch wenn der Anschlussrahmen vorübergehend nicht nutzbar ist. Beim laufenden Laden begrenzt der frisch berechnete Anschlussrahmen die Leistung; veraltete oder fehlende Phasenwerte geben kein Netzladen frei.
+Fehlen im laufenden Fenster beim Lesen der Messwerte nur die Phasenwerte oder die Akkuleistung, plant E3DC-Control ebenfalls mit der eingestellten Ladeleistung; außerhalb der Wartezeit wirkt ein gültiger Rahmen, auch ein kleiner. Ist die gesamte Messung ungültig oder zu alt, plant E3DC-Control bis zum nächsten Planlauf kein Netzladen.
 Gerätegrenze, „Max. Laden“, Markt-Ladelimit und
 Hausanschluss begrenzen die Ladeleistung. E3DC-Control löst die eigene gemessene
 Akkuleistung und frisch gemessene geregelte Fahrzeuganteile jeweils einmal aus
@@ -320,7 +333,7 @@ Wirksame Schlüssel:
 |---|---|
 | `market_charge_profile` | Ladeprofil: `economic`, `balanced`, `comfort`, `custom` |
 | `market_price_limit_ct` | Komfort-Preislimit in ct/kWh; leer = Mittelpreis des Tarifs |
-| `cheap_grid_battery_max_soc` | Komfort-Ziel „Speicher max.“ (Standard 80 %) |
+| `cheap_grid_battery_max_soc` | Komfort-Ziel „Speicher max.“ (Standard 80 %), zugleich Obergrenze des Speichers im Preis-Boost |
 | `market_min_margin_pct` | Mindestmarge (vom Profil gesetzt, frei bei Eigene Einstellungen) und Preistoleranz für das nächste Fenster |
 | `market_safety_correction_ct_per_kwh` | Sicherheitskorrektur (vom Profil gesetzt, frei bei Eigene Einstellungen) |
 | `market_autarky_horizon_buffer_wh` | Prognosepuffer im Sollbestand am Fensterende und in der Autarkieprüfung (Standard 500 Wh) |

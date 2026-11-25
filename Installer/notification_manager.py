@@ -246,10 +246,10 @@ def main():
             safe_execute(["/usr/bin/python3", sqlite_script])
             last_run['archiver'] = archiver_id
             
-        # 6b. ML Modell Training (Sonntags um 03:00 Uhr)
-        ml_train_id = f"{c_date}_train"
-        if now.weekday() == 6 and c_time == "03:00" and last_run.get('ml_train') != ml_train_id and not is_standby:
-            safe_execute(["/usr/bin/python3", ml_script, "--train"])
+        # 6b. ML-Modelltraining: stündlich prüfen, fällig ab Sonntag 03:00 Uhr (auch nachträglich)
+        ml_train_id = f"{c_date}_{now.strftime('%H')}"
+        if c_minute == "00" and last_run.get('ml_train') != ml_train_id and not is_standby:
+            safe_execute(["/usr/bin/python3", ml_script, "--train-due"], silent=True)
             last_run['ml_train'] = ml_train_id
             
         # 6c. Tägliche KI-Prognose (Um 00:05 Uhr)

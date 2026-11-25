@@ -563,7 +563,7 @@ def _run_module(web, key, action, request):
                        "sudoers: effektive www-data-Rechte exakt gebunden", "sudoers: Update-Launcher für Installationsbenutzer",
                        "sudoers: kein breiter privilegierter Installer-Webzugang", "keine freien systemctl-Kommandos",
                        "keine direkten www-data-Kommandos", "alter C++ Dienst bleibt gesperrt", "kein aktiver Job-Lock"}
-        reasons = ["Freigabeprüfung: " + item["label"] for item in result.get("readiness", {}).get("hard_blockers", [])
+        reasons = ["Modulfreigabe: " + item["label"] for item in result.get("readiness", {}).get("hard_blockers", [])
                    if item.get("label") in safe_labels]
         for reason in result.get("blocked_reasons", []):
             if isinstance(reason, str) and reason.startswith("Konfiguration unvollständig"):

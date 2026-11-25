@@ -47,66 +47,54 @@ Aktor, Anti-Flattern, Akkustützung nach Korridorlage) stehen in
 | `Aus` | NGNA: E3DC-Control beobachtet nur. Eine Standardfreigabe wird nur einmalig nach bewusstem Wechsel auf `Aus` in der WebUI gesendet. |
 | `PV-Kurve ruhig` | E3DC-Control lädt aus PV-Überschuss entlang der Speicher-Ladekurve mit Hysterese. Der Hausspeicher ist keine Ladequelle für das Fahrzeug. Das Wolkenkontingent gilt nur unterhalb des Kurvenkorridors. Unter dem Korridor erhält die Wallbox bei ausgeschalteter zentraler PV-Aufteilung den reinen PV-Überschuss; mit der experimentellen zentralen PV-Aufteilung („Kurve zuerst“) wird der Kurvenbedarf des Speichers zuerst abgezogen. Details stehen in `V4_Konfiguration_und_Regelung.md`, Abschnitt „Akkustützung der Wallbox in `PV-Kurve ruhig` nach Korridorlage“. |
 | `Grundladung stabil` | Hält eine ruhige Grundladung, solange das Speicherziel laut Planung erreichbar bleibt. |
-| `PV + Akku bis Untergrenze` | Nutzt PV und oberhalb der Hausakku-Untergrenze zusätzlich den Speicher. In der Haltezone direkt über der Untergrenze folgt die Wallbox dem PV-Rahmen des Speichers; der Akku überbrückt bis zum normalen Unterdeckungsstopp ohne eigenes Energiekonto. Reicht die PV unter den Speicher- und belegten Fahrzeug-Leistungsgrenzen nicht für Akku und geeignete Fahrzeuge, endet die heutige PV-Kurve bei wbminSoC, auch bei Prognose auf 100%. Bedarf 0 lässt das normale Ziel bestehen; unbekannter Bedarf zählt nach bestätigter Ladung weiter, nur am selben Kurventag und in derselben Steck-Episode; nach 60 Minuten unter 300 W bei ausreichendem PV- und Stromangebot endet dieser Beleg. Unterbrechungen bis zwei Minuten pausieren die Uhr; längere setzen sie zurück. Das gilt für alle Wallboxen (geregelt und beobachtet), in Aus nur mit „Nur beobachten, Speicher oberhalb Hausreserve freigegeben“. Zur normalen Kurve ab 110 %, zurück unter 100 %; jede Wahl hält etwa 15 Minuten. Bestätigtes Abstecken und Pause wirken ab dem nächsten Planlauf; relevante Änderungen lösen nach 60 Sekunden stabilem Zustand neu aus. Folgetage und Netzladeziele bleiben normal. Details stehen in `Ladekurve_Berechnung.md`, Abschnitt „Abendziel bei PV + Akku“. Die unten beschriebene begrenzte Phasenerkennung darf kurz Netzleistung überbrücken. Ist die Untergrenze erreicht und trägt das PV-Budget dieser Wallbox die Mindestleistung der aktuellen Phasenzahl nicht, wird eine laufende Ladung bei dieser Phasenzahl auf den Mindeststrom gesetzt (ohne PV sofort, bei noch anliegendem PV nach 20 s Bestätigung) und nach einem Durchlauf des Wh-Kontos gestoppt; eine dreiphasig ladende openWB Pro wechselt stattdessen auf 1p, wenn das PV-Budget das 1p-Minimum trägt. Laden mehrere Wallboxen, wird diese Wallbox ohne Netzbezug zuerst abgesenkt, sofern sie selbst über ihrer Zuteilung lädt; deckt ihre Zuteilung die tatsächliche Ladeleistung, lädt sie weiter. Netzbezug und ein laufender Phasenwechsel einer anderen Wallbox haben Vorrang. |
+| `PV + Akku bis Untergrenze` | Nutzt PV und oberhalb der Hausakku-Untergrenze zusätzlich den Speicher. In der Haltezone direkt über der Untergrenze folgt die Wallbox dem PV-Rahmen des Speichers; der Akku überbrückt bis zum normalen Unterdeckungsstopp ohne eigenes Energiekonto. Reicht die PV unter den Speicher- und belegten Fahrzeug-Leistungsgrenzen nicht für Akku und geeignete Fahrzeuge, endet die heutige PV-Kurve bei wbminSoC, auch bei Prognose auf 100%. Bedarf 0 lässt das normale Ziel bestehen; unbekannter Bedarf zählt nach bestätigter Ladung weiter, nur am selben Kurventag und in derselben Steck-Episode; nach 60 Minuten unter 300 W bei ausreichendem PV- und Stromangebot endet dieser Beleg. Unterbrechungen bis zwei Minuten pausieren die Uhr; längere setzen sie zurück. Das gilt für alle Wallboxen (geregelt und beobachtet), in Aus nur mit „Nur beobachten, Speicher oberhalb Hausreserve freigegeben“. Zur normalen Kurve ab 110 %, zurück unter 100 %; jede Wahl hält etwa 15 Minuten. Bestätigtes Abstecken und Pause wirken ab dem nächsten Planlauf; relevante Änderungen lösen nach 60 Sekunden stabilem Zustand neu aus. Folgetage und Netzladeziele bleiben normal. Details stehen in `Ladekurve_Berechnung.md`, Abschnitt „Abendziel bei PV + Akku“. Ist die Untergrenze erreicht und trägt das PV-Budget dieser Wallbox die Mindestleistung der aktuellen Phasenzahl nicht, wird eine laufende Ladung bei dieser Phasenzahl auf den Mindeststrom gesetzt (ohne PV sofort, bei noch anliegendem PV nach 20 s Bestätigung) und nach einem Durchlauf des Wh-Kontos gestoppt; eine dreiphasig ladende openWB Pro wechselt stattdessen auf 1p, wenn das PV-Budget das 1p-Minimum trägt. Laden mehrere Wallboxen, wird diese Wallbox ohne Netzbezug zuerst abgesenkt, sofern sie selbst über ihrer Zuteilung lädt; deckt ihre Zuteilung die tatsächliche Ladeleistung, lädt sie weiter. Netzbezug und ein laufender Phasenwechsel einer anderen Wallbox haben Vorrang. |
 | `Sofort bis Preislimit` | Netzladen nur, wenn der aktuelle Preis unter dem Wallbox-Preislimit liegt. Ohne Preis- oder Netzfenster gilt an der Hausakku-Untergrenze dieselbe Absenkung wie in `PV + Akku bis Untergrenze`. |
 | `Akku bis Abfahrt` | Lädt im Freigabefenster vor der Abfahrtszeit aus PV und Hausspeicher bis zur Hausakku-Untergrenze `wbminsoc`; Netzladen bleibt gesperrt. Gestoppt wird bei erreichter Abfahrtszeit und bei vollem Fahrzeug; an der Untergrenze kann mit ausreichendem PV-Anteil weitergeladen werden. Abfahrtszeit `wb<n>_battery_departure_time` (Standard `06:30`), Fenster `wb<n>_battery_departure_window_h` (Standard 3 h, 1–36 h). |
 
 ## Phasenerkennung an einer festen Wallbox
 
-Bei einer durch Python stromgeregelten E3DC-Wallbox ohne nutzbare Phasenumschaltung
-kann ein unbekanntes Fahrzeug mit 6 A gestartet werden, sobald mindestens
-1.380 W echter, zentral freigegebener PV-Anteil verfügbar sind. Die 6 A gelten
-je genutzter Phase: Das Fahrzeug beziehungsweise das Kabel bestimmt, ob daraus
-ungefähr 1,38, 2,76 oder 4,14 kW werden. Es erfolgt kein Phasenwechselbefehl.
-Die Grundbedeutung der Stromvorgabe ist in der
-[Herstellerbeschreibung zu IEC 61851](https://infosys.beckhoff.com/content/1031/el6761/18724365579.html)
-erläutert.
+Dieser Abschnitt gilt für feste E3DC-Wallboxen mit der
+WBchar6-Kompatibilitätsregelung (im Config-Editor „E3/DC efy/Easy:
+WBchar6-Kompatibilitätsregelung (empfohlen)“): Easy Connect und Multi Connect
+ohne efy-Automatik und ohne eigene Phasenumschaltung. Nur dort verfolgt
+E3DC-Control die Stecksitzung mit ihren gemessenen Phasen. An anderen
+E3DC-Wallboxen rechnet E3DC-Control ohne Messbeleg und ohne einphasiges
+Fahrzeugprofil dreiphasig.
 
-Reicht das PV-Angebot zunächst nicht für die mögliche dreiphasige Last, muss
-der zentrale Leistungsentscheider die fehlende Leistung ausdrücklich freigeben.
-Netzleistung bleibt dabei durch die Hausanschlussgrenzen begrenzt; eine gesperrte
-oder erschöpfte Batterie ist keine Voraussetzung für diese Netzüberbrückung.
-Die Batterie darf nur innerhalb ihrer eigenen Leistungs- und Reservegrenzen
-beitragen. `Aus`, fehlende Freigaben, ungültige Messwerte und harte
-Schutzgrenzen verhindern die Probe.
+E3DC-Control setzt vor der ersten Messung einer Stecksitzung die Phasenzahl
+der festen E3DC-Wallbox an: drei Phasen. Bei einem gewählten Fahrzeugprofil
+gilt der kleinere Wert aus Box und Profil. Ein PV-Start benötigt damit bei
+6 A mindestens 4.140 W beziehungsweise 1.380 W bei einem einphasigen Profil.
+Der einfache Regelkern entscheidet Start, Strom und Stopp mit seiner
+bestehenden Hysterese. Eine eigene Erkennungsprobe gibt es nicht.
 
-Für diese Erkennung gilt ein gemeinsames Konto für alle Wallboxen mit höchstens
-40 Wh und genau einem Probeversuch zur selben Zeit. Eine kleinere konfigurierte
-Wh-Stoppgrenze bleibt wirksam. Der mögliche Verbrauch wird vor dem Start privat
-gespeichert; das Erkennungsfenster dauert höchstens 30 Sekunden. Der Wh-Wert
-beschreibt die konservativ berechnete PV-Deckungslücke, keine getrennte Messung
-der Batterieenergie. Fehlende oder widersprüchliche Messwerte beenden die
-Überbrückung konservativ.
+E3DC-Control übernimmt während der Ladung die gemessene Phasenzahl aus einer
+frischen, vollständigen Messung aller drei Phasenleistungen. Eine Phase zählt
+bei mehr als 250 W. Die Messung hat Vorrang vor dem Fahrzeugprofil, auch wenn
+ein anderes Fahrzeug oder ein einphasiges Kabel angeschlossen ist. Eine
+zusätzliche gemessene Phase erhöht die Zahl sofort. Reicht das Budget danach
+nicht, entscheidet der Regelkern über Strom und Stopp.
 
-Während einer reservierten Probe startet kein weiterer ruhender Ladepunkt aus
-dieser Zusage. Bereits laufende Ladungen bleiben in der gemeinsamen Zuteilung
-berücksichtigt; eine ausdrücklich konfigurierte Wallboxpriorität bleibt wirksam.
+E3DC-Control hält die höchste gemessene Zahl im Arbeitsspeicher bis zum
+bestätigten Abstecken. Ladepausen, 0 W und Statusausfälle senken sie nicht.
+Nach einem Dienstneustart gilt wieder die Annahme aus Box und Profil bis zur
+nächsten vollständigen Messung. Die Beobachtung speichert keine eigene Datei
+und sendet keine Hardwarebefehle. Nutzer-Aus, Reserve, Hausanschluss je Phase
+und Datenvalidität bleiben vorrangig. Bei unbekannter Phasenlage berücksichtigt
+der elektrische Rahmen alle drei möglichen Netzphasen.
 
-Mehrere frische, vollständige Phasenmessungen bei stabilen 6 A bestätigen die
-benutzten Phasen. Wurde das kurze Startfenster nicht erfolgreich ausgewertet,
-kann die Erkennung auch bei einer später stabilen höheren Stromvorgabe erfolgen.
-Die Leistung jeder belasteten Phase muss dabei zur Stromvorgabe passen; eine
-Stromänderung startet die Einschwing- und Bestätigungszeit erneut. Die begrenzte
-6-A-Startprobe und ihr Energiekonto bleiben unverändert.
-Im laufenden Dienst bleiben bestätigte Phasen bei Ladepausen und 0 W
-erhalten. Erst bestätigtes Abstecken beginnt die Erkennung erneut. Eine später
-zusätzlich gemessene Phase erhöht die angesetzte Last sofort. Fehlen nach einem
-Dienstneustart sichere Belege für die unveränderte Steckepisode, wird die
-Phasenzahl erneut konservativ ermittelt.
+Ein einphasiges Fahrzeug, ein einphasiges Kabel oder eine einphasig
+angeschlossene Box ohne einphasiges Profil startet beim ersten
+PV-Start der Sitzung erst ab 4,14 kW statt 1,38 kW. Nach der Messung regelt
+E3DC-Control einphasig bis 1,38 kW und startet nach einer Pause in derselben
+Stecksitzung wieder ab dieser Schwelle. Mit einem einphasigen Profil gilt die
+kleinere Schwelle schon vor der ersten Ladung. Im Modus „Sofort bis Preislimit“
+entfällt diese Komforteinbuße bei freigegebenem Netzladen.
 
-Deckt die PV-Leistung die erkannte Last, geht die Ladung ohne erzwungenen Stopp
-in die normale Regelung über. Andernfalls beendet der Wh- oder Zeitwächter die
-Probe. Nach einem solchen Stopp gibt es in derselben Stecksession keine weitere
-Überbrückungsprobe; eine normale Ladung mit ausreichendem PV-Angebot bleibt
-unter den bestehenden Wiederanlaufzeiten möglich. Abstecken und Dienstneustart
-löschen den verbrauchten Anteil nicht. Nur fortlaufend belegte tatsächliche
-PV-Ladung baut die Defizitschuld langsam wieder ab.
-
-Herstellereigene efy-Automatik, go-e und die Rollensteuerung einer normalen
-openWB behalten ihre eigenen Startpfade. Geräte mit einem Mindeststrom oberhalb von
-6 A erhalten keine 6-A-Probe; für sie gilt weiterhin die normale konservative
-Startzuteilung. Ohne vollständige Phasenmessung wird keine kleinere Phasenzahl
-behauptet. Es ist keine zusätzliche Konfiguration erforderlich.
+Herstellereigene efy-Automatik, Multi Connect II mit eigener Phasenumschaltung,
+go-e und openWB behalten ihre vorhandenen Phasen- und Startverträge. Die feste
+Sitzungsbeobachtung öffnet
+weder eine Quellenfreigabe noch ein Energiekonto und sperrt keine andere Box.
 
 ## Budget beim Ende der tatsächlichen Ladung
 
@@ -158,7 +146,7 @@ RSCP-Zeitüberschreitung oder leere bzw. unmögliche Werte), sind Netz-, Haus-
 und PV-Werte dieser Probe nicht belastbar. Eine laufende Ladung wird deshalb
 nicht aus diesen Werten gestoppt, sondern kurz gehalten. Das gilt für alle
 geregelten Wallbox-Typen (openWB Pro, openWB, go-e, E3DC).
-Weichen Netzwert des E3DC und Summe des Netzzählers voneinander ab, bleibt die Probe gültig; die Abweichung wird als Diagnose vermerkt. Die Abweichung verändert weder den Netzladerahmen noch die Quellenfreigabe. Für Netzladen müssen eine gültige Hausabsicherung und ein gültiger Netzwert vorliegen.
+Weichen Netzwert des E3DC und Summe des Netzzählers voneinander ab, bleibt die Probe gültig; die Abweichung wird als Diagnose vermerkt. Die Abweichung verändert weder den Netzladerahmen noch die Quellenfreigabe. Für Netzladen müssen eine gültige Hausabsicherung und gültige, frische Phasenwerte des E3DC-Leistungsmessers vorliegen.
 
 * Gehalten wird der zuletzt ausgeführte Strom, höchstens 10 s nach der
   letzten gültigen Probe (maßgeblich ist ihr Zeitstempel, nicht der
@@ -643,9 +631,13 @@ Pfad bewährt:
   ausschließlich ein zuvor gedecktes, bereits stehendes Angebot unverändert.
   Er erlaubt weder eine Anhebung noch ein neues Angebot. Ab 45 Sekunden,
   bei ungültigen Live-Daten oder einer harten Schutzgrenze folgt 0 A.
-  Ein kurzer Budgeteinbruch lässt das Angebot für `openwb_pro_start_hold_s`
+  Ist das eigenständige Startfenster der openWB Pro eröffnet, lässt ein kurzer
+  Budgeteinbruch das bestätigte Angebot für `openwb_pro_start_hold_s`
   stehen (Standard 180 s, gültig 60–600 s; bei HLC oder unbekannter
-  Signalisierung gilt der vorhandene Faktor 2). Danach setzt die Regelung
+  Signalisierung gilt der vorhandene Faktor 2). Das Fenster reserviert keinen
+  Akku; der reguläre PV-Start eröffnet es nicht, er wartet auf 60 Sekunden
+  ausreichendes Budget, und eine laufende Ladung folgt der Mindestladezeit und
+  der Unterdeckungsprüfung. Nach Ablauf des Fensters setzt die Regelung
   einmal `ampere=0` und bleibt ohne weitere Befehle, solange der Zustand
   unverändert ist. Nutzer- und Schutzgrenzen wirken weiterhin sofort.
   Bei erneut ausreichendem Budget bietet sie
@@ -1197,6 +1189,11 @@ gültigen Messwerten, ausreichendem zugeteiltem Quellenanteil und den
 Freigaben der Box. Eigene Ladeende- und Untergrenzenanker werden nur in
 derselben Stecksession gelöst. Fremde oder geschützte Stopps bleiben erhalten.
 
+Pause und Ladepunktsperre gelten auch dann weiter, wenn E3DC-Control die
+Konfigurationsdatei gerade nicht lesen kann: Es gilt der letzte gültig gelesene
+Stand, bis die Datei wieder lesbar geändert ist. Ein Formfehler in einer anderen
+Einstellung hebt Pause und Ladepunktsperre ebenfalls nicht auf.
+
 Ein PV- oder Akkustart benötigt 60 Sekunden ausreichenden, gültigen
 Quellenanteil. Eine freigegebene Netzquelle startet ohne diese Wartezeit.
 Pause, Ladepunktsperre, Not-Aus, Hausanschluss,
@@ -1273,7 +1270,11 @@ Nutzer-Aus gelten weiterhin vorrangig; die Reserve begrenzt die Akkustützung. K
 zum Mindeststrom, solange Stützung autorisiert ist: bei „PV-Kurve ruhig“ nur
 aus dem Wolken-Kontingent, bei „Grundladung stabil“ nur solange die bestehende
 Grundladungsbedingung gilt, bei Akkubetriebsarten nur oberhalb der Untergrenze.
-Haltestützung erlaubt keinen Start aus fehlender Quelle. Nach drei Minuten
+Haltestützung erlaubt keinen Start aus fehlender Quelle. Ist das
+Wolken-Kontingent aufgebraucht, entfällt die Akkustützung; Mindestladezeit und
+Unterdeckungsprüfung können eine junge Ladung dennoch fortsetzen, dabei kann
+Netzenergie anfallen (im untersuchten Fall etwa 0,2 kWh). Notstromreserve und
+elektrische Grenzen bleiben verbindlich. Nach drei Minuten
 Unterdeckung und mindestens fünf Minuten Ladung endet die Sitzung regulär;
 danach benötigt ein PV-Start erneut 60 Sekunden ausreichenden Anteil.
 Eine freigegebene Netzquelle startet ohne diese Wartezeit. Diese Unterdeckungsregel gilt
@@ -1334,7 +1335,11 @@ Gruppenzuteilung, gilt für jede Box der elektrische Nulldeckel, und laufende
 Boxen stoppen sofort. Für andere fehlende Live-, Box- oder Anteilsdaten sowie
 gesperrte Budgets gilt die vorhandene 300-Sekunden-Datenfrist
 mit Mindeststrom; danach stoppt die Ladung. Ein veraltetes Budget hält den Mindeststrom; nach 45 Sekunden ohne neues Budget endet eine PV- oder Akkuladung. Die Datenfrist wird erst nach zehn
-Sekunden durchgehend gültiger Daten zurückgesetzt. Ein gültiges Nullbudget ist kein
+Sekunden durchgehend gültiger Daten zurückgesetzt. Läuft diese Erholung beim
+Ablauf der 300 Sekunden noch, endet die Ladung erst mit der nächsten
+ungültigen Probe, höchstens rund zehn Sekunden später; bis dahin bleibt der
+Strom unverändert. Eine laufende Ladung, deren Erholung gelingt, setzt
+E3DC-Control ohne erneuten Stopp durch die alte Frist fort. Ein gültiges Nullbudget ist kein
 Datenfehler; dafür gilt die Unterdeckungsregel. Kurze ungültige Liveproben halten den
 Ausgang zunächst zehn Sekunden unverändert; bei länger ungültigen Proben gilt
 Mindeststrom. Auch während der folgenden zehn Sekunden Erholung bleibt der

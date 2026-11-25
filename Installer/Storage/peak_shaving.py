@@ -8,6 +8,11 @@ und liefert höchstens einen Kandidaten für den zentralen Storage Manager.
 Aktive Spitzenkappung bleibt in E3/DC-AUTO und setzt ausschließlich eine
 flüchtige Entladeobergrenze; sie fordert niemals eine Entladung oder Einspeisung
 an.
+
+Unterhalb der Speicherschwelle rechnet der Planer je Takt genau eine Zahl aus dem
+Viertelstundenkonto: die Entladegrenze, 0 W zum Halten des Puffers oder den
+Spielraum für das ausdrücklich freigegebene Nachladen. Die Entladegrenze folgt nur
+dem gemessenen Netzbezug; oberhalb der Schwelle entlädt E3/DC-AUTO frei.
 """
 
 from __future__ import annotations
@@ -30,6 +35,9 @@ PEAK_SHAVING_WINDOW_S = 15 * 60
 PEAK_SHAVING_MIN_COMMAND_W = 300
 PEAK_SHAVING_MIN_HYSTERESIS_W = PEAK_SHAVING_MIN_COMMAND_W + 1
 PEAK_SHAVING_DEFAULT_HYSTERESIS_W = 600
+# Rechentakt am Viertelstundenraster: lang gegen die Totzeit der Entladegrenze
+# (ein bis drei Messrahmen) und gegen Lastrauschen, kurz gegen die Viertelstunde.
+PEAK_SHAVING_STEP_S = 30
 
 
 def _enabled(cfg: Dict[str, Any], key: str, default: bool = False) -> bool:
@@ -111,11 +119,6 @@ def _config_contract(
         "peak_shaving_max_sample_gap_s",
         10.0,
     )
-    release_debounce_s, release_debounce_typed = _configured_number(
-        cfg,
-        "peak_shaving_release_debounce_s",
-        20.0,
-    )
 
     errors = []
     if not limit_typed or limit_w < 1000.0:
@@ -156,12 +159,6 @@ def _config_contract(
         or max_sample_gap_s > 60.0
     ):
         errors.append("sample_gap_invalid")
-    if (
-        not release_debounce_typed
-        or release_debounce_s < 5.0
-        or release_debounce_s > 120.0
-    ):
-        errors.append("release_debounce_invalid")
 
     return {
         "valid": not errors,
@@ -174,7 +171,6 @@ def _config_contract(
         "hysteresis_w": hysteresis_w,
         "soc_hysteresis_pct": soc_hysteresis_pct,
         "max_sample_gap_s": max_sample_gap_s,
-        "release_debounce_s": release_debounce_s,
     }
 
 
@@ -189,7 +185,6 @@ def _config_signature(cfg: Dict[str, Any]) -> str:
         "peak_shaving_hysteresis_w",
         "peak_shaving_soc_hysteresis_pct",
         "peak_shaving_max_sample_gap_s",
-        "peak_shaving_release_debounce_s",
     )
     encoded = json.dumps(
         {key: cfg.get(key) for key in keys},
@@ -419,7 +414,7 @@ def _base_context(
             0,
             safe_int(config.get("recharge_max_w"), 0),
         ),
-        "hysteresis_enter_w": max(
+        "deadband_w": max(
             PEAK_SHAVING_MIN_HYSTERESIS_W,
             safe_int(
                 config.get("hysteresis_w"),
@@ -431,10 +426,6 @@ def _base_context(
             safe_float(config.get("soc_hysteresis_pct"), 1.0),
         ),
         "max_sample_gap_s": max_sample_gap_s,
-        "release_debounce_s": max(
-            5.0,
-            safe_float(config.get("release_debounce_s"), 20.0),
-        ),
         "history_status": (
             "disabled"
             if not enabled
@@ -452,9 +443,11 @@ def _base_context(
         "last_action": "disabled" if not enabled else "observe",
         "last_target_w": 0,
         "last_discharge_interval_start_ts": None,
-        "release_since_ts": None,
+        "step_ts": None,
+        "step_import_ws": 0.0,
+        "step_needed_w": None,
+        "step_room_w": None,
         "allowed_remaining_import_w": None,
-        "projected_average_w": None,
         "unavoidable_exceedance_w": 0,
         "grid_import_headroom_w": None,
     }
@@ -479,7 +472,10 @@ def _integrate_interval(
         "last_action",
         "last_target_w",
         "last_discharge_interval_start_ts",
-        "release_since_ts",
+        "step_ts",
+        "step_import_ws",
+        "step_needed_w",
+        "step_room_w",
     ):
         if previous_valid and key in previous:
             current[key] = previous[key]
@@ -624,10 +620,6 @@ def _integrate_interval(
         0.0,
         safe_float(current.get("base_import_w"), 0.0),
     )
-    projected_ws = (
-        safe_float(current.get("import_ws"), 0.0)
-        + base_import_w * remaining_s
-    )
     configured_discharge_w = max(
         0,
         safe_int(current.get("peak_max_discharge_w"), 0),
@@ -638,10 +630,6 @@ def _integrate_interval(
         "target_import_wh": round(target_ws / 3600.0, 6),
         "remaining_import_wh": round(remaining_ws / 3600.0, 6),
         "allowed_remaining_import_w": max(0, int(math.floor(allowed_w))),
-        "projected_average_w": max(
-            0,
-            int(round(projected_ws / PEAK_SHAVING_WINDOW_S)),
-        ),
         "required_discharge_w": max(
             0,
             int(math.ceil(required_discharge_w)),
@@ -662,26 +650,83 @@ def _integrate_interval(
     return current
 
 
+def _interval_step(
+    context: Dict[str, Any],
+    *,
+    discharge_cap_w: int,
+    charge_w: float,
+) -> int:
+    """Führt die Entladegrenze einmal je Takt am Viertelstundenkonto nach.
+
+    Regelgröße ist der mittlere Netzbezug des Takts gegen den zulässigen
+    Restbezug. Jede Abweichung steht im Konto und wird in derselben
+    Viertelstunde ausgeglichen. Ein negativer Bedarf ist der Spielraum für das
+    freigegebene Nachladen; nur dafür zählt die wirksame Ladeleistung.
+    """
+    interval_start = safe_int(context.get("interval_start_ts"), 0)
+    sample_ts = safe_float(context.get("sample_ts"), 0.0)
+    step_ts = safe_float(context.get("step_ts"), 0.0)
+    import_ws = safe_float(context.get("import_ws"), 0.0)
+    if not interval_start <= step_ts <= sample_ts:
+        # Neue Viertelstunde (oder Uhrsprung): Grenze weiterführen, Taktmittel
+        # neu beginnen. Ein laufendes Nachladen behält höchstens seine Leistung,
+        # ein neues beginnt erst mit dem ersten Takt.
+        context["step_ts"] = float(interval_start)
+        context["step_import_ws"] = 0.0
+        context["step_room_w"] = (
+            max(0, safe_int(context.get("last_target_w"), 0))
+            if context.get("last_action") == "grid_recharge"
+            else 0
+        )
+        return discharge_cap_w
+    if (
+        (sample_ts - interval_start) // PEAK_SHAVING_STEP_S
+        <= (step_ts - interval_start) // PEAK_SHAVING_STEP_S
+    ):
+        return discharge_cap_w
+    mean_import_w = (
+        import_ws - safe_float(context.get("step_import_ws"), 0.0)
+    ) / (sample_ts - step_ts)
+    needed_w = (
+        discharge_cap_w
+        - charge_w
+        + mean_import_w
+        - safe_float(context.get("allowed_remaining_import_w"), 0.0)
+    )
+    context.update({
+        "step_ts": sample_ts,
+        "step_import_ws": import_ws,
+        "step_needed_w": int(round(needed_w)),
+        "step_room_w": max(0, int(math.floor(-needed_w))),
+    })
+    if needed_w < PEAK_SHAVING_MIN_COMMAND_W:
+        return 0
+    if abs(needed_w - discharge_cap_w) < safe_int(
+        context.get("deadband_w"),
+        PEAK_SHAVING_DEFAULT_HYSTERESIS_W,
+    ):
+        return discharge_cap_w
+    return int(math.ceil(needed_w))
+
+
 def _active_cap_decision(
     context: Dict[str, Any],
     *,
     target_w: int,
     max_charge_w: int,
     heartbeat_s: float,
-    release_debounce_active: bool = False,
 ) -> Dict[str, Any]:
     reason = (
-        "15-Minuten-Netzbezug sanft begrenzen: Prognose %d W, Ziel %d W; "
-        "E3/DC-AUTO bleibt aktiv, Entladung ist auf %d W begrenzt und "
-        "Einspeisung wird nicht angefordert."
+        "15-Minuten-Netzbezug sanft begrenzen: %d von %d Wh bezogen, "
+        "zulässiger Restbezug %d W; E3/DC-AUTO bleibt aktiv, Entladung ist "
+        "auf %d W begrenzt und Einspeisung wird nicht angefordert."
         % (
-            safe_int(context.get("projected_average_w"), 0),
-            safe_int(context.get("configured_limit_w"), 0),
+            int(round(safe_float(context.get("import_wh"), 0.0))),
+            int(round(safe_float(context.get("target_import_wh"), 0.0))),
+            safe_int(context.get("allowed_remaining_import_w"), 0),
             target_w,
         )
     )
-    if release_debounce_active:
-        reason += " Die Freigabe-Entprellung hält den bisherigen Rahmen kurz stabil."
     return {
         "state": "peak_shaving_active",
         "mode": MODE_AUTO,
@@ -694,9 +739,6 @@ def _active_cap_decision(
         "peak_shaving_action_class": "active_cap",
         "peak_shaving_active": True,
         "peak_shaving_target_w": target_w,
-        "peak_shaving_release_debounce_active": bool(
-            release_debounce_active
-        ),
         "peak_shaving_no_export_contract": True,
         "auto_limit": _auto_discharge_cap(
             max_charge_w=max_charge_w,
@@ -723,6 +765,21 @@ def _reserve_hold_decision(
             safe_float(context.get("usable_reserve_pct"), 0.0),
         )
     )
+    if (
+        context.get("coverage_complete")
+        and safe_float(context.get("effective_limit_w"), 0.0)
+        < safe_float(context.get("grid_w"), 0.0)
+        <= safe_float(context.get("allowed_remaining_import_w"), 0.0)
+    ):
+        reason += (
+            " Der Netzbezug liegt über der Grenze abzüglich Sicherheitsabstand "
+            "(%d W); die laufende Viertelstunde reicht noch (%d von %d Wh)."
+            % (
+                safe_int(context.get("effective_limit_w"), 0),
+                int(round(safe_float(context.get("import_wh"), 0.0))),
+                int(round(safe_float(context.get("target_import_wh"), 0.0))),
+            )
+        )
     recharge_blocker = str(context.get("grid_recharge_blocker") or "")
     if recharge_blocker == "pv_source_invalid":
         reason += " PV-Daten fehlen; eine Netz-Nachladung bleibt gesperrt."
@@ -775,7 +832,7 @@ def _grid_recharge_decision(
         "peak_shaving_target_w": charge_w,
         "peak_shaving_grid_recharge_authorized": True,
         "peak_shaving_interval_room_w": safe_int(
-            context.get("grid_import_headroom_w"),
+            context.get("step_room_w"),
             0,
         ),
         "peak_shaving_house_connection_room_w": safe_int(
@@ -921,7 +978,7 @@ def evaluate_peak_shaving(
     reserve_hold_active = bool(
         soc <= reserve_soc
         or (
-            previous_action in {"reserve_hold", "grid_recharge"}
+            previous_action in {"active_cap", "reserve_hold", "grid_recharge"}
             and soc < reserve_soc + soc_hysteresis
         )
     )
@@ -955,71 +1012,24 @@ def evaluate_peak_shaving(
         return {"context": context, "decision": None}
 
     grid_w = safe_float(context.get("grid_w"), 0.0)
-    base_import_w = max(
-        0.0,
-        safe_float(context.get("base_import_w"), 0.0),
-    )
-    required_discharge_w = max(
-        0,
-        safe_int(context.get("required_discharge_w"), 0),
-    )
-    hysteresis_enter_w = max(
-        PEAK_SHAVING_MIN_HYSTERESIS_W,
-        safe_int(
-            context.get("hysteresis_enter_w"),
-            PEAK_SHAVING_DEFAULT_HYSTERESIS_W,
-        ),
-    )
-    # Das Ein-/Ausschaltband ist stets strikt größer als die kleinste
-    # flüchtige E3/DC-Leistungsgrenze.
-    hysteresis_exit_w = max(0, hysteresis_enter_w - 350)
-    context["hysteresis_exit_w"] = hysteresis_exit_w
-    context["hysteresis_band_w"] = hysteresis_enter_w - hysteresis_exit_w
-    discharge_needed = bool(
-        required_discharge_w
-        >= (hysteresis_exit_w if previous_active else hysteresis_enter_w)
-    )
-    export_guard = bool(grid_w <= 0.0 or base_import_w <= 0.0)
-    physical_energy_available = soc > physical_reserve + 0.2
-    remaining_s = max(
-        1.0,
-        safe_float(context.get("remaining_s"), 1.0),
-    )
-    storage_kwh = max(
-        0.1,
-        safe_float(context.get("storage_capacity_kwh"), 0.1),
-    )
-    available_above_reserve_wh = max(
-        0.0,
-        storage_kwh * 1000.0 * (soc - physical_reserve) / 100.0,
-    )
-    reserve_energy_cap_w = max(
-        0,
-        int(math.floor(available_above_reserve_wh * 3600.0 / remaining_s)),
-    )
-    configured_discharge_w = max(
-        0,
-        safe_int(context.get("peak_max_discharge_w"), 0),
-    )
+    battery_w = safe_float(context.get("battery_w"), 0.0)
+    previous_target_w = max(0, safe_int(context.get("last_target_w"), 0))
     target_w = min(
+        _interval_step(
+            context,
+            discharge_cap_w=previous_target_w if previous_active else 0,
+            charge_w=(
+                min(previous_target_w, max(0.0, battery_w))
+                if previous_action == "grid_recharge"
+                else 0.0
+            ),
+        ),
         max(0, int(max_discharge_w)),
-        configured_discharge_w,
-        max(0, int(math.ceil(base_import_w))),
-        max(0, int(required_discharge_w)),
-        reserve_energy_cap_w,
+        max(0, safe_int(context.get("peak_max_discharge_w"), 0)),
     )
-    if 0 < target_w < PEAK_SHAVING_MIN_COMMAND_W:
-        target_w = 0
-    if discharge_needed:
-        context["unavoidable_exceedance_w"] = max(
-            safe_int(context.get("unavoidable_exceedance_w"), 0),
-            max(0, required_discharge_w - target_w),
-        )
-
     if (
-        discharge_needed
-        and physical_energy_available
-        and not export_guard
+        reserve_hold_active
+        and soc > physical_reserve + 0.2
         and target_w >= PEAK_SHAVING_MIN_COMMAND_W
     ):
         context["last_action"] = "active_cap"
@@ -1027,59 +1037,12 @@ def evaluate_peak_shaving(
         context["last_discharge_interval_start_ts"] = context.get(
             "interval_start_ts"
         )
-        context["release_since_ts"] = None
         return {
             "context": context,
             "decision": _active_cap_decision(
                 context,
                 target_w=target_w,
                 max_charge_w=max_charge_w,
-                heartbeat_s=heartbeat_s,
-            ),
-        }
-
-    if previous_active:
-        release_since_ts = safe_float(
-            context.get("release_since_ts"),
-            0.0,
-        )
-        if release_since_ts <= 0.0:
-            release_since_ts = float(now_s)
-            context["release_since_ts"] = round(release_since_ts, 3)
-        debounce_s = max(
-            5.0,
-            safe_float(context.get("release_debounce_s"), 20.0),
-        )
-        if float(now_s) - release_since_ts < debounce_s:
-            held_target_w = min(
-                max(0, int(max_discharge_w)),
-                configured_discharge_w,
-                max(
-                    PEAK_SHAVING_MIN_COMMAND_W,
-                    safe_int(context.get("last_target_w"), 0),
-                ),
-            )
-            context["last_action"] = "active_cap"
-            context["last_target_w"] = held_target_w
-            return {
-                "context": context,
-                "decision": _active_cap_decision(
-                    context,
-                    target_w=held_target_w,
-                    max_charge_w=max_charge_w,
-                    heartbeat_s=heartbeat_s,
-                    release_debounce_active=True,
-                ),
-            }
-        context["last_action"] = "release"
-        context["last_target_w"] = 0
-        context["release_since_ts"] = None
-        return {
-            "context": context,
-            "decision": _release_decision(
-                context,
-                max_charge_w=max_charge_w,
-                max_discharge_w=max_discharge_w,
                 heartbeat_s=heartbeat_s,
             ),
         }
@@ -1099,7 +1062,6 @@ def evaluate_peak_shaving(
     )
     pv_w = _typed_number(live.get("PV_Power"))
     home_w = _typed_number(live.get("Home_Power"))
-    battery_w = safe_float(context.get("battery_w"), 0.0)
     pv_first_block = bool(
         not pv_source_valid
         or pv_w is None
@@ -1119,13 +1081,20 @@ def evaluate_peak_shaving(
     else:
         context["grid_recharge_blocker"] = None
     house_room_w = context.get("house_grid_charge_room_w")
-    interval_room_w = max(
-        0,
-        safe_int(context.get("grid_import_headroom_w"), 0),
-    )
+    # Spielraum aus demselben Takt; der Beginn braucht wie jede Änderung der
+    # Grenze mindestens das Totband.
+    interval_room_w = max(0, safe_int(context.get("step_room_w"), 0))
     if (
         below_recharge_threshold
         and recharge_enabled
+        and interval_room_w >= (
+            PEAK_SHAVING_MIN_COMMAND_W
+            if previous_action == "grid_recharge"
+            else safe_int(
+                context.get("deadband_w"),
+                PEAK_SHAVING_DEFAULT_HYSTERESIS_W,
+            )
+        )
         and not same_discharge_interval
         and not pv_first_block
         and house_room_w is not None
@@ -1165,7 +1134,7 @@ def evaluate_peak_shaving(
             ),
         }
 
-    if previous_action in {"reserve_hold", "grid_recharge"}:
+    if previous_action in {"active_cap", "reserve_hold", "grid_recharge"}:
         context["last_action"] = "release"
         context["last_target_w"] = 0
         return {

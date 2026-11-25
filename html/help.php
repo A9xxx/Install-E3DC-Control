@@ -90,6 +90,16 @@ $paths = getInstallPaths();
             color: #000;
             padding: 0;
         }
+        .doc-hit {
+            background: var(--bs-secondary-bg);
+            border: 1px solid var(--bs-border-color);
+            border-radius: 12px;
+            padding: 14px 18px;
+            margin-bottom: 12px;
+        }
+        .doc-hit-source { font-size: 0.8rem; color: var(--bs-secondary-color); }
+        .doc-hit-snippet { margin: 6px 0; }
+        .doc-hit-text { white-space: pre-wrap; color: var(--bs-secondary-color); border-top: 1px solid var(--bs-border-color); padding-top: 10px; margin-top: 8px; }
         .nav-link-back {
             color: #fff;
             text-decoration: none;
@@ -115,7 +125,7 @@ $paths = getInstallPaths();
     <div class="container">
         <div class="d-flex justify-content-between align-items-center mb-4">
             <a href="index.php" class="nav-link-back"><i class="fas fa-arrow-left me-2"></i>Dashboard</a>
-            <span class="badge bg-success text-light">v5.5.8 Stable</span>
+            <span class="badge bg-success text-light">v5.5.9 Stable</span>
         </div>
         <h1 class="display-4 fw-bold">Hilfe & Support</h1>
         <p class="lead opacity-75">Häufige Fragen und Lösungen rund um E3DC-Control.</p>
@@ -126,15 +136,16 @@ $paths = getInstallPaths();
     <div class="search-container mb-5">
         <div class="input-group">
             <span class="input-group-text bg-white border-0 ps-4"><i class="fas fa-search text-muted"></i></span>
-            <input type="text" id="helpSearch" class="form-control search-input" placeholder="Suche nach evcc, tibber, backup, shadow, etc...">
+            <input type="text" id="helpSearch" class="form-control search-input" placeholder="FAQ und Dokumentation durchsuchen, z. B. evcc, Tibber, Backup" aria-label="FAQ und Dokumentation durchsuchen">
         </div>
+        <p class="text-center mt-3 mb-0"><a id="docJump" href="#docResults" hidden></a></p>
     </div>
 
     <div class="row" id="faqContainer">
         <div class="col-12 faq-item" data-tags="docker image stable rollback update">
             <div class="card bg-card border-0 shadow-sm"><div class="card-body">
                 <h5 class="card-title"><span class="tag">Docker</span> Wie prüfe ich Image und Update?</h5>
-                <p>Die mitgelieferte Compose-Datei verwendet standardmäßig <code>image: "ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}"</code>. Ohne Pin folgt sie dem Stable-Tag <code>latest</code>. Ein fester Tag bleibt bei <code>pull</code> absichtlich fest; für einen bewussten Pin wird zum Beispiel <code>E3DC_IMAGE_TAG=v5.5.8</code> in <code>.env</code> gesetzt.</p>
+                <p>Die mitgelieferte Compose-Datei verwendet standardmäßig <code>image: "ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}"</code>. Ohne Pin folgt sie dem Stable-Tag <code>latest</code>. Ein fester Tag bleibt bei <code>pull</code> absichtlich fest; für einen bewussten Pin wird zum Beispiel <code>E3DC_IMAGE_TAG=v5.5.9</code> in <code>.env</code> gesetzt.</p>
                 <p><strong>Update-Knopf und Auto-Update:</strong> Der Container tauscht sein Image nicht selbst. Läuft das Compose-Profil <code>auto-update</code> (Watchtower-Fork <code>ghcr.io/nicholas-fedor/watchtower</code>), gibt der Knopf <strong>System Update</strong> Watchtower über dessen lokale HTTP-API das Signal: Watchtower lädt das Image, erstellt den Container neu, und die Oberfläche lädt nach dem Start neu. Mit <strong>Auto-Update</strong> im Config-Editor passiert dasselbe täglich zur eingestellten Uhrzeit; Watchtower selbst pollt nicht. Gibt es kein neues Image, passiert nichts.</p>
                 <p>Einmalige Freischaltung auf dem Docker-Host im Compose-Ordner (Token für beide Dienste in <code>.env</code>, Container mit Token neu erstellen, Watchtower starten):</p>
                 <pre>cd "${E3DC_DOCKER_PATH:-$HOME/e3dc-docker}"
@@ -233,7 +244,8 @@ sudo docker compose logs --tail=80 e3dc-control</pre>
             </div>
         </div>
 
-        <div class="alert alert-info"><strong>MQTT-Wärmepumpe (nur Anzeige):</strong>
+        <h4 class="mb-4 text-accent">MQTT-Wärmepumpe</h4>
+        <div class="alert alert-info faq-item" data-tags="mqtt wärmepumpe waermepumpe heizstab cop heizleistung leistung typ 7 sg-ready shelly smart home"><strong>MQTT-Wärmepumpe (nur Anzeige):</strong>
         Typ 7 zeigt Leistung, Heizleistung, COP, Status und Temperaturen aus MQTT.
         Fehlende oder mindestens 180 Sekunden alte Werte bleiben unbekannt; gültige 0 bleibt 0.
         Die Detailansichten zeigen Alter und Herkunft je Feld. Die Steuerung bleibt bei SG-Ready/Shelly bzw. extern.
@@ -246,6 +258,21 @@ sudo docker compose logs --tail=80 e3dc-control</pre>
         Ohne getrennte Nachricht unter <code>in/heatpump/electric_w</code> bleiben elektrische Einzelleistung und COP unbekannt.
         Ein getrenntes frisches <code>electric_w</code> ermöglicht den COP bei ebenfalls frischer Heizleistung.
         <?= e3dcDocLink('Smart_Home_Mqtt_Websockets.md', 'MQTT-Topics und Einheiten') ?></div>
+        <h4 class="mb-4 text-accent">Stable 5.5.9: Zugriff von außen, Dashboard im Heimnetz, Wallbox-Start und Suche</h4>
+        <div class="col-12 faq-item" data-tags="5.5.9 stable zugriff von außen domain web-pin portfreigabe heimnetz dashboard anmeldung localhost wallbox easy connect multi connect phasen fahrzeugprofil netzfreigabe ladeplan pv-start openwb pro pause ladepunktsperre netzladen puffer pause hauptblock direktvermarktung lastspitzen dimplex verdichter suche dokumentation einrichtungsstand marktpfad prognose training update">
+            <div class="card bg-card border-0 shadow-sm"><div class="card-body">
+                <h5 class="card-title">Was bringt Stable-Release 5.5.9?</h5>
+                <p><strong>Zugriff von außen:</strong> Ohne Web-PIN ist der Zugriff über Domainnamen und öffentliche IP-Adressen gesperrt, frühestens 14 Tage nach dem ersten solchen Zugriff; bis dahin zeigt die Oberfläche oben einen Hinweis mit dem Datum. Private IP-Adressen, lokale Namen und Tailscale bleiben frei. Zum Freischalten die Oberfläche im Heimnetz öffnen und im Config-Editor unter „Sicherheit, Webansicht &amp; Updates“ im Bereich „Sicherheit“ die Web-PIN setzen oder „Domainzugriff ohne Web-PIN“ bewusst auf „Ja, bewusst ohne Web-PIN“ stellen.</p>
+                <p><strong>Dashboard im Heimnetz:</strong> Mit Web-PIN sind Live-Daten, Diagramme, Prognose und Tagesstatistik im Heimnetz ohne Anmeldung sichtbar; Kostenhistorie, Einstellungen und Schaltfunktionen brauchen die PIN. Über <code>localhost</code> ist die Anmeldung nötig.</p>
+                <p><strong>Wallbox:</strong> Feste E3DC-Wallboxen ohne eigene Phasenumschaltung rechnen bis zur ersten Messung mit Box und Fahrzeugprofil; für einphasige Fahrzeuge ein Profil mit einer Phase wählen. Mit Netzfreigabe beginnt die Ladung auch ohne Phasenangabe am Fahrzeug. Der PV-Start wartet auf 60 Sekunden ausreichenden Überschuss, ohne Akkureservierung. Pause und Ladepunktsperre gelten auch bei nicht lesbarer Konfigurationsdatei.</p>
+                <p><strong>Speicher:</strong> Beim Netzladen gelten Puffer, Pause und Hauptblock auch auf langsameren Geräten. Ohne aktive Einspeisegrenze pendelt die Ladegrenze nicht mehr, und der Verkauf aus dem Akku pendelt nicht mehr bei hoher Hauslast. Netzladen braucht gültige Phasenwerte, keinen Netzwert. Die Lastspitzenkappung (ab Werk aus) rechnet die Entladegrenze alle 30 Sekunden aus der laufenden Viertelstunde.</p>
+                <p><strong>Prognose und Wärmepumpe:</strong> Ein verpasstes wöchentliches Training der Verbrauchsprognose wird nachgeholt; scheitert es, bleibt die Prognose mit dem bisherigen Modell erhalten. Dimplex liest den Verdichterstatus aus dem Ausgang „Verdichter 1“ und zeigt die Betriebsstunden.</p>
+                <p><strong>Suche und Einrichtung:</strong> Der Config-Editor sucht auch in Hilfetexten, diese Hilfeseite in der mitgelieferten Dokumentation. Die Installationszentrale zeigt den „Einrichtungsstand“ mit Sprung zum Feld.</p>
+                <p><strong>Config-Editor:</strong> „Marktpfad öffnen“ mit Zustandszeile, Hinweise beim Einschalten der Direktvermarktung, ausgeblendete Felder ohne Wirkung; gespeicherte Werte bleiben. Schalter ohne gespeicherten Wert erscheinen so, wie E3DC-Control sie anwendet.</p>
+                <p><strong>Grenzen:</strong> Verdeckt ein Reverse-Proxy oder eine Docker-Portweiterleitung Absender und Namen, ist ein Zugriff von außen nicht erkennbar. Der Vergleich der neuen Speicherregelung beschreibt Entscheidungen, keine gemessene Wirkung. Weitere Grenzen stehen in den Release Notes.</p>
+                <p><strong>Update:</strong> Wie gewohnt über <strong>System Update</strong> beziehungsweise das Docker-Update; während des Updates kein Fahrzeug anstecken.</p>
+            </div></div>
+        </div>
         <h4 class="mb-4 text-accent">Stable 5.5.8: Akku-Netzladen, Hausanschluss, Haltezone und Web-PIN</h4>
         <div class="col-12 faq-item" data-tags="5.5.8 stable akku netzladen puffer halten hauptblock hausanschluss phase einphasig wurzelzähler phasen invertieren haltezone untergrenze pre-dump wallbox fahrzeugvorlagen wärmepumpe hauswert automatik heizstab pv-prognose solcast forecast.solar leistungsverlauf vergleichsbetrieb web-pin domainzugriff geheimnisfelder webpush docker piguard update">
             <div class="card bg-card border-0 shadow-sm"><div class="card-body">
@@ -300,7 +327,7 @@ sudo docker compose logs --tail=80 e3dc-control</pre>
             <div class="card bg-card border-0 shadow-sm"><div class="card-body">
                 <h5 class="card-title">Was bringt Stable-Release 5.5.5b?</h5>
                 <p>5.5.5b ist ein Korrekturupdate zu 5.5.5a. Ist der Ladezustand des Hausakkus unbekannt (fehlende, beschädigte oder veraltete Livedaten, ungültiger oder unplausibler Wert), erteilt der automatische Regelpfad des Heizstab-Managers keine neuen Starts oder Leistungsfreigaben. Bisher galt ein fehlender Wert als 0 %; bei „Mindest-SOC (%)“ = 0 konnte daraus eine Freigabe entstehen. Eine von E3DC-Control eingeschaltete Wärmepumpe am Shelly-Pro3EM-Relais beendet ihre Mindestlaufzeit und erhält danach einen Aus-Auftrag, statt sofort abgeschaltet zu werden. Ein unabhängiger, automatisch geregelter Heizstab wird zurückgenommen; der manuelle Vollgasauftrag ist nicht betroffen.</p>
-                <p>Für die E3/DC Multi Connect II gibt es bei „Wallbox 1 Modell / API“ beziehungsweise „Wallbox 2 Modell / API“ = „E3/DC Multi Connect I/II“ das neue Feld „Modell“. Mit „Multi Connect II“ schaltet im Sonnenmodus nur die Wallbox die Phasen; die eigene 6-A-Phasenerkennung läuft dann nicht mehr parallel. Eine geänderte Auswahl übernimmt der Wallbox-Manager mit einem einmaligen automatischen Neustart, im Docker-Betrieb mit einem Neustart des Containers. „nicht festgelegt“ behält das bisherige Verhalten.</p>
+                <p>Für die E3/DC Multi Connect II gibt es bei „Wallbox 1 Modell / API“ beziehungsweise „Wallbox 2 Modell / API“ = „E3/DC Multi Connect I/II“ das neue Feld „Modell“. Mit „Multi Connect II“ schaltet im Sonnenmodus nur die Wallbox die Phasen. Eine geänderte Auswahl übernimmt der Wallbox-Manager mit einem einmaligen automatischen Neustart, im Docker-Betrieb mit einem Neustart des Containers. „nicht festgelegt“ behält das bisherige Verhalten.</p>
                 <p>Ohne eigenen Breiten- und Längengrad unter „Standort & PV-Prognose“ nutzt die PV-Prognose eine neutrale Vorgabe (Mitte Deutschlands). Die Konfigurationsprüfung empfiehlt dann, den eigenen Standort einzutragen, und blockiert nichts.</p>
                 <p><strong>Update:</strong> Wie gewohnt über <strong>System Update</strong> beziehungsweise das Docker-Update. Eine Konfigurationsänderung ist nicht nötig. Die Änderungen sind mit Simulationen und Gerätemodellen geprüft, ein Praxisnachweis auf mehreren Anlagen steht noch aus.</p>
             </div></div>
@@ -445,7 +472,7 @@ sudo docker compose logs --tail=80 e3dc-control</pre>
         <div class="col-12 faq-item" data-tags="5.4.6c stable wallbox phasen pv wärme luxtronik docker">
             <div class="card bg-card border-0 shadow-sm"><div class="card-body">
                 <h5 class="card-title">Was verbessert Wartungsrelease 5.4.6c?</h5>
-                <p>Feste Python-E3DC-Wallboxen können unbekannte Fahrzeuge mit einer begrenzten 6-A-Probe erkennen. Tatsächliche Phasenmessung, ein gemeinsames 40-Wh-Konto und die zentrale Leistungsfreigabe bestimmen den weiteren Lauf. Zweite Wallboxen und Phasenwechsel werden berücksichtigt.</p>
+                <p>Feste E3DC-Wallboxen rechnen vor der ersten Messung einer Stecksitzung mit den drei Phasen der Box beziehungsweise mit einem kleineren Wert aus dem Fahrzeugprofil. Mit der WBchar6-Kompatibilitätsregelung (Easy Connect und Multi Connect ohne efy-Automatik und ohne eigene Phasenumschaltung) gilt, sobald das Fahrzeug lädt, die gemessene Phasenzahl bis zum Abstecken; nach einem Neustart des Wallbox-Managers wird neu gemessen. Ein einphasiges Fahrzeug ohne einphasiges Profil startet im PV-Modus deshalb erst ab 4,14 kW; ein Fahrzeugprofil mit einer Phase senkt die Schwelle auf 1,38 kW. Zweite Wallboxen und Phasenwechsel werden berücksichtigt.</p>
                 <p>Luxtronik-Heizung und Warmwasser erhalten getrennte PV-Aufträge. Mindestlaufzeit, tatsächliche Leistungsannahme und getrennte Akku-/Netzgrenzen schützen die Wärmepumpe. Vor optionalem PV-Boost das elektrische Leistungsprofil und die erlaubten Überbrückungskontingente im Config Editor eintragen.</p>
                 <p>Docker unterstützt zusätzlich bestimmte ältere Compose-Ausgaben und die Privilegienprüfung älterer Kernel. Zuerst den Host-Updater aktualisieren und die Sicherungs- und Wartungshinweise beachten.</p>
             </div></div>
@@ -1808,6 +1835,20 @@ journalctl -u e3dc-live -n 80 --no-pager</pre>
 
         <h4 class="mt-5 mb-4 text-accent"><i class="fas fa-server me-2"></i>System & Sicherheit</h4>
 
+        <div class="col-12 faq-item" data-tags="dashboard web pin heimnetz tunnel proxy sicherheit tagesstatistik kostenhistorie">
+            <div class="faq-card">
+                <div class="faq-question">
+                    <div><span class="tag">Sicherheit</span>Dashboard und Web-PIN</div>
+                    <i class="fas fa-chevron-down"></i>
+                </div>
+                <div class="faq-answer">
+                    <p>E3DC-Control zeigt Live-Daten, Diagramme, Prognose und Tagesstatistik einschließlich Archivtagen im Heimnetz auch mit Web-PIN ohne Anmeldung und mit denselben vollständigen Daten wie ohne PIN. Die Ausnahme gilt nur bei lokalem Namen oder privater Adresse und einem Absender im Heimnetz. Die Kostenhistorie, geschützte Ansichten, Einstellungen und Schaltfunktionen benötigen weiterhin die Anmeldung.</p>
+                    <p>E3DC-Control verlangt auch für einen Proxy oder Tunnel auf demselben Gerät die Anmeldung, wenn dieser die Anlage über <code>127.0.0.1</code>/<code>localhost</code> anspricht und der Zugriff mit einer solchen Absenderadresse ankommt. Ein Ziel über die Heimnetz-Adresse fällt bei lokalem Namen und Heimnetz-Absender unter die Ausnahme. Für eine Anzeige direkt am Gerät das Dashboard über dessen Heimnetz-Adresse öffnen; über <code>localhost</code> verlangt E3DC-Control die Anmeldung.</p>
+                    <p>E3DC-Control schützt bei gesetzter Web-PIN Einstellungen und Schaltfunktionen auch bei Zugriffen aus dem Internet. Für eine Internetfreigabe eine Web-PIN setzen. Über den dokumentierten Cloudflare-Tunnel schützt die PIN auch das Dashboard, weil der Tunnel den öffentlichen Namen durchreicht. Ersetzt ein Reverse-Proxy oder eine Docker-Portweiterleitung den Absender durch eine interne Adresse und den aufgerufenen Namen durch einen lokalen Namen, kann E3DC-Control den Zugriff von außen nicht erkennen; die Dashboard-Daten bleiben dann trotz PIN ohne Anmeldung sichtbar. In diesem Fall den öffentlichen Namen durchreichen lassen oder ein VPN nutzen.</p>
+                </div>
+            </div>
+        </div>
+
         <div class="col-12 faq-item" data-tags="konfiguration download sicherheit raw redacted web pin zugangsdaten">
             <div class="faq-card">
                 <div class="faq-question">
@@ -2225,8 +2266,11 @@ journalctl -u e3dc-live -n 80 --no-pager</pre>
                     <p>Peak Shaving begrenzt den mittleren Netzbezug in einer festen Zähler-Viertelstunde. Beim Begrenzen und Halten bleibt E3/DC in AUTO; der Storage Manager setzt nur den flüchtigen Lade- oder Entladerahmen, der zum Schutz der eingestellten Grenze erforderlich ist. Die Funktion fordert keine Netzeinspeisung an.</p>
                     <ul>
                         <li>Der Speicherpuffer muss oberhalb der wirksamen Notstromreserve liegen.</li>
-                        <li>Sicherheitsabstand, Leistungs- und SoC-Hysterese sowie Freigabe-Entprellung verhindern Flattern.</li>
-                        <li>Bei einer zu großen Messlücke bleibt die Regelung passiv und beginnt erst mit einer neuen vollständigen Viertelstunde.</li>
+                        <li>Unterhalb der Speicherschwelle rechnet E3DC-Control alle 30 Sekunden aus dem Netzbezug der laufenden Viertelstunde, wie viel der Akku liefern muss. Reicht die Viertelstunde, bleibt der Puffer stehen.</li>
+                        <li>Maßgeblich ist der Mittelwert der Viertelstunde: Der momentane Netzbezug darf zeitweise über der eingestellten Grenze liegen. Der Speicherstatus nennt dann den Stand der Viertelstunde.</li>
+                        <li>Oberhalb der Speicherschwelle entlädt der E3/DC frei. Für lange Spitzen mit mehr Akkureserve die Speicherschwelle höher setzen.</li>
+                        <li>Leistungs- und SoC-Hysterese verhindern Flattern; der Sicherheitsabstand deckt Messabweichungen und einen Lastsprung am Ende der Viertelstunde.</li>
+                        <li>Bei einer zu großen Messlücke begrenzt die Regelung nicht; unterhalb der Speicherschwelle bleibt der Puffer stehen. Sie beginnt erst mit einer neuen vollständigen Viertelstunde.</li>
                         <li>Netz-Nachladung des Puffers ist ein eigener, standardmäßig ausgeschalteter Opt-in, verwendet vorübergehend den angeforderten Netzlademodus und bleibt an Viertelstunden- und Hausanschlussgrenze gebunden.</li>
                     </ul>
                 </div>
@@ -2505,10 +2549,16 @@ journalctl -u e3dc-live -n 80 --no-pager</pre>
 
     </div>
 
+    <div id="docResults" class="mt-2 mb-5" hidden>
+        <h2 class="h5"><i class="fas fa-book me-2 text-accent"></i>Treffer in der Dokumentation</h2>
+        <div id="docResultList"></div>
+        <p id="docResultNote" class="small text-secondary mb-0"></p>
+    </div>
+
     <div id="noResults" class="text-center py-5" style="display: none;">
         <i class="fas fa-search fs-1 text-muted mb-3"></i>
         <h4>Keine Hilfethemen gefunden.</h4>
-        <p class="text-muted">Versuchen Sie es mit anderen Begriffen wie "MQTT", "Solar" oder "Tibber".</p>
+        <p class="text-muted">Andere Begriffe wie „MQTT“, „Solar“ oder „Tibber“ versuchen.</p>
     </div>
 </div>
 
@@ -2525,28 +2575,153 @@ journalctl -u e3dc-live -n 80 --no-pager</pre>
         });
     });
 
-    // Suche
+    // Suche: FAQ auf dieser Seite und mitgelieferte Dokumentation (offline, Index aus doc/*.md)
     const searchInput = document.getElementById('helpSearch');
     const items = document.querySelectorAll('.faq-item');
+    const faqContainer = document.getElementById('faqContainer');
     const noResults = document.getElementById('noResults');
+    const docResults = document.getElementById('docResults');
+    const docJump = document.getElementById('docJump');
+    const docResultList = document.getElementById('docResultList');
+    const docResultNote = document.getElementById('docResultNote');
+    const DOC_INDEX_URL = <?= json_encode('doku_suche.json?v=' . (@filemtime(__DIR__ . '/doku_suche.json') ?: 0)) ?>;
+    const DOC_BASE_URL = <?= json_encode(E3DC_DOC_BASE_URL) ?>;
+    const DOC_MAX_HITS = 8;
+    let docIndex = null;
+    let docIndexLoad = null;
+    let docSearchTimer = null;
+
+    function helpSearchWords(term) {
+        return String(term || '').toLowerCase().split(/\s+/).filter(Boolean);
+    }
+
+    function helpEscape(text) {
+        return String(text).replace(/[&<>"']/g, c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]));
+    }
+
+    function helpMark(text, words) {
+        // Erst im Rohtext markieren, dann jedes Stück einzeln maskieren: keine Treffer in HTML-Entitäten.
+        const parts = words.filter(Boolean).map(w => w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+        if (!parts.length) return helpEscape(text);
+        const re = new RegExp('(' + parts.join('|') + ')', 'gi');
+        return String(text).split(re).map((part, i) => (i % 2 ? '<mark>' + helpEscape(part) + '</mark>' : helpEscape(part))).join('');
+    }
+
+    function docSearch(index, words) {
+        if (!index || !Array.isArray(index.abschnitte) || words.length === 0) return [];
+        const hits = [];
+        index.abschnitte.forEach(section => {
+            const title = String(section.t || '').toLowerCase();
+            const text = String(section.x || '').toLowerCase();
+            let score = 0;
+            for (const w of words) {
+                const inTitle = title.includes(w);
+                if (!inTitle && !text.includes(w)) return;
+                score += inTitle ? 5 : 1;
+            }
+            hits.push({section, score});
+        });
+        hits.sort((a, b) => b.score - a.score || String(a.section.d).localeCompare(String(b.section.d)));
+        return hits;
+    }
+
+    function docSnippet(text, words) {
+        const lower = text.toLowerCase();
+        let pos = -1;
+        for (const w of words) {
+            const p = lower.indexOf(w);
+            if (p >= 0 && (pos < 0 || p < pos)) pos = p;
+        }
+        const start = Math.max(0, pos - 80);
+        const end = Math.min(text.length, (pos < 0 ? 0 : pos) + 200);
+        return (start > 0 ? '… ' : '') + text.slice(start, end).replace(/\s+/g, ' ') + (end < text.length ? ' …' : '');
+    }
+
+    function renderDocResults(term) {
+        const words = helpSearchWords(term);
+        docJump.hidden = true;
+        if (words.join('').length < 3 || !docIndex) {
+            docResults.hidden = true;
+            return 0;
+        }
+        const hits = docSearch(docIndex, words);
+        docJump.hidden = hits.length === 0;
+        docJump.textContent = '↓ ' + hits.length + ' Treffer in der Dokumentation';
+        docResultList.innerHTML = hits.slice(0, DOC_MAX_HITS).map((hit, i) => {
+            const s = hit.section;
+            const link = DOC_BASE_URL + encodeURIComponent(s.d) + (s.a ? '#' + encodeURIComponent(s.a) : '');
+            return '<div class="doc-hit">'
+                + '<div class="doc-hit-source">' + helpEscape(s.d.replace(/\.md$/, '').replace(/_/g, ' ')) + '</div>'
+                + '<div class="fw-semibold">' + helpMark(s.t, words) + '</div>'
+                + '<div class="doc-hit-snippet">' + helpMark(docSnippet(String(s.x || ''), words), words) + '</div>'
+                + '<button type="button" class="btn btn-sm btn-outline-info me-2" data-doc-toggle="' + i + '">Abschnitt anzeigen</button>'
+                + '<a class="btn btn-sm btn-outline-secondary" href="' + helpEscape(link) + '" target="_blank" rel="noopener">Auf GitHub öffnen</a>'
+                + '<div class="doc-hit-text" data-doc-text="' + i + '" hidden>' + helpMark(String(s.x || ''), words) + '</div>'
+                + '</div>';
+        }).join('');
+        docResultNote.textContent = hits.length > DOC_MAX_HITS
+            ? hits.length + ' Abschnitte gefunden, die ersten ' + DOC_MAX_HITS + ' werden gezeigt. Weitere Suchwörter grenzen ein.'
+            : (hits.length ? '' : 'Kein Abschnitt der Dokumentation enthält alle Suchwörter.');
+        docResults.hidden = false;
+        return hits.length;
+    }
+
+    function loadDocIndex() {
+        if (!docIndexLoad) {
+            docIndexLoad = fetch(DOC_INDEX_URL, {cache: 'force-cache'})
+                .then(r => (r.ok ? r.json() : null))
+                .then(data => { docIndex = data; return data; })
+                .catch(() => null);
+        }
+        return docIndexLoad;
+    }
+
+    docResultList.addEventListener('click', (e) => {
+        const button = e.target.closest('[data-doc-toggle]');
+        if (!button) return;
+        const text = docResultList.querySelector('[data-doc-text="' + button.getAttribute('data-doc-toggle') + '"]');
+        if (!text) return;
+        text.hidden = !text.hidden;
+        button.textContent = text.hidden ? 'Abschnitt anzeigen' : 'Abschnitt ausblenden';
+    });
+
+    // Überschriften der FAQ während der Suche nur mit sichtbarem Eintrag; sonst lägen die Doku-Treffer weit unter leeren Überschriften.
+    function showFaqHeadings(words) {
+        let heading = null;
+        Array.from(faqContainer.children).forEach(el => {
+            if (el.tagName === 'H4') {
+                heading = el;
+                heading.style.display = words.length ? 'none' : '';
+            } else if (heading && el.style.display !== 'none') {
+                heading.style.display = '';
+            }
+        });
+    }
 
     searchInput.addEventListener('input', (e) => {
         const term = e.target.value.toLowerCase();
+        const words = helpSearchWords(term);
         let hasResults = false;
 
         items.forEach(item => {
-            const content = item.innerText.toLowerCase();
-            const tags = item.getAttribute('data-tags').toLowerCase();
-
-            if (content.includes(term) || tags.includes(term)) {
+            const content = (item.innerText + ' ' + item.getAttribute('data-tags')).toLowerCase();
+            if (words.every(w => content.includes(w))) {
                 item.style.display = 'block';
                 hasResults = true;
             } else {
                 item.style.display = 'none';
             }
         });
+        showFaqHeadings(words);
 
         noResults.style.display = hasResults ? 'none' : 'block';
+        clearTimeout(docSearchTimer);
+        docSearchTimer = setTimeout(() => {
+            loadDocIndex().then(() => {
+                const docHits = renderDocResults(searchInput.value);
+                if (docHits > 0) noResults.style.display = 'none';
+            });
+        }, 200);
     });
 
     // Direkt-Suche via URL Parameter
